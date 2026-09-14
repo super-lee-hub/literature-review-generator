@@ -131,6 +131,7 @@ def test_production_artifacts_are_relocated_into_job_workspace(tmp_path: Path) -
         archive.writestr("trace.trace", "{}")
     screenshot.write_bytes(b"png")
     job_workspace = tmp_path / "output" / "project__job"
+    job_workspace.mkdir(parents=True)
     collector = PlaywrightEvidenceCollector(
         PlaywrightProductionScenarioInputV2(
             base_url="http://127.0.0.1:8080",
@@ -164,6 +165,150 @@ def test_production_artifacts_are_relocated_into_job_workspace(tmp_path: Path) -
     assert screenshot_path.is_file()
     assert not trace.exists()
     assert not screenshot.exists()
+
+
+def test_production_artifact_relocation_rolls_back_a_partial_move(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    trace = staging / "trace.zip"
+    screenshot = staging / "dashboard.png"
+    trace.write_bytes(b"trace")
+    screenshot.write_bytes(b"png")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    real_move = __import__("runtime.playwright_evidence", fromlist=["shutil"]).shutil.move
+    calls = 0
+
+    def fail_second_move(source: str, destination: str) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("controlled move failure")
+        return real_move(source, destination)
+
+    monkeypatch.setattr("runtime.playwright_evidence.shutil.move", fail_second_move)
+
+    with pytest.raises(PlaywrightEvidenceError, match="could not move"):
+        PlaywrightEvidenceCollector._relocate_production_artifacts(
+            staging_trace_path=trace,
+            staging_screenshot_path=screenshot,
+            job_workspace=workspace,
+        )
+
+    assert trace.is_file()
+    assert screenshot.is_file()
+    assert not (workspace / "acceptance_gui").exists()
+
+
+def test_production_artifact_relocation_recovers_only_unregistered_remnants(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    destination = workspace / "acceptance_gui"
+    destination.mkdir(parents=True)
+    (destination / "trace.zip").write_bytes(b"interrupted")
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    trace = staging / "trace.zip"
+    screenshot = staging / "dashboard.png"
+    trace.write_bytes(b"fresh-trace")
+    screenshot.write_bytes(b"fresh-png")
+
+    _, trace_path, _, screenshot_path = PlaywrightEvidenceCollector._relocate_production_artifacts(
+        staging_trace_path=trace,
+        staging_screenshot_path=screenshot,
+        job_workspace=workspace,
+        job_id="job-retry",
+    )
+
+    assert trace_path.read_bytes() == b"fresh-trace"
+    assert screenshot_path.read_bytes() == b"fresh-png"
+
+
+def test_production_artifact_relocation_refuses_registry_published_destination(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    destination = workspace / "acceptance_gui"
+    destination.mkdir(parents=True)
+    published_trace = destination / "trace.zip"
+    with zipfile.ZipFile(published_trace, "w") as archive:
+        archive.writestr("trace.trace", "published")
+    registry = ArtifactRegistry(workspace / "artifact_registry.json", "job-published")
+    registry.register_file(
+        artifact_id="acceptance-I:playwright_trace:published",
+        artifact_role="playwright_trace",
+        artifact_type="playwright_trace",
+        artifact_version="v1",
+        path=published_trace,
+        producer="tests",
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    trace = staging / "trace.zip"
+    screenshot = staging / "dashboard.png"
+    trace.write_bytes(b"fresh")
+    screenshot.write_bytes(b"fresh")
+
+    with pytest.raises(PlaywrightEvidenceError, match="Registry-published"):
+        PlaywrightEvidenceCollector._relocate_production_artifacts(
+            staging_trace_path=trace,
+            staging_screenshot_path=screenshot,
+            job_workspace=workspace,
+            job_id="job-published",
+        )
+
+    with zipfile.ZipFile(published_trace) as archive:
+        assert archive.read("trace.trace") == b"published"
+    assert trace.read_bytes() == b"fresh"
+    assert screenshot.read_bytes() == b"fresh"
+
+
+def test_production_staging_cleanup_only_removes_expected_regular_files(tmp_path: Path) -> None:
+    staging = tmp_path / "acceptance_gui_staging" / "run"
+    staging.mkdir(parents=True)
+    (staging / "trace.zip").write_bytes(b"trace")
+    (staging / "dashboard.png").write_bytes(b"png")
+
+    PlaywrightEvidenceCollector._cleanup_production_staging_artifacts(staging)
+
+    assert not staging.exists()
+    unsafe = tmp_path / "acceptance_gui_staging" / "unsafe"
+    unsafe.mkdir(parents=True)
+    (unsafe / "unexpected.txt").write_text("retain", encoding="utf-8")
+    PlaywrightEvidenceCollector._cleanup_production_staging_artifacts(unsafe)
+    assert (unsafe / "unexpected.txt").is_file()
+
+
+def test_browser_control_fallback_is_recorded_in_evidence() -> None:
+    class ViewportLimitedControl:
+        def scroll_into_view_if_needed(self, **_kwargs) -> None:
+            raise RuntimeError("outside viewport")
+
+        def click(self, **_kwargs) -> None:
+            raise AssertionError("pointer click must not be attempted after scroll failure")
+
+        def evaluate(self, expression: str) -> None:
+            assert expression == "(element) => element.click()"
+
+    assertions: list[dict[str, object]] = []
+    PlaywrightEvidenceCollector._activate_browser_control(
+        ViewportLimitedControl(),
+        assertion_name="fallback_control",
+        assertions=assertions,
+    )
+
+    assert assertions == [
+        {
+            "name": "fallback_control",
+            "passed": True,
+            "detail": "dom_click_fallback_after_viewport_error",
+            "pointer_error_type": "RuntimeError",
+        }
+    ]
 
 
 def test_playwright_collector_registers_all_durable_outputs(tmp_path: Path) -> None:

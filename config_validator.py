@@ -17,7 +17,13 @@ from services.config_values import (
     normalize_stage1_config_sections,
 )
 from services.credential_provenance import is_template_credential
-from services.settings import ApplicationSettings, validate_config_keys
+from services.settings import (
+    ApplicationSettings,
+    PREPROCESS_FALLBACK_PARSERS,
+    PREPROCESS_PARSER_MODES,
+    PREPROCESS_PRIMARY_PARSERS,
+    validate_config_keys,
+)
 
 
 class ConfigValidationError(Exception):
@@ -437,6 +443,16 @@ def validate_all_config(
             )
         )
     preprocess = config_dict.get("Preprocess", {})
+    parser_values = (
+        ("parser_mode", PREPROCESS_PARSER_MODES),
+        ("primary_parser", PREPROCESS_PRIMARY_PARSERS),
+        ("fallback_parser", PREPROCESS_FALLBACK_PARSERS),
+    )
+    for field_name, allowed_values in parser_values:
+        value = str(preprocess.get(field_name, "")).strip().casefold()
+        if value and value not in allowed_values:
+            allowed = "/".join(sorted(allowed_values))
+            return False, [f"[Preprocess] {field_name} 应为 {allowed} 之一"]
     if str(preprocess.get("ocr_mode", "auto")).lower() not in {"auto", "off", "always"}:
         return False, ["[Preprocess] ocr_mode 应为 auto/off/always 之一"]
     if "local_rag_retain_recent_identities" in preprocess:

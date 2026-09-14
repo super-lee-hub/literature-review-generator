@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import time
 from dataclasses import replace
 
@@ -10,6 +11,7 @@ from reviewctl import main as reviewctl_main
 from runtime.control_plane import FORBIDDEN_ACTIONS, ReviewControlPlane
 from runtime.outline_v3_dag import OutlineNodeStore
 from services.artifact_registry import ArtifactRegistry
+from services.credential_provenance import PREPROCESS_ENV_MAPPING
 from services.job_workspace import JobWorkspace
 
 
@@ -104,6 +106,79 @@ def test_doctor_fails_for_configured_missing_certificate(tmp_path: Path, monkeyp
     assert certificate["status"] == "fail"
     assert certificate["details"]["valid"] is False
     assert result["ok"] is False
+
+
+def _clear_preprocess_environment(monkeypatch) -> None:
+    for env_name in PREPROCESS_ENV_MAPPING:
+        monkeypatch.delenv(env_name, raising=False)
+
+
+def _example_config(path: Path) -> None:
+    source = Path(__file__).resolve().parents[1] / "config.ini.example"
+    path.write_text(
+        re.sub(
+            r"(?im)^(api_key\s*=\s*).*$",
+            r"\1test-provider-key",
+            source.read_text(encoding="utf-8"),
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_doctor_reports_mineru_remote_fallback_without_network(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _clear_preprocess_environment(monkeypatch)
+    config_path = tmp_path / "config.ini"
+    _example_config(config_path)
+
+    result = ReviewControlPlane(repo_root=tmp_path).doctor(config_path=config_path)
+
+    admission = next(
+        check for check in result["checks"] if check["name"] == "mineru_remote_admission"
+    )
+    assert admission["status"] == "warn"
+    assert admission["details"] == {
+        "status": "warn",
+        "remote_requested": True,
+        "token_present": False,
+        "fallback_will_be_used": True,
+        "parser_mode": "hybrid",
+        "primary_parser": "mineru_remote",
+        "fallback_parser": "local",
+        "network_probe": False,
+        "reason": "remote_parser_admission_failed",
+        "error_type": "ValueError",
+    }
+    assert result["provider_network_calls"] == 0
+
+
+def test_provider_preflight_fails_when_remote_mineru_has_no_fallback(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _clear_preprocess_environment(monkeypatch)
+    config_path = tmp_path / "config.ini"
+    _example_config(config_path)
+    (tmp_path / ".env").write_text(
+        "ALLOW_LOCAL_PARSE_FALLBACK=false\n",
+        encoding="utf-8",
+    )
+
+    result = ReviewControlPlane(repo_root=tmp_path).provider_preflight(
+        config_path=config_path,
+        action="analyze",
+    )
+
+    assert result["status"] == "fail"
+    assert result["ok"] is False
+    admission = result["mineru_remote_admission"]
+    assert admission["remote_requested"] is True
+    assert admission["token_present"] is False
+    assert admission["fallback_will_be_used"] is False
+    assert admission["network_probe"] is False
+    assert result["network_calls"] == 0
 
 
 def test_control_plane_retry_node_uses_persisted_outline_v3_scope(tmp_path: Path) -> None:

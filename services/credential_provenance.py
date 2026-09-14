@@ -20,6 +20,33 @@ API_ENV_MAPPING: dict[str, str] = {
     "Validator_API": "LLM_VALIDATOR_API",
 }
 
+# Non-provider runtime settings that can alter where user documents are sent
+# or whether a remote parser is used.  These values use the same explicit
+# precedence and conflict policy as provider credentials.
+PREPROCESS_ENV_MAPPING: dict[str, str] = {
+    "MINERU_BASE_URL": "mineru_base_url",
+    "MINERU_API_TOKEN": "mineru_api_token",
+    "MINERU_MODEL_VERSION": "mineru_model_version",
+    "MINERU_UPLOAD_ENDPOINT": "mineru_upload_endpoint",
+    "MINERU_POLL_ENDPOINT_TEMPLATES": "mineru_poll_endpoint_templates",
+    "MINERU_POLL_INTERVAL_SECONDS": "mineru_poll_interval_seconds",
+    "MINERU_POLL_TIMEOUT_SECONDS": "mineru_poll_timeout_seconds",
+    "MINERU_REQUEST_MAX_RETRIES": "mineru_request_max_retries",
+    "MINERU_RETRY_BACKOFF_SECONDS": "mineru_retry_backoff_seconds",
+    "MINERU_RESPONSE_MAX_BYTES": "mineru_response_max_bytes",
+    "MINERU_ZIP_MAX_ENTRIES": "mineru_zip_max_entries",
+    "MINERU_ZIP_MAX_UNCOMPRESSED_BYTES": "mineru_zip_max_uncompressed_bytes",
+    "MINERU_ZIP_MAX_ENTRY_BYTES": "mineru_zip_max_entry_bytes",
+    "MINERU_ZIP_MAX_COMPRESSION_RATIO": "mineru_zip_max_compression_ratio",
+    "MINERU_JSON_MAX_BYTES": "mineru_json_max_bytes",
+    "MINERU_TEXT_MAX_BYTES": "mineru_text_max_bytes",
+    "MINERU_SOURCE_PDF_MAX_BYTES": "source_pdf_max_bytes",
+    "MINERU_ALLOWED_URL_HOSTS": "mineru_allowed_url_hosts",
+    "ALLOW_LOCAL_PARSE_FALLBACK": "allow_local_parse_fallback",
+    "DOCLING_TIMEOUT_SECONDS": "docling_timeout_seconds",
+    "OCR_TIMEOUT_SECONDS": "ocr_timeout_seconds",
+}
+
 _TEMPLATE_CREDENTIAL_RE = re.compile(
     r"^(?:loaded_from_\.env_file|your_.+_api_key_here)$",
     re.IGNORECASE,
@@ -137,6 +164,87 @@ def resolve_credentials(
         provenance.append(
             CredentialProvenance(
                 section=section,
+                env_var=env_var,
+                process_env_present=bool(raw_process_value),
+                dotenv_present=bool(raw_dotenv_value),
+                config_present=bool(raw_config_value),
+                selected_source=selected_source,
+                process_env_equals_dotenv=_comparison(process_value, dotenv_value),
+                process_env_equals_config=_comparison(process_value, config_value),
+                dotenv_equals_config=_comparison(dotenv_value, config_value),
+                conflict=False,
+            )
+        )
+    return resolved, tuple(provenance)
+
+
+def resolve_preprocess_environment(
+    config: Mapping[str, Mapping[str, Any]],
+    *,
+    config_path: str | os.PathLike[str],
+    environ: Mapping[str, str] | None = None,
+    dotenv_path: str | os.PathLike[str] | None = None,
+) -> tuple[dict[str, dict[str, Any]], tuple[CredentialProvenance, ...]]:
+    """Resolve MinerU/preprocess settings without leaking their values.
+
+    The process environment, adjacent dotenv, and config file must agree when
+    more than one meaningful source is present.  This prevents a stale
+    process-only token or endpoint from silently routing document uploads to a
+    different account or service.
+    """
+
+    env = environ if environ is not None else os.environ
+    config_dir = Path(config_path).expanduser().resolve().parent
+    selected_dotenv = (
+        Path(dotenv_path).expanduser().resolve()
+        if dotenv_path
+        else config_dir / ".env"
+    )
+    dotenv_payload: Mapping[str, Any] = {}
+    if selected_dotenv.is_file():
+        dotenv_payload = dotenv_values(selected_dotenv)
+
+    resolved = {
+        str(section): dict(values) if isinstance(values, Mapping) else {}
+        for section, values in config.items()
+    }
+    preprocess = resolved.setdefault("Preprocess", {})
+    provenance: list[CredentialProvenance] = []
+    for env_var, config_key in PREPROCESS_ENV_MAPPING.items():
+        raw_config_value = str(preprocess.get(config_key) or "").strip()
+        raw_dotenv_value = str(dotenv_payload.get(env_var) or "").strip()
+        raw_process_value = str(env.get(env_var) or "").strip()
+        config_value = _meaningful(raw_config_value)
+        dotenv_value = _meaningful(raw_dotenv_value)
+        process_value = _meaningful(raw_process_value)
+        meaningful_values = {
+            source: value
+            for source, value in (
+                ("process_env", process_value),
+                ("dotenv", dotenv_value),
+                ("config.ini", config_value),
+            )
+            if value
+        }
+        if len(set(meaningful_values.values())) > 1:
+            sources = ", ".join(sorted(meaningful_values))
+            raise CredentialConflictError(
+                f"preprocess setting sources conflict for [Preprocess] ({env_var}); "
+                f"meaningful sources={sources}"
+            )
+        if process_value:
+            selected_source, selected_value = "process_env", process_value
+        elif dotenv_value:
+            selected_source, selected_value = "dotenv", dotenv_value
+        elif config_value:
+            selected_source, selected_value = "config.ini", config_value
+        else:
+            selected_source, selected_value = "none", ""
+        if selected_value:
+            preprocess[config_key] = selected_value
+        provenance.append(
+            CredentialProvenance(
+                section="Preprocess",
                 env_var=env_var,
                 process_env_present=bool(raw_process_value),
                 dotenv_present=bool(raw_dotenv_value),

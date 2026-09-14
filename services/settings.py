@@ -17,6 +17,20 @@ from services.repair_policy import DEFAULT_REPAIR_POLICY, parse_repair_policy
 
 CONFIG_SCHEMA_VERSION = 4
 
+PREPROCESS_PARSER_MODES = frozenset({"local", "hybrid", "remote_first", "remote"})
+PREPROCESS_PRIMARY_PARSERS = frozenset({"local", "mineru_remote"})
+PREPROCESS_FALLBACK_PARSERS = frozenset({"none", *PREPROCESS_PRIMARY_PARSERS})
+
+
+def mineru_remote_requested(parser_mode: object, primary_parser: object) -> bool:
+    """Return whether the selected parser configuration requires MinerU."""
+
+    mode = str(parser_mode or "").strip().casefold()
+    primary = str(primary_parser or "").strip().casefold()
+    return mode in {"remote", "remote_first"} or (
+        mode == "hybrid" and primary == "mineru_remote"
+    )
+
 # Kept in the accepted schema only so older config files can be read and
 # normalized.  This field is not a current parser-routing control.
 _DEPRECATED_PREPROCESS_KEYS = frozenset({"strategy_policy"})

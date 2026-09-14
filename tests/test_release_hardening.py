@@ -1187,6 +1187,48 @@ def test_public_acceptance_run_persists_blocked_state_without_owner_inputs(tmp_p
     assert state["final_sha"]
 
 
+def test_public_acceptance_run_binds_evidence_to_run_owned_root(tmp_path: Path) -> None:
+    from runtime.control_plane import ControlPlaneError, ReviewControlPlane
+
+    acceptance_spec = tmp_path / "acceptance.json"
+    external_manifest = tmp_path / "outside" / "evidence.json"
+    acceptance_spec.write_text(
+        json.dumps(
+            {
+                "gates": ["C"],
+                "state_path": "state.json",
+                "evidence_manifest": str(external_manifest),
+            }
+        ),
+        encoding="utf-8",
+    )
+    control = ReviewControlPlane(repo_root=Path.cwd())
+
+    result = control.acceptance_run(acceptance_spec)
+    state_path = tmp_path / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    run_dir = tmp_path / state["run_id"]
+    evidence_root = run_dir / "evidence"
+
+    assert result["status"] == "blocked"
+    assert Path(state["evidence_root"]) == evidence_root
+    assert not external_manifest.exists()
+    marker = json.loads((run_dir / "acceptance_evidence_root_v1.json").read_text(encoding="utf-8"))
+    assert marker["acceptance_run_id"] == state["run_id"]
+    assert marker["evidence_root"] == str(evidence_root)
+
+    state["evidence_root"] = str(tmp_path / "outside" / "evidence")
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    with pytest.raises(ControlPlaneError, match="run-owned"):
+        control.acceptance_run(acceptance_spec)
+
+    state["evidence_root"] = str(evidence_root)
+    state["process_event_log"] = str(tmp_path / "outside" / "events.jsonl")
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    with pytest.raises(ControlPlaneError, match="process event log"):
+        control.acceptance_run(acceptance_spec)
+
+
 def test_acceptance_live_execution_rejects_dirty_checkout(monkeypatch, tmp_path: Path) -> None:
     from runtime.control_plane import ControlPlaneError, ReviewControlPlane
 
@@ -1610,6 +1652,58 @@ def test_acceptance_run_binds_spec_budget_to_runtime_context(tmp_path: Path, mon
     assert result["acceptance_execution_context"]["provider_budget"]["max_provider_calls_total"] == 1
     assert Path(result["provider_budget_state_path"]).is_file()
     assert Path(result["provider_budget_state_path"]).parent.name == result["run_id"]
+
+
+def test_acceptance_run_blocks_before_runtime_when_preflight_rejects_mineru(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_spec = tmp_path / "runtime.json"
+    runtime_spec.write_text(
+        json.dumps(
+            {
+                "project_name": "acceptance-preflight",
+                "source": {"mode": "direct", "pdf_folder": str(tmp_path / "pdfs")},
+                "config": str(tmp_path / "config.ini"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    acceptance_spec = tmp_path / "acceptance.json"
+    acceptance_spec.write_text(
+        json.dumps(
+            {"runtime_spec": "runtime.json", "state_path": "state.json", "gates": ["C"]}
+        ),
+        encoding="utf-8",
+    )
+    control = __import__("runtime.control_plane", fromlist=["ReviewControlPlane"]).ReviewControlPlane(
+        repo_root=Path.cwd()
+    )
+    monkeypatch.setenv("AUTO_GENERATE_RUN_LIVE_ACCEPTANCE", "1")
+    monkeypatch.setattr(control, "_acceptance_checkout_sha", lambda *_args, **_kwargs: "a" * 40)
+    monkeypatch.setattr(
+        control,
+        "provider_preflight",
+        lambda **_kwargs: {
+            "ok": False,
+            "status": "fail",
+            "mineru_remote_admission": {"reason": "remote_parser_admission_failed"},
+        },
+    )
+    called = False
+
+    def fail_if_run(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("runtime must not execute after failed preflight")
+
+    monkeypatch.setattr(control, "run", fail_if_run)
+
+    result = control.acceptance_run(acceptance_spec)
+
+    assert called is False
+    assert result["runtime_result"]["status"] == "BLOCKED_INPUT"
+    assert "preflight did not admit" in result["runtime_result"]["reason"]
 
 
 def test_acceptance_evidence_manifest_refreshes_with_revision_on_resume(tmp_path: Path) -> None:

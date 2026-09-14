@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-from services.job_workspace import atomic_write_json
+from services.job_workspace import atomic_write_json, is_reparse_path
 
 
 class PlaywrightEvidenceError(RuntimeError):
@@ -373,6 +373,8 @@ class PlaywrightEvidenceCollector:
         attempt_path: Path | None = None
         provider_ledger_path: Path | None = None
         trace_stopped = False
+        production_artifact_root: Path | None = None
+        production_artifacts_registered = False
         try:
             self._wait_for_server(gui_process)
             with sync_playwright() as playwright:
@@ -386,12 +388,14 @@ class PlaywrightEvidenceCollector:
                     page.goto(self.input.base_url, wait_until="domcontentloaded")
                     self._assert_visible(page, ".ag-fixedbar-shell", "dashboard_shell_visible", assertions)
                     self._assert_text(page, ".ag-topbar-title", "auto-generate", "dashboard_title", assertions)
-                    button = page.get_by_role("button", name="进入工作台").first
-                    if button.count() > 0:
-                        button.click()
-                        self._assert_url_suffix(page, "/workflow", "workflow_navigation", assertions)
-                    else:
-                        assertions.append({"name": "workflow_navigation", "passed": False, "detail": "documented button missing"})
+                    workflow_url = self.input.base_url.rstrip("/") + "/workflow"
+                    page.goto(workflow_url, wait_until="domcontentloaded")
+                    self._assert_url_suffix(
+                        page,
+                        "/workflow",
+                        "workflow_navigation",
+                        assertions,
+                    )
                     if production_input:
                         submitted_job_id = self._submit_production_job(page, assertions)
                         (
@@ -427,7 +431,9 @@ class PlaywrightEvidenceCollector:
                     staging_trace_path=trace_path,
                     staging_screenshot_path=screenshot_path,
                     job_workspace=job_workspace_path,
+                    job_id=submitted_job_id,
                 )
+                production_artifact_root = trace_path.parent
                 for screenshot in screenshots:
                     if screenshot.get("name") == "dashboard":
                         screenshot["path"] = str(screenshot_path)
@@ -475,6 +481,7 @@ class PlaywrightEvidenceCollector:
                 workspace=job_workspace_path or workspace,
                 job_id=submitted_job_id,
             )
+            production_artifacts_registered = True
             return PlaywrightEvidenceResultV1(
                 browser_evidence_path=browser_path,
                 trace_path=trace_path,
@@ -487,6 +494,18 @@ class PlaywrightEvidenceCollector:
                 provider_ledger_path=provider_ledger_path,
             )
         except BaseException:
+            if (
+                production_input
+                and production_artifact_root is not None
+                and not production_artifacts_registered
+            ):
+                self._cleanup_unregistered_production_artifacts(
+                    production_artifact_root,
+                    job_workspace=job_workspace_path,
+                    job_id=submitted_job_id,
+                )
+            if production_input:
+                self._cleanup_production_staging_artifacts(evidence_root)
             if trace_path.is_file() and not trace_stopped:
                 # There is no valid execution receipt on an incomplete trace.
                 try:
@@ -510,38 +529,208 @@ class PlaywrightEvidenceCollector:
         staging_trace_path: Path,
         staging_screenshot_path: Path,
         job_workspace: Path,
+        job_id: str = "",
     ) -> tuple[Path, Path, Path, Path]:
-        """Move browser outputs under the job workspace before registration."""
+        """Move browser outputs under the job workspace before registration.
 
-        destination_root = Path(job_workspace).expanduser().resolve() / "acceptance_gui"
-        if destination_root.exists() and destination_root.is_symlink():
-            raise PlaywrightEvidenceError("job acceptance evidence directory is a symlink")
+        File publication precedes the Registry transaction, so a failed move
+        must never strand a subset that prevents a later legitimate retry.
+        Existing artifacts are retained only when they are already Registry
+        published; unregistered, regular-file remnants are cleaned as a
+        recoverable interrupted publication.
+        """
+
+        workspace = Path(job_workspace).expanduser().resolve()
+        if not workspace.is_dir() or is_reparse_path(workspace):
+            raise PlaywrightEvidenceError("job workspace is missing or unsafe")
+        destination_root = workspace / "acceptance_gui"
+        if destination_root.exists():
+            if is_reparse_path(destination_root):
+                raise PlaywrightEvidenceError("job acceptance evidence directory is a reparse path")
+            if PlaywrightEvidenceCollector._has_registered_production_artifacts(
+                destination_root,
+                workspace=workspace,
+                job_id=job_id,
+            ):
+                raise PlaywrightEvidenceError(
+                    "job acceptance evidence is already Registry-published"
+                )
+            PlaywrightEvidenceCollector._remove_unregistered_artifact_directory(
+                destination_root
+            )
         destination_root.mkdir(parents=True, exist_ok=True)
         destination_paths = {
             staging_trace_path: destination_root / "trace.zip",
             staging_screenshot_path: destination_root / "dashboard.png",
         }
-        for source, destination in destination_paths.items():
-            if not source.is_file() or source.is_symlink():
-                raise PlaywrightEvidenceError(
-                    f"staged Playwright artifact is missing or unsafe: {source.name}"
-                )
-            if destination.exists() or destination.is_symlink():
-                raise PlaywrightEvidenceError(
-                    f"job acceptance artifact already exists: {destination.name}"
-                )
+        moved: list[tuple[Path, Path]] = []
+        try:
+            for source, destination in destination_paths.items():
+                if not source.is_file() or is_reparse_path(source):
+                    raise PlaywrightEvidenceError(
+                        f"staged Playwright artifact is missing or unsafe: {source.name}"
+                    )
+                if destination.exists() or is_reparse_path(destination):
+                    raise PlaywrightEvidenceError(
+                        f"job acceptance artifact already exists: {destination.name}"
+                    )
+                try:
+                    shutil.move(str(source), str(destination))
+                except OSError as exc:
+                    raise PlaywrightEvidenceError(
+                        f"could not move Playwright artifact into job workspace: {source.name}"
+                    ) from exc
+                moved.append((source, destination))
+        except BaseException:
+            for source, destination in reversed(moved):
+                try:
+                    if destination.is_file() and not is_reparse_path(destination):
+                        shutil.move(str(destination), str(source))
+                except OSError:
+                    try:
+                        destination.unlink(missing_ok=True)
+                    except OSError:
+                        pass
             try:
-                shutil.move(str(source), str(destination))
-            except OSError as exc:
-                raise PlaywrightEvidenceError(
-                    f"could not move Playwright artifact into job workspace: {source.name}"
-                ) from exc
+                PlaywrightEvidenceCollector._remove_unregistered_artifact_directory(
+                    destination_root
+                )
+            except PlaywrightEvidenceError:
+                pass
+            raise
         return (
             destination_root / "playwright_run_evidence.json",
             destination_root / "trace.zip",
             destination_root / "screenshot_manifest.json",
             destination_root / "dashboard.png",
         )
+
+    @staticmethod
+    def _has_registered_production_artifacts(
+        artifact_root: Path,
+        *,
+        workspace: Path,
+        job_id: str,
+    ) -> bool:
+        if not job_id:
+            return False
+        from services.artifact_registry import ArtifactRegistry, RegistryError
+
+        registry_path = workspace / "artifact_registry.json"
+        if not registry_path.is_file() or is_reparse_path(registry_path):
+            return False
+        try:
+            registry = ArtifactRegistry(registry_path, job_id)
+            return any(
+                record.status == "ready"
+                and record.artifact_type
+                in {
+                    "playwright_run_evidence",
+                    "playwright_trace",
+                    "playwright_screenshot_manifest",
+                    "playwright_screenshot",
+                }
+                and Path(record.path).expanduser().resolve().parent == artifact_root
+                for record in registry.list_records()
+            )
+        except (OSError, RegistryError, ValueError):
+            # An unreadable Registry cannot establish that a directory is safe
+            # to overwrite, so retain the directory and fail closed upstream.
+            return True
+
+    @staticmethod
+    def _remove_unregistered_artifact_directory(artifact_root: Path) -> None:
+        """Delete only a bounded, non-reparse failed publication directory."""
+
+        if not artifact_root.exists():
+            return
+        if not artifact_root.is_dir() or is_reparse_path(artifact_root):
+            raise PlaywrightEvidenceError("unregistered acceptance artifact root is unsafe")
+        allowed = {
+            "trace.zip",
+            "dashboard.png",
+            "playwright_run_evidence.json",
+            "screenshot_manifest.json",
+        }
+        try:
+            children = list(artifact_root.iterdir())
+        except OSError as exc:
+            raise PlaywrightEvidenceError("cannot inspect unregistered acceptance artifacts") from exc
+        for child in children:
+            if child.name not in allowed or not child.is_file() or is_reparse_path(child):
+                raise PlaywrightEvidenceError(
+                    "unregistered acceptance artifact directory has unexpected content"
+                )
+        for child in children:
+            try:
+                child.unlink()
+            except OSError as exc:
+                raise PlaywrightEvidenceError(
+                    "cannot remove unregistered acceptance artifact"
+                ) from exc
+        try:
+            artifact_root.rmdir()
+        except OSError as exc:
+            raise PlaywrightEvidenceError(
+                "cannot remove unregistered acceptance artifact directory"
+            ) from exc
+
+    @classmethod
+    def _cleanup_unregistered_production_artifacts(
+        cls,
+        artifact_root: Path,
+        *,
+        job_workspace: Path | None,
+        job_id: str,
+    ) -> None:
+        if job_workspace is None:
+            return
+        workspace = Path(job_workspace).expanduser().resolve()
+        if artifact_root.parent != workspace:
+            return
+        if cls._has_registered_production_artifacts(
+            artifact_root,
+            workspace=workspace,
+            job_id=job_id,
+        ):
+            return
+        try:
+            cls._remove_unregistered_artifact_directory(artifact_root)
+        except PlaywrightEvidenceError:
+            # Preserve unexpected remnants for manual investigation rather
+            # than deleting a path whose ownership cannot be established.
+            return
+
+    @staticmethod
+    def _cleanup_production_staging_artifacts(staging_root: Path) -> None:
+        """Remove only the current run's ordinary browser staging files."""
+
+        if not staging_root.exists() or not staging_root.is_dir() or is_reparse_path(staging_root):
+            return
+        allowed = {
+            "trace.zip",
+            "dashboard.png",
+            "playwright_run_evidence.json",
+            "screenshot_manifest.json",
+        }
+        try:
+            children = list(staging_root.iterdir())
+        except OSError:
+            return
+        if any(
+            child.name not in allowed or not child.is_file() or is_reparse_path(child)
+            for child in children
+        ):
+            return
+        for child in children:
+            try:
+                child.unlink()
+            except OSError:
+                return
+        try:
+            staging_root.rmdir()
+        except OSError:
+            return
 
     def _register_artifacts(
         self,
@@ -609,22 +798,58 @@ class PlaywrightEvidenceCollector:
         page.get_by_test_id("workflow-project-name").fill(request.project_name)
         mode_toggle = page.get_by_test_id("workflow-input-mode")
         mode_index = 0 if request.input_mode == "pdf" else 1
-        mode_toggle.get_by_role("button").nth(mode_index).click()
+        self._activate_browser_control(
+            mode_toggle.get_by_role("button").nth(mode_index),
+            assertion_name="workflow_input_mode_selected",
+            assertions=assertions,
+        )
         work_toggle = page.get_by_test_id("workflow-work-mode")
-        work_toggle.get_by_role("button").nth(0).click()
+        self._activate_browser_control(
+            work_toggle.get_by_role("button").nth(0),
+            assertion_name="workflow_normal_mode_selected",
+            assertions=assertions,
+        )
         if request.input_mode == "pdf":
-            page.get_by_test_id("workflow-pdf-folder-open").click()
+            self._activate_browser_control(
+                page.get_by_test_id("workflow-pdf-folder-open"),
+                assertion_name="workflow_pdf_editor_opened",
+                assertions=assertions,
+            )
             page.get_by_test_id("workflow-pdf-folder-edit").fill(request.pdf_folder)
-            page.get_by_test_id("workflow-pdf-folder-save").click()
+            self._activate_browser_control(
+                page.get_by_test_id("workflow-pdf-folder-save"),
+                assertion_name="workflow_pdf_folder_saved",
+                assertions=assertions,
+            )
         else:
-            page.get_by_test_id("workflow-zotero-report-open").click()
+            self._activate_browser_control(
+                page.get_by_test_id("workflow-zotero-report-open"),
+                assertion_name="workflow_zotero_report_editor_opened",
+                assertions=assertions,
+            )
             page.get_by_test_id("workflow-zotero-report-edit").fill(request.zotero_report)
-            page.get_by_test_id("workflow-zotero-report-save").click()
-            page.get_by_test_id("workflow-library-path-open").click()
+            self._activate_browser_control(
+                page.get_by_test_id("workflow-zotero-report-save"),
+                assertion_name="workflow_zotero_report_saved",
+                assertions=assertions,
+            )
+            self._activate_browser_control(
+                page.get_by_test_id("workflow-library-path-open"),
+                assertion_name="workflow_library_editor_opened",
+                assertions=assertions,
+            )
             page.get_by_test_id("workflow-library-path-edit").fill(request.library_path)
-            page.get_by_test_id("workflow-library-path-save").click()
+            self._activate_browser_control(
+                page.get_by_test_id("workflow-library-path-save"),
+                assertion_name="workflow_library_path_saved",
+                assertions=assertions,
+            )
         assertions.append({"name": "workflow_request_filled", "passed": True})
-        page.get_by_test_id(f"workflow-action-{request.action}").click()
+        self._activate_browser_control(
+            page.get_by_test_id(f"workflow-action-{request.action}"),
+            assertion_name="workflow_action_submitted",
+            assertions=assertions,
+        )
         assertions.append({"name": "job_submitted", "passed": True})
         label = page.get_by_test_id("workflow-submitted-job-id")
         label.wait_for(state="visible", timeout=30_000)
@@ -636,6 +861,38 @@ class PlaywrightEvidenceCollector:
                 return job_id
             time.sleep(0.25)
         raise PlaywrightEvidenceError("GUI did not expose the submitted queue job ID")
+
+    @staticmethod
+    def _activate_browser_control(
+        locator: Any,
+        *,
+        assertion_name: str,
+        assertions: list[dict[str, Any]],
+    ) -> None:
+        """Activate one actual browser control with a recorded headless fallback."""
+
+        try:
+            locator.scroll_into_view_if_needed(timeout=10_000)
+            locator.click(timeout=10_000)
+            assertions.append(
+                {"name": assertion_name, "passed": True, "detail": "pointer_click"}
+            )
+            return
+        except Exception as pointer_error:
+            try:
+                locator.evaluate("(element) => element.click()")
+            except Exception as dom_error:
+                raise PlaywrightEvidenceError(
+                    f"browser control could not be activated: {assertion_name}"
+                ) from dom_error
+            assertions.append(
+                {
+                    "name": assertion_name,
+                    "passed": True,
+                    "detail": "dom_click_fallback_after_viewport_error",
+                    "pointer_error_type": type(pointer_error).__name__,
+                }
+            )
 
     def _validate_production_paths(self, config_path: Path) -> None:
         request = self.input

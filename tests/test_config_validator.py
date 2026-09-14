@@ -96,6 +96,53 @@ def test_validate_all_config_accepts_default_reasoning_transport_combo():
     assert not any("provider_family" in warning or "endpoint_type" in warning for warning in warnings)
 
 
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    (
+        ("parser_mode", "unknown_mode"),
+        ("primary_parser", "unknown_primary"),
+        ("fallback_parser", "unknown_fallback"),
+    ),
+)
+def test_validate_all_config_rejects_unknown_preprocess_parser_values(
+    field_name: str,
+    value: str,
+) -> None:
+    config = _base_config()
+    config["Preprocess"][field_name] = value
+
+    valid, messages = validate_all_config(config)
+
+    assert valid is False
+    assert any(field_name in message for message in messages)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    (
+        ("parser_mode", "local"),
+        ("parser_mode", "hybrid"),
+        ("parser_mode", "remote_first"),
+        ("parser_mode", "remote"),
+        ("primary_parser", "local"),
+        ("primary_parser", "mineru_remote"),
+        ("fallback_parser", "none"),
+        ("fallback_parser", "local"),
+        ("fallback_parser", "mineru_remote"),
+    ),
+)
+def test_validate_all_config_accepts_gui_preprocess_parser_values(
+    field_name: str,
+    value: str,
+) -> None:
+    config = _base_config()
+    config["Preprocess"][field_name] = value
+
+    valid, messages = validate_all_config(config)
+
+    assert valid is True, messages
+
+
 def _anthropic_outline(config):
     """Point [Outline_API] at a native Anthropic Messages endpoint."""
 

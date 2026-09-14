@@ -18,6 +18,7 @@ from ai_interface import classify_provider_endpoint
 from config_loader import provider_sections_for_stage_plan
 from services.configuration_service import (
     API_ENV_MAPPING,
+    ConfigurationPersistenceError,
     MINERU_ENV_KEYS,
     PROVIDER_PRESETS,
     ensure_config_sections,
@@ -29,7 +30,9 @@ from services.configuration_service import (
 )
 from services.credential_provenance import (
     CredentialConflictError,
+    PREPROCESS_ENV_MAPPING,
     resolve_credentials,
+    resolve_preprocess_environment,
 )
 from services.settings import ApplicationSettings
 from services.environment_service import (
@@ -1136,28 +1139,9 @@ class WorkspaceController:
         self.sections = _read_existing_config(self.config_path)
         self.env_values = read_env_file(self.env_path)
         self.effective_env_values = dict(self.env_values)
-        for env_key in MINERU_ENV_KEYS:
-            process_value = str(os.environ.get(env_key) or "").strip()
-            if process_value:
-                self.effective_env_values[env_key] = process_value
         self.credential_error = ""
-        try:
-            self.resolved_sections, credential_provenance = resolve_credentials(
-                self.sections,
-                config_path=self.config_path,
-                environ=os.environ,
-                dotenv_path=self.env_path,
-            )
-            self.credential_provenance = {
-                item.section: item.selected_source
-                for item in credential_provenance
-            }
-        except CredentialConflictError as exc:
-            # Keep the editable values visible, but remember the same
-            # fail-closed conflict that the formal loader will report.
-            self.resolved_sections = self.sections
-            self.credential_provenance = {}
-            self.credential_error = str(exc)
+        self.preprocess_provenance: Dict[str, str] = {}
+        self._resolve_runtime_sources()
         self.language = self.sections.get("GUI", {}).get("language", "zh-CN")
         if self.language not in LANGUAGE_OPTIONS:
             self.language = "zh-CN"
@@ -1292,6 +1276,50 @@ class WorkspaceController:
         self._queue_service: Optional[Any] = None
         self._queue_runner: Optional[Any] = None
         self._init_queue_service()
+
+    def _resolve_runtime_sources(self) -> None:
+        """Mirror the formal loader without exposing resolved secret values."""
+
+        self.effective_env_values = dict(self.env_values)
+        self.credential_error = ""
+        try:
+            resolved_sections, credential_provenance = resolve_credentials(
+                self.sections,
+                config_path=self.config_path,
+                environ=os.environ,
+                dotenv_path=self.env_path,
+            )
+            resolved_sections, preprocess_provenance = resolve_preprocess_environment(
+                resolved_sections,
+                config_path=self.config_path,
+                environ=os.environ,
+                dotenv_path=self.env_path,
+            )
+        except CredentialConflictError as exc:
+            # Keep editable values visible while surfacing the same fail-closed
+            # admission that the runtime will enforce before any document I/O.
+            self.resolved_sections = self.sections
+            self.credential_provenance = {}
+            self.preprocess_provenance = {}
+            self.credential_error = str(exc)
+            return
+
+        self.resolved_sections = resolved_sections
+        self.credential_provenance = {
+            item.section: item.selected_source
+            for item in credential_provenance
+        }
+        self.preprocess_provenance = {
+            item.env_var: item.selected_source
+            for item in preprocess_provenance
+        }
+        resolved_preprocess = self.resolved_sections.get("Preprocess", {})
+        for env_name, config_key in PREPROCESS_ENV_MAPPING.items():
+            value = str(resolved_preprocess.get(config_key) or "").strip()
+            if value:
+                self.effective_env_values[env_name] = value
+            else:
+                self.effective_env_values.pop(env_name, None)
 
     def _init_queue_service(self) -> None:
         """初始化队列服务"""
@@ -1970,11 +1998,7 @@ class WorkspaceController:
 
     def _sync_env_values_from_disk(self) -> None:
         self.env_values = read_env_file(self.env_path)
-        self.effective_env_values = dict(self.env_values)
-        for env_key in MINERU_ENV_KEYS:
-            process_value = str(os.environ.get(env_key) or "").strip()
-            if process_value:
-                self.effective_env_values[env_key] = process_value
+        self._resolve_runtime_sources()
 
     def _free_mode_status_text(self) -> str:
         if self.free_mode_busy:
@@ -2643,6 +2667,10 @@ class WorkspaceController:
         return result
 
     def persist_config(self, *, notify_user: bool = True) -> None:
+        if self.credential_error:
+            raise ConfigurationPersistenceError(
+                "configuration source conflict must be resolved before saving"
+            )
         updated_sections, api_keys, extra_env_values = self._collect_config_payload()
         normalize_for_save(updated_sections)
         save_config_and_env(
@@ -3646,14 +3674,20 @@ def _page_shell(controller: WorkspaceController, page_title: str, subtitle: str,
                         on_change=lambda event: controller.change_language(str(event.value)),
                     ).classes("min-w-[150px]")
                     ui.button(controller.t("保存配置"), on_click=lambda: controller.persist_config()).props("unelevated")
-    with ui.column().classes("ag-page w-full gap-5"):
-        with ui.element("div").classes("ag-reminder ag-page-reminder"):
-            ui.icon("tips_and_updates").classes("text-lg")
-            status_label = ui.label("").classes("ag-reminder-text")
-            controller.register_status_label(status_label)
-        with ui.column().classes("ag-page-head"):
-            ui.label(controller.t(page_title)).classes("ag-page-title")
-            ui.label(controller.t(subtitle)).classes("ag-page-subtitle")
+        with ui.column().classes("ag-page w-full gap-5"):
+            with ui.element("div").classes("ag-reminder ag-page-reminder"):
+                ui.icon("tips_and_updates").classes("text-lg")
+                status_label = ui.label("").classes("ag-reminder-text")
+                controller.register_status_label(status_label)
+            if controller.credential_error:
+                with ui.element("div").classes("ag-reminder ag-page-reminder"):
+                    ui.icon("warning").classes("text-lg")
+                    ui.label(
+                        controller.t("配置来源存在冲突；请统一 process environment、.env 和 config.ini 后再保存或运行。")
+                    ).classes("ag-reminder-text")
+            with ui.column().classes("ag-page-head"):
+                ui.label(controller.t(page_title)).classes("ag-page-title")
+                ui.label(controller.t(subtitle)).classes("ag-page-subtitle")
         yield
 
 

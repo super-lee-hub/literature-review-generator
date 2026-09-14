@@ -375,6 +375,7 @@ def test_parent_acceptance_plan_dispatches_each_runtime_child_independently(
     calls: list[str] = []
     control = ReviewControlPlane(repo_root=Path.cwd())
     monkeypatch.setattr(control, "_acceptance_checkout_sha", lambda *_args, **_kwargs: "a" * 40)
+    monkeypatch.setattr(control, "provider_preflight", lambda **_kwargs: {"ok": True, "route_plan": {}})
 
     def fake_run(runtime_spec: str | Path) -> dict[str, object]:
         calls.append(str(runtime_spec))
@@ -454,6 +455,7 @@ def test_parent_acceptance_resumes_child_with_durable_workspace_marker(
     control = ReviewControlPlane(repo_root=Path.cwd())
     calls: list[str] = []
     monkeypatch.setattr(control, "_acceptance_checkout_sha", lambda *_args, **_kwargs: "a" * 40)
+    monkeypatch.setattr(control, "provider_preflight", lambda **_kwargs: {"ok": True, "route_plan": {}})
     monkeypatch.setattr(
         control,
         "resume",
@@ -476,6 +478,76 @@ def test_parent_acceptance_resumes_child_with_durable_workspace_marker(
     control.acceptance_run(plan_path)
 
     assert calls == ["resume"]
+
+
+def test_parent_acceptance_blocks_runtime_child_after_failed_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from runtime.control_plane import ReviewControlPlane
+
+    monkeypatch.setenv("AUTO_GENERATE_RUN_LIVE_ACCEPTANCE", "1")
+    workspace = tmp_path / "workspace-c"
+    runtime_path = tmp_path / "c-runtime.json"
+    runtime_path.write_text(
+        json.dumps(
+            {
+                "project_name": "acceptance-c",
+                "job_id": "job-c",
+                "workspace_path": str(workspace),
+                "source": {"mode": "direct", "pdf_folder": str(tmp_path / "papers")},
+                "config": str(tmp_path / "config.ini"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    plan_path = tmp_path / "acceptance-plan.json"
+    plan_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "release-acceptance-plan-v2",
+                "parent_run_id": "parent-preflight",
+                "state_path": "state.json",
+                "scenarios": {
+                    "C": {
+                        "scenario_id": "C",
+                        "gate": "C",
+                        "runtime_spec": "c-runtime.json",
+                        "workspace": str(workspace),
+                        "job_id": "job-c",
+                        "execution_mode": "runtime",
+                        "budget_domain": "live",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    control = ReviewControlPlane(repo_root=Path.cwd())
+    monkeypatch.setattr(control, "_acceptance_checkout_sha", lambda *_args, **_kwargs: "a" * 40)
+    monkeypatch.setattr(
+        control,
+        "provider_preflight",
+        lambda **_kwargs: {
+            "ok": False,
+            "status": "fail",
+            "mineru_remote_admission": {"reason": "remote_parser_admission_failed"},
+        },
+    )
+    called = False
+
+    def fail_if_run(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("child runtime must not execute after failed preflight")
+
+    monkeypatch.setattr(control, "run", fail_if_run)
+
+    result = control.acceptance_run(plan_path)
+
+    assert called is False
+    assert result["scenarios"]["C"]["status"] == "BLOCKED"
+    assert "preflight did not admit" in result["scenarios"]["C"]["reason"]
 
 
 def test_gate_d_plan_carries_production_modality_refs_into_child_evidence(
@@ -527,6 +599,7 @@ def test_gate_d_plan_carries_production_modality_refs_into_child_evidence(
     plan_path.write_text(json.dumps(payload), encoding="utf-8")
     control = ReviewControlPlane(repo_root=Path.cwd())
     monkeypatch.setattr(control, "_acceptance_checkout_sha", lambda *_args, **_kwargs: "a" * 40)
+    monkeypatch.setattr(control, "provider_preflight", lambda **_kwargs: {"ok": True, "route_plan": {}})
     final_sha = control._acceptance_checkout_sha(control.repo_root)
     modality_path = tmp_path / "modality-profile.json"
     modality_path.write_text("{}", encoding="utf-8")
@@ -647,6 +720,7 @@ def test_runtime_child_rejects_plan_to_runtime_identity_mismatch_before_executio
     calls: list[str] = []
     control = ReviewControlPlane(repo_root=Path.cwd())
     monkeypatch.setattr(control, "_acceptance_checkout_sha", lambda *_args, **_kwargs: "a" * 40)
+    monkeypatch.setattr(control, "provider_preflight", lambda **_kwargs: {"ok": True, "route_plan": {}})
     monkeypatch.setattr(
         control,
         "run",

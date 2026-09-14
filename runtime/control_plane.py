@@ -57,10 +57,10 @@ from services.artifact_registry import (
     file_sha256,
 )
 from services.model_capabilities import resolve_model_capability
-from services.settings import ApplicationSettings
+from services.settings import ApplicationSettings, mineru_remote_requested
 from services.stage1_output_budget import stage1_output_budget_sequence, provider_output_token_limit
 from preprocess.service import DEFAULT_MINERU_ALLOWED_URL_HOSTS, PreprocessManager
-from services.job_workspace import JobWorkspace, atomic_write_json
+from services.job_workspace import JobWorkspace, atomic_write_json, is_reparse_path
 from services.durable_io import atomic_replace_with_retry, interprocess_file_lock
 from runtime.cancellation import CancellationRequestStore
 from runtime.export_bundle import ExportBundleService, ExportBundleSpecV1, ForensicAttestationService
@@ -597,11 +597,7 @@ class ReviewControlPlane:
 
         state_path = Path(
             acceptance_spec.state_path
-            or (
-                Path(acceptance_spec.evidence_manifest).parent
-                if acceptance_spec.evidence_manifest
-                else self.repo_root / "output" / "_acceptance"
-            )
+            or self.repo_root / "output" / "_acceptance"
         ).expanduser().resolve()
         if state_path.suffix.casefold() != ".json":
             state_path = state_path / "acceptance_run_state_v1.json"
@@ -654,7 +650,10 @@ class ReviewControlPlane:
                     },
                     updated_at=self._utc_now(),
                 )
-            run_dir = state_path.parent / state.run_id
+            run_dir, evidence_root = self._bind_acceptance_evidence_root(
+                state_path,
+                state,
+            )
             if not execution_context_owner_authorized and state.provider_budget_state_path:
                 budget_path = Path(state.provider_budget_state_path)
                 budget_started = False
@@ -669,7 +668,6 @@ class ReviewControlPlane:
                 if not budget_started and budget_path.parent == run_dir.resolve():
                     budget_path.unlink(missing_ok=True)
                     state = replace(state, provider_budget_state_path="")
-            run_dir.mkdir(parents=True, exist_ok=True)
             state = replace(
                 state,
                 provider_budget_state_path=(
@@ -677,7 +675,7 @@ class ReviewControlPlane:
                     or (str(run_dir / "provider_budget_state_v1.json")
                         if execution_context_owner_authorized else "")
                 ),
-                evidence_root=state.evidence_root or str(run_dir / "evidence"),
+                evidence_root=str(evidence_root),
                 process_event_log=(
                     state.process_event_log
                     or str(run_dir / "process_events.jsonl")
@@ -685,25 +683,10 @@ class ReviewControlPlane:
             )
             atomic_write_json(str(state_path), state.to_dict())
 
-        if acceptance_spec.evidence_manifest and evidence_path.is_file():
-            try:
-                existing_evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeError, json.JSONDecodeError):
-                existing_evidence = None
-            if (
-                not isinstance(existing_evidence, Mapping)
-                or str(existing_evidence.get("final_sha") or "") != current_sha
-                or str(existing_evidence.get("acceptance_run_id") or "") != state.run_id
-            ):
-                evidence_path = (
-                    Path(state.evidence_root).expanduser().resolve()
-                    / "acceptance_evidence_index_v1.json"
-                )
-        if not acceptance_spec.evidence_manifest:
-            evidence_path = (
-                Path(state.evidence_root).expanduser().resolve()
-                / "acceptance_evidence_index_v1.json"
-            )
+        evidence_path = (
+            Path(state.evidence_root).expanduser().resolve()
+            / "acceptance_evidence_index_v1.json"
+        )
         budget_controller = ProviderBudgetController(
             acceptance_spec.budget.to_provider_budget()
         )
@@ -763,7 +746,7 @@ class ReviewControlPlane:
                         runtime_spec.parent
                     )
                     config_path = Path(runtime_job_spec.config).expanduser().resolve()
-                    route_plan = self.provider_preflight(
+                    preflight = self.provider_preflight(
                         config_path=config_path,
                         action=runtime_job_spec.action,
                         requested_stages=runtime_job_spec.metadata.get("requested_stages"),
@@ -772,7 +755,18 @@ class ReviewControlPlane:
                             or runtime_job_spec.free_mode_idea
                             or runtime_job_spec.metadata.get("free_mode_input")
                         ),
-                    ).get("route_plan")
+                    )
+                    route_plan = preflight.get("route_plan")
+                    if preflight.get("ok") is False:
+                        admission = preflight.get("mineru_remote_admission")
+                        reason = (
+                            str(admission.get("reason") or "")
+                            if isinstance(admission, Mapping)
+                            else ""
+                        ) or str(preflight.get("error_type") or "provider_preflight_failed")
+                        raise ControlPlaneError(
+                            f"acceptance provider preflight did not admit execution: {reason}"
+                        )
                     prior_workspace = state.workspace_path if state else ""
                     if prior_workspace and Path(prior_workspace).is_dir():
                         budget_controller.reconcile_orphaned_reservations(
@@ -1021,6 +1015,77 @@ class ReviewControlPlane:
         if not sha:
             raise ControlPlaneError("acceptance plan cannot bind to the current checkout SHA")
         return sha
+
+    @staticmethod
+    def _bind_acceptance_evidence_root(
+        state_path: Path,
+        state: Any,
+    ) -> tuple[Path, Path]:
+        """Create and verify the sole run-owned acceptance evidence root."""
+
+        run_id = str(getattr(state, "run_id", "") or "").strip()
+        final_sha = str(getattr(state, "final_sha", "") or "").strip()
+        if not run_id or not final_sha:
+            raise ControlPlaneError("acceptance evidence root is missing run identity")
+        run_dir = (state_path.parent / run_id).resolve()
+        evidence_root = run_dir / "evidence"
+        expected_budget_path = run_dir / "provider_budget_state_v1.json"
+        expected_event_log = run_dir / "process_events.jsonl"
+        configured_root = str(getattr(state, "evidence_root", "") or "").strip()
+        if configured_root and Path(configured_root).expanduser().resolve() != evidence_root:
+            raise ControlPlaneError(
+                "acceptance evidence root must be the run-owned evidence directory"
+            )
+        configured_budget = str(
+            getattr(state, "provider_budget_state_path", "") or ""
+        ).strip()
+        if configured_budget and Path(configured_budget).expanduser().resolve() != expected_budget_path:
+            raise ControlPlaneError(
+                "acceptance provider budget state must be in the run-owned directory"
+            )
+        configured_event_log = str(getattr(state, "process_event_log", "") or "").strip()
+        if configured_event_log and Path(configured_event_log).expanduser().resolve() != expected_event_log:
+            raise ControlPlaneError(
+                "acceptance process event log must be in the run-owned directory"
+            )
+        for candidate in (run_dir, evidence_root):
+            current = candidate
+            while True:
+                if os.path.lexists(current) and is_reparse_path(current):
+                    raise ControlPlaneError(
+                        "acceptance evidence root contains a symlink or reparse path"
+                    )
+                parent = current.parent
+                if parent == current:
+                    break
+                current = parent
+        run_dir.mkdir(parents=True, exist_ok=True)
+        evidence_root.mkdir(parents=True, exist_ok=True)
+        if is_reparse_path(run_dir) or is_reparse_path(evidence_root):
+            raise ControlPlaneError("acceptance evidence root is a symlink or reparse path")
+        marker_path = run_dir / "acceptance_evidence_root_v1.json"
+        expected_marker = {
+            "schema_version": "acceptance-evidence-root-v1",
+            "acceptance_run_id": run_id,
+            "final_executable_sha": final_sha,
+            "evidence_root": str(evidence_root),
+        }
+        if marker_path.is_file():
+            if is_reparse_path(marker_path):
+                raise ControlPlaneError("acceptance evidence root marker is unsafe")
+            try:
+                marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise ControlPlaneError("acceptance evidence root marker is unreadable") from exc
+            if marker != expected_marker:
+                raise ControlPlaneError(
+                    "acceptance evidence root marker does not match run identity"
+                )
+        elif marker_path.exists():
+            raise ControlPlaneError("acceptance evidence root marker is not a regular file")
+        else:
+            atomic_write_json(str(marker_path), expected_marker)
+        return run_dir, evidence_root
 
     @staticmethod
     def _acceptance_file_hash(path: str | Path, *, allow_missing: bool = False) -> str:
@@ -2292,12 +2357,14 @@ class ReviewControlPlane:
                     if budget_path.parent == (state_path.parent / state.run_id).resolve():
                         budget_path.unlink(missing_ok=True)
                     state = replace(state, provider_budget_state_path="")
-            run_dir = state_path.parent / state.run_id
-            run_dir.mkdir(parents=True, exist_ok=True)
+            run_dir, evidence_root = self._bind_acceptance_evidence_root(
+                state_path,
+                state,
+            )
             state = replace(
                 state,
                 plan_sha256=plan_sha,
-                evidence_root=state.evidence_root or str(run_dir / "evidence"),
+                evidence_root=str(evidence_root),
                 provider_budget_state_path=(
                     state.provider_budget_state_path
                     or (str(run_dir / "provider_budget_state_v1.json")
@@ -2431,6 +2498,27 @@ class ReviewControlPlane:
                             child,
                             runtime_job_spec,
                         )
+                        child_preflight = self.provider_preflight(
+                            config_path=runtime_job_spec.config,
+                            action=runtime_job_spec.action,
+                            requested_stages=runtime_job_spec.metadata.get("requested_stages"),
+                            free_mode_enabled=bool(
+                                runtime_job_spec.free_mode_profile
+                                or runtime_job_spec.free_mode_idea
+                                or runtime_job_spec.metadata.get("free_mode_input")
+                            ),
+                        )
+                        if child_preflight.get("ok") is False:
+                            admission = child_preflight.get("mineru_remote_admission")
+                            reason = (
+                                str(admission.get("reason") or "")
+                                if isinstance(admission, Mapping)
+                                else ""
+                            ) or str(child_preflight.get("error_type") or "provider_preflight_failed")
+                            raise ControlPlaneError(
+                                "acceptance child provider preflight did not admit execution: "
+                                + reason
+                            )
                         # A claimed child workspace is durable execution state.
                         # Starting a fresh run against it would either reject
                         # the workspace or duplicate completed work. Resume
@@ -2952,9 +3040,7 @@ class ReviewControlPlane:
             required_scenarios=plan.gates,
             expected_child_bindings=expected_child_bindings,
         )
-        parent_result_path = Path(
-            acceptance_spec.evidence_manifest or run_dir / "parent_acceptance_result_v2.json"
-        ).expanduser().resolve()
+        parent_result_path = run_dir / "parent_acceptance_result_v2.json"
         if parent_result_path.is_file():
             try:
                 old = json.loads(parent_result_path.read_text(encoding="utf-8"))
@@ -4260,7 +4346,12 @@ class ReviewControlPlane:
             add("reachable_provider_routes", "fail", {"error": str(exc)})
 
         try:
-            mineru = PreprocessManager(dict(normalized_config))
+            mineru = PreprocessManager(
+                normalized_config,
+                preprocess_environment_resolved=bool(
+                    getattr(normalized_config, "preprocess_environment_resolved", False)
+                ),
+            )
             invalid_hosts = sorted(
                 str(item) for item in getattr(mineru, "mineru_invalid_allowed_url_hosts", set())
             )
@@ -4283,6 +4374,20 @@ class ReviewControlPlane:
             )
         except Exception as exc:
             add("mineru_result_allowlist", "fail", {"error": str(exc)})
+
+        if normalized_config:
+            mineru_admission = self._mineru_remote_admission(normalized_config)
+            add(
+                "mineru_remote_admission",
+                str(mineru_admission["status"]),
+                mineru_admission,
+            )
+        else:
+            add(
+                "mineru_remote_admission",
+                "skipped",
+                {"reason": "configuration is unavailable", "network_probe": False},
+            )
 
         add(
             "current_settings",
@@ -4335,6 +4440,52 @@ class ReviewControlPlane:
             "provider_network_calls": 0,
             "read_only": True,
         }
+
+    @staticmethod
+    def _mineru_remote_admission(
+        config: Mapping[str, Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Describe zero-network MinerU readiness for the selected parser path."""
+
+        manager = PreprocessManager(
+            config,
+            preprocess_environment_resolved=bool(
+                getattr(config, "preprocess_environment_resolved", False)
+            ),
+        )
+        remote_requested = mineru_remote_requested(
+            manager.parser_mode,
+            manager.primary_parser,
+        )
+        details: dict[str, Any] = {
+            "remote_requested": remote_requested,
+            "token_present": bool(manager.mineru_api_token),
+            "fallback_will_be_used": False,
+            "parser_mode": manager.parser_mode,
+            "primary_parser": manager.primary_parser,
+            "fallback_parser": manager.fallback_parser,
+            "network_probe": False,
+        }
+        if not remote_requested:
+            details["status"] = "pass"
+            details["reason"] = "remote_parser_not_requested"
+            return details
+        try:
+            manager.preflight_mineru()
+        except Exception as exc:
+            fallback = bool(manager.allow_local_parse_fallback)
+            details.update(
+                {
+                    "status": "warn" if fallback else "fail",
+                    "fallback_will_be_used": fallback,
+                    "reason": "remote_parser_admission_failed",
+                    "error_type": type(exc).__name__,
+                }
+            )
+            return details
+        details["status"] = "pass"
+        details["reason"] = "remote_parser_admitted"
+        return details
 
     def provider_preflight(
         self,
@@ -4397,10 +4548,12 @@ class ReviewControlPlane:
                 )
                 details["section"] = role
                 providers.append(details)
+            mineru_admission = self._mineru_remote_admission(normalized)
+            admission_status = str(mineru_admission["status"])
             return {
                 "control_plane_version": CONTROL_PLANE_VERSION,
-                "status": "pass",
-                "ok": True,
+                "status": admission_status,
+                "ok": admission_status != "fail",
                 "action": action,
                 "requested_stages": list(requested_stages or ()),
                 "free_mode_enabled": bool(free_mode_enabled),
@@ -4410,6 +4563,7 @@ class ReviewControlPlane:
                 "credential_provenance": provenance_payload(
                     list(getattr(normalized, "credential_provenance", ()))
                 ),
+                "mineru_remote_admission": mineru_admission,
                 "proxy_policy": "formal ai_interface._post_with_proxy_mode",
                 "network_calls": 0,
                 "read_only": True,

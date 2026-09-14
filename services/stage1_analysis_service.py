@@ -5099,7 +5099,13 @@ class Stage1AnalysisService:
             "cache_dir", self.workspace.artifact_path("preprocess_cache")
         )
         preprocess_config["Preprocess"] = preprocess_section
-        manager = PreprocessManager(preprocess_config, logger=self.logger)
+        manager = PreprocessManager(
+            preprocess_config,
+            logger=self.logger,
+            preprocess_environment_resolved=bool(
+                getattr(self.config, "preprocess_environment_resolved", False)
+            ),
+        )
         owner_paper_key = str(paper_key or source_pdf)
         lease_id = (
             f"stage1:{self.job_id}:{self.attempt_id}:{owner_paper_key}:"

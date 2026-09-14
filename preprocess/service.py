@@ -34,6 +34,7 @@ from services.stage1_input_completeness import (
     has_blocking_stage1_reason,
 )
 from services.stage1_input_selector import Stage1InputSelection, select_stage1_input
+from services.settings import mineru_remote_requested
 
 DEFAULT_MINERU_ALLOWED_URL_HOSTS = frozenset(
     {
@@ -250,15 +251,21 @@ class PreprocessManager:
 
     def __init__(
         self,
-        config: Optional[Dict[str, Any]] = None,
+        config: Mapping[str, Any] | None = None,
         logger: Any = None,
         *,
         mineru_circuit_breaker: ProviderCircuitBreaker | None = None,
+        preprocess_environment_resolved: bool | None = None,
     ):
         self.config = config or {}
         self.logger = logger
-        preprocess_section = self.config.get("Preprocess", {}) if isinstance(self.config, dict) else {}
-        paths_section = self.config.get("Paths", {}) if isinstance(self.config, dict) else {}
+        preprocess_section = self.config.get("Preprocess", {}) if isinstance(self.config, Mapping) else {}
+        paths_section = self.config.get("Paths", {}) if isinstance(self.config, Mapping) else {}
+        self.preprocess_environment_resolved = (
+            bool(preprocess_environment_resolved)
+            if preprocess_environment_resolved is not None
+            else bool(getattr(self.config, "preprocess_environment_resolved", False))
+        )
 
         self.enabled = _as_bool(preprocess_section.get("enabled", "true"), default=True)
         self.cache_root = preprocess_section.get("cache_dir") or os.path.join(
@@ -307,23 +314,24 @@ class PreprocessManager:
         self.retain_page_index = _as_bool(preprocess_section.get("retain_page_index", "true"), default=True)
         self.retain_diagnostics = _as_bool(preprocess_section.get("retain_diagnostics", "true"), default=True)
         self.force_docling_strategy = False
+        def setting(key: str, env_name: str, default: str) -> str:
+            if not self.preprocess_environment_resolved:
+                process_value = str(os.environ.get(env_name) or "").strip()
+                if process_value:
+                    return process_value
+            return str(preprocess_section.get(key, default)).strip()
+
         self.source_pdf_max_bytes = max(
             1,
             _as_int(
-                preprocess_section.get(
+                setting(
                     "source_pdf_max_bytes",
-                    os.getenv("MINERU_SOURCE_PDF_MAX_BYTES", str(DEFAULT_MINERU_SOURCE_PDF_MAX_BYTES)),
+                    "MINERU_SOURCE_PDF_MAX_BYTES",
+                    str(DEFAULT_MINERU_SOURCE_PDF_MAX_BYTES),
                 ),
                 DEFAULT_MINERU_SOURCE_PDF_MAX_BYTES,
             ),
         )
-
-        def setting(key: str, env_name: str, default: str) -> str:
-            process_value = str(os.environ.get(env_name) or "").strip()
-            if process_value:
-                return process_value
-            return str(preprocess_section.get(key, default)).strip()
-
         self.mineru_base_url = setting("mineru_base_url", "MINERU_BASE_URL", "https://mineru.net/api/v4").rstrip("/")
         self.mineru_api_token = setting("mineru_api_token", "MINERU_API_TOKEN", "")
         self.mineru_model_version = setting("mineru_model_version", "MINERU_MODEL_VERSION", "vlm") or "vlm"
@@ -407,11 +415,11 @@ class PreprocessManager:
         )
         self.allow_local_parse_fallback = _as_bool(setting("allow_local_parse_fallback", "ALLOW_LOCAL_PARSE_FALLBACK", "true"), default=True)
         self.docling_timeout_seconds = _as_float(
-            preprocess_section.get("docling_timeout_seconds", os.getenv("DOCLING_TIMEOUT_SECONDS", "300")),
+            setting("docling_timeout_seconds", "DOCLING_TIMEOUT_SECONDS", "300"),
             300.0,
         )
         self.ocr_timeout_seconds = _as_float(
-            preprocess_section.get("ocr_timeout_seconds", os.getenv("OCR_TIMEOUT_SECONDS", "120")),
+            setting("ocr_timeout_seconds", "OCR_TIMEOUT_SECONDS", "120"),
             120.0,
         )
         self.mineru_circuit_breaker = mineru_circuit_breaker or ProviderCircuitBreaker("mineru")
@@ -1533,8 +1541,9 @@ class PreprocessManager:
         mineru_attempted = False
         mineru_succeeded = False
 
-        remote_requested = self.parser_mode in {"remote", "remote_first"} or (
-            self.parser_mode == "hybrid" and self.primary_parser == "mineru_remote"
+        remote_requested = mineru_remote_requested(
+            self.parser_mode,
+            self.primary_parser,
         )
         remote_enabled = remote_requested
         circuit_snapshot = self.mineru_circuit_breaker.snapshot

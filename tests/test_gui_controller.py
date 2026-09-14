@@ -11,6 +11,7 @@ import types
 from pathlib import Path
 
 import pytest
+from services.configuration_service import ConfigurationPersistenceError
 from services.queue_service import QueueJobSpec
 
 
@@ -1047,8 +1048,12 @@ def test_gui_save_does_not_persist_process_only_mineru_token(
     monkeypatch.setenv("MINERU_API_TOKEN", "process-only-token")
 
     controller = gui_app_module.WorkspaceController(str(config_path))
-    assert controller.state["mineru"]["api_token"] == "process-only-token"
-    controller.persist_config(notify_user=False)
+    assert controller.state["mineru"]["api_token"] == "dotenv-token"
+    assert "MINERU_API_TOKEN" in controller.credential_error
+    assert "dotenv-token" not in controller.credential_error
+    assert "process-only-token" not in controller.credential_error
+    with pytest.raises(ConfigurationPersistenceError, match="source conflict"):
+        controller.persist_config(notify_user=False)
 
     saved = env_path.read_text(encoding="utf-8")
     assert "MINERU_API_TOKEN=dotenv-token" in saved

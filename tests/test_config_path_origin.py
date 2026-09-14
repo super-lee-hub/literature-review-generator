@@ -3,6 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import config_loader
+import pytest
+from preprocess.service import PreprocessManager
+from services.credential_provenance import CredentialConflictError
 from services.configuration_service import ensure_config_sections
 
 
@@ -87,3 +90,49 @@ def test_load_config_reads_mineru_settings_from_config_directory_dotenv(
     assert loaded["Preprocess"]["mineru_response_max_bytes"] == "1024"
     assert loaded["Preprocess"]["mineru_allowed_url_hosts"] == "storage.example.com"
     assert loaded["Preprocess"]["allow_local_parse_fallback"] == "false"
+
+
+def test_load_config_rejects_conflicting_mineru_process_and_dotenv_values(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config_path = tmp_path / "config.ini"
+    config_path.write_text(
+        "[Application]\nconfig_schema=3\n[Paths]\noutput_path=output\n[Preprocess]\nenabled=true\n",
+        encoding="utf-8",
+    )
+    (tmp_path / ".env").write_text(
+        "MINERU_API_TOKEN=dotenv-only-secret\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MINERU_API_TOKEN", "process-only-secret")
+    monkeypatch.setattr(config_loader, "validate_all_config", lambda _config, **_kwargs: (True, []))
+
+    with pytest.raises(CredentialConflictError) as caught:
+        config_loader.load_config(str(config_path))
+
+    message = str(caught.value)
+    assert "MINERU_API_TOKEN" in message
+    assert "dotenv-only-secret" not in message
+    assert "process-only-secret" not in message
+
+
+def test_preprocess_manager_keeps_formally_resolved_mineru_values(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("MINERU_API_TOKEN", "stale-process-token")
+    monkeypatch.setenv("MINERU_BASE_URL", "https://stale.example/api")
+
+    manager = PreprocessManager(
+        {
+            "Paths": {"output_path": str(tmp_path)},
+            "Preprocess": {
+                "mineru_api_token": "resolved-config-token",
+                "mineru_base_url": "https://resolved.example/api",
+            },
+        },
+        preprocess_environment_resolved=True,
+    )
+
+    assert manager.mineru_api_token == "resolved-config-token"
+    assert manager.mineru_base_url == "https://resolved.example/api"
