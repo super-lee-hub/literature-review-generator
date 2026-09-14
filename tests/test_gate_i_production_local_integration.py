@@ -25,7 +25,8 @@ from summary_schema import normalize_ai_summary
 pytestmark = [pytest.mark.integration, pytest.mark.playwright]
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-FINAL_SHA = "9fcbf04f5399147ea5602e79968a5465987482e3"
+# Synthetic identity: this offline fixture must never be used as release evidence.
+TEST_EXECUTABLE_SHA = "0" * 40
 
 
 def _pick_free_port() -> int:
@@ -241,7 +242,7 @@ def test_gate_i_production_gui_local_provider_is_real_io_but_offline(
         evidence_root = tmp_path / "acceptance-evidence"
         context = AcceptanceScenarioContextV1(
             acceptance_run_id=acceptance_run_id,
-            final_executable_sha=FINAL_SHA,
+            final_executable_sha=TEST_EXECUTABLE_SHA,
             runtime_spec_path="",
             workspace_path="",
             job_id="",
@@ -269,7 +270,7 @@ def test_gate_i_production_gui_local_provider_is_real_io_but_offline(
     assert len(job_ids) == 1
     job_id = job_ids.pop()
     assert job_id
-    evidence = GateEvidenceProducer(final_sha=FINAL_SHA).build_gate(
+    evidence = GateEvidenceProducer(final_sha=TEST_EXECUTABLE_SHA).build_gate(
         "I",
         result.evidence_refs,
         acceptance_run_id=acceptance_run_id,
@@ -279,7 +280,7 @@ def test_gate_i_production_gui_local_provider_is_real_io_but_offline(
     verdict = GateEvidenceVerifier().verify(
         "I",
         evidence,
-        expected_final_sha=FINAL_SHA,
+        expected_final_sha=TEST_EXECUTABLE_SHA,
         expected_acceptance_run_id=acceptance_run_id,
         expected_job_id=job_id,
     )

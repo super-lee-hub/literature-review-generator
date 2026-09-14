@@ -101,3 +101,10 @@ def test_deleted_pointer_documents_have_no_inbound_references() -> None:
         "TRUTH_SOURCES.md",
     ):
         assert name not in text
+
+
+def test_strict_offline_workflow_excludes_playwright_gate_i_module() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "windows-tests.yml").read_text(
+        encoding="utf-8"
+    )
+    assert '"test_gate_i_production_local_integration.py"' in workflow

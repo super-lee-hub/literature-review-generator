@@ -90,6 +90,7 @@ jobs:
                     "test_review_batch.py",
                     "test_runtime_lifecycle_parity.py",
                     "test_gui_playwright.py",
+                    "test_gate_i_production_local_integration.py",
                     "test_deepseek_vision_smoke.py",
                     "test_runtime_bridge_helpers.py"
                   ))
