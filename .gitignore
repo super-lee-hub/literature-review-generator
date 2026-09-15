@@ -179,6 +179,8 @@ acceptance_artifacts/f1_*/D_source_corpus/
 acceptance_artifacts/f1_*/runs/
 acceptance_artifacts/f1_*/preprocess_cache/
 acceptance_artifacts/f1_*/F1_ACCEPTANCE_PLAN_STATE*.json
+acceptance_artifacts/f1_*/F1_ACCEPTANCE_PLAN_STATE*.json.lock
+acceptance_artifacts/f1_*/f1-acceptance-*/
 
 # iFlow CLI generated files
 IFLOW.md
