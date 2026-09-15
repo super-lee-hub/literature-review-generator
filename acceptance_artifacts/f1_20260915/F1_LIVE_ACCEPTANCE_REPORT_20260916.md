@@ -8,10 +8,12 @@ into live acceptance.
 
 ## Frozen identities
 
-- Executable SHA: `12bf400d3cf6fd7711da8750856e25ebc7d0da85`
+- Code executable SHA: `12bf400d3cf6fd7711da8750856e25ebc7d0da85`
+- Current evidence checkout at the latest dry-run: `f392c8475686b7c28204c967b0a699b98fcd2e2d`.
+- The stored plan intentionally leaves `final_executable_sha` blank so a future authorized run binds the exact clean checkout at execution time. The latest dry-run below is bound to the current evidence checkout; a later evidence-only commit does not change production code but will require a fresh receipt for any live claim.
 - Branch: `codex/f1-validation-authority-closure`
 - Acceptance plan: [F1_ACCEPTANCE_PLAN_20260915.json](F1_ACCEPTANCE_PLAN_20260915.json)
-- Plan SHA-256 at the dry-run: `a1f6bfd3b110ff8dfff3e89a680b2bf90e79d9ebec1f9e4994012b92f9fb9345`
+- Plan SHA-256 at the latest dry-run: `9640c9fa1228e8be983db939b804520ed6a422b5e89dde9b1c862b445c03a6cc`
 - Corpus manifest: [F1_CORPUS_MANIFEST_20260915.json](F1_CORPUS_MANIFEST_20260915.json)
 - Corpus manifest file SHA-256: `f741776ea2eda6b5937f4fc13e40569216eb3173ff597fb80eeea2e46dab3e90`
 - Corpus content SHA-256: `ebaf5c2a9220ed23b527e279c0fd82a6770fa70e5d4ab5d1e1e64f2150ce4319`
@@ -72,14 +74,14 @@ The no-network command was:
 python -m reviewctl acceptance-run --acceptance-spec acceptance_artifacts/f1_20260915/F1_ACCEPTANCE_PLAN_20260915.json
 ```
 
-Its durable parent result is [parent_acceptance_result_v2.json](f1-acceptance-20260915/parent_acceptance_result_v2.json).
-The result binds every child receipt to executable SHA
-`12bf400d...`, corpus manifest SHA `f741776e...`, and the plan SHA above. The
+Its latest durable parent result is [parent_acceptance_result_v2.json](f1-acceptance-20260915-f392c8475686/parent_acceptance_result_v2.json).
+The result binds every child receipt to checkout SHA
+`f392c8475686b7c28204c967b0a699b98fcd2e2d`, corpus manifest SHA `f741776e...`, and the plan SHA above. The
 child receipts are:
 
-- C: [scenario_execution_receipt.json](f1-acceptance-20260915/C/scenario_execution_receipt.json)
-- D: [scenario_execution_receipt.json](f1-acceptance-20260915/D/scenario_execution_receipt.json)
-- Q: [scenario_execution_receipt.json](f1-acceptance-20260915/Q/scenario_execution_receipt.json)
+- C: [scenario_execution_receipt.json](f1-acceptance-20260915-f392c8475686/C/scenario_execution_receipt.json)
+- D: [scenario_execution_receipt.json](f1-acceptance-20260915-f392c8475686/D/scenario_execution_receipt.json)
+- Q: [scenario_execution_receipt.json](f1-acceptance-20260915-f392c8475686/Q/scenario_execution_receipt.json)
 
 All three are `status=BLOCKED`; the parent is `status=BLOCKED`,
 `live_pass=false`, `ready_to_merge=false`. The acceptance budget was not
@@ -108,5 +110,5 @@ fingerprint; the code must not synthesize `acknowledged=true`.
   validator challenge, repair/revalidation, and DOCX visual QA.
 - Production GUI/Playwright flow and real OCR/scanned-primary flow.
 - Real MinerU create→upload→poll→download→parse and kill/resume.
-- Hosted CI for executable SHA `12bf400d...` (the remote PR still has the old
+- Hosted CI for the new checkout SHA `f392c847...` (the remote PR still has the old
   head because push was unavailable).

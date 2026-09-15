@@ -37,10 +37,12 @@ The code result below is `PASS_OFFLINE` only where the current repository checks
 - Formal manifest: [F1_CORPUS_MANIFEST_20260915.json](acceptance_artifacts/f1_20260915/F1_CORPUS_MANIFEST_20260915.json), content SHA `ebaf5c2a9220ed23b527e279c0fd82a6770fa70e5d4ab5d1e1e64f2150ce4319`, file SHA `f741776ea2eda6b5937f4fc13e40569216eb3173ff597fb80eeea2e46dab3e90`.
 - The controlled staging root contains 15 copied PDFs; all 15 current bytes match the prior canonical-resolution manifest. The original Zotero PDFs were not modified or deleted.
 - Machine-only source ledger: [F1_SOURCE_GROUND_TRUTH_20260915.md](acceptance_artifacts/f1_20260915/F1_SOURCE_GROUND_TRUTH_20260915.md). It deliberately marks semantic ground truth and human review as not done.
-- The current no-network acceptance dry-run bound all C/D/Q receipts to executable SHA `12bf400d...` and manifest file SHA `f741776e...`, then stopped at owner authorization before Provider transport. Therefore C, D, and Q are `NOT_VERIFIED`, not PASS.
+- The latest no-network acceptance dry-run bound all C/D/Q receipts to checkout SHA `f392c847...` and manifest file SHA `f741776e...`, then stopped at owner authorization before Provider transport. The production code was fully tested at its preceding code commit `12bf400d...`; the intervening commit is evidence-only. Therefore C, D, and Q are `NOT_VERIFIED`, not PASS.
 
 ## Delivery state
 
 - Local executable commit exists at the SHA above.
+- The stored F1 plan is executable-SHA-neutral for future authorized runs; the control plane records the exact current checkout SHA at run time. The latest dry-run is the separate `f392c847...` evidence; production code was verified at `12bf400d...`.
+- Evidence commit currently in the checkout: `f392c8475686b7c28204c967b0a699b98fcd2e2d`.
 - PR #24 was read back as `OPEN`, `isDraft=false`, with remote head still `1fcc5b5a4c4f78de9378419d9a981f149edc5a08` and the previously reported six Hosted CI successes. The push of `12bf400d...` failed over both SSH and HTTPS; the branch was not force-pushed and no merge was performed.
 - The code and evidence remain locally available. A later evidence-only commit may change PR HEAD without changing the frozen executable SHA; any live receipt must continue to bind to the frozen SHA explicitly.

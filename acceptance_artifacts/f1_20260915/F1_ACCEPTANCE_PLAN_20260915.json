@@ -1,7 +1,7 @@
 {
   "schema_version": "release-acceptance-plan-v2",
   "parent_run_id": "f1-acceptance-20260915",
-  "final_executable_sha": "12bf400d3cf6fd7711da8750856e25ebc7d0da85",
+  "final_executable_sha": "",
   "state_path": "F1_ACCEPTANCE_PLAN_STATE_20260915.json",
   "budget": {
     "max_provider_calls_total": 4,
