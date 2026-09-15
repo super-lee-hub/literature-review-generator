@@ -216,9 +216,12 @@ class RuntimeJobSpec:
                 raise ValueError("metadata.external_host_acknowledgement must be a JSON object")
             allowed_acknowledgement_fields = {
                 "schema_version",
+                "version",
                 "acknowledged",
                 "hosts",
                 "route_fingerprint",
+                "issued_at",
+                "expires_at",
             }
             unknown_acknowledgement_fields = sorted(
                 str(key)
@@ -238,13 +241,25 @@ class RuntimeJobSpec:
                 )
             if "hosts" in acknowledgement:
                 hosts = acknowledgement["hosts"]
-                if not isinstance(hosts, (list, tuple)) or any(
+                if not isinstance(hosts, list) or any(
                     not isinstance(item, str) for item in hosts
                 ):
                     raise ValueError(
                         "metadata.external_host_acknowledgement.hosts must be a JSON array of strings"
                     )
-            for field_name in ("schema_version", "route_fingerprint"):
+            if "version" in acknowledgement and (
+                isinstance(acknowledgement["version"], bool)
+                or not isinstance(acknowledgement["version"], int)
+            ):
+                raise ValueError(
+                    "metadata.external_host_acknowledgement.version must be a JSON integer"
+                )
+            for field_name in (
+                "schema_version",
+                "route_fingerprint",
+                "issued_at",
+                "expires_at",
+            ):
                 if field_name in acknowledgement and not isinstance(
                     acknowledgement[field_name], str
                 ):

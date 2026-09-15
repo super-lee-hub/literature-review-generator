@@ -233,7 +233,13 @@ def test_stage1_visual_length_retry_is_recorded_before_scan_can_close(
     document = fitz.open()
     for page_number in range(1, 14):
         page = document.new_page()
-        page.insert_text((72, 72), f"Page {page_number}. Figure and results.")
+        page.insert_text(
+            (72, 72),
+            f"Page {page_number}. The figure and results describe experimental cohort "
+            f"{page_number}, treatment effect {page_number * 2} percent, confidence "
+            f"interval {page_number + 10} to {page_number + 20}, and the interpretation "
+            f"for this distinct condition is recorded for the visual scan.",
+        )
     document.save(pdf_path)
     document.close()
     scan_calls: list[tuple[int, int]] = []

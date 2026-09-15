@@ -83,6 +83,23 @@ def test_f1_binding_requires_exact_manifest_selected_source_paths_and_hashes(tmp
     assert binding_snapshot["manifest_sha256"] == hashlib.sha256(manifest.read_bytes()).hexdigest()
 
 
+def test_f1_binding_filters_a_reusable_full_root_to_c_or_d_selection(tmp_path: Path) -> None:
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    manifest, sources = _write_manifest(source_root)
+
+    bound = validate_f1_corpus_source_bundle(
+        _bundle(source_root, sources),
+        binding=_binding(manifest, sources[:1]),
+    )
+
+    assert len(bound.paper_work_items) == 1
+    assert bound.paper_work_items[0].source_pdf.endswith("paper-01.pdf")
+    assert bound.source_snapshot["declared_pdf_count"] == 15
+    assert bound.source_snapshot["pdf_count"] == 1
+    assert bound.source_snapshot["f1_corpus_binding"]["excluded_source_count"] == 14
+
+
 def test_f1_binding_rejects_same_bytes_from_unbound_paths(tmp_path: Path) -> None:
     source_root = tmp_path / "sources"
     source_root.mkdir()

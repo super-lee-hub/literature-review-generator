@@ -36,7 +36,11 @@ def _pdf(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     document = fitz.open()
     page = document.new_page()
-    page.insert_text((72, 72), text)
+    page.insert_text(
+        (72, 72),
+        f"{text}. This verified source contains enough substantive context for "
+        "a deterministic Stage 1 identity and reuse-contract exercise.",
+    )
     document.save(path)
     document.close()
 

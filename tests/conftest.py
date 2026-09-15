@@ -22,10 +22,18 @@ from offline_guard import (  # noqa: E402
     install_offline_guard,
     live_api_skip_reason,
 )
+from runtime.test_dependencies import (  # noqa: E402
+    RuntimeTestDependencies,
+    install_runtime_test_dependencies,
+)
 
 
 configure_offline_environment()
 install_offline_guard()
+# This is an explicit Python dependency injection for the in-process pytest
+# lane.  Production run/resume/GUI processes never use the ordinary offline
+# environment variable as an authorization bypass.
+install_runtime_test_dependencies(RuntimeTestDependencies())
 
 
 _OPTIONAL_MARKERS = {"live_api", "playwright", "heavy_ocr", "optional"}

@@ -35,17 +35,18 @@ from services.stage1_input_completeness import (
     has_blocking_stage1_reason,
 )
 from services.stage1_input_selector import Stage1InputSelection, select_stage1_input
+from services.mineru_policy import (
+    DEFAULT_MINERU_ALLOWED_URL_HOSTS as SHARED_DEFAULT_MINERU_ALLOWED_URL_HOSTS,
+    effective_mineru_allowed_url_hosts,
+    normalize_exact_mineru_host,
+    parse_mineru_http_url,
+)
 from services.settings import (
     PreprocessParserPolicy,
     resolve_preprocess_parser_policy,
 )
 
-DEFAULT_MINERU_ALLOWED_URL_HOSTS = frozenset(
-    {
-        "mineru.oss-cn-shanghai.aliyuncs.com",
-        "cdn-mineru.openxlab.org.cn",
-    }
-)
+DEFAULT_MINERU_ALLOWED_URL_HOSTS = SHARED_DEFAULT_MINERU_ALLOWED_URL_HOSTS
 DEFAULT_MINERU_RESPONSE_MAX_BYTES = 64 * 1024 * 1024
 DEFAULT_MINERU_ZIP_MAX_ENTRIES = 4096
 DEFAULT_MINERU_ZIP_MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
@@ -106,7 +107,100 @@ class MineruRemoteBudget:
     tasks_used: int = 0
     http_calls_used: int = 0
     upload_bytes_used: int = 0
+    state_path: str | Path | None = None
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+    _reservations: dict[str, dict[str, Any]] = field(default_factory=dict, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.state_path:
+            self.state_path = str(Path(self.state_path).expanduser().resolve())
+
+    def _durable_path(self) -> Path | None:
+        if not self.state_path:
+            return None
+        return Path(self.state_path).expanduser().resolve()
+
+    @staticmethod
+    def _integer(value: Any, *, field_name: str) -> int:
+        if isinstance(value, bool):
+            raise MineruConfigurationError(f"MinerU budget field {field_name} must be an integer")
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise MineruConfigurationError(
+                f"MinerU budget field {field_name} must be an integer"
+            ) from exc
+        if parsed < 0:
+            raise MineruConfigurationError(
+                f"MinerU budget field {field_name} must be non-negative"
+            )
+        return parsed
+
+    def _read_state_unlocked(self) -> Mapping[str, Any] | None:
+        target = self._durable_path()
+        if target is None or not target.is_file():
+            return None
+        try:
+            payload = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise MineruConfigurationError("MinerU budget state is unreadable") from exc
+        if not isinstance(payload, Mapping) or payload.get("schema_version") != "mineru-remote-budget-v1":
+            raise MineruConfigurationError("MinerU budget state schema is invalid")
+        return payload
+
+    def _apply_state_unlocked(self, payload: Mapping[str, Any]) -> None:
+        limits = payload.get("limits")
+        if not isinstance(limits, Mapping):
+            raise MineruConfigurationError("MinerU budget state limits are missing")
+        stored_limits = (
+            self._integer(limits.get("max_tasks"), field_name="max_tasks"),
+            self._integer(limits.get("max_http_calls"), field_name="max_http_calls"),
+            self._integer(limits.get("max_upload_bytes"), field_name="max_upload_bytes"),
+        )
+        current_limits = (self.max_tasks, self.max_http_calls, self.max_upload_bytes)
+        if any(value is not None for value in current_limits):
+            if any(
+                value is not None and value != stored
+                for value, stored in zip(current_limits, stored_limits, strict=True)
+            ):
+                raise MineruConfigurationError("MinerU budget state limits changed")
+        self.max_tasks, self.max_http_calls, self.max_upload_bytes = stored_limits
+        self.tasks_used = self._integer(payload.get("tasks_used", 0), field_name="tasks_used")
+        self.http_calls_used = self._integer(
+            payload.get("http_calls_used", 0), field_name="http_calls_used"
+        )
+        self.upload_bytes_used = self._integer(
+            payload.get("upload_bytes_used", 0), field_name="upload_bytes_used"
+        )
+        raw_reservations = payload.get("reservations", {})
+        if not isinstance(raw_reservations, Mapping):
+            raise MineruConfigurationError("MinerU budget reservations are invalid")
+        self._reservations = {
+            str(key): dict(value)
+            for key, value in raw_reservations.items()
+            if isinstance(value, Mapping)
+        }
+
+    def _state_payload_unlocked(self) -> dict[str, Any]:
+        return {
+            "schema_version": "mineru-remote-budget-v1",
+            "limits": {
+                "max_tasks": int(self.max_tasks or 0),
+                "max_http_calls": int(self.max_http_calls or 0),
+                "max_upload_bytes": int(self.max_upload_bytes or 0),
+            },
+            "tasks_used": int(self.tasks_used),
+            "http_calls_used": int(self.http_calls_used),
+            "upload_bytes_used": int(self.upload_bytes_used),
+            "reservations": {
+                str(key): dict(value) for key, value in self._reservations.items()
+            },
+        }
+
+    def _persist_state_unlocked(self) -> None:
+        target = self._durable_path()
+        if target is not None:
+            atomic_write_json(str(target), self._state_payload_unlocked())
 
     def bind_limits(
         self,
@@ -117,39 +211,133 @@ class MineruRemoteBudget:
     ) -> None:
         """Bind one configuration exactly once for a shared job budget."""
 
-        requested = (int(max_tasks), int(max_http_calls), int(max_upload_bytes))
+        requested = (
+            self._integer(max_tasks, field_name="max_tasks"),
+            self._integer(max_http_calls, field_name="max_http_calls"),
+            self._integer(max_upload_bytes, field_name="max_upload_bytes"),
+        )
         with self._lock:
             current = (self.max_tasks, self.max_http_calls, self.max_upload_bytes)
+            target = self._durable_path()
+            if target is not None:
+                with interprocess_file_lock(target):
+                    existing = self._read_state_unlocked()
+                    if existing is not None:
+                        stored_limits = existing.get("limits")
+                        if not isinstance(stored_limits, Mapping):
+                            raise MineruConfigurationError("MinerU budget state limits are missing")
+                        stored = (
+                            self._integer(stored_limits.get("max_tasks"), field_name="max_tasks"),
+                            self._integer(stored_limits.get("max_http_calls"), field_name="max_http_calls"),
+                            self._integer(stored_limits.get("max_upload_bytes"), field_name="max_upload_bytes"),
+                        )
+                        if stored != requested:
+                            raise MineruConfigurationError("MinerU budget state limits changed")
+                        self._apply_state_unlocked(existing)
+                    elif any(value is not None for value in current) and tuple(current) != requested:
+                        raise MineruConfigurationError(
+                            "shared MinerU budget cannot change after remote preprocessing starts"
+                        )
+                    self.max_tasks, self.max_http_calls, self.max_upload_bytes = requested
+                    self._persist_state_unlocked()
+                return
             if any(value is not None for value in current):
-                if current != requested:
+                if tuple(current) != requested:
                     raise MineruConfigurationError(
                         "shared MinerU budget cannot change after remote preprocessing starts"
                     )
                 return
             self.max_tasks, self.max_http_calls, self.max_upload_bytes = requested
 
-    def reserve_task(self) -> None:
+    def reserve_task(self, *, reservation_id: str = "") -> str:
+        reservation = str(reservation_id or uuid.uuid4().hex).strip()
+        if not reservation:
+            raise MineruConfigurationError("MinerU task reservation ID is required")
         with self._lock:
-            if self.max_tasks is None:
-                raise MineruConfigurationError("MinerU remote-task budget is not configured")
-            if self.tasks_used >= self.max_tasks:
-                raise MineruBudgetExceeded("MinerU remote-task budget exhausted")
-            self.tasks_used += 1
+            target = self._durable_path()
+            lock = interprocess_file_lock(target) if target is not None else None
+            if lock is not None:
+                with lock:
+                    existing = self._read_state_unlocked()
+                    if existing is not None:
+                        self._apply_state_unlocked(existing)
+                    self._reserve_task_unlocked(reservation)
+                    self._persist_state_unlocked()
+            else:
+                self._reserve_task_unlocked(reservation)
+        return reservation
 
-    def reserve_http_call(self, *, upload_bytes: int = 0) -> None:
-        payload_bytes = max(0, int(upload_bytes))
+    def _reserve_task_unlocked(self, reservation: str) -> None:
+        existing = self._reservations.get(reservation)
+        if existing is not None:
+            if str(existing.get("kind") or "") != "task":
+                raise MineruConfigurationError("MinerU reservation ID has a conflicting kind")
+            return
+        if self.max_tasks is None:
+            raise MineruConfigurationError("MinerU remote-task budget is not configured")
+        if self.tasks_used >= self.max_tasks:
+            raise MineruBudgetExceeded("MinerU remote-task budget exhausted")
+        self.tasks_used += 1
+        self._reservations[reservation] = {"kind": "task", "amount": 0}
+
+    def reserve_http_call(
+        self,
+        *,
+        upload_bytes: int = 0,
+        reservation_id: str = "",
+    ) -> str:
+        if isinstance(upload_bytes, bool):
+            raise MineruConfigurationError("MinerU upload byte reservation must be an integer")
+        try:
+            payload_bytes = int(upload_bytes)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise MineruConfigurationError("MinerU upload byte reservation must be an integer") from exc
+        if payload_bytes < 0:
+            raise MineruConfigurationError("MinerU upload byte reservation must be non-negative")
+        reservation = str(reservation_id or uuid.uuid4().hex).strip()
+        if not reservation:
+            raise MineruConfigurationError("MinerU transport reservation ID is required")
         with self._lock:
-            if self.max_http_calls is None or self.max_upload_bytes is None:
-                raise MineruConfigurationError("MinerU remote transport budget is not configured")
-            if self.http_calls_used >= self.max_http_calls:
-                raise MineruBudgetExceeded("MinerU remote HTTP-call budget exhausted")
-            if self.upload_bytes_used + payload_bytes > self.max_upload_bytes:
-                raise MineruBudgetExceeded("MinerU remote upload-byte budget exhausted")
-            self.http_calls_used += 1
-            self.upload_bytes_used += payload_bytes
+            target = self._durable_path()
+            lock = interprocess_file_lock(target) if target is not None else None
+            if lock is not None:
+                with lock:
+                    existing = self._read_state_unlocked()
+                    if existing is not None:
+                        self._apply_state_unlocked(existing)
+                    self._reserve_http_call_unlocked(reservation, payload_bytes)
+                    self._persist_state_unlocked()
+            else:
+                self._reserve_http_call_unlocked(reservation, payload_bytes)
+        return reservation
+
+    def _reserve_http_call_unlocked(self, reservation: str, payload_bytes: int) -> None:
+        existing = self._reservations.get(reservation)
+        if existing is not None:
+            if (
+                str(existing.get("kind") or "") != "http"
+                or int(existing.get("upload_bytes") or 0) != payload_bytes
+            ):
+                raise MineruConfigurationError("MinerU reservation ID has conflicting transport data")
+            return
+        if self.max_http_calls is None or self.max_upload_bytes is None:
+            raise MineruConfigurationError("MinerU remote transport budget is not configured")
+        if self.http_calls_used >= self.max_http_calls:
+            raise MineruBudgetExceeded("MinerU remote HTTP-call budget exhausted")
+        if self.upload_bytes_used + payload_bytes > self.max_upload_bytes:
+            raise MineruBudgetExceeded("MinerU remote upload-byte budget exhausted")
+        self.http_calls_used += 1
+        self.upload_bytes_used += payload_bytes
+        self._reservations[reservation] = {"kind": "http", "upload_bytes": payload_bytes}
 
     def snapshot(self) -> dict[str, int]:
         with self._lock:
+            target = self._durable_path()
+            if target is not None:
+                with interprocess_file_lock(target):
+                    existing = self._read_state_unlocked()
+                    if existing is not None:
+                        self._apply_state_unlocked(existing)
             return {
                 "max_tasks": int(self.max_tasks or 0),
                 "max_http_calls": int(self.max_http_calls or 0),
@@ -396,10 +584,14 @@ class PreprocessManager:
         mineru_circuit_breaker: ProviderCircuitBreaker | None = None,
         preprocess_environment_resolved: bool | None = None,
         mineru_budget: MineruRemoteBudget | None = None,
+        mineru_budget_state_path: str | Path | None = None,
+        mineru_trace_state_path: str | Path | None = None,
+        cancellation_checker: Callable[[], None] | None = None,
         mineru_receipt_sink: Callable[[Mapping[str, Any]], None] | None = None,
     ):
         self.config = config or {}
         self.logger = logger
+        self.cancellation_checker = cancellation_checker
         preprocess_section = self.config.get("Preprocess", {}) if isinstance(self.config, Mapping) else {}
         paths_section = self.config.get("Paths", {}) if isinstance(self.config, Mapping) else {}
         self.preprocess_environment_resolved = (
@@ -583,22 +775,18 @@ class PreprocessManager:
                 DEFAULT_MINERU_TEXT_MAX_BYTES,
             ),
         )
-        configured_allowed_hosts = {
-            item.strip().lower()
-            for item in setting("mineru_allowed_url_hosts", "MINERU_ALLOWED_URL_HOSTS", "").split(",")
-            if item.strip()
-        }
-        self.mineru_invalid_allowed_url_hosts = {
-            item
-            for item in configured_allowed_hosts
-            if not self._is_safe_exact_mineru_host(item)
-        }
-        self.mineru_allowed_url_hosts = set(DEFAULT_MINERU_ALLOWED_URL_HOSTS)
-        self.mineru_allowed_url_hosts.update(
-            item
-            for item in configured_allowed_hosts
-            if item not in self.mineru_invalid_allowed_url_hosts
+        configured_allowed_hosts = setting(
+            "mineru_allowed_url_hosts", "MINERU_ALLOWED_URL_HOSTS", ""
         )
+        (
+            effective_allowed_hosts,
+            invalid_allowed_hosts,
+        ) = effective_mineru_allowed_url_hosts(configured_allowed_hosts)
+        self.mineru_invalid_allowed_url_hosts = set(invalid_allowed_hosts)
+        # This is the one effective destination set used by preflight and the
+        # result URL validator.  Trust admission imports the same helper and
+        # therefore acknowledges precisely this set, including defaults.
+        self.mineru_allowed_url_hosts = set(effective_allowed_hosts)
         legacy_local_fallback = setting(
             "allow_local_parse_fallback", "ALLOW_LOCAL_PARSE_FALLBACK", "true"
         )
@@ -650,7 +838,9 @@ class PreprocessManager:
             maximum=10_000_000_000,
             field_name="mineru_max_remote_upload_bytes",
         )
-        self.mineru_budget = mineru_budget or MineruRemoteBudget()
+        self.mineru_budget = mineru_budget or MineruRemoteBudget(
+            state_path=mineru_budget_state_path
+        )
         self.mineru_budget.bind_limits(
             max_tasks=self.mineru_max_remote_tasks,
             max_http_calls=self.mineru_max_remote_http_calls,
@@ -658,6 +848,13 @@ class PreprocessManager:
         )
         self.mineru_receipt_sink = mineru_receipt_sink
         self._active_mineru_trace: dict[str, Any] | None = None
+        self._active_mineru_private: dict[str, Any] | None = None
+        self._resumed_mineru_payload: dict[str, Any] | None = None
+        self._mineru_trace_state_path = (
+            Path(mineru_trace_state_path).expanduser().resolve()
+            if mineru_trace_state_path
+            else None
+        )
         self._last_mineru_receipt: dict[str, Any] = {}
         self.mineru_circuit_breaker = mineru_circuit_breaker or ProviderCircuitBreaker("mineru")
         self.processing_fingerprint = self._processing_fingerprint()
@@ -668,9 +865,10 @@ class PreprocessManager:
         self.mineru_circuit_breaker.ensure_closed()
         if not self.mineru_api_token:
             raise ValueError("MINERU_API_TOKEN is not configured")
-        parsed = urlparse(self.mineru_base_url)
-        if parsed.scheme.lower() != "https" or not parsed.hostname:
-            raise ValueError("MINERU_BASE_URL must be an absolute HTTPS URL")
+        try:
+            parse_mineru_http_url(self.mineru_base_url, require_https=True)
+        except ValueError as exc:
+            raise ValueError("MINERU_BASE_URL must be an absolute HTTPS URL without userinfo") from exc
         self._validate_mineru_url(
             self.mineru_base_url,
             purpose="preflight URL",
@@ -707,15 +905,64 @@ class PreprocessManager:
 
         if self._active_mineru_trace is not None:
             raise MineruConfigurationError("MinerU trace is already active")
-        self.mineru_budget.reserve_task()
-        source_sha256 = self._source_identity(pdf_path)["sha256"]
+        source_identity = self._source_identity(pdf_path)
+        source_sha256 = str(source_identity["sha256"])
+        request_hash = _stable_hash(dict(request_payload))
+        config_hash = self._mineru_config_fingerprint()
+        pending = self._read_mineru_trace_state()
+        if pending is not None and pending.get("state") == "in_progress":
+            pending_trace = pending.get("trace")
+            pending_private = pending.get("private")
+            if not isinstance(pending_trace, Mapping) or not isinstance(pending_private, Mapping):
+                raise MineruSubmissionUncertainError(
+                    "MinerU has an unreadable pending submission; refusing to create another task"
+                )
+            if (
+                str(pending_trace.get("source_pdf_sha256") or "") != source_sha256
+                or str(pending_trace.get("request_hash") or "") != request_hash
+                or str(pending_trace.get("config_hash") or "") != config_hash
+            ):
+                raise MineruSubmissionUncertainError(
+                    "MinerU has a pending submission for a different source or configuration"
+                )
+            task_id = str(pending_private.get("task_id") or "").strip()
+            if bool(pending_private.get("post_sent")) and not task_id:
+                raise MineruSubmissionUncertainError(
+                    "MinerU task-create outcome is unknown; refusing to retry the POST"
+                )
+            self._active_mineru_trace = dict(pending_trace)
+            self._active_mineru_private = dict(pending_private)
+            if not bool(self._active_mineru_private.get("budget_reserved")):
+                task_reservation_id = str(
+                    self._active_mineru_private.get("task_reservation_id") or ""
+                ).strip()
+                if not task_reservation_id:
+                    raise MineruSubmissionUncertainError(
+                        "MinerU pending submission has no stable task reservation ID"
+                    )
+                # A crash between the pending marker and the reservation must
+                # not turn the next process into an unbudgeted POST.  Reusing
+                # the stable reservation ID is idempotent in the durable
+                # budget ledger.
+                self.mineru_budget.reserve_task(reservation_id=task_reservation_id)
+                self._active_mineru_private["budget_reserved"] = True
+                self._persist_mineru_trace()
+            create_response = self._active_mineru_private.get("create_response")
+            self._resumed_mineru_payload = (
+                dict(create_response) if isinstance(create_response, Mapping) else None
+            )
+            return
+
+        receipt_id = f"mineru-receipt-{uuid.uuid4().hex}"
+        task_reservation_id = f"task:{receipt_id}"
         self._active_mineru_trace = {
             "artifact_type": "mineru_remote_receipt",
             "artifact_version": "v1",
-            "receipt_id": f"mineru-receipt-{uuid.uuid4().hex}",
+            "receipt_id": receipt_id,
             "source_pdf_sha256": str(source_sha256),
-            "request_hash": _stable_hash(dict(request_payload)),
-            "config_hash": self._mineru_config_fingerprint(),
+            "source_pdf_size": int(source_identity.get("size") or 0),
+            "request_hash": request_hash,
+            "config_hash": config_hash,
             "schema_hash": _stable_hash({"schema": "mineru-remote-receipt-v1"}),
             "task_id_hash": "",
             "response_hash": "",
@@ -723,8 +970,93 @@ class PreprocessManager:
             "network_calls": 0,
             "upload_bytes": 0,
             "transport_events": [],
+            "transport_sequence": 0,
+            "transport_events_truncated": 0,
             "started_at": datetime.now(timezone.utc).isoformat(),
         }
+        self._active_mineru_private = {
+            "source_pdf_path": str(pdf_path),
+            "task_reservation_id": task_reservation_id,
+            "budget_reserved": False,
+            "post_sent": False,
+            "task_id": "",
+            "create_response": {},
+            "upload_targets": [],
+            "uploaded_target_hashes": [],
+        }
+        # Persist the pending marker before reserving the budget.  The
+        # reservation uses a stable ID, so a restart can safely complete the
+        # same reservation instead of allocating a second task allowance.
+        self._persist_mineru_trace()
+        self.mineru_budget.reserve_task(reservation_id=task_reservation_id)
+        self._active_mineru_private["budget_reserved"] = True
+        self._persist_mineru_trace()
+
+    def _read_mineru_trace_state(self) -> dict[str, Any] | None:
+        path = self._mineru_trace_state_path
+        if path is None or not path.is_file():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise MineruSubmissionUncertainError(
+                "MinerU pending submission state is unreadable"
+            ) from exc
+        if not isinstance(payload, Mapping) or payload.get("schema_version") != "mineru-remote-trace-v1":
+            raise MineruSubmissionUncertainError("MinerU pending submission state schema is invalid")
+        return dict(payload)
+
+    def _persist_mineru_trace(self) -> None:
+        path = self._mineru_trace_state_path
+        trace = self._active_mineru_trace
+        private = self._active_mineru_private
+        if path is None or trace is None or private is None:
+            return
+        atomic_write_json(
+            str(path),
+            {
+                "schema_version": "mineru-remote-trace-v1",
+                "state": "in_progress",
+                "trace": self._make_json_safe(trace),
+                # This file is job-owned recovery state, not a shareable
+                # receipt.  Presigned targets and task IDs never reach the
+                # public receipt sink below.
+                "private": self._make_json_safe(private),
+            },
+        )
+
+    def _remember_mineru_create_response(
+        self,
+        response: Mapping[str, Any],
+        upload_targets: Iterable[str],
+    ) -> None:
+        if self._active_mineru_private is None:
+            return
+        self._active_mineru_private["create_response"] = dict(response)
+        self._active_mineru_private["upload_targets"] = [
+            str(item) for item in upload_targets if str(item).strip()
+        ]
+        self._persist_mineru_trace()
+
+    def _clear_mineru_source_copy(self, private: Mapping[str, Any] | None) -> None:
+        raw = str((private or {}).get("source_pdf_path") or "").strip()
+        if not raw:
+            return
+        cache_root = Path(self.cache_root).expanduser().resolve()
+        try:
+            if os.path.commonpath([str(cache_root), str(Path(raw).expanduser().resolve())]) != str(
+                cache_root
+            ):
+                return
+        except ValueError:
+            return
+        try:
+            Path(raw).unlink(missing_ok=True)
+            parent = Path(raw).parent
+            if parent.name.startswith("mineru-source-") and not any(parent.iterdir()):
+                parent.rmdir()
+        except OSError:
+            pass
 
     def _reserve_mineru_transport(
         self,
@@ -735,46 +1067,81 @@ class PreprocessManager:
     ) -> None:
         """Account for every physical MinerU HTTP call before it is sent."""
 
-        self.mineru_budget.reserve_http_call(upload_bytes=upload_bytes)
         trace = self._active_mineru_trace
         if trace is None:
+            self.mineru_budget.reserve_http_call(upload_bytes=upload_bytes)
             return
+        sequence = int(trace.get("transport_sequence") or 0) + 1
+        transport_id = f"transport:{trace.get('receipt_id')}:{sequence}"
+        reservation_id = f"http:{trace.get('receipt_id')}:{sequence}"
+        self.mineru_budget.reserve_http_call(
+            upload_bytes=upload_bytes,
+            reservation_id=reservation_id,
+        )
+        trace["transport_sequence"] = sequence
         trace["network_calls"] = int(trace.get("network_calls") or 0) + 1
         trace["upload_bytes"] = int(trace.get("upload_bytes") or 0) + max(0, int(upload_bytes))
         events = list(trace.get("transport_events") or [])
         # Retain bounded, non-secret request identity. The full URL can carry
         # presigned query credentials and must never enter durable evidence.
+        parsed = urlparse(url)
+        event = {
+            "transport_id": transport_id,
+            "sequence": sequence,
+            "kind": str(kind),
+            "host": str(parsed.hostname or "").lower(),
+            "path_hash": _stable_hash(str(parsed.path or "")),
+            "status_code": None,
+        }
         if len(events) < 64:
-            parsed = urlparse(url)
-            events.append(
-                {
-                    "kind": str(kind),
-                    "host": str(parsed.hostname or "").lower(),
-                    "path_hash": _stable_hash(str(parsed.path or "")),
-                    "status_code": None,
-                }
-            )
+            event["host"] = str(parsed.hostname or "").lower()
+            event["path_hash"] = _stable_hash(str(parsed.path or ""))
+            events.append(event)
+        else:
+            trace["transport_events_truncated"] = int(
+                trace.get("transport_events_truncated") or 0
+            ) + 1
+        trace["_active_transport_id"] = transport_id
+        if self._active_mineru_private is not None:
+            self._active_mineru_private["last_transport_id"] = transport_id
+            if str(kind) == "json_post":
+                self._active_mineru_private["post_sent"] = True
         trace["transport_events"] = events
+        self._persist_mineru_trace()
 
     def _record_mineru_transport_result(self, *, status_code: Any = None) -> None:
         trace = self._active_mineru_trace
         if trace is None:
             return
         events = list(trace.get("transport_events") or [])
-        if not events:
-            return
         try:
             normalized = int(status_code) if status_code is not None else None
         except (TypeError, ValueError):
             normalized = None
-        events[-1] = {**dict(events[-1]), "status_code": normalized}
+        active_id = str(trace.pop("_active_transport_id", "") or "")
+        for index, event in enumerate(events):
+            if str(event.get("transport_id") or "") == active_id:
+                events[index] = {**dict(event), "status_code": normalized}
+                break
+        else:
+            # The event may be outside the bounded public prefix.  Never
+            # mutate a prior event merely because the new event was omitted.
+            trace["unrecorded_transport_results"] = int(
+                trace.get("unrecorded_transport_results") or 0
+            ) + 1
         trace["transport_events"] = events
+        if self._active_mineru_private is not None:
+            self._active_mineru_private.pop("last_transport_id", None)
+        self._persist_mineru_trace()
 
     def _set_mineru_task_id(self, value: Any) -> None:
         trace = self._active_mineru_trace
         task_id = str(value or "").strip()
         if trace is not None and task_id:
             trace["task_id_hash"] = hashlib.sha256(task_id.encode("utf-8")).hexdigest()
+            if self._active_mineru_private is not None:
+                self._active_mineru_private["task_id"] = task_id
+            self._persist_mineru_trace()
 
     def _finish_mineru_trace(
         self,
@@ -797,11 +1164,38 @@ class PreprocessManager:
         trace["budget"] = self.mineru_budget.snapshot()
         trace["finished_at"] = datetime.now(timezone.utc).isoformat()
         completed = self._make_json_safe(trace)
+        private = dict(self._active_mineru_private or {})
+        if self._mineru_trace_state_path is not None:
+            atomic_write_json(
+                str(self._mineru_trace_state_path),
+                {
+                    "schema_version": "mineru-remote-trace-v1",
+                    "state": "terminal",
+                    "trace": completed,
+                },
+            )
         self._active_mineru_trace = None
+        self._active_mineru_private = None
+        self._resumed_mineru_payload = None
         self._last_mineru_receipt = dict(completed)
         if self.mineru_receipt_sink is not None:
             self.mineru_receipt_sink(dict(completed))
+        self._clear_mineru_source_copy(private)
         return dict(completed)
+
+    def _mark_mineru_submission_uncertain(self, error: BaseException) -> None:
+        """Keep an unresolved create/upload boundary resumable but non-retryable."""
+
+        trace = self._active_mineru_trace
+        if trace is None:
+            return
+        trace["status"] = "submission_uncertain"
+        trace["error_type"] = type(error).__name__
+        trace["error_hash"] = _stable_hash(
+            {"type": type(error).__name__, "message": str(error)}
+        )
+        trace["budget"] = self.mineru_budget.snapshot()
+        self._persist_mineru_trace()
 
     @staticmethod
     def _mineru_response_identity(result: Mapping[str, Any]) -> dict[str, Any]:
@@ -1980,10 +2374,32 @@ class PreprocessManager:
                     return remote_result
                 remote_error = RuntimeError("MinerU remote parser returned no usable content")
             except MineruArtifactError as exc:
-                self._finish_mineru_trace(status="blocked", error=exc)
+                private = self._active_mineru_private or {}
+                if bool(private.get("post_sent")) and not str(
+                    private.get("task_id") or ""
+                ).strip():
+                    # A response-size/format/error boundary after the
+                    # non-idempotent POST may mean the server accepted it.
+                    # Preserve the pending marker so a restart refuses to
+                    # create a duplicate task.
+                    self._mark_mineru_submission_uncertain(exc)
+                else:
+                    self._finish_mineru_trace(status="blocked", error=exc)
                 raise
             except Exception as exc:  # pragma: no cover - remote integration path.
                 remote_error = exc
+                private = self._active_mineru_private or {}
+                if bool(private.get("post_sent")) and not str(
+                    private.get("task_id") or ""
+                ).strip():
+                    # A non-MinerU parsing/normalization exception can still
+                    # occur after the non-idempotent POST returned an
+                    # unexpected shape.  Do not turn that unknown outcome
+                    # into a local fallback or a second POST on resume.
+                    self._mark_mineru_submission_uncertain(exc)
+                    raise MineruSubmissionUncertainError(
+                        "MinerU task-create outcome is unknown; refusing local fallback"
+                    ) from exc
                 self._log(f"MinerU remote parsing failed, falling back to local parser: {exc}", level="warning")
 
         if remote_enabled and not mineru_token_present:
@@ -2144,131 +2560,304 @@ class PreprocessManager:
         baseline_page_blocks: List[Dict[str, Any]],
         baseline_page_index: List[Dict[str, Any]],
     ) -> Optional[Dict[str, Any]]:
+        frozen_path = ""
         try:
-            source_pdf_size = int(os.path.getsize(pdf_path))
-        except OSError as exc:
-            raise MineruArtifactError(f"cannot stat source PDF before upload: {exc}") from exc
-        if source_pdf_size > self.source_pdf_max_bytes:
-            raise MineruArtifactLimitError(
-                "source PDF exceeds the configured upload byte limit "
-                f"({source_pdf_size} > {self.source_pdf_max_bytes})"
-            )
-        self.preflight_mineru()
-        upload_url = self._join_base_url(self.mineru_upload_endpoint)
-        payload = {
-            "files": [
-                {
-                    "name": os.path.basename(pdf_path),
-                    "data_id": self._pdf_cache_key(pdf_path),
-                }
-            ],
-            "model_version": self.mineru_model_version,
-        }
+            frozen_path, source_identity = self._freeze_mineru_source(pdf_path)
+            source_pdf_size = int(source_identity["size"])
+            self.preflight_mineru()
+            upload_url = self._join_base_url(self.mineru_upload_endpoint)
+            payload = {
+                "files": [
+                    {
+                        "name": os.path.basename(pdf_path),
+                        "data_id": self._pdf_cache_key(pdf_path, source_identity),
+                    }
+                ],
+                "model_version": self.mineru_model_version,
+            }
 
-        # The task-create endpoint is non-idempotent. Reserve its one allowed
-        # attempt before the POST and never let generic retry logic duplicate
-        # a potentially charged parser task.
-        self._begin_mineru_trace(pdf_path=pdf_path, request_payload=payload)
-        upload_response = self._request_json("post", upload_url, json=payload)
-        if not upload_response:
-            raise MineruSubmissionUncertainError(
-                "MinerU task-create response was empty; task state cannot be verified"
-            )
+            # The task-create endpoint is non-idempotent. Reserve its one
+            # allowed attempt before the POST and recover a durable pending
+            # submission when this process is a resume.
+            self._begin_mineru_trace(pdf_path=frozen_path, request_payload=payload)
+            upload_response = self._resumed_mineru_payload
+            if upload_response is None:
+                upload_response = self._request_json("post", upload_url, json=payload)
+            if not upload_response:
+                raise MineruSubmissionUncertainError(
+                    "MinerU task-create response was empty; task state cannot be verified"
+                )
 
-        batch_id = str(self._find_first_value(upload_response, {"batch_id", "task_id", "id"}) or "").strip()
-        if not batch_id:
-            raise MineruSubmissionUncertainError(
-                "MinerU task-create response omitted a task identifier"
+            batch_id = str(
+                self._find_first_value(upload_response, {"batch_id", "task_id", "id"}) or ""
+            ).strip()
+            if not batch_id:
+                raise MineruSubmissionUncertainError(
+                    "MinerU task-create response omitted a task identifier"
+                )
+            self._set_mineru_task_id(batch_id)
+            upload_targets = self._normalize_upload_targets(
+                self._find_first_value(upload_response, {"file_urls", "upload_urls", "urls"})
             )
-        self._set_mineru_task_id(batch_id)
-        upload_targets = self._normalize_upload_targets(
-            self._find_first_value(upload_response, {"file_urls", "upload_urls", "urls"})
-        )
-        if not upload_targets:
-            raise MineruSubmissionUncertainError(
-                "MinerU task-create response omitted presigned upload URLs"
-            )
+            if not upload_targets:
+                raise MineruSubmissionUncertainError(
+                    "MinerU task-create response omitted presigned upload URLs"
+                )
+            self._remember_mineru_create_response(upload_response, upload_targets)
 
-        self._last_mineru_upload_bytes = 0
-        for target in upload_targets:
-            self.mineru_circuit_breaker.ensure_closed()
-            safe_target = self._validate_mineru_url(target, purpose="upload URL")
-            with open(pdf_path, "rb") as handle:
+            # Read the job-owned frozen object once.  Subsequent source-path
+            # replacement or in-place edits cannot change the bytes sent to a
+            # presigned URL or the amount reserved in the budget.
+            frozen_bytes = Path(frozen_path).read_bytes()
+            frozen_check = self._source_identity(frozen_path)
+            if (
+                int(frozen_check["size"]) != source_pdf_size
+                or str(frozen_check["sha256"]) != str(source_identity["sha256"])
+            ):
+                raise MineruArtifactError("frozen source PDF changed before upload")
+
+            self._last_mineru_upload_bytes = int(
+                (self._active_mineru_private or {}).get("completed_upload_bytes") or 0
+            )
+            completed_targets = {
+                str(item)
+                for item in (self._active_mineru_private or {}).get(
+                    "uploaded_target_hashes", []
+                )
+                if str(item)
+            }
+            for target in upload_targets:
+                self.mineru_circuit_breaker.ensure_closed()
+                safe_target = self._validate_mineru_url(target, purpose="upload URL")
+                target_hash = hashlib.sha256(safe_target.encode("utf-8")).hexdigest()
+                if target_hash in completed_targets:
+                    continue
                 self._reserve_mineru_transport(
                     kind="upload_put",
                     url=safe_target,
-                    upload_bytes=source_pdf_size,
+                    upload_bytes=len(frozen_bytes),
                 )
                 try:
                     response = requests.put(
                         safe_target,
-                        data=handle,
+                        data=frozen_bytes,
                         timeout=self.mineru_upload_timeout_seconds,
                         allow_redirects=False,
                     )
                 except Exception:
                     self._record_mineru_transport_result()
                     raise
-            self._record_mineru_transport_result(
-                status_code=getattr(response, "status_code", None)
+                try:
+                    self._record_mineru_transport_result(
+                        status_code=getattr(response, "status_code", None)
+                    )
+                    status_code = int(getattr(response, "status_code", 200))
+                    if status_code in {401, 403}:
+                        self.mineru_circuit_breaker.open(
+                            reason="upload_authorization_rejected",
+                            status_code=status_code,
+                        )
+                        raise ProviderCircuitOpen(
+                            f"MinerU upload authorization rejected with HTTP {status_code}",
+                            snapshot=self.mineru_circuit_breaker.snapshot,
+                        )
+                    response.raise_for_status()
+                    self._last_mineru_upload_bytes += len(frozen_bytes)
+                    if self._active_mineru_private is not None:
+                        completed_targets.add(target_hash)
+                        self._active_mineru_private["uploaded_target_hashes"] = sorted(
+                            completed_targets
+                        )
+                        self._active_mineru_private["completed_upload_bytes"] = (
+                            self._last_mineru_upload_bytes
+                        )
+                        self._persist_mineru_trace()
+                finally:
+                    close = getattr(response, "close", None)
+                    if callable(close):
+                        close()
+
+            poll_payload = self._poll_mineru_result(
+                batch_id=batch_id, seed_payload=upload_response
             )
-            self._last_mineru_upload_bytes += source_pdf_size
-            status_code = int(getattr(response, "status_code", 200))
-            if status_code in {401, 403}:
-                self.mineru_circuit_breaker.open(
-                    reason="upload_authorization_rejected",
-                    status_code=status_code,
-                )
-                raise ProviderCircuitOpen(
-                    f"MinerU upload authorization rejected with HTTP {status_code}",
-                    snapshot=self.mineru_circuit_breaker.snapshot,
-                )
-            response.raise_for_status()
+            if not poll_payload:
+                return None
 
-        poll_payload = self._poll_mineru_result(batch_id=batch_id, seed_payload=upload_response)
-        if not poll_payload:
-            return None
+            normalized = self._normalize_mineru_payload(
+                payload=poll_payload,
+                baseline_page_diagnostics=baseline_page_diagnostics,
+                baseline_page_blocks=baseline_page_blocks,
+                baseline_page_index=baseline_page_index,
+            )
+            if not normalized or (
+                not normalized.get("markdown_text") and not normalized.get("plain_text")
+            ):
+                return None
 
-        normalized = self._normalize_mineru_payload(
-            payload=poll_payload,
-            baseline_page_diagnostics=baseline_page_diagnostics,
-            baseline_page_blocks=baseline_page_blocks,
-            baseline_page_index=baseline_page_index,
+            normalized["extractor_used"] = "mineru"
+            normalized["layout_fidelity"] = "layout_aware"
+            normalized["conversion_used"] = "native_pdf"
+            normalized["used_ocr"] = False
+            normalized["mineru_upload_bytes"] = self._last_mineru_upload_bytes
+            return normalized
+        finally:
+            if frozen_path and self._active_mineru_trace is None:
+                self._clear_mineru_source_copy(
+                    {"source_pdf_path": frozen_path}
+                )
+
+    def _freeze_mineru_source(self, pdf_path: str) -> tuple[str, Dict[str, Any]]:
+        """Create one immutable, job-owned byte source for remote upload."""
+
+        lexical_source = Path(pdf_path).expanduser()
+        if is_reparse_path(lexical_source):
+            raise MineruArtifactError("source PDF is a symlink or reparse point")
+        try:
+            source_identity = self._source_identity(str(lexical_source))
+        except OSError as exc:
+            raise MineruArtifactError(f"cannot stat source PDF before upload: {exc}") from exc
+        source_pdf_size = int(source_identity["size"])
+        if source_pdf_size > self.source_pdf_max_bytes:
+            raise MineruArtifactLimitError(
+                "source PDF exceeds the configured upload byte limit "
+                f"({source_pdf_size} > {self.source_pdf_max_bytes})"
+            )
+        freeze_root = Path(self.cache_root).expanduser().resolve()
+        freeze_root.mkdir(parents=True, exist_ok=True)
+        freeze_dir = Path(tempfile.mkdtemp(prefix=".mineru-source-", dir=str(freeze_root)))
+        temp_path = freeze_dir / ".source.pdf.tmp"
+        frozen_path = freeze_dir / "source.pdf"
+        try:
+            with lexical_source.open("rb") as source_handle, temp_path.open("wb") as target:
+                shutil.copyfileobj(source_handle, target, length=1024 * 1024)
+                target.flush()
+                os.fsync(target.fileno())
+            os.replace(str(temp_path), str(frozen_path))
+            frozen_identity = self._source_identity(str(frozen_path))
+            source_after = self._source_identity(str(lexical_source))
+            if (
+                str(frozen_identity["sha256"]) != str(source_identity["sha256"])
+                or int(frozen_identity["size"]) != source_pdf_size
+                or str(source_after["sha256"]) != str(source_identity["sha256"])
+                or str(source_after["file_id"]) != str(source_identity["file_id"])
+            ):
+                raise MineruArtifactError(
+                    "source PDF changed while creating the remote-upload freeze"
+                )
+            return str(frozen_path), dict(source_identity)
+        except BaseException:
+            try:
+                shutil.rmtree(freeze_dir)
+            except OSError:
+                pass
+            raise
+
+    def _read_bounded_json_response(self, response: Any) -> bytes:
+        """Read decompressed response bytes under a streaming deadline/limit."""
+
+        limit = min(
+            max(1, int(self.mineru_response_max_bytes)),
+            max(1, int(self.mineru_json_max_bytes)),
         )
-        if not normalized or (not normalized.get("markdown_text") and not normalized.get("plain_text")):
-            return None
+        headers = getattr(response, "headers", {})
+        content_length = headers.get("Content-Length") if hasattr(headers, "get") else None
+        try:
+            advertised_bytes = int(content_length) if content_length else 0
+        except (TypeError, ValueError):
+            advertised_bytes = 0
+        if advertised_bytes > limit:
+            raise MineruArtifactLimitError(
+                "MinerU JSON response exceeds the configured byte limit "
+                f"({advertised_bytes} > {limit})"
+            )
 
-        normalized["extractor_used"] = "mineru"
-        normalized["layout_fidelity"] = "layout_aware"
-        normalized["conversion_used"] = "native_pdf"
-        normalized["used_ocr"] = False
-        normalized["mineru_upload_bytes"] = self._last_mineru_upload_bytes
-        return normalized
+        deadline = time.monotonic() + float(self.mineru_request_timeout_seconds)
+        chunks: list[bytes] = []
+        total_bytes = 0
+        iterator = cast(
+            Callable[..., Iterable[Any]] | None,
+            getattr(response, "iter_content", None),
+        )
+        if callable(iterator):
+            for chunk in iterator(chunk_size=64 * 1024):
+                if callable(self.cancellation_checker):
+                    self.cancellation_checker()
+                if time.monotonic() > deadline:
+                    raise TimeoutError("MinerU JSON response deadline exceeded")
+                if not chunk:
+                    continue
+                chunk_bytes = bytes(chunk)
+                total_bytes += len(chunk_bytes)
+                if total_bytes > limit:
+                    raise MineruArtifactLimitError(
+                        "MinerU JSON response exceeded the configured byte limit "
+                        f"({total_bytes} > {limit})"
+                    )
+                chunks.append(chunk_bytes)
+            return b"".join(chunks)
+
+        # This branch exists only for small test doubles and non-requests
+        # adapters.  Production requests always use stream=True and expose
+        # iter_content, so a real response is never eagerly buffered here.
+        content = getattr(response, "content", b"") or b""
+        if not content:
+            json_method = getattr(response, "json", None)
+            if callable(json_method):
+                try:
+                    content = json.dumps(
+                        json_method(), ensure_ascii=False, separators=(",", ":")
+                    ).encode("utf-8")
+                except (TypeError, ValueError) as exc:
+                    raise MineruArtifactFormatError(
+                        "MinerU JSON response is not serializable"
+                    ) from exc
+        response_bytes = content.encode("utf-8") if isinstance(content, str) else bytes(content)
+        if len(response_bytes) > limit:
+            raise MineruArtifactLimitError(
+                "MinerU JSON response exceeds the configured byte limit "
+                f"({len(response_bytes)} > {limit})"
+            )
+        return response_bytes
 
     def _request_json(self, method: str, url: str, **kwargs: Any) -> Optional[Dict[str, Any]]:
-        safe_url = self._validate_mineru_url(url, purpose="JSON request URL", require_mineru_origin=True)
+        safe_url = self._validate_mineru_url(
+            url, purpose="JSON request URL", require_mineru_origin=True
+        )
         normalized_method = str(method or "").strip().upper()
         if normalized_method not in {"GET", "POST"}:
-            raise MineruConfigurationError(f"unsupported MinerU JSON method: {normalized_method or '<empty>'}")
+            raise MineruConfigurationError(
+                f"unsupported MinerU JSON method: {normalized_method or '<empty>'}"
+            )
         last_exception: Optional[Exception] = None
         # MinerU task creation is non-idempotent. Without a provider-supported
         # idempotency contract a lost POST response is an unknown charged task,
         # so one transport attempt is the only safe behavior.
-        total_attempts = 1 if normalized_method == "POST" else self.mineru_request_max_retries + 1
+        total_attempts = (
+            1 if normalized_method == "POST" else self.mineru_request_max_retries + 1
+        )
         for attempt in range(total_attempts):
+            response: Any = None
+            transport_recorded = False
             try:
+                if callable(self.cancellation_checker):
+                    self.cancellation_checker()
                 self.mineru_circuit_breaker.ensure_closed()
-                self._reserve_mineru_transport(kind=f"json_{normalized_method.lower()}", url=safe_url)
+                self._reserve_mineru_transport(
+                    kind=f"json_{normalized_method.lower()}", url=safe_url
+                )
+                request_kwargs = dict(kwargs)
+                request_kwargs["stream"] = True
                 response = requests.request(
                     method=normalized_method,
                     url=safe_url,
                     headers=self._mineru_headers(),
                     timeout=self.mineru_request_timeout_seconds,
                     allow_redirects=False,
-                    **kwargs,
+                    **request_kwargs,
                 )
                 status_code = int(getattr(response, "status_code", 200))
                 self._record_mineru_transport_result(status_code=status_code)
+                transport_recorded = True
                 if status_code in {401, 403}:
                     self.mineru_circuit_breaker.open(
                         reason="authorization_rejected",
@@ -2279,23 +2868,14 @@ class PreprocessManager:
                         snapshot=self.mineru_circuit_breaker.snapshot,
                     )
                 response.raise_for_status()
-                content_length = getattr(response, "headers", {}).get("Content-Length")
+                response_content = self._read_bounded_json_response(response)
                 try:
-                    advertised_bytes = int(content_length) if content_length else 0
-                except (TypeError, ValueError):
-                    advertised_bytes = 0
-                if advertised_bytes > self.mineru_response_max_bytes:
-                    raise MineruArtifactLimitError(
-                        "MinerU JSON response exceeds the configured byte limit "
-                        f"({advertised_bytes} > {self.mineru_response_max_bytes})"
-                    )
-                response_content = bytes(getattr(response, "content", b"") or b"")
-                if len(response_content) > self.mineru_response_max_bytes:
-                    raise MineruArtifactLimitError(
-                        "MinerU JSON response exceeds the configured byte limit "
-                        f"({len(response_content)} > {self.mineru_response_max_bytes})"
-                    )
-                return response.json()
+                    payload = json.loads(response_content.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise MineruArtifactFormatError("MinerU JSON response is invalid JSON") from exc
+                if not isinstance(payload, dict):
+                    raise MineruArtifactFormatError("MinerU JSON response must be an object")
+                return payload
             except ProviderCircuitOpen as exc:
                 if normalized_method == "POST":
                     raise MineruSubmissionUncertainError(
@@ -2306,7 +2886,8 @@ class PreprocessManager:
             except MineruArtifactError:
                 raise
             except Exception as exc:  # pragma: no cover - transport path.
-                self._record_mineru_transport_result()
+                if not transport_recorded:
+                    self._record_mineru_transport_result()
                 if normalized_method == "POST":
                     raise MineruSubmissionUncertainError(
                         "MinerU task-create request outcome is unknown; refusing retry or local fallback"
@@ -2314,7 +2895,13 @@ class PreprocessManager:
                 last_exception = exc
                 if attempt >= total_attempts - 1:
                     break
+                if callable(self.cancellation_checker):
+                    self.cancellation_checker()
                 time.sleep(self.mineru_retry_backoff_seconds * (attempt + 1))
+            finally:
+                close = getattr(response, "close", None)
+                if callable(close):
+                    close()
         if last_exception:
             raise last_exception
         return None
@@ -2330,6 +2917,8 @@ class PreprocessManager:
         session.trust_env = False
         try:
             for attempt in range(self.mineru_request_max_retries + 1):
+                response: Any = None
+                transport_recorded = False
                 try:
                     is_mineru_origin = self._is_mineru_origin_url(safe_url)
                     if is_mineru_origin:
@@ -2345,6 +2934,7 @@ class PreprocessManager:
                     )
                     status_code = int(getattr(response, "status_code", 200))
                     self._record_mineru_transport_result(status_code=status_code)
+                    transport_recorded = True
                     if status_code in {401, 403}:
                         self.mineru_circuit_breaker.open(
                             reason="artifact_authorization_rejected",
@@ -2396,11 +2986,16 @@ class PreprocessManager:
                 except MineruArtifactError:
                     raise
                 except Exception as exc:  # pragma: no cover - transport path.
-                    self._record_mineru_transport_result()
+                    if not transport_recorded:
+                        self._record_mineru_transport_result()
                     last_exception = exc
                     if attempt >= self.mineru_request_max_retries:
                         break
                     time.sleep(self.mineru_retry_backoff_seconds * (attempt + 1))
+                finally:
+                    close = getattr(response, "close", None)
+                    if callable(close):
+                        close()
         finally:
             session.close()
         if last_exception:
@@ -2976,10 +3571,13 @@ class PreprocessManager:
         require_mineru_origin: bool = False,
     ) -> str:
         url = self._join_base_url(value)
-        parsed = urlparse(url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise RuntimeError(f"MinerU {purpose} must be an absolute HTTP(S) URL.")
+        try:
+            parsed = parse_mineru_http_url(url)
+        except ValueError as exc:
+            raise RuntimeError(f"MinerU {purpose} is unsafe: {exc}") from exc
         if require_mineru_origin:
+            if parsed.scheme.casefold() != "https":
+                raise RuntimeError(f"MinerU {purpose} must use HTTPS")
             if not self._is_mineru_origin_url(url):
                 raise RuntimeError(f"MinerU {purpose} must use the configured MinerU service origin.")
             return url
@@ -2990,26 +3588,31 @@ class PreprocessManager:
         return url
 
     def _is_mineru_origin_url(self, value: str) -> bool:
-        parsed = urlparse(value)
-        base = urlparse(self.mineru_base_url)
-        return parsed.scheme == base.scheme and parsed.netloc.lower() == base.netloc.lower()
+        try:
+            parsed = parse_mineru_http_url(value)
+            base = parse_mineru_http_url(self.mineru_base_url)
+        except ValueError:
+            return False
+        return (
+            parsed.scheme.casefold() == base.scheme.casefold()
+            and str(parsed.hostname or "").casefold() == str(base.hostname or "").casefold()
+            and (parsed.port or (443 if parsed.scheme.casefold() == "https" else 80))
+            == (base.port or (443 if base.scheme.casefold() == "https" else 80))
+        )
 
     def _is_allowed_mineru_host(self, value: str) -> bool:
-        parsed = urlparse(value)
-        hostname = (parsed.hostname or "").lower()
-        return bool(parsed.scheme == "https" and hostname and hostname in self.mineru_allowed_url_hosts)
+        try:
+            parsed = parse_mineru_http_url(value, require_https=True)
+        except ValueError:
+            return False
+        if parsed.port not in {None, 443}:
+            return False
+        hostname = str(parsed.hostname or "").casefold()
+        return bool(hostname and hostname in self.mineru_allowed_url_hosts)
 
     @staticmethod
     def _is_safe_exact_mineru_host(value: str) -> bool:
-        host = str(value or "").strip().lower()
-        if not host or "*" in host or "/" in host or ":" in host or "@" in host:
-            return False
-        if host.startswith(".") or host.endswith(".") or ".." in host:
-            return False
-        return all(
-            part and all(char.isalnum() or char == "-" for char in part)
-            for part in host.split(".")
-        )
+        return bool(normalize_exact_mineru_host(value))
 
     def _mineru_headers(self) -> Dict[str, str]:
         return {

@@ -106,6 +106,8 @@ def test_remote_mineru_hosts_are_part_of_the_exact_policy() -> None:
         "mineru.example.test",
         "uploads.example.test",
         "results.example.test",
+        "mineru.oss-cn-shanghai.aliyuncs.com",
+        "cdn-mineru.openxlab.org.cn",
     }
     acknowledgement = acknowledgement_from_values(
         policy,

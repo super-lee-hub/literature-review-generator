@@ -56,7 +56,14 @@ def _normalize_planner_response(response: Dict[str, Any]) -> Dict[str, Any]:
     profile = normalize_profile(raw_profile if isinstance(raw_profile, dict) else {})
     missing_information = _normalize_string_list(response.get("missing_information", []))
     assistant_message = str(response.get("assistant_message") or "").strip()
-    ready_to_apply = bool(response.get("ready_to_apply"))
+    raw_ready_to_apply = response.get("ready_to_apply")
+    # This is a control field, not a generic truthy value.  The model contract
+    # accepts JSON booleans only; malformed values fail closed and are retained
+    # as a bounded diagnostic instead of turning "false" into True.
+    ready_to_apply = raw_ready_to_apply if isinstance(raw_ready_to_apply, bool) else False
+    normalization_errors = []
+    if raw_ready_to_apply is not None and not isinstance(raw_ready_to_apply, bool):
+        normalization_errors.append("ready_to_apply must be a JSON boolean")
 
     if not assistant_message:
         if ready_to_apply:
@@ -71,6 +78,7 @@ def _normalize_planner_response(response: Dict[str, Any]) -> Dict[str, Any]:
         "ready_to_apply": ready_to_apply,
         "missing_information": missing_information,
         "profile": profile,
+        "normalization_errors": normalization_errors,
     }
 
 

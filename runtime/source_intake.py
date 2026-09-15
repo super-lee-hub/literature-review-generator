@@ -181,6 +181,7 @@ def validate_f1_corpus_source_bundle(
 
     bundle.validate()
     actual_by_path: dict[str, str] = {}
+    actual_items_by_path: dict[str, Any] = {}
     for item in bundle.paper_work_items:
         source_pdf = str(item.source_pdf or "").strip()
         if not source_pdf or not Path(source_pdf).is_file():
@@ -189,16 +190,32 @@ def validate_f1_corpus_source_bundle(
         if resolved_path in actual_by_path:
             raise ValueError("f1_corpus_binding_duplicate_source_path")
         actual_by_path[resolved_path] = _sha256_file(source_pdf)
+        actual_items_by_path[resolved_path] = item
 
-    if len(actual_by_path) != len(expected_by_path):
-        raise ValueError("f1_corpus_binding_source_count_mismatch")
-    if set(actual_by_path) != set(expected_by_path):
+    # Direct source folders are often a reusable 15-paper staging root while
+    # C/D intentionally bind only a manifest-selected subset.  Reopen and
+    # verify every enumerated source, but publish only the exact expected set;
+    # this prevents unselected papers from reaching preprocessing or a
+    # provider without making each gate maintain a second corpus authority.
+    if not set(expected_by_path).issubset(actual_by_path):
         raise ValueError("f1_corpus_binding_source_paths_mismatch")
     for path, expected_source in expected_by_path.items():
         if actual_by_path[path] != expected_source.sha256:
             raise ValueError("f1_corpus_binding_source_sha256_mismatch")
 
+    selected_items = [actual_items_by_path[path] for path in expected_by_path]
+    if len(selected_items) != len(expected_by_path):
+        raise ValueError("f1_corpus_binding_source_count_mismatch")
+
     snapshot = dict(bundle.source_snapshot)
+    snapshot["declared_pdf_count"] = len(actual_by_path)
+    snapshot["pdf_count"] = len(selected_items)
+    snapshot["source_paths"] = [str(item.source_pdf) for item in selected_items]
+    snapshot["excluded_source_paths"] = [
+        str(item.source_pdf)
+        for item in bundle.paper_work_items
+        if _abs(str(item.source_pdf)).casefold() not in expected_by_path
+    ]
     snapshot["f1_corpus_binding"] = {
         "schema_version": "f1-corpus-binding-v1",
         "manifest_path": manifest.manifest_path,
@@ -206,11 +223,15 @@ def validate_f1_corpus_source_bundle(
         "manifest_content_sha256": manifest.content_sha256,
         "source_ids": [source.source_id for source in selected_sources],
         "gate": resolved_gate,
+        "declared_source_count": len(actual_by_path),
+        "selected_source_count": len(selected_items),
+        "excluded_source_count": len(actual_by_path) - len(selected_items),
+        "selected_source_paths": [str(item.source_pdf) for item in selected_items],
     }
     return SourceBundle(
         source_mode=bundle.source_mode,
         project_name=bundle.project_name,
-        paper_work_items=list(bundle.paper_work_items),
+        paper_work_items=selected_items,
         source_snapshot=snapshot,
     )
 

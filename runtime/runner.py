@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import json
-import os
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -476,6 +475,7 @@ class AgentRuntimeRunner:
         from services.settings import ApplicationSettings
         from runtime.provider_routes import build_reachable_provider_route_plan
         from runtime.stage_planning import StagePlanError, build_stage_plan
+        from runtime.test_dependencies import current_runtime_test_dependencies
         from runtime.trust_admission import (
             ExternalHostAdmissionError,
             build_external_host_policy,
@@ -488,12 +488,17 @@ class AgentRuntimeRunner:
                 or self.job_spec.free_mode_idea
                 or metadata.get("free_mode_input")
             )
+            test_dependencies = current_runtime_test_dependencies()
+            if test_dependencies is not None:
+                test_dependencies.validate()
             resolved_config = load_config(
                 self.job_spec.config,
                 action=self.job_spec.action,
                 requested_stages=requested_stages,
                 free_mode_enabled=free_mode_enabled,
-                allow_template_credentials=os.getenv("AUTO_GENERATE_OFFLINE_TESTS", "0") == "1",
+                allow_template_credentials=bool(
+                    test_dependencies and test_dependencies.allow_template_credentials
+                ),
             )
             settings = ApplicationSettings.from_config(resolved_config)
             plan = build_stage_plan(
@@ -506,11 +511,10 @@ class AgentRuntimeRunner:
                     "allow_unvalidated_when_validation_optional"
                 ),
             )
-            # pytest's offline guard forbids any external socket connection;
-            # it is the only supported fixture lane that may omit a durable
-            # acknowledgement. Every production runner, including GUI and
-            # queued runners that bypass reviewctl, validates the same policy.
-            if os.getenv("AUTO_GENERATE_OFFLINE_TESTS", "0") != "1":
+            # Only an explicitly injected, in-process test adapter may omit
+            # external-host acknowledgement.  Ordinary environment variables
+            # are never an authority boundary for production run/resume.
+            if test_dependencies is None:
                 policy = build_external_host_policy(
                     resolved_config,
                     build_reachable_provider_route_plan(

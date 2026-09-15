@@ -63,7 +63,13 @@ def test_current_stage1_visual_bundle_is_traceable_and_passed_to_reader(tmp_path
     pdf_path = tmp_path / "visual-paper.pdf"
     document = fitz.open()
     page = document.new_page()
-    page.insert_text((72, 72), "Figure 1. Treatment effect\nResults: 20 percent improvement.")
+    page.insert_text(
+        (72, 72),
+        "Figure 1. Treatment effect\n"
+        "Results: 20 percent improvement.\n"
+        "This one-page empirical note reports a controlled treatment comparison "
+        "and a bounded interpretation of the observed result.",
+    )
     page.draw_rect(fitz.Rect(72, 100, 260, 220), color=(0, 0, 1), fill=(0.8, 0.8, 1))
     document.save(pdf_path)
     document.close()

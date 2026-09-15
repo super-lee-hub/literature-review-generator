@@ -15,16 +15,53 @@ def _sha256_text(value: str) -> str:
 
 
 def sanitize_config_for_fingerprint(config: Mapping[str, Any] | None) -> dict[str, Any]:
-    sanitized: dict[str, Any] = {}
-    for section_name, section_value in (config or {}).items():
-        if not isinstance(section_value, Mapping):
-            continue
-        sanitized[section_name] = {}
-        for key, value in section_value.items():
-            if str(key).lower() == "api_key":
-                continue
-            sanitized[section_name][str(key)] = value
-    return sanitized
+    """Return a recursive, secret-free configuration projection."""
+
+    secret_exact = {
+        "api_key",
+        "apikey",
+        "authorization",
+        "password",
+        "secret",
+        "token",
+        "credential",
+        "userinfo",
+    }
+    non_secret_token_keys = {
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "max_tokens",
+        "max_output_tokens",
+        "max_context_tokens",
+        "max_total_tokens",
+        "reasoning_tokens",
+    }
+
+    def is_secret_key(key: Any) -> bool:
+        normalized = str(key or "").casefold().replace("-", "_")
+        if normalized in non_secret_token_keys:
+            return False
+        if normalized in secret_exact:
+            return True
+        return any(
+            normalized.endswith("_" + marker)
+            or normalized.startswith(marker + "_")
+            for marker in secret_exact
+        )
+
+    def clean(value: Any, *, key: str = "") -> Any:
+        if isinstance(value, Mapping):
+            return {
+                str(item_key): clean(item_value, key=str(item_key))
+                for item_key, item_value in value.items()
+                if not is_secret_key(item_key)
+            }
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return [clean(item, key=key) for item in value]
+        return value
+
+    return clean(config if isinstance(config, Mapping) else {})
 
 
 @dataclass(frozen=True)

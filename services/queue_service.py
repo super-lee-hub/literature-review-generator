@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import configparser
 import hashlib
+import hmac
 import inspect
 import json
 import os
@@ -24,7 +25,11 @@ from services.artifact_registry import (
     RegistryError,
     file_sha256,
 )
-from services.durable_io import AtomicReplaceTimeoutError, atomic_replace_with_retry
+from services.durable_io import (
+    AtomicReplaceTimeoutError,
+    atomic_replace_with_retry,
+    interprocess_file_lock,
+)
 
 T = TypeVar("T")
 
@@ -645,14 +650,156 @@ class PersistentQueueService:
         if not target.is_file():
             return {"label": label, "path": resolved, "status": "missing", "sha256": ""}
         try:
+            stat_info = target.stat()
             return {
                 "label": label,
                 "path": resolved,
                 "status": "ready",
-                "sha256": file_sha256(target),
+                "sha256": "" if label == "config" else file_sha256(target),
+                "size": str(int(stat_info.st_size)),
+                "mtime_ns": str(int(stat_info.st_mtime_ns)),
             }
         except OSError:
             return {"label": label, "path": resolved, "status": "unreadable", "sha256": ""}
+
+    def _credential_identity_key(self) -> bytes:
+        """Load/create a queue-local HMAC key kept outside queue JSON."""
+
+        target = self.queue_file_path.with_name(
+            self.queue_file_path.name + ".credential-identity.key"
+        )
+        with interprocess_file_lock(target):
+            if target.is_symlink() or not target.is_file() and target.exists():
+                raise QueueInputDriftError("queue credential identity key is unsafe")
+            if target.is_file():
+                key = target.read_bytes()
+                if len(key) != 32:
+                    raise QueueInputDriftError("queue credential identity key is invalid")
+                return key
+            target.parent.mkdir(parents=True, exist_ok=True)
+            fd, temp_name = tempfile.mkstemp(
+                prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
+            )
+            key = os.urandom(32)
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(key)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                atomic_replace_with_retry(temp_name, str(target), timeout_seconds=5.0)
+            finally:
+                Path(temp_name).unlink(missing_ok=True)
+            return key
+
+    @staticmethod
+    def _source_file_metadata(path_value: str) -> dict[str, Any]:
+        value = str(path_value or "").strip()
+        if not value:
+            return {"path": "", "status": "not_requested"}
+        target = Path(value).expanduser().resolve()
+        if not target.is_file():
+            return {"path": str(target), "status": "missing"}
+        try:
+            stat_info = target.stat()
+        except OSError:
+            return {"path": str(target), "status": "unreadable"}
+        return {
+            "path": str(target),
+            "status": "ready",
+            "size": int(stat_info.st_size),
+            "mtime_ns": int(stat_info.st_mtime_ns),
+        }
+
+    def _effective_runtime_snapshot(
+        self,
+        runtime_spec: Any,
+    ) -> dict[str, Any]:
+        """Freeze the resolved non-secret settings actually used at execution."""
+
+        from config_loader import load_config
+        from runtime.provider_routes import build_reachable_provider_route_plan
+        from services.credential_provenance import (
+            PREPROCESS_ENV_MAPPING,
+            provenance_payload,
+        )
+        from services.job_fingerprint import sanitize_config_for_fingerprint
+
+        free_mode_enabled = bool(
+            runtime_spec.free_mode_profile
+            or runtime_spec.free_mode_idea
+            or runtime_spec.metadata.get("free_mode_input")
+        )
+        resolved = load_config(
+            str(runtime_spec.config),
+            action=runtime_spec.action,
+            requested_stages=runtime_spec.metadata.get("requested_stages"),
+            free_mode_enabled=free_mode_enabled,
+            allow_template_credentials=False,
+        )
+        route_plan = build_reachable_provider_route_plan(
+            resolved,
+            action=runtime_spec.action,
+            requested_stages=runtime_spec.metadata.get("requested_stages"),
+            free_mode_enabled=free_mode_enabled,
+        )
+        identity_key = self._credential_identity_key()
+        inverse_preprocess = {value: key for key, value in PREPROCESS_ENV_MAPPING.items()}
+        credential_identities: list[dict[str, Any]] = []
+        for item in getattr(resolved, "credential_provenance", ()):
+            section = str(item.section)
+            env_var = str(item.env_var)
+            if section in resolved and env_var.startswith("LLM_"):
+                config_key = "api_key"
+            elif section == "Preprocess":
+                config_key = inverse_preprocess.get(env_var, "")
+            else:
+                config_key = ""
+            section_values = resolved.get(section, {})
+            selected_value = (
+                str(section_values.get(config_key) or "")
+                if config_key and isinstance(section_values, Mapping)
+                else ""
+            )
+            selected_source = str(item.selected_source or "")
+            source_path = ""
+            if selected_source == "dotenv":
+                source_path = str(Path(runtime_spec.config).expanduser().resolve().parent / ".env")
+            elif selected_source == "config.ini":
+                source_path = str(Path(runtime_spec.config).expanduser().resolve())
+            value_hmac = (
+                hmac.new(
+                    identity_key,
+                    f"{section}\x00{env_var}\x00{selected_value}".encode("utf-8"),
+                    hashlib.sha256,
+                ).hexdigest()
+                if selected_value
+                else ""
+            )
+            credential_identities.append(
+                {
+                    "section": section,
+                    "env_var": env_var,
+                    "selected_source": selected_source,
+                    "value_hmac_sha256": value_hmac,
+                    "source_file": self._source_file_metadata(source_path),
+                }
+            )
+        payload: dict[str, Any] = {
+            "schema_version": "queue-effective-runtime-settings-v1",
+            "status": "ready",
+            "config_projection": sanitize_config_for_fingerprint(resolved),
+            "route_plan": route_plan.to_dict(),
+            "credential_provenance": provenance_payload(
+                list(getattr(resolved, "credential_provenance", ()))
+            ),
+            "credential_identities": credential_identities,
+            "config_source": self._source_file_metadata(str(runtime_spec.config)),
+            "dotenv_source": self._source_file_metadata(
+                str(Path(runtime_spec.config).expanduser().resolve().parent / ".env")
+            ),
+        }
+        payload["fingerprint"] = self._snapshot_hash(payload)
+        return payload
 
     def _strict_runtime_spec(self, job_spec: QueueJobSpec):
         """Build the only runtime contract a queue worker is allowed to execute."""
@@ -804,6 +951,27 @@ class PersistentQueueService:
             for diagnostic in inventory.diagnostics
             if diagnostic.severity == "error"
         ]
+        try:
+            effective_runtime = self._effective_runtime_snapshot(runtime_spec)
+            # The queue record never stores a digest of raw config bytes.  Its
+            # config identity is the non-secret projection plus a local HMAC
+            # identity for selected credentials and source metadata.
+            config_snapshot["sha256"] = self._snapshot_hash(
+                effective_runtime.get("config_projection") or {}
+            )
+            config_snapshot["hash_kind"] = "non_secret_effective_config"
+        except Exception as exc:
+            effective_runtime = {
+                "schema_version": "queue-effective-runtime-settings-v1",
+                # Keep legacy/minimal queue records inspectable without
+                # pretending that their runtime configuration was resolved.
+                # The real worker still performs the canonical config check;
+                # fully resolved jobs use the stronger drift identity above.
+                "status": "unresolved",
+                "reason_code": f"effective_settings_resolution_failed:{type(exc).__name__}",
+                "config_source": self._source_file_metadata(str(runtime_spec.config)),
+            }
+            effective_runtime["fingerprint"] = self._snapshot_hash(effective_runtime)
         snapshot: dict[str, Any] = {
             "schema_version": "queue-execution-snapshot-v1",
             "runtime_spec": runtime_spec.to_dict(),
@@ -811,11 +979,14 @@ class PersistentQueueService:
             "auxiliary_files": auxiliary_files,
             "source_inventory": inventory.to_dict(),
             "source_inventory_fingerprint": inventory.fingerprint(),
+            "effective_runtime": effective_runtime,
         }
         valid = (
             config_snapshot["status"] == "ready"
             and all(item["status"] == "ready" for item in auxiliary_files)
             and not source_errors
+            and effective_runtime.get("status", "ready") in {"ready", "unresolved"}
+            and bool(effective_runtime.get("fingerprint"))
         )
         snapshot["status"] = "ready" if valid else "invalid"
         if not valid:

@@ -35,6 +35,12 @@ from runtime.provider_runtime import (
     is_process_alive,
     process_identity_for_pid,
 )
+from runtime.trust_admission import (
+    ACKNOWLEDGEMENT_SCHEMA_VERSION,
+    ACKNOWLEDGEMENT_VERSION,
+    ACK_CLOCK_SKEW,
+    ACK_MAX_TTL,
+)
 from services.durable_io import atomic_replace_with_retry
 
 
@@ -108,7 +114,15 @@ _CHILD_SCENARIO_FIELDS = frozenset(
     }
 )
 _EXTERNAL_HOST_ACKNOWLEDGEMENT_FIELDS = frozenset(
-    {"schema_version", "acknowledged", "hosts", "route_fingerprint"}
+    {
+        "schema_version",
+        "version",
+        "acknowledged",
+        "hosts",
+        "route_fingerprint",
+        "issued_at",
+        "expires_at",
+    }
 )
 _F1_ACCEPTANCE_GATES = frozenset({"C", "D", "Q"})
 _MERGE_READINESS_GATES = frozenset(
@@ -342,6 +356,9 @@ class ExternalHostAcknowledgementV1:
     acknowledged: bool
     hosts: tuple[str, ...]
     route_fingerprint: str
+    version: int = ACKNOWLEDGEMENT_VERSION
+    issued_at: str = ""
+    expires_at: str = ""
 
     @staticmethod
     def _normalize_host(value: Any) -> str:
@@ -380,9 +397,13 @@ class ExternalHostAcknowledgementV1:
             _EXTERNAL_HOST_ACKNOWLEDGEMENT_FIELDS,
             "external_host_acknowledgement",
         )
-        if payload.get("schema_version") != "external-host-acknowledgement-v1":
+        if payload.get("schema_version") != ACKNOWLEDGEMENT_SCHEMA_VERSION:
             raise ReleaseAcceptanceSpecError(
                 "external_host_acknowledgement schema is invalid"
+            )
+        if payload.get("version") != ACKNOWLEDGEMENT_VERSION:
+            raise ReleaseAcceptanceSpecError(
+                "external_host_acknowledgement version is invalid"
             )
         acknowledged = payload.get("acknowledged")
         if not isinstance(acknowledged, bool):
@@ -408,18 +429,52 @@ class ExternalHostAcknowledgementV1:
             raise ReleaseAcceptanceSpecError(
                 "external_host_acknowledgement route_fingerprint must be lowercase SHA-256"
             )
+        issued_at = str(payload.get("issued_at") or "").strip()
+        expires_at = str(payload.get("expires_at") or "").strip()
+        try:
+            issued = datetime.fromisoformat(issued_at.replace("Z", "+00:00"))
+            expires = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ReleaseAcceptanceSpecError(
+                "external_host_acknowledgement timestamps are invalid"
+            ) from exc
+        if issued.tzinfo is None or expires.tzinfo is None:
+            raise ReleaseAcceptanceSpecError(
+                "external_host_acknowledgement timestamps must be timezone-aware"
+            )
+        now = datetime.now(timezone.utc)
+        issued = issued.astimezone(timezone.utc)
+        expires = expires.astimezone(timezone.utc)
+        if issued > now + ACK_CLOCK_SKEW:
+            raise ReleaseAcceptanceSpecError(
+                "external_host_acknowledgement is issued in the future"
+            )
+        if expires <= issued or expires <= now:
+            raise ReleaseAcceptanceSpecError(
+                "external_host_acknowledgement is expired"
+            )
+        if expires - issued > ACK_MAX_TTL:
+            raise ReleaseAcceptanceSpecError(
+                "external_host_acknowledgement lifetime is too long"
+            )
         return cls(
             acknowledged=acknowledged,
             hosts=hosts,
             route_fingerprint=route_fingerprint,
+            version=ACKNOWLEDGEMENT_VERSION,
+            issued_at=issued.isoformat().replace("+00:00", "Z"),
+            expires_at=expires.isoformat().replace("+00:00", "Z"),
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": "external-host-acknowledgement-v1",
+            "schema_version": ACKNOWLEDGEMENT_SCHEMA_VERSION,
+            "version": self.version,
             "acknowledged": self.acknowledged,
             "hosts": list(self.hosts),
             "route_fingerprint": self.route_fingerprint,
+            "issued_at": self.issued_at,
+            "expires_at": self.expires_at,
         }
 
 

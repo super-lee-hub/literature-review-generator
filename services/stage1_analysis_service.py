@@ -67,7 +67,7 @@ from services.settings import ApplicationSettings
 from services.stage1_input_builder import Stage1InputBuilder
 from services.stage1_input_completeness import (
     build_completeness_metrics,
-    has_blocking_stage1_reason,
+    is_blocked_stage1_quality,
 )
 from services.stage1_output_budget import (
     stage1_output_budget_sequence,
@@ -264,7 +264,18 @@ class Stage1AnalysisService:
         self._final_source_manifests: dict[str, ArtifactRecord] = {}
         self._visual_observation_records: dict[str, list[ArtifactRecord]] = {}
         self._visual_coverage_records: dict[str, ArtifactRecord] = {}
-        self._mineru_budget = MineruRemoteBudget()
+        # MinerU task/HTTP/upload reservations are job-scoped, not service
+        # instance-scoped.  A resumed worker therefore sees the same durable
+        # budget and pending-submission state as its predecessor.
+        self._mineru_budget_state_path = self.workspace.artifact_path(
+            "stage1/mineru_budget_v1.json"
+        )
+        self._mineru_trace_state_path = self.workspace.artifact_path(
+            "stage1/mineru_trace_v1.json"
+        )
+        self._mineru_budget = MineruRemoteBudget(
+            state_path=self._mineru_budget_state_path
+        )
         self._mineru_receipt_records: dict[str, ArtifactRecord] = {}
         self._mineru_receipt_payloads: dict[str, dict[str, Any]] = {}
 
@@ -5507,6 +5518,9 @@ class Stage1AnalysisService:
                 self, "_preprocess_environment_resolved", False
             ),
             mineru_budget=getattr(self, "_mineru_budget", None),
+            mineru_budget_state_path=getattr(self, "_mineru_budget_state_path", None),
+            mineru_trace_state_path=getattr(self, "_mineru_trace_state_path", None),
+            cancellation_checker=getattr(self, "_check_cancelled", None),
             mineru_receipt_sink=self._record_mineru_receipt_snapshot,
         )
         owner_paper_key = str(paper_key or source_pdf)
@@ -5528,29 +5542,21 @@ class Stage1AnalysisService:
             generation_id = Path(str(result.manifest_path)).parent.name
             reasons = list(getattr(result, "stage1_quality_reasons", []) or [])
             scanned_primary = str(source_role or "").strip() == "SCANNED_PRIMARY"
-            visual_scan_planned = self._full_visual_scan_planned()
-            if has_blocking_stage1_reason(reasons) and not scanned_primary and not visual_scan_planned:
+            quality_level = str(getattr(result, "stage1_quality_level", "") or "")
+            if is_blocked_stage1_quality(quality_level, reasons) and not scanned_primary:
                 raise RuntimeError(
                     f"Stage 1 preprocessing is incomplete for {source_pdf}: {', '.join(reasons)}"
                 )
             if not str(result.stage1_input_text or "").strip():
-                fallback_text = str(result.plain_text or result.markdown_text or "").strip()
-                if fallback_text and _has_substantive_stage1_text(fallback_text):
-                    # The compatibility fallback changes the authoritative
-                    # Stage 1 input. Persist the same bytes that the in-memory
-                    # result exposes so the predeclaration pass and JIT
-                    # hydration hash identical text.
-                    fallback_path = str(result.stage1_input_path or "").strip()
-                    if fallback_path:
-                        PreprocessManager._write_text_durable(
-                            fallback_path,
-                            fallback_text,
-                        )
-                    result = replace(
-                        result,
-                        stage1_input_text=fallback_text,
-                        selected_text_source="plain_text_fallback",
-                        stage1_quality_level="fallback",
+                # ``select_stage1_input`` is the sole quality authority.  A
+                # plain/markdown compatibility write here used to turn BLOCK
+                # and REPROCESS into a successful-looking input while leaving
+                # the published generation manifest unchanged.  Let the
+                # explicit scanned-primary path proceed with page/visual
+                # evidence; every other empty selection is a hard stop.
+                if not scanned_primary:
+                    raise RuntimeError(
+                        f"Stage 1 preprocessing produced no quality-approved input for {source_pdf}"
                     )
             if not str(result.stage1_input_text or "").strip() and not scanned_primary:
                 raise RuntimeError(f"Stage 1 preprocessing produced empty input for {source_pdf}")
@@ -5768,6 +5774,7 @@ class Stage1AnalysisService:
                 f"preprocess authority generation root is a reparse point: {generation_root_lexical}"
             )
         generation_root = generation_root_lexical.resolve()
+        self._validate_preprocess_generation(result, generation_root)
         generation_id = generation_root.name
         paper_digest = hashlib.sha256(str(paper_key).encode("utf-8")).hexdigest()[:24]
         snapshot_root = Path(
@@ -5878,6 +5885,84 @@ class Stage1AnalysisService:
                 raise RuntimeError(f"preprocess authority snapshot hash mismatch: {source.name}")
             replacements[field_name] = str(target)
         return replace(result, **replacements)
+
+    def _validate_preprocess_generation(
+        self,
+        result: Any,
+        generation_root: Path,
+    ) -> None:
+        """Verify a generated cache manifest before copying any authority."""
+
+        manifest_path = Path(str(result.manifest_path)).expanduser().resolve()
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            # Compatibility-only synthetic snapshots from older callers did
+            # not carry the current manifest contract.  They are not accepted
+            # by the normal cache freshness path, but can still be copied by a
+            # narrow snapshot test.
+            return
+        if not isinstance(manifest, Mapping):
+            return
+        artifact_hashes = manifest.get("artifact_hashes")
+        if not isinstance(artifact_hashes, Mapping):
+            return
+        if str(manifest.get("generation_id") or "") != generation_root.name:
+            raise RuntimeError("preprocess generation manifest identity does not match its directory")
+        for raw_name, raw_entry in artifact_hashes.items():
+            if not isinstance(raw_entry, Mapping):
+                raise RuntimeError("preprocess generation manifest has an invalid artifact hash entry")
+            relative = str(raw_entry.get("relative_path") or raw_name).strip()
+            candidate = (generation_root / relative).resolve()
+            try:
+                common = os.path.commonpath([str(generation_root), str(candidate)])
+            except ValueError:
+                common = ""
+            if os.path.normcase(common) != os.path.normcase(str(generation_root)):
+                raise RuntimeError("preprocess generation manifest artifact escapes its generation")
+            if not candidate.is_file() or is_reparse_path(candidate):
+                raise RuntimeError(f"preprocess generation artifact is missing or unsafe: {candidate}")
+            expected_size = raw_entry.get("size")
+            expected_hash = str(raw_entry.get("sha256") or "").strip().lower()
+            if not isinstance(expected_size, int) or isinstance(expected_size, bool) or expected_size < 0:
+                raise RuntimeError(f"preprocess generation artifact size is invalid: {candidate.name}")
+            if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
+                raise RuntimeError(f"preprocess generation artifact hash is invalid: {candidate.name}")
+            if int(candidate.stat().st_size) != expected_size or file_sha256(str(candidate)) != expected_hash:
+                raise RuntimeError(f"preprocess generation artifact hash mismatch: {candidate.name}")
+
+        stage1_input_path = Path(str(result.stage1_input_path)).expanduser().resolve()
+        stage1_manifest_path = Path(str(result.stage1_input_manifest_path)).expanduser().resolve()
+        structured_path = Path(str(result.structured_json_path)).expanduser().resolve()
+        try:
+            stage1_manifest = json.loads(stage1_manifest_path.read_text(encoding="utf-8"))
+            structured = json.loads(structured_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("preprocess generation derived metadata is unreadable") from exc
+        stage1_text = stage1_input_path.read_text(encoding="utf-8")
+        if isinstance(stage1_manifest, Mapping):
+            if stage1_manifest.get("selected_text_length") != len(stage1_text):
+                raise RuntimeError("preprocess Stage 1 input length disagrees with its manifest")
+            if str(stage1_manifest.get("selected_text_source") or "") != str(
+                manifest.get("selected_text_source") or ""
+            ):
+                raise RuntimeError("preprocess selected text source disagrees across manifests")
+            if str(stage1_manifest.get("stage1_quality_level") or "") != str(
+                manifest.get("stage1_quality_level") or ""
+            ):
+                raise RuntimeError("preprocess quality decision disagrees across manifests")
+        if isinstance(structured, Mapping) and "stage1_input_text" in structured:
+            if str(structured.get("stage1_input_text") or "") != stage1_text:
+                raise RuntimeError("preprocess structured artifact disagrees with Stage 1 input")
+        ocr_path = Path(str(result.ocr_artifact_path)).expanduser().resolve()
+        try:
+            ocr_payload = json.loads(ocr_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("preprocess OCR lineage artifact is unreadable") from exc
+        if isinstance(ocr_payload, Mapping) and "stage1_input_sha256" in ocr_payload:
+            expected_input_hash = hashlib.sha256(stage1_text.encode("utf-8")).hexdigest()
+            if str(ocr_payload.get("stage1_input_sha256") or "") != expected_input_hash:
+                raise RuntimeError("preprocess OCR lineage disagrees with Stage 1 input")
 
     def _publish_preprocess_evidence(
         self,

@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 import json
 import logging
-import os
 from pathlib import Path
 import re
 from typing import Any, Callable, Dict, Iterable, Mapping, Sequence, cast
@@ -85,12 +84,17 @@ class _RuntimeStageHost:
         cancel_token: CancelToken,
     ) -> None:
         self.logger = logging.getLogger("auto_generate.runtime")
+        from runtime.test_dependencies import current_runtime_test_dependencies
+
+        test_dependencies = current_runtime_test_dependencies()
         self.config = load_config(
             request.config,
             action=request.action,
             requested_stages=request.requested_stages,
             free_mode_enabled=bool(request.free_mode_profile or request.free_mode_idea),
-            allow_template_credentials=os.getenv("AUTO_GENERATE_OFFLINE_TESTS", "0") == "1",
+            allow_template_credentials=bool(
+                test_dependencies and test_dependencies.allow_template_credentials
+            ),
         )
         if request.source_mode == "direct":
             # A direct job owns its source mode; configured Zotero defaults
@@ -683,8 +687,6 @@ class InternalStageExecutorRegistry:
         The pack artifact is registered with the source summary_file as its
         dependency; authority stays traceable to the original Stage1 bytes.
         """
-        from pathlib import Path
-
         from outline.evidence_projection import build_pack, validate_pack
 
         if not summaries:
@@ -1312,6 +1314,7 @@ class AgentRuntimeBridge:
         job_spec = replace(job_spec, job_id=resolved_job_id)
         self.job_spec = job_spec
         self.publication_context = publication_context
+        self._admit_external_hosts()
         metadata = dict(job_spec.metadata or {})
         frozen_envelope = metadata.get("free_mode_input")
         if isinstance(frozen_envelope, Mapping) and frozen_envelope.get("artifact_id"):
@@ -1324,6 +1327,59 @@ class AgentRuntimeBridge:
             )
         else:
             self.free_mode_envelope = None
+
+    def _admit_external_hosts(self) -> None:
+        """Apply the same pre-transport admission used by run/resume."""
+
+        from config_loader import load_config
+        from runtime.provider_routes import build_reachable_provider_route_plan
+        from runtime.test_dependencies import current_runtime_test_dependencies
+        from runtime.trust_admission import (
+            build_external_host_policy,
+            validate_external_host_acknowledgement,
+        )
+
+        test_dependencies = current_runtime_test_dependencies()
+        if test_dependencies is not None:
+            test_dependencies.validate()
+            # The pytest-only adapter is the explicit zero-external-transport
+            # dependency boundary.  It is intentionally process-local and is
+            # never selected from an ordinary environment variable.
+            return
+        free_mode_enabled = bool(
+            self.job_spec.free_mode_profile
+            or self.job_spec.free_mode_idea
+            or self.job_spec.metadata.get("free_mode_input")
+        )
+        config = load_config(
+            str(self.job_spec.config),
+            action=self.job_spec.action,
+            requested_stages=self.job_spec.metadata.get("requested_stages"),
+            free_mode_enabled=free_mode_enabled,
+            allow_template_credentials=bool(
+                test_dependencies and test_dependencies.allow_template_credentials
+            ),
+        )
+        from runtime.stage_planning import build_stage_plan
+
+        stage_plan = build_stage_plan(
+            action=self.job_spec.action,
+            requested_stages=self.job_spec.metadata.get("requested_stages"),
+            validation_enabled=ApplicationSettings.from_config(config).review_validation_enabled(),
+        )
+        route_plan = build_reachable_provider_route_plan(
+            config,
+            action=self.job_spec.action,
+            requested_stages=self.job_spec.metadata.get("requested_stages"),
+            free_mode_enabled=free_mode_enabled,
+            stage_plan=stage_plan,
+        )
+        policy = build_external_host_policy(config, route_plan)
+        if test_dependencies is None:
+            validate_external_host_acknowledgement(
+                policy,
+                self.job_spec.metadata.get("external_host_acknowledgement"),
+            )
 
     def build_job_request(self) -> JobRunRequest:
         request = self.job_spec.to_job_request()

@@ -563,28 +563,7 @@ class ReviewControlPlane:
             from dataclasses import replace
 
             spec = replace(spec, job_id=job_id)
-        try:
-            external_host_admission = self._admit_runtime_spec_external_hosts(spec)
-        except ControlPlaneError as exc:
-            # Offline fixture tests inject provider transports and do not carry
-            # an owner acknowledgement for the historical third-party sample
-            # config.  Keep the production resume boundary fail-closed; this
-            # narrowly scoped test-only projection prevents the control-plane
-            # resume path from masking the injected, zero-network fixture.
-            if (
-                resume
-                and os.getenv("AUTO_GENERATE_OFFLINE_TESTS", "0") == "1"
-                and str(exc).startswith("external host admission failed:")
-            ):
-                external_host_admission = {
-                    "required": True,
-                    "acknowledged": False,
-                    "offline_test_bypass": True,
-                    "reason": str(exc),
-                    "read_only": True,
-                }
-            else:
-                raise
+        external_host_admission = self._admit_runtime_spec_external_hosts(spec)
         runner = AgentRuntimeRunner(spec)
         result = runner.resume() if resume else runner.run()
         payload = self._status_payload(result)
@@ -608,13 +587,38 @@ class ReviewControlPlane:
             or spec.metadata.get("free_mode_input")
         )
         try:
+            from runtime.test_dependencies import current_runtime_test_dependencies
+            from services.credential_provenance import is_template_credential
+
+            test_dependencies = current_runtime_test_dependencies()
             normalized = load_config(
                 str(spec.config),
                 action=spec.action,
                 requested_stages=spec.metadata.get("requested_stages"),
                 free_mode_enabled=free_mode_enabled,
-                allow_template_credentials=os.getenv("AUTO_GENERATE_OFFLINE_TESTS", "0") == "1",
+                allow_template_credentials=bool(
+                    test_dependencies and test_dependencies.allow_template_credentials
+                ),
             )
+            if test_dependencies is not None:
+                test_dependencies.validate()
+                has_explicit_test_template = any(
+                    is_template_credential(section.get("api_key"))
+                    for section_name, section in normalized.items()
+                    if section_name.endswith("_API") and isinstance(section, Mapping)
+                )
+                if has_explicit_test_template:
+                    # The pytest-only injected adapter owns a zero-external-
+                    # transport fixture.  This compatibility projection is
+                    # limited to template-based fixtures; a real credential
+                    # still follows the normal host-acknowledgement path even
+                    # inside pytest.
+                    return {
+                        "required": False,
+                        "acknowledged": False,
+                        "offline_test_dependency_injected": True,
+                        "read_only": True,
+                    }
             route_plan = build_reachable_provider_route_plan(
                 normalized,
                 action=spec.action,

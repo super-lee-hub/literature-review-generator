@@ -116,7 +116,12 @@ def test_long_paper_scans_every_nonblank_page_and_publishes_observations(tmp_pat
     document = fitz.open()
     for page_no in range(15):
         page = document.new_page()
-        page.insert_text((72, 72), f"Page {page_no + 1} Figure {page_no + 1} evidence")
+        page.insert_text(
+            (72, 72),
+            f"Page {page_no + 1} Figure {page_no + 1} evidence\n"
+            f"The distinct condition for cohort {page_no + 1} reports a treatment "
+            f"effect of {page_no + 2} percent and a bounded visual interpretation.",
+        )
     document.save(pdf_path)
     document.close()
     scan_calls: list[int] = []
@@ -217,7 +222,12 @@ def test_long_paper_visual_run_reuses_without_rescan_or_provider_transport(tmp_p
     document = fitz.open()
     for page_no in range(15):
         page = document.new_page()
-        page.insert_text((72, 72), f"Page {page_no + 1} Figure {page_no + 1} evidence")
+        page.insert_text(
+            (72, 72),
+            f"Page {page_no + 1} Figure {page_no + 1} evidence\n"
+            f"The distinct condition for cohort {page_no + 1} reports a treatment "
+            f"effect of {page_no + 2} percent and a bounded visual interpretation.",
+        )
     document.save(pdf_path)
     document.close()
     calls: list[str] = []

@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 from typing import Any, Mapping
+from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import dotenv_values  # type: ignore
 
@@ -31,8 +32,14 @@ PREPROCESS_ENV_MAPPING: dict[str, str] = {
     "MINERU_POLL_ENDPOINT_TEMPLATES": "mineru_poll_endpoint_templates",
     "MINERU_POLL_INTERVAL_SECONDS": "mineru_poll_interval_seconds",
     "MINERU_POLL_TIMEOUT_SECONDS": "mineru_poll_timeout_seconds",
+    "MINERU_REQUEST_TIMEOUT_SECONDS": "mineru_request_timeout_seconds",
+    "MINERU_UPLOAD_TIMEOUT_SECONDS": "mineru_upload_timeout_seconds",
+    "MINERU_DOWNLOAD_TIMEOUT_SECONDS": "mineru_download_timeout_seconds",
     "MINERU_REQUEST_MAX_RETRIES": "mineru_request_max_retries",
     "MINERU_RETRY_BACKOFF_SECONDS": "mineru_retry_backoff_seconds",
+    "MINERU_MAX_REMOTE_TASKS": "mineru_max_remote_tasks",
+    "MINERU_MAX_REMOTE_HTTP_CALLS": "mineru_max_remote_http_calls",
+    "MINERU_MAX_REMOTE_UPLOAD_BYTES": "mineru_max_remote_upload_bytes",
     "MINERU_RESPONSE_MAX_BYTES": "mineru_response_max_bytes",
     "MINERU_ZIP_MAX_ENTRIES": "mineru_zip_max_entries",
     "MINERU_ZIP_MAX_UNCOMPRESSED_BYTES": "mineru_zip_max_uncompressed_bytes",
@@ -51,6 +58,35 @@ _TEMPLATE_CREDENTIAL_RE = re.compile(
     r"^(?:loaded_from_\.env_file|your_.+_api_key_here)$",
     re.IGNORECASE,
 )
+_DIAGNOSTIC_SECRET_MARKERS = frozenset(
+    {"api_key", "apikey", "token", "authorization", "secret", "password", "credential", "userinfo"}
+)
+
+
+def redact_for_diagnostics(value: Any, *, key: str = "") -> Any:
+    """Return a shareable diagnostic projection without secret values."""
+
+    folded_key = str(key or "").casefold().replace("-", "_")
+    if any(marker in folded_key for marker in _DIAGNOSTIC_SECRET_MARKERS):
+        return {"configured": bool(str(value or "").strip())}
+    if isinstance(value, Mapping):
+        return {
+            str(item_key): redact_for_diagnostics(item_value, key=str(item_key))
+            for item_key, item_value in value.items()
+        }
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [redact_for_diagnostics(item, key=key) for item in value]
+    if "url" in folded_key or folded_key.endswith("_endpoint") or folded_key.endswith("_base"):
+        raw = str(value or "").strip()
+        if "://" in raw:
+            try:
+                parsed = urlsplit(raw)
+                if parsed.username or parsed.password:
+                    return "[REDACTED_URL]"
+                return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+            except (TypeError, ValueError):
+                return "[REDACTED_URL]"
+    return value
 
 
 class CredentialConflictError(ValueError):
@@ -261,3 +297,16 @@ def resolve_preprocess_environment(
 
 def provenance_payload(items: tuple[CredentialProvenance, ...] | list[CredentialProvenance]) -> list[dict[str, Any]]:
     return [item.to_dict() for item in items]
+
+
+__all__ = [
+    "API_ENV_MAPPING",
+    "PREPROCESS_ENV_MAPPING",
+    "CredentialConflictError",
+    "CredentialProvenance",
+    "is_template_credential",
+    "provenance_payload",
+    "redact_for_diagnostics",
+    "resolve_credentials",
+    "resolve_preprocess_environment",
+]

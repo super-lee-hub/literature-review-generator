@@ -1,12 +1,13 @@
 import configparser
 import logging
 import os
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping
 
 from config_validator import validate_all_config
-from dotenv import load_dotenv  # type: ignore  # compatibility for legacy callers/tests
+from dotenv import load_dotenv  # type: ignore  # noqa: F401  # compatibility for legacy callers/tests
 from services.credential_provenance import (
     CredentialProvenance,
+    redact_for_diagnostics,
     resolve_credentials,
     resolve_preprocess_environment,
 )
@@ -230,12 +231,23 @@ if __name__ == "__main__":
     try:
         config = load_config()
         logger.info("配置加载成功:")
+        provenance_by_section = {
+            item.section: item
+            for item in getattr(config, "credential_provenance", ())
+            if isinstance(item, CredentialProvenance)
+        }
         for section, values in config.items():
             logger.info(f"[{section}]")
             for key, value in values.items():
-                if key == "api_key" and value:
-                    logger.info(f"  {key} = ********")
+                if str(key).casefold() in {"api_key", "mineru_api_token"}:
+                    provenance = provenance_by_section.get(section)
+                    selected_source = provenance.selected_source if provenance else "unknown"
+                    logger.info(
+                        f"  {key} = configured={bool(str(value or '').strip())}, "
+                        f"selected_source={selected_source}"
+                    )
                 else:
-                    logger.info(f"  {key} = {value}")
+                    safe_value = redact_for_diagnostics(value, key=key)
+                    logger.info(f"  {key} = {safe_value}")
     except Exception as exc:
         logger.error(f"配置加载失败: {exc}")
