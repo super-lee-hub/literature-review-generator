@@ -22,6 +22,7 @@ from typing import Any, Iterable, Mapping, cast
 from urllib.parse import urlsplit
 import zipfile
 
+from runtime.f1_corpus import F1CorpusManifestError, F1CorpusManifestV1
 from runtime.provider_runtime import (
     AcceptanceExecutionContextV1,
     acceptance_context_environment,
@@ -69,6 +70,7 @@ _ACCEPTANCE_FIELDS = frozenset(
         "job_id",
         "third_party_acknowledged",
         "third_party_hosts",
+        "external_host_acknowledgement",
         "gates",
     }
 )
@@ -84,6 +86,7 @@ _PLAN_FIELDS = frozenset(
         "third_party_acknowledged",
         "third_party_acknowledgement",
         "third_party_hosts",
+        "external_host_acknowledgement",
         "evidence_manifest",
         "state_path",
         "job_id",
@@ -97,11 +100,19 @@ _CHILD_SCENARIO_FIELDS = frozenset(
         "runtime_spec",
         "workspace",
         "input_manifest",
+        "f1_source_ids",
         "execution_mode",
         "budget_domain",
         "prerequisites",
         "job_id",
     }
+)
+_EXTERNAL_HOST_ACKNOWLEDGEMENT_FIELDS = frozenset(
+    {"schema_version", "acknowledged", "hosts", "route_fingerprint"}
+)
+_F1_ACCEPTANCE_GATES = frozenset({"C", "D", "Q"})
+_MERGE_READINESS_GATES = frozenset(
+    {"C", "D", "E", "F", "G", "H", "I", "J", "K", "Q", "R", "S", "T"}
 )
 _SCENARIO_RECEIPT_FIELDS = frozenset(
     {
@@ -166,6 +177,23 @@ _VALIDATOR_CHALLENGE_INPUT_FIELDS = frozenset(
     }
 )
 
+_BUDGET_DIMENSION_ALIASES: Mapping[str, tuple[str, ...]] = {
+    "max_provider_calls_total": ("max_provider_calls_total", "max_provider_calls"),
+    "max_output_tokens_total": ("max_output_tokens_total", "max_output_tokens"),
+    "max_retry_attempts_total": ("max_retry_attempts_total", "max_retry_attempts"),
+    "max_wall_seconds": ("max_wall_seconds", "timeout_seconds"),
+}
+
+
+def _explicit_budget_dimensions(value: Mapping[str, Any] | None) -> frozenset[str]:
+    if not isinstance(value, Mapping):
+        return frozenset()
+    return frozenset(
+        canonical
+        for canonical, aliases in _BUDGET_DIMENSION_ALIASES.items()
+        if any(alias in value for alias in aliases)
+    )
+
 
 def _resolve_acceptance_path(
     value: Any,
@@ -173,6 +201,7 @@ def _resolve_acceptance_path(
     field_name: str,
     origin_dir: str | Path | None,
     required: bool = False,
+    allow_missing_final: bool = False,
 ) -> str:
     if value is None:
         value = ""
@@ -185,8 +214,13 @@ def _resolve_acceptance_path(
         return ""
     path = Path(value).expanduser()
     if origin_dir is not None and not path.is_absolute():
-        path = Path(origin_dir).expanduser().resolve() / path
-    return str(path.resolve())
+        origin = _assert_no_reparse_components(Path(origin_dir).expanduser())
+        path = origin / path
+    unresolved = _assert_no_reparse_components(
+        path,
+        allow_missing_final=allow_missing_final,
+    )
+    return str(unresolved.resolve())
 
 
 def _absolute_unresolved(path: str | Path) -> Path:
@@ -204,7 +238,12 @@ def _assert_no_reparse_components(path: str | Path, *, allow_missing_final: bool
         try:
             info = os.lstat(current)
         except FileNotFoundError:
-            if allow_missing_final and index == len(parts) - 1:
+            if allow_missing_final:
+                # The path may be a run-owned state/evidence target whose
+                # parent tree is created after admission.  Once the first
+                # missing component is reached, the remainder is an
+                # unresolved suffix; there is no existing reparse component
+                # left to inspect. Existing ancestors were already checked.
                 break
             raise ReleaseAcceptanceSpecError(f"evidence path component is missing: {current}") from None
         except OSError as exc:
@@ -297,6 +336,94 @@ class ReleaseAcceptanceBudget:
 
 
 @dataclass(frozen=True)
+class ExternalHostAcknowledgementV1:
+    """A route-plan-bound authorization for content sent to external hosts."""
+
+    acknowledged: bool
+    hosts: tuple[str, ...]
+    route_fingerprint: str
+
+    @staticmethod
+    def _normalize_host(value: Any) -> str:
+        if not isinstance(value, str):
+            raise ReleaseAcceptanceSpecError(
+                "external host acknowledgement hosts must be JSON strings"
+            )
+        host = value.strip().casefold()
+        if (
+            not host
+            or "/" in host
+            or "\\" in host
+            or ":" in host
+            or host in {"localhost", "127.0.0.1", "::1"}
+            or not re.fullmatch(
+                r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+",
+                host,
+            )
+        ):
+            raise ReleaseAcceptanceSpecError(
+                "external host acknowledgement contains an unsafe nonlocal host"
+            )
+        return host
+
+    @classmethod
+    def from_mapping(
+        cls,
+        payload: Mapping[str, Any],
+    ) -> "ExternalHostAcknowledgementV1":
+        if not isinstance(payload, Mapping):
+            raise ReleaseAcceptanceSpecError(
+                "external_host_acknowledgement must be a JSON object"
+            )
+        _reject_unknown(
+            payload,
+            _EXTERNAL_HOST_ACKNOWLEDGEMENT_FIELDS,
+            "external_host_acknowledgement",
+        )
+        if payload.get("schema_version") != "external-host-acknowledgement-v1":
+            raise ReleaseAcceptanceSpecError(
+                "external_host_acknowledgement schema is invalid"
+            )
+        acknowledged = payload.get("acknowledged")
+        if not isinstance(acknowledged, bool):
+            raise ReleaseAcceptanceSpecError(
+                "external_host_acknowledgement acknowledged must be a JSON boolean"
+            )
+        raw_hosts = payload.get("hosts")
+        if not isinstance(raw_hosts, (list, tuple)):
+            raise ReleaseAcceptanceSpecError(
+                "external_host_acknowledgement hosts must be a JSON array"
+            )
+        hosts = tuple(cls._normalize_host(item) for item in raw_hosts)
+        if len(hosts) != len(set(hosts)):
+            raise ReleaseAcceptanceSpecError(
+                "external_host_acknowledgement hosts must be unique"
+            )
+        if acknowledged != bool(hosts):
+            raise ReleaseAcceptanceSpecError(
+                "external_host_acknowledgement acknowledged must match its host set"
+            )
+        route_fingerprint = str(payload.get("route_fingerprint") or "").strip()
+        if not _valid_sha256(route_fingerprint):
+            raise ReleaseAcceptanceSpecError(
+                "external_host_acknowledgement route_fingerprint must be lowercase SHA-256"
+            )
+        return cls(
+            acknowledged=acknowledged,
+            hosts=hosts,
+            route_fingerprint=route_fingerprint,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": "external-host-acknowledgement-v1",
+            "acknowledged": self.acknowledged,
+            "hosts": list(self.hosts),
+            "route_fingerprint": self.route_fingerprint,
+        }
+
+
+@dataclass(frozen=True)
 class AcceptanceValidatorChallengeInputV1:
     """Owner-supplied input for the real Gate H challenge executor."""
 
@@ -384,6 +511,7 @@ class AcceptanceChildScenarioSpecV2:
     runtime_spec: str = ""
     workspace: str = ""
     input_manifest: str = ""
+    f1_source_ids: tuple[str, ...] = ()
     execution_mode: str = "runtime"
     budget_domain: str = "live"
     prerequisites: tuple[str, ...] = ()
@@ -457,11 +585,13 @@ class AcceptanceChildScenarioSpecV2:
             field_name="acceptance child runtime_spec",
             origin_dir=origin_dir,
             required=execution_mode in {"runtime", "ocr", "crash_resume", "validator_challenge"},
+            allow_missing_final=True,
         )
         workspace = _resolve_acceptance_path(
             payload.get("workspace", ""),
             field_name="acceptance child workspace",
             origin_dir=origin_dir,
+            allow_missing_final=True,
         )
         if not workspace:
             raise ReleaseAcceptanceSpecError(
@@ -482,16 +612,62 @@ class AcceptanceChildScenarioSpecV2:
             raise ReleaseAcceptanceSpecError(
                 f"{gate} acceptance child requires an explicit input_manifest"
             )
+        input_manifest = _resolve_acceptance_path(
+            payload.get("input_manifest", ""),
+            field_name="acceptance child input_manifest",
+            origin_dir=origin_dir,
+            allow_missing_final=True,
+        )
+        raw_f1_source_ids = payload.get("f1_source_ids", [])
+        if not isinstance(raw_f1_source_ids, (list, tuple)) or any(
+            not isinstance(item, str) or not item.strip() for item in raw_f1_source_ids
+        ):
+            raise ReleaseAcceptanceSpecError(
+                "acceptance child f1_source_ids must be a non-empty-string array"
+            )
+        f1_source_ids = tuple(str(item).strip() for item in raw_f1_source_ids)
+        if gate in _F1_ACCEPTANCE_GATES:
+            if not input_manifest:
+                raise ReleaseAcceptanceSpecError(
+                    f"Gate {gate} acceptance child requires an authoritative F1 input_manifest"
+                )
+            if not f1_source_ids:
+                raise ReleaseAcceptanceSpecError(
+                    f"Gate {gate} acceptance child requires an explicit f1_source_ids selection"
+                )
+            try:
+                manifest, selected_sources = _load_f1_child_binding(
+                    runtime_spec_path=runtime_spec,
+                    input_manifest_path=input_manifest,
+                    gate=gate,
+                )
+            except F1CorpusManifestError as exc:
+                raise ReleaseAcceptanceSpecError(
+                    f"Gate {gate} F1 corpus manifest is invalid: {exc}"
+                ) from exc
+            except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                raise ReleaseAcceptanceSpecError(
+                    f"Gate {gate} F1 runtime binding is invalid: {type(exc).__name__}"
+                ) from exc
+            selected_ids = tuple(source.source_id for source in selected_sources)
+            if f1_source_ids and tuple(item.casefold() for item in f1_source_ids) != tuple(
+                item.casefold() for item in selected_ids
+            ):
+                raise ReleaseAcceptanceSpecError(
+                    f"Gate {gate} F1 source selection does not match its RuntimeJobSpec binding"
+                )
+            f1_source_ids = selected_ids
+        elif f1_source_ids:
+            raise ReleaseAcceptanceSpecError(
+                "f1_source_ids is reserved for Gates C, D, and Q"
+            )
         return cls(
             scenario_id=scenario_id,
             gate=gate,
             runtime_spec=runtime_spec,
             workspace=workspace,
-            input_manifest=_resolve_acceptance_path(
-                payload.get("input_manifest", ""),
-                field_name="acceptance child input_manifest",
-                origin_dir=origin_dir,
-            ),
+            input_manifest=input_manifest,
+            f1_source_ids=f1_source_ids,
             execution_mode=execution_mode,
             budget_domain=budget_domain,
             prerequisites=tuple(str(item).strip() for item in raw_prerequisites),
@@ -505,6 +681,7 @@ class AcceptanceChildScenarioSpecV2:
             "runtime_spec": self.runtime_spec,
             "workspace": self.workspace,
             "input_manifest": self.input_manifest,
+            "f1_source_ids": list(self.f1_source_ids),
             "execution_mode": self.execution_mode,
             "budget_domain": self.budget_domain,
             "prerequisites": list(self.prerequisites),
@@ -522,6 +699,7 @@ class ReleaseAcceptancePlanV2:
     final_executable_sha: str = ""
     third_party_acknowledged: bool = False
     third_party_hosts: tuple[str, ...] = ()
+    external_host_acknowledgement: ExternalHostAcknowledgementV1 | None = None
 
     @classmethod
     def from_mapping(
@@ -542,17 +720,20 @@ class ReleaseAcceptancePlanV2:
         if not re.fullmatch(r"[A-Za-z0-9_.:-]+", parent_run_id):
             raise ReleaseAcceptanceSpecError("release acceptance plan parent_run_id contains unsafe characters")
         budget_values: list[ReleaseAcceptanceBudget] = []
+        explicit_budget_dimensions: set[str] = set()
         for budget_field in ("budget", "acceptance_budget"):
             if budget_field not in payload:
                 continue
             raw_budget = payload[budget_field]
             if not isinstance(raw_budget, Mapping):
                 raise ReleaseAcceptanceSpecError(f"{budget_field} must be a JSON object")
+            explicit_budget_dimensions.update(_explicit_budget_dimensions(raw_budget))
             budget_values.append(
                 ReleaseAcceptanceBudget.from_mapping(raw_budget, defaults=defaults)
             )
         if len(budget_values) == 2 and budget_values[0] != budget_values[1]:
             raise ReleaseAcceptanceSpecError("acceptance plan budget aliases disagree")
+        has_explicit_budget = bool(budget_values)
         budget = budget_values[0] if budget_values else ReleaseAcceptanceBudget.from_mapping({}, defaults=defaults)
         raw_scenarios = payload.get("scenarios")
         if not isinstance(raw_scenarios, Mapping) or not raw_scenarios:
@@ -573,6 +754,19 @@ class ReleaseAcceptancePlanV2:
                 raise ReleaseAcceptanceSpecError("acceptance plan child scenario IDs must be unique")
             scenario_ids.add(child.scenario_id)
             scenarios[gate] = child
+        if any(child.budget_domain == "live" for child in scenarios.values()):
+            if not has_explicit_budget:
+                raise ReleaseAcceptanceSpecError(
+                    "live acceptance plan requires an explicit budget object"
+                )
+            missing_dimensions = sorted(
+                set(_BUDGET_DIMENSION_ALIASES) - explicit_budget_dimensions
+            )
+            if missing_dimensions:
+                raise ReleaseAcceptanceSpecError(
+                    "live acceptance plan requires explicit budget dimensions: "
+                    + ", ".join(missing_dimensions)
+                )
         cardinality_gates = [scenarios[gate] for gate in ("C", "D", "Q") if gate in scenarios]
         runtime_specs = [item.runtime_spec.casefold() for item in cardinality_gates if item.runtime_spec]
         workspaces = [item.workspace.casefold() for item in scenarios.values() if item.workspace]
@@ -597,6 +791,31 @@ class ReleaseAcceptancePlanV2:
         raw_hosts = payload.get("third_party_hosts", [])
         if not isinstance(raw_hosts, (list, tuple)) or any(not isinstance(item, str) for item in raw_hosts):
             raise ReleaseAcceptanceSpecError("third_party_hosts must be an array of strings")
+        external_acknowledgement: ExternalHostAcknowledgementV1 | None = None
+        raw_external_acknowledgement = payload.get("external_host_acknowledgement")
+        if raw_external_acknowledgement is not None:
+            external_acknowledgement = ExternalHostAcknowledgementV1.from_mapping(
+                raw_external_acknowledgement
+            )
+            normalized_legacy_hosts = tuple(
+                ExternalHostAcknowledgementV1._normalize_host(item)
+                for item in raw_hosts
+                if item.strip()
+            )
+            if "third_party_acknowledged" in payload and raw_ack != external_acknowledgement.acknowledged:
+                raise ReleaseAcceptanceSpecError(
+                    "third_party_acknowledged does not match external_host_acknowledgement"
+                )
+            if "third_party_hosts" in payload and normalized_legacy_hosts != external_acknowledgement.hosts:
+                raise ReleaseAcceptanceSpecError(
+                    "third_party_hosts does not match external_host_acknowledgement"
+                )
+            raw_ack = external_acknowledgement.acknowledged
+            raw_hosts = list(external_acknowledgement.hosts)
+        elif raw_ack or any(item.strip() for item in raw_hosts):
+            raise ReleaseAcceptanceSpecError(
+                "third-party plan acknowledgement requires external_host_acknowledgement"
+            )
         sha_values: list[str] = []
         for field_name in ("final_executable_sha", "executable_sha"):
             if field_name not in payload:
@@ -621,6 +840,7 @@ class ReleaseAcceptancePlanV2:
             final_executable_sha=final_sha,
             third_party_acknowledged=raw_ack,
             third_party_hosts=tuple(item.strip() for item in raw_hosts if item.strip()),
+            external_host_acknowledgement=external_acknowledgement,
         )
 
     @property
@@ -647,6 +867,11 @@ class ReleaseAcceptancePlanV2:
             "budget": self.budget.to_dict(),
             "third_party_acknowledged": self.third_party_acknowledged,
             "third_party_hosts": list(self.third_party_hosts),
+            "external_host_acknowledgement": (
+                self.external_host_acknowledgement.to_dict()
+                if self.external_host_acknowledgement is not None
+                else None
+            ),
             "scenarios": {gate: child.to_dict() for gate, child in self.scenarios.items()},
         }
 
@@ -832,13 +1057,20 @@ class ParentAcceptanceResultV2:
         expected_child_bindings: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> "ParentAcceptanceResultV2":
         required = tuple(str(item).strip().upper() for item in required_scenarios)
-        full_release_profile = frozenset({"C", "D", "E", "F", "G", "H", "I", "J", "K", "Q"})
+        full_release_profile = _MERGE_READINESS_GATES
         scoped = frozenset(required) != full_release_profile
         normalized: dict[str, Mapping[str, Any]] = {}
         issues: list[str] = []
         statuses: list[str] = []
         live_authority = True
         required_live_scenarios = False
+        if not required:
+            issues.append("release acceptance requires at least one child scenario")
+        if len(required) != len(set(required)):
+            issues.append("required child scenario IDs must be unique")
+        unknown_required = sorted(set(required) - set(GATE_CONTRACTS))
+        if unknown_required:
+            issues.append("unsupported required child scenarios: " + ", ".join(unknown_required))
         for scenario_id in required:
             raw = child_results.get(scenario_id)
             if not isinstance(raw, Mapping):
@@ -884,6 +1116,15 @@ class ParentAcceptanceResultV2:
                     issues.append("Gate K success must use the offline-k budget domain")
             elif scenario_id != "K" and status in {"PASS_OFFLINE", "PASS_OFFLINE_HOSTED"}:
                 issues.append(f"offline acceptance status is reserved for Gate K: {scenario_id}")
+            if scenario_id in {"R", "S", "T"}:
+                readiness_error = _validate_merge_readiness_child(
+                    scenario_id,
+                    raw,
+                    receipt,
+                    expected_final_sha=final_executable_sha,
+                )
+                if readiness_error:
+                    issues.append(f"merge-readiness child {scenario_id} is not durable: {readiness_error}")
             normalized[scenario_id] = {
                 **dict(raw),
                 "receipt": receipt.to_dict(),
@@ -1003,9 +1244,107 @@ def _is_nonlocal_provider_receipt(receipt: Any) -> bool:
     return bool(host) and host not in {"localhost", "127.0.0.1", "::1"}
 
 
+_MERGE_READINESS_REPORTS: Mapping[str, tuple[str, str, str]] = {
+    "R": (
+        "negative_behavior_report",
+        "release_negative_behavior_report",
+        "release-negative-behavior-report-v1",
+    ),
+    "S": (
+        "secret_privacy_scan",
+        "release_secret_privacy_scan",
+        "release-secret-privacy-scan-v1",
+    ),
+    "T": (
+        "branch_protection_readback",
+        "release_branch_protection_readback",
+        "release-branch-protection-readback-v1",
+    ),
+}
+
+
+def _validate_merge_readiness_child(
+    gate: str,
+    raw_child: Mapping[str, Any],
+    receipt: ScenarioExecutionReceiptV1,
+    *,
+    expected_final_sha: str,
+) -> str | None:
+    """Require R/S/T to be re-opened, typed release evidence, not status text."""
+
+    expected = _MERGE_READINESS_REPORTS.get(gate)
+    if expected is None:
+        return "unsupported merge-readiness gate"
+    verified = raw_child.get("verified")
+    if not isinstance(verified, Mapping) or str(verified.get("status") or "").upper() != "PASS":
+        return "typed evidence verifier did not return PASS"
+    role, artifact_type, schema_version = expected
+    matches: list[DurableEvidenceRefV1] = []
+    for raw_ref in receipt.produced_evidence_refs:
+        try:
+            ref = DurableEvidenceRefV1.from_mapping(raw_ref)
+        except (ReleaseAcceptanceSpecError, TypeError, ValueError):
+            continue
+        if ref.role == role:
+            matches.append(ref)
+    if len(matches) != 1:
+        return f"requires exactly one {role} reference"
+    ref = matches[0]
+    if (
+        ref.artifact_type != artifact_type
+        or ref.schema_version != schema_version
+        or (ref.job_id and ref.job_id != receipt.job_id)
+    ):
+        return "report reference type, schema, or job binding is invalid"
+    try:
+        raw = _bounded_read(Path(ref.path), max_bytes=_MAX_EVIDENCE_BYTES)
+    except (OSError, ReleaseAcceptanceSpecError):
+        return "report reference is unreadable"
+    if len(raw) != ref.size or hashlib.sha256(raw).hexdigest() != ref.sha256:
+        return "report reference hash or size is stale"
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        return "report reference is not valid JSON"
+    if not isinstance(payload, Mapping):
+        return "report reference is not a JSON object"
+    actual_sha = str(
+        payload.get("final_executable_sha") or payload.get("final_sha") or ""
+    ).strip()
+    if (
+        payload.get("artifact_type") != artifact_type
+        or payload.get("schema_version") != schema_version
+        or actual_sha != expected_final_sha
+        or str(payload.get("status") or "").casefold() not in {"passed", "pass", "clean"}
+    ):
+        return "report payload is not a passed final-SHA-bound release result"
+    if gate == "R":
+        if not isinstance(payload.get("negative_cases"), list) or not payload["negative_cases"]:
+            return "negative behavior report has no executed negative cases"
+        if payload.get("zero_call_failures") is not True:
+            return "negative behavior report did not prove zero-call failure handling"
+    elif gate == "S":
+        if payload.get("tracked_secret_hits") != 0 or payload.get("credential_values_exposed") is not False:
+            return "secret/privacy report does not prove a clean scan"
+    elif gate == "T":
+        readback = payload.get("branch_protection_readback")
+        if not isinstance(readback, Mapping):
+            return "branch protection readback is missing"
+        required_checks = readback.get("required_checks")
+        if (
+            str(readback.get("branch") or "") != "main"
+            or readback.get("protected") is not True
+            or not isinstance(required_checks, list)
+            or not required_checks
+        ):
+            return "branch protection readback does not prove protected main with required checks"
+    return None
+
+
 @dataclass(frozen=True)
 class ReleaseAcceptanceSpec:
     budget: ReleaseAcceptanceBudget = field(default_factory=ReleaseAcceptanceBudget)
+    budget_explicit: bool = False
     final_executable_sha: str = ""
     evidence_manifest: str = ""
     runtime_spec: str = ""
@@ -1023,11 +1362,13 @@ class ReleaseAcceptanceSpec:
         *,
         origin_dir: str | Path | None = None,
         defaults: ReleaseAcceptanceBudget | None = None,
+        allow_missing_live_budget: bool = False,
     ) -> "ReleaseAcceptanceSpec":
         if not isinstance(payload, Mapping):
             raise ReleaseAcceptanceSpecError("release acceptance spec must be a JSON object")
         _reject_unknown(payload, _ACCEPTANCE_FIELDS, "release acceptance spec")
         plan: ReleaseAcceptancePlanV2 | None = None
+        has_explicit_budget = False
         if payload.get("schema_version") == "release-acceptance-plan-v2":
             plan = ReleaseAcceptancePlanV2.from_mapping(
                 payload,
@@ -1052,9 +1393,12 @@ class ReleaseAcceptanceSpec:
                 raise ReleaseAcceptanceSpecError(
                     "acceptance budget aliases disagree"
                 )
+            has_explicit_budget = bool(budget_values)
             budget = budget_values[0] if budget_values else ReleaseAcceptanceBudget.from_mapping(
                 {}, defaults=defaults
             )
+        if plan is not None:
+            has_explicit_budget = True
         sha_values: list[str] = []
         for field_name in ("final_executable_sha", "executable_sha"):
             if field_name not in payload:
@@ -1086,30 +1430,65 @@ class ReleaseAcceptanceSpec:
             evidence = ""
         if not isinstance(evidence, str):
             raise ReleaseAcceptanceSpecError("evidence_manifest must be a JSON string")
-        evidence_path = Path(evidence).expanduser() if evidence else None
-        if origin_dir is not None and evidence_path is not None and not evidence_path.is_absolute():
-            evidence_path = Path(origin_dir).expanduser().resolve() / evidence_path
+        evidence_path = (
+            _resolve_acceptance_path(
+                evidence,
+                field_name="evidence_manifest",
+                origin_dir=origin_dir,
+                allow_missing_final=True,
+            )
+            if evidence.strip()
+            else ""
+        )
         runtime_spec = payload.get("runtime_spec", "")
         if runtime_spec is None:
             runtime_spec = ""
         if not isinstance(runtime_spec, str):
             raise ReleaseAcceptanceSpecError("runtime_spec must be a JSON string")
-        runtime_path = Path(runtime_spec).expanduser() if runtime_spec else None
-        if origin_dir is not None and runtime_path is not None and not runtime_path.is_absolute():
-            runtime_path = Path(origin_dir).expanduser().resolve() / runtime_path
+        runtime_path = (
+            _resolve_acceptance_path(
+                runtime_spec,
+                field_name="runtime_spec",
+                origin_dir=origin_dir,
+                allow_missing_final=True,
+            )
+            if runtime_spec.strip()
+            else ""
+        )
         state_path = payload.get("state_path", "")
         if state_path is None:
             state_path = ""
         if not isinstance(state_path, str):
             raise ReleaseAcceptanceSpecError("state_path must be a JSON string")
-        state_file = Path(state_path).expanduser() if state_path else None
-        if origin_dir is not None and state_file is not None and not state_file.is_absolute():
-            state_file = Path(origin_dir).expanduser().resolve() / state_file
+        state_file = (
+            _resolve_acceptance_path(
+                state_path,
+                field_name="state_path",
+                origin_dir=origin_dir,
+                allow_missing_final=True,
+            )
+            if state_path.strip()
+            else ""
+        )
         job_id = payload.get("job_id", "")
         if job_id is None:
             job_id = ""
         if not isinstance(job_id, str):
             raise ReleaseAcceptanceSpecError("job_id must be a JSON string")
+        external_acknowledgement: ExternalHostAcknowledgementV1 | None = None
+        raw_external_acknowledgement = payload.get("external_host_acknowledgement")
+        if raw_external_acknowledgement is not None:
+            external_acknowledgement = ExternalHostAcknowledgementV1.from_mapping(
+                raw_external_acknowledgement
+            )
+            if (
+                plan is not None
+                and plan.external_host_acknowledgement is not None
+                and external_acknowledgement != plan.external_host_acknowledgement
+            ):
+                raise ReleaseAcceptanceSpecError(
+                    "acceptance external_host_acknowledgement does not match its plan"
+                )
         acknowledged = payload.get(
             "third_party_acknowledged",
             plan.third_party_acknowledged if plan is not None else False,
@@ -1124,12 +1503,39 @@ class ReleaseAcceptanceSpec:
             not isinstance(item, str) for item in raw_hosts
         ):
             raise ReleaseAcceptanceSpecError("third_party_hosts must be an array of strings")
+        if external_acknowledgement is not None:
+            normalized_hosts = tuple(
+                ExternalHostAcknowledgementV1._normalize_host(item)
+                for item in raw_hosts
+                if item.strip()
+            )
+            if "third_party_acknowledged" in payload and acknowledged != external_acknowledgement.acknowledged:
+                raise ReleaseAcceptanceSpecError(
+                    "third_party_acknowledged does not match external_host_acknowledgement"
+                )
+            if "third_party_hosts" in payload and normalized_hosts != external_acknowledgement.hosts:
+                raise ReleaseAcceptanceSpecError(
+                    "third_party_hosts does not match external_host_acknowledgement"
+                )
+            acknowledged = external_acknowledgement.acknowledged
+            raw_hosts = list(external_acknowledgement.hosts)
+        elif acknowledged or any(item.strip() for item in raw_hosts):
+            raise ReleaseAcceptanceSpecError(
+                "third-party acknowledgement requires external_host_acknowledgement"
+            )
         raw_gates = payload.get("gates", list(plan.gates) if plan is not None else [])
         if not isinstance(raw_gates, (list, tuple)) or any(
             not isinstance(item, str) for item in raw_gates
         ):
             raise ReleaseAcceptanceSpecError("gates must be an array of strings")
         gates = tuple(item.strip() for item in raw_gates if item.strip())
+        if len(gates) != len(set(gates)):
+            raise ReleaseAcceptanceSpecError("acceptance gates must be unique")
+        unsupported_gates = sorted(set(gates) - set(GATE_CONTRACTS))
+        if unsupported_gates:
+            raise ReleaseAcceptanceSpecError(
+                "acceptance gates are unsupported: " + ", ".join(unsupported_gates)
+            )
         if plan is not None and gates != plan.gates:
             raise ReleaseAcceptanceSpecError(
                 "acceptance plan gates must match its child scenario keys"
@@ -1138,12 +1544,22 @@ class ReleaseAcceptanceSpec:
             raise ReleaseAcceptanceSpecError(
                 "multi-gate acceptance requires independent child scenarios"
             )
+        if (
+            plan is None
+            and any(bool(GATE_CONTRACTS[gate].get("required_live")) for gate in gates)
+            and not has_explicit_budget
+            and not allow_missing_live_budget
+        ):
+            raise ReleaseAcceptanceSpecError(
+                "live acceptance requires an explicit budget object"
+            )
         return cls(
             budget=budget,
+            budget_explicit=has_explicit_budget,
             final_executable_sha=final_sha,
-            evidence_manifest=str(evidence_path) if evidence_path is not None else "",
-            runtime_spec=str(runtime_path) if runtime_path is not None else "",
-            state_path=str(state_file) if state_file is not None else "",
+            evidence_manifest=evidence_path,
+            runtime_spec=runtime_path,
+            state_path=state_file,
             job_id=job_id.strip(),
             third_party_acknowledged=acknowledged,
             third_party_hosts=tuple(item.strip() for item in raw_hosts if item.strip()),
@@ -2608,7 +3024,7 @@ _SHA256_RE = r"^[0-9a-f]{64}$"
 
 _GATE_REF_ROLES: dict[str, frozenset[str]] = {
     "C": frozenset({"runtime_spec", "source_pdf", "canonical_stage1", "stage_terminal", "job_outcome", "attempt", "registry", "provider_receipt_ledger", "closure", "scenario_execution_receipt"}),
-    "D": frozenset({"source_pdf", "modality_profile", "canonical_stage1", "stage_terminal", "registry", "provider_receipt_ledger", "closure", "scenario_execution_receipt"}),
+    "D": frozenset({"runtime_spec", "source_pdf", "modality_profile", "canonical_stage1", "stage_terminal", "registry", "provider_receipt_ledger", "closure", "scenario_execution_receipt"}),
     "E": frozenset({"interruption_event", "resume_event", "provider_receipt_ledger", "process_events", "scenario_execution_receipt"}),
     "F": frozenset({"canonical_stage1", "outline_provider_call_plan", "provider_receipt_ledger", "stage_terminal", "closure", "scenario_execution_receipt"}),
     "G": frozenset({"free_mode_profile", "provider_receipt_ledger", "stage_terminal", "scenario_execution_receipt"}),
@@ -2625,7 +3041,7 @@ _GATE_REF_ROLES: dict[str, frozenset[str]] = {
     }),
     "J": frozenset({"source_pdf", "ocr_diagnostics", "ocr_artifact", "canonical_stage1", "registry", "scenario_execution_receipt"}),
     "K": frozenset({"process_events", "lock_state", "scenario_execution_receipt"}),
-    "Q": frozenset({"source_pdf", "canonical_stage1", "outline_terminal", "review_docx", "validation_artifact", "provider_receipt_ledger", "registry", "closure", "job_outcome", "citation_manifest", "scenario_execution_receipt"}),
+    "Q": frozenset({"runtime_spec", "source_pdf", "canonical_stage1", "outline_terminal", "review_docx", "validation_artifact", "provider_receipt_ledger", "registry", "closure", "job_outcome", "citation_manifest", "scenario_execution_receipt"}),
 }
 
 
@@ -2690,6 +3106,94 @@ def _valid_sha256(value: Any) -> bool:
 def _valid_checkout_sha(value: Any) -> bool:
     text = str(value or "").strip().lower()
     return len(text) in {40, 64} and all(char in "0123456789abcdef" for char in text)
+
+
+_F1_RUNTIME_BINDING_FIELDS = frozenset(
+    {"schema_version", "manifest_path", "manifest_sha256", "source_ids"}
+)
+
+
+def _read_f1_runtime_binding(runtime_spec_path: str | Path) -> Mapping[str, Any]:
+    """Read the strict F1 binding embedded in one child RuntimeJobSpec."""
+
+    target = _assert_no_reparse_components(runtime_spec_path)
+    raw = _bounded_read(target, max_bytes=_MAX_EVIDENCE_BYTES)
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ReleaseAcceptanceSpecError("F1 child RuntimeJobSpec is unreadable") from exc
+    if not isinstance(payload, Mapping):
+        raise ReleaseAcceptanceSpecError("F1 child RuntimeJobSpec must be a JSON object")
+    try:
+        from runtime.job_spec import RuntimeJobSpec
+
+        runtime_spec = RuntimeJobSpec.from_dict(payload)
+        runtime_spec.validate()
+    except (TypeError, ValueError) as exc:
+        raise ReleaseAcceptanceSpecError("F1 child RuntimeJobSpec is invalid") from exc
+    raw_binding = runtime_spec.metadata.get("f1_corpus_binding")
+    if not isinstance(raw_binding, Mapping):
+        raise ReleaseAcceptanceSpecError(
+            "F1 child RuntimeJobSpec requires metadata.f1_corpus_binding"
+        )
+    _reject_unknown(raw_binding, _F1_RUNTIME_BINDING_FIELDS, "f1_corpus_binding")
+    if raw_binding.get("schema_version") != "f1-corpus-binding-v1":
+        raise ReleaseAcceptanceSpecError("f1_corpus_binding schema is invalid")
+    manifest_path = _resolve_acceptance_path(
+        raw_binding.get("manifest_path"),
+        field_name="f1_corpus_binding manifest_path",
+        origin_dir=target.parent,
+        required=True,
+    )
+    manifest_sha256 = str(raw_binding.get("manifest_sha256") or "").strip()
+    if not _valid_sha256(manifest_sha256):
+        raise ReleaseAcceptanceSpecError(
+            "f1_corpus_binding manifest_sha256 must be lowercase SHA-256"
+        )
+    raw_source_ids = raw_binding.get("source_ids")
+    if not isinstance(raw_source_ids, (list, tuple)) or any(
+        not isinstance(item, str) or not item.strip() for item in raw_source_ids
+    ):
+        raise ReleaseAcceptanceSpecError(
+            "f1_corpus_binding source_ids must be a non-empty-string array"
+        )
+    source_ids = tuple(str(item).strip() for item in raw_source_ids)
+    if len({item.casefold() for item in source_ids}) != len(source_ids):
+        raise ReleaseAcceptanceSpecError("f1_corpus_binding source_ids must be unique")
+    return {
+        "manifest_path": manifest_path,
+        "manifest_sha256": manifest_sha256,
+        "source_ids": source_ids,
+    }
+
+
+def _load_f1_child_binding(
+    *,
+    runtime_spec_path: str | Path,
+    input_manifest_path: str | Path | None,
+    gate: str,
+) -> tuple[F1CorpusManifestV1, tuple[Any, ...]]:
+    """Verify plan input, RuntimeJobSpec metadata, and authoritative PDFs agree."""
+
+    binding = _read_f1_runtime_binding(runtime_spec_path)
+    manifest_path = str(binding["manifest_path"])
+    if input_manifest_path:
+        expected = _assert_no_reparse_components(input_manifest_path)
+        actual = _assert_no_reparse_components(manifest_path)
+        if actual != expected:
+            raise ReleaseAcceptanceSpecError(
+                "F1 child RuntimeJobSpec manifest_path does not match the plan input_manifest"
+            )
+    manifest = F1CorpusManifestV1.from_file(
+        manifest_path,
+        verify_source_files=True,
+    )
+    if manifest.manifest_sha256 != str(binding["manifest_sha256"]):
+        raise ReleaseAcceptanceSpecError(
+            "F1 child RuntimeJobSpec manifest_sha256 does not match the manifest bytes"
+        )
+    selected = manifest.validate_selection(binding["source_ids"], gate=gate)
+    return manifest, selected
 
 
 def _bounded_read(path: Path, *, max_bytes: int) -> bytes:
@@ -3726,6 +4230,44 @@ class GateEvidenceVerifier:
             return "candidate_provider_generation"
         return value
 
+    def _f1_bound_sources(
+        self,
+        gate: str,
+        by_role: Mapping[str, list[DurableEvidenceRefV1]],
+        payloads: Mapping[str, Any],
+    ) -> tuple[F1CorpusManifestV1 | None, tuple[Any, ...], str | None]:
+        """Prove C/D/Q evidence uses the exact F1 subset in its RuntimeJobSpec."""
+
+        runtime_refs = by_role.get("runtime_spec", [])
+        source_refs = by_role.get("source_pdf", [])
+        if len(runtime_refs) != 1:
+            return None, (), "F1 gate requires exactly one bound RuntimeJobSpec reference"
+        try:
+            manifest, selected = _load_f1_child_binding(
+                runtime_spec_path=runtime_refs[0].path,
+                input_manifest_path=None,
+                gate=gate,
+            )
+        except (F1CorpusManifestError, OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            return None, (), f"F1 manifest or RuntimeJobSpec binding is invalid: {type(exc).__name__}"
+        selected_hashes = {source.sha256 for source in selected}
+        evidence_hashes = {source.sha256 for source in source_refs}
+        if len(source_refs) != len(selected) or evidence_hashes != selected_hashes:
+            return None, (), "F1 source evidence does not match the selected manifest records"
+        receipt_refs = by_role.get("scenario_execution_receipt", [])
+        if len(receipt_refs) != 1:
+            return None, (), "F1 gate requires exactly one scenario execution receipt"
+        try:
+            receipt_payload = payloads.get(receipt_refs[0].ref_id)
+            if not isinstance(receipt_payload, Mapping):
+                raise ReleaseAcceptanceSpecError("scenario receipt is not an object")
+            receipt = ScenarioExecutionReceiptV1.from_mapping(receipt_payload)
+        except (ReleaseAcceptanceSpecError, TypeError, ValueError) as exc:
+            return None, (), f"F1 scenario receipt is invalid: {type(exc).__name__}"
+        if receipt.input_identity_sha256 != manifest.manifest_sha256:
+            return None, (), "F1 scenario receipt input identity does not match the manifest file"
+        return manifest, selected, None
+
     def _derive_semantic_facts(
         self,
         gate: str,
@@ -3741,6 +4283,13 @@ class GateEvidenceVerifier:
             by_role.setdefault(ref.role, []).append(ref)
 
         if gate == "C":
+            manifest, selected_sources, f1_error = self._f1_bound_sources(
+                gate,
+                by_role,
+                payloads,
+            )
+            if f1_error:
+                return {}, f1_error
             source_refs = by_role.get("source_pdf", [])
             canonical_refs = by_role.get("canonical_stage1", [])
             if len(source_refs) != 1 or not canonical_refs:
@@ -3782,7 +4331,16 @@ class GateEvidenceVerifier:
             )
             if not outcome_ok or not terminal_ok:
                 return {}, "one-paper gate lacks a completed durable outcome and successful Stage 1 terminal"
-            return {"source_count": 1, "canonical_stage1_count": 1, "closure_complete": True}, None
+            return {
+                "source_count": 1,
+                "canonical_stage1_count": 1,
+                "closure_complete": True,
+                "f1_corpus_id": manifest.corpus_id if manifest is not None else "",
+                "f1_corpus_content_sha256": (
+                    manifest.content_sha256 if manifest is not None else ""
+                ),
+                "f1_source_ids": [source.source_id for source in selected_sources],
+            }, None
 
         if gate == "G":
             profile_refs = by_role.get("free_mode_profile", [])
@@ -4436,6 +4994,13 @@ class GateEvidenceVerifier:
             }, None
 
         if gate == "D":
+            manifest, selected_sources, f1_error = self._f1_bound_sources(
+                gate,
+                by_role,
+                payloads,
+            )
+            if f1_error:
+                return {}, f1_error
             source_refs = by_role.get("source_pdf", [])
             profile_refs = by_role.get("modality_profile", [])
             source_hashes = {ref.sha256 for ref in source_refs}
@@ -4461,6 +5026,11 @@ class GateEvidenceVerifier:
                 "heterogeneity": len(modalities),
                 "derived_modalities": sorted(modalities),
                 "modality_profiles": [profile.source_pdf_sha256 for profile in profiles],
+                "f1_corpus_id": manifest.corpus_id if manifest is not None else "",
+                "f1_corpus_content_sha256": (
+                    manifest.content_sha256 if manifest is not None else ""
+                ),
+                "f1_source_ids": [source.source_id for source in selected_sources],
             }, None
 
         if gate == "H":
@@ -4636,6 +5206,13 @@ class GateEvidenceVerifier:
             }, None
 
         if gate == "Q":
+            manifest, selected_sources, f1_error = self._f1_bound_sources(
+                gate,
+                by_role,
+                payloads,
+            )
+            if f1_error:
+                return {}, f1_error
             source_refs = by_role.get("source_pdf", [])
             canonical_refs = by_role.get("canonical_stage1", [])
             if len({ref.sha256 for ref in source_refs}) != 15 or not canonical_refs:
@@ -4718,6 +5295,11 @@ class GateEvidenceVerifier:
                 "outline_complete": True,
                 "docx_complete": True,
                 "validation_complete": True,
+                "f1_corpus_id": manifest.corpus_id if manifest is not None else "",
+                "f1_corpus_content_sha256": (
+                    manifest.content_sha256 if manifest is not None else ""
+                ),
+                "f1_source_ids": [source.source_id for source in selected_sources],
             }, None
 
         return {}, None
@@ -5164,6 +5746,36 @@ class GateEvidenceVerifier:
                 "reason": "gate evidence contains roles owned by another scenario: " + ", ".join(unexpected_roles),
                 "contract": contract,
             }
+        refs_by_role: dict[str, list[DurableEvidenceRefV1]] = {}
+        for ref in refs:
+            refs_by_role.setdefault(ref.role, []).append(ref)
+        # Keep specialized diagnostics useful even when an older evidence
+        # producer has not yet been upgraded with the new F1 runtime binding.
+        # These are still hard failures; they never bypass the required-role
+        # check below or make a gate PASS.
+        if str(gate) == "D":
+            profile_payloads = [payloads.get(ref.ref_id) for ref in refs_by_role.get("modality_profile", [])]
+            if any(
+                isinstance(payload, Mapping)
+                and "self-declared" in str(payload.get("extractor_used") or "").casefold()
+                for payload in profile_payloads
+            ):
+                return {
+                    "status": "FAIL",
+                    "reason": "derived modality profiles are required; self-declared modality profiles are not authoritative",
+                    "contract": contract,
+                }
+        if str(gate) == "Q":
+            source_count = len(
+                {ref.sha256 for ref in refs_by_role.get("source_pdf", [])}
+            )
+            if source_count != 15:
+                return {
+                    "status": "FAIL",
+                    "reason": "F1 gate requires exactly fifteen durable paper identities; observed "
+                    + str(source_count),
+                    "contract": contract,
+                }
         missing_roles = sorted(required_roles - {ref.role for ref in refs})
         if missing_roles:
             return {
@@ -5329,6 +5941,9 @@ __all__ = [
     "DocumentModalityProfileV1",
     "DocumentModalityProfileV2",
     "DurableEvidenceRefV1",
+    "ExternalHostAcknowledgementV1",
+    "F1CorpusManifestError",
+    "F1CorpusManifestV1",
     "GateEvidenceProducer",
     "GateEvidenceVerifier",
     "ReleaseAcceptanceBudget",

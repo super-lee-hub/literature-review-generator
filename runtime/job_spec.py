@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field, replace
 import json
 from pathlib import Path
+import re
 from typing import Any, Dict, Literal, Mapping, cast
 
 from services.job_runner import JobRunRequest, resolve_stage1_reuse, validate_free_mode_options
@@ -46,7 +47,24 @@ _RUNTIME_METADATA_FIELDS = frozenset({
     "audit_reason",
     "audit_scope",
     "stage_plan",
+    "external_host_acknowledgement",
+    "f1_corpus_binding",
 })
+_RUNTIME_COMPATIBILITY_FIELDS = frozenset(
+    {
+        "source_mode",
+        "pdf_folder",
+        "zotero_report",
+        "library_path",
+        "run_all",
+        "analyze_only",
+        "generate_outline",
+        "generate_review",
+        "validate_review",
+        "retry_failed",
+        "retry_review_failed",
+    }
+)
 
 
 def _reject_unknown_fields(
@@ -192,6 +210,89 @@ class RuntimeJobSpec:
         for field_name in ("audit_scope", "stage_plan"):
             if field_name in self.metadata and not isinstance(self.metadata[field_name], Mapping):
                 raise ValueError(f"metadata.{field_name} must be a JSON object")
+        acknowledgement = self.metadata.get("external_host_acknowledgement")
+        if acknowledgement is not None:
+            if not isinstance(acknowledgement, Mapping):
+                raise ValueError("metadata.external_host_acknowledgement must be a JSON object")
+            allowed_acknowledgement_fields = {
+                "schema_version",
+                "acknowledged",
+                "hosts",
+                "route_fingerprint",
+            }
+            unknown_acknowledgement_fields = sorted(
+                str(key)
+                for key in acknowledgement
+                if str(key) not in allowed_acknowledgement_fields
+            )
+            if unknown_acknowledgement_fields:
+                raise ValueError(
+                    "metadata.external_host_acknowledgement contains unknown fields: "
+                    + ", ".join(unknown_acknowledgement_fields)
+                )
+            if "acknowledged" in acknowledgement and not isinstance(
+                acknowledgement["acknowledged"], bool
+            ):
+                raise ValueError(
+                    "metadata.external_host_acknowledgement.acknowledged must be a JSON boolean"
+                )
+            if "hosts" in acknowledgement:
+                hosts = acknowledgement["hosts"]
+                if not isinstance(hosts, (list, tuple)) or any(
+                    not isinstance(item, str) for item in hosts
+                ):
+                    raise ValueError(
+                        "metadata.external_host_acknowledgement.hosts must be a JSON array of strings"
+                    )
+            for field_name in ("schema_version", "route_fingerprint"):
+                if field_name in acknowledgement and not isinstance(
+                    acknowledgement[field_name], str
+                ):
+                    raise ValueError(
+                        f"metadata.external_host_acknowledgement.{field_name} must be a JSON string"
+                    )
+        f1_binding = self.metadata.get("f1_corpus_binding")
+        if f1_binding is not None:
+            if not isinstance(f1_binding, Mapping):
+                raise ValueError("metadata.f1_corpus_binding must be a JSON object")
+            allowed_f1_binding_fields = {
+                "schema_version",
+                "manifest_path",
+                "manifest_sha256",
+                "source_ids",
+            }
+            unknown_f1_binding_fields = sorted(
+                str(key)
+                for key in f1_binding
+                if str(key) not in allowed_f1_binding_fields
+            )
+            if unknown_f1_binding_fields:
+                raise ValueError(
+                    "metadata.f1_corpus_binding contains unknown fields: "
+                    + ", ".join(unknown_f1_binding_fields)
+                )
+            if f1_binding.get("schema_version") != "f1-corpus-binding-v1":
+                raise ValueError("metadata.f1_corpus_binding schema_version is invalid")
+            manifest_path = f1_binding.get("manifest_path")
+            if not isinstance(manifest_path, str) or not manifest_path.strip():
+                raise ValueError("metadata.f1_corpus_binding.manifest_path must be a non-empty JSON string")
+            manifest_sha256 = f1_binding.get("manifest_sha256")
+            if not isinstance(manifest_sha256, str) or not re.fullmatch(
+                r"[0-9a-f]{64}", manifest_sha256.strip()
+            ):
+                raise ValueError("metadata.f1_corpus_binding.manifest_sha256 must be a lowercase SHA-256")
+            source_ids = f1_binding.get("source_ids")
+            if not isinstance(source_ids, (list, tuple)) or not source_ids or any(
+                not isinstance(item, str)
+                or not re.fullmatch(r"[A-Za-z0-9_.-]+", item.strip())
+                for item in source_ids
+            ):
+                raise ValueError(
+                    "metadata.f1_corpus_binding.source_ids must be a non-empty array of safe strings"
+                )
+            normalized_source_ids = [item.strip() for item in source_ids]
+            if len(normalized_source_ids) != len(set(normalized_source_ids)):
+                raise ValueError("metadata.f1_corpus_binding.source_ids must be unique")
         requested_stages = self.metadata.get("requested_stages")
         if requested_stages is not None:
             if not isinstance(requested_stages, (list, tuple)):
@@ -300,6 +401,14 @@ class RuntimeJobSpec:
                 origin_dir=origin,
             ).to_dict()
 
+        f1_binding = metadata.get("f1_corpus_binding")
+        if isinstance(f1_binding, Mapping):
+            binding = dict(f1_binding)
+            manifest_path = binding.get("manifest_path")
+            if isinstance(manifest_path, str) and manifest_path.strip():
+                binding["manifest_path"] = resolve_path(manifest_path)
+            metadata["f1_corpus_binding"] = binding
+
         return replace(
             self,
             source=replace(
@@ -322,7 +431,20 @@ class RuntimeJobSpec:
     def from_dict(cls, payload: Mapping[str, Any]) -> "RuntimeJobSpec":
         if not isinstance(payload, Mapping):
             raise ValueError("RuntimeJobSpec root must be a JSON object")
-        _reject_unknown_fields(payload, _RUNTIME_JOB_FIELDS, label="RuntimeJobSpec")
+        # Queue GUI parity records may carry a flattened adapter projection
+        # beside the canonical nested source.  Accept only this enumerated
+        # compatibility set and ignore it; all other unknown fields remain a
+        # strict schema error.
+        schema_payload = (
+            {
+                key: value
+                for key, value in payload.items()
+                if key not in _RUNTIME_COMPATIBILITY_FIELDS
+            }
+            if "source" in payload
+            else payload
+        )
+        _reject_unknown_fields(schema_payload, _RUNTIME_JOB_FIELDS, label="RuntimeJobSpec")
         raw_source = payload.get("source", {})
         if not isinstance(raw_source, Mapping):
             raise ValueError("source must be a JSON object")

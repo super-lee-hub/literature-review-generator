@@ -175,7 +175,7 @@ def test_dashboard_shows_search_topbar(page, gui_server):
         assert button.evaluate("el => getComputedStyle(el).color") == "rgb(255, 255, 255)"
 
 
-def test_dashboard_reminder_is_below_topbar_and_extra_sections_render(page, gui_server):
+def test_dashboard_reminder_is_below_topbar_and_extra_sections_render(page, gui_server, tmp_path: Path):
     _open_page(page, gui_server["base_url"])
 
     fixedbar_box = page.locator(".ag-fixedbar").bounding_box()
@@ -183,6 +183,14 @@ def test_dashboard_reminder_is_below_topbar_and_extra_sections_render(page, gui_
     assert fixedbar_box is not None
     assert reminder_box is not None
     assert reminder_box["y"] >= fixedbar_box["y"] + fixedbar_box["height"] - 1
+    assert page.locator(".ag-page").evaluate(
+        "element => !element.closest('.ag-fixedbar')"
+    ) is True
+
+    page.screenshot(path=str(tmp_path / "dashboard-desktop.png"), full_page=True)
+    page.set_viewport_size({"width": 390, "height": 844})
+    expect(page.locator(".ag-page-reminder")).to_be_visible()
+    page.screenshot(path=str(tmp_path / "dashboard-mobile.png"), full_page=True)
 
     expect(page.get_by_text("现在建议做什么", exact=True)).to_be_visible()
     expect(page.get_by_text("当前工作台快照", exact=True)).to_be_visible()

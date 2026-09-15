@@ -22,11 +22,107 @@ PREPROCESS_PRIMARY_PARSERS = frozenset({"local", "mineru_remote"})
 PREPROCESS_FALLBACK_PARSERS = frozenset({"none", *PREPROCESS_PRIMARY_PARSERS})
 
 
-def mineru_remote_requested(parser_mode: object, primary_parser: object) -> bool:
-    """Return whether the selected parser configuration requires MinerU."""
+@dataclass(frozen=True)
+class PreprocessParserPolicy:
+    """One validated parser route, shared by admission and execution.
 
-    mode = str(parser_mode or "").strip().casefold()
-    primary = str(primary_parser or "").strip().casefold()
+    ``fallback_parser`` used to be only an accepted configuration value while
+    the runtime consulted a separate boolean.  Keeping the resolved route in
+    one small value object prevents a configuration from claiming a parser
+    behavior that the execution path cannot actually provide.
+    """
+
+    parser_mode: str
+    primary_parser: str
+    fallback_parser: str
+    local_fallback_allowed: bool
+
+    @property
+    def remote_requested(self) -> bool:
+        return self.primary_parser == "mineru_remote"
+
+    @property
+    def hybrid(self) -> bool:
+        return self.parser_mode == "hybrid"
+
+
+def _optional_preprocess_bool(value: object) -> bool | None:
+    if value is None or not str(value).strip():
+        return None
+    normalized = str(value).strip().casefold()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError("[Preprocess] allow_local_parse_fallback must be a boolean")
+
+
+def resolve_preprocess_parser_policy(
+    parser_mode: object,
+    primary_parser: object,
+    fallback_parser: object,
+    *,
+    allow_local_parse_fallback: object | None = None,
+) -> PreprocessParserPolicy:
+    """Validate and resolve the only supported parser/fallback state machine.
+
+    MinerU can be the primary parser for ``hybrid``/``remote`` modes.  A local
+    fallback is then explicit.  A MinerU *fallback* is intentionally rejected:
+    the public trust-admission path has no safe way to acknowledge a remote
+    route that is hidden behind a local primary.  Rejecting it is preferable to
+    silently never using it or sending content to an unadmitted host.
+    """
+
+    mode = str(parser_mode or "local").strip().casefold() or "local"
+    primary = str(primary_parser or "local").strip().casefold() or "local"
+    fallback = str(fallback_parser or "local").strip().casefold() or "local"
+    if mode not in PREPROCESS_PARSER_MODES:
+        raise ValueError(f"[Preprocess] parser_mode is unsupported: {mode}")
+    if primary not in PREPROCESS_PRIMARY_PARSERS:
+        raise ValueError(f"[Preprocess] primary_parser is unsupported: {primary}")
+    if fallback not in PREPROCESS_FALLBACK_PARSERS:
+        raise ValueError(f"[Preprocess] fallback_parser is unsupported: {fallback}")
+    if fallback == "mineru_remote":
+        raise ValueError(
+            "[Preprocess] fallback_parser=mineru_remote is unsupported; "
+            "select mineru_remote as primary_parser with an admitted remote mode"
+        )
+    if mode == "local" and primary != "local":
+        raise ValueError("[Preprocess] parser_mode=local requires primary_parser=local")
+    if mode in {"remote", "remote_first"} and primary != "mineru_remote":
+        raise ValueError(
+            f"[Preprocess] parser_mode={mode} requires primary_parser=mineru_remote"
+        )
+
+    configured_local_fallback = _optional_preprocess_bool(
+        allow_local_parse_fallback
+    )
+    local_fallback_allowed = fallback == "local"
+    if local_fallback_allowed and configured_local_fallback is False:
+        raise ValueError(
+            "[Preprocess] fallback_parser=local conflicts with "
+            "allow_local_parse_fallback=false"
+        )
+    return PreprocessParserPolicy(
+        parser_mode=mode,
+        primary_parser=primary,
+        fallback_parser=fallback,
+        local_fallback_allowed=local_fallback_allowed,
+    )
+
+
+def mineru_remote_requested(parser_mode: object, primary_parser: object) -> bool:
+    """Return whether the selected primary parser requires MinerU.
+
+    This compatibility helper is used by trust admission, where a fallback
+    route is deliberately not accepted.  Runtime execution resolves the full
+    three-field policy above.
+    """
+
+    mode = str(parser_mode or "local").strip().casefold() or "local"
+    primary = str(primary_parser or "local").strip().casefold() or "local"
+    if mode not in PREPROCESS_PARSER_MODES or primary not in PREPROCESS_PRIMARY_PARSERS:
+        raise ValueError("invalid preprocess parser policy")
     return mode in {"remote", "remote_first"} or (
         mode == "hybrid" and primary == "mineru_remote"
     )
@@ -259,7 +355,9 @@ CONFIG_KEYS: Dict[str, frozenset[str]] = {
             "source_pdf_max_bytes",
             "mineru_base_url", "mineru_api_token", "mineru_model_version", "mineru_upload_endpoint",
             "mineru_poll_endpoint_templates", "mineru_poll_interval_seconds", "mineru_poll_timeout_seconds",
-            "mineru_request_max_retries", "mineru_retry_backoff_seconds", "mineru_response_max_bytes",
+            "mineru_request_timeout_seconds", "mineru_upload_timeout_seconds", "mineru_download_timeout_seconds",
+            "mineru_request_max_retries", "mineru_retry_backoff_seconds", "mineru_max_remote_tasks",
+            "mineru_max_remote_http_calls", "mineru_max_remote_upload_bytes", "mineru_response_max_bytes",
             "mineru_zip_max_entries", "mineru_zip_max_uncompressed_bytes", "mineru_zip_max_entry_bytes",
             "mineru_zip_max_compression_ratio", "mineru_json_max_bytes", "mineru_text_max_bytes",
             "mineru_allowed_url_hosts", "allow_local_parse_fallback", "docling_timeout_seconds", "ocr_timeout_seconds",

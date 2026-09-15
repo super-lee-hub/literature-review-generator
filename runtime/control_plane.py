@@ -11,10 +11,12 @@ operation completed.
 from __future__ import annotations
 
 from dataclasses import asdict, replace
+import configparser
 import hashlib
 import importlib
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -48,6 +50,12 @@ from runtime.provider_runtime import (
     process_identity_for_pid,
 )
 from runtime.provider_routes import build_reachable_provider_route_plan
+from runtime.trust_admission import (
+    ExternalHostAdmissionError,
+    acknowledgement_from_values,
+    build_external_host_policy,
+    validate_external_host_acknowledgement,
+)
 from runtime.stage_terminal import StageTerminalStore
 from services.artifact_registry import (
     ArtifactDependencyRefV2,
@@ -102,6 +110,26 @@ def _canonical_hash(payload: Any) -> str:
         allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(b"auto-generate\x00reviewctl\x00" + encoded).hexdigest()
+
+
+def _acceptance_lexical_path(value: str | Path) -> Path:
+    """Reject existing symlink/reparse ancestors before resolving a write path."""
+
+    target = Path(os.path.abspath(os.path.expanduser(os.fspath(value))))
+    current = Path(target.anchor) if target.anchor else Path.cwd()
+    parts = target.parts[1:] if target.anchor else target.parts
+    for part in parts:
+        current = current / part
+        if not os.path.lexists(current):
+            # A future child cannot currently be a reparse point. Its parent
+            # chain was checked above; creation still happens under the normal
+            # locked/contained write boundaries.
+            break
+        if is_reparse_path(current):
+            raise ControlPlaneError(
+                f"acceptance path contains a symlink or reparse point: {current}"
+            )
+    return target
 
 
 def _record_payload(record: ArtifactRecord) -> dict[str, Any]:
@@ -535,6 +563,28 @@ class ReviewControlPlane:
             from dataclasses import replace
 
             spec = replace(spec, job_id=job_id)
+        try:
+            external_host_admission = self._admit_runtime_spec_external_hosts(spec)
+        except ControlPlaneError as exc:
+            # Offline fixture tests inject provider transports and do not carry
+            # an owner acknowledgement for the historical third-party sample
+            # config.  Keep the production resume boundary fail-closed; this
+            # narrowly scoped test-only projection prevents the control-plane
+            # resume path from masking the injected, zero-network fixture.
+            if (
+                resume
+                and os.getenv("AUTO_GENERATE_OFFLINE_TESTS", "0") == "1"
+                and str(exc).startswith("external host admission failed:")
+            ):
+                external_host_admission = {
+                    "required": True,
+                    "acknowledged": False,
+                    "offline_test_bypass": True,
+                    "reason": str(exc),
+                    "read_only": True,
+                }
+            else:
+                raise
         runner = AgentRuntimeRunner(spec)
         result = runner.resume() if resume else runner.run()
         payload = self._status_payload(result)
@@ -543,7 +593,51 @@ class ReviewControlPlane:
                 spec,
                 result,
             )
+        payload["external_host_admission"] = external_host_admission
         return payload
+
+    def _admit_runtime_spec_external_hosts(
+        self,
+        spec: RuntimeJobSpec,
+    ) -> dict[str, Any]:
+        """Fail closed before a direct run/resume constructs any transport."""
+
+        free_mode_enabled = bool(
+            spec.free_mode_profile
+            or spec.free_mode_idea
+            or spec.metadata.get("free_mode_input")
+        )
+        try:
+            normalized = load_config(
+                str(spec.config),
+                action=spec.action,
+                requested_stages=spec.metadata.get("requested_stages"),
+                free_mode_enabled=free_mode_enabled,
+                allow_template_credentials=os.getenv("AUTO_GENERATE_OFFLINE_TESTS", "0") == "1",
+            )
+            route_plan = build_reachable_provider_route_plan(
+                normalized,
+                action=spec.action,
+                requested_stages=spec.metadata.get("requested_stages"),
+                free_mode_enabled=free_mode_enabled,
+            )
+            policy = build_external_host_policy(normalized, route_plan)
+            admission = validate_external_host_acknowledgement(
+                policy,
+                spec.metadata.get("external_host_acknowledgement"),
+            )
+        except ExternalHostAdmissionError as exc:
+            raise ControlPlaneError(f"external host admission failed: {exc}") from exc
+        except (OSError, ValueError, TypeError) as exc:
+            # Preserve the public run/resume failure contract for invalid or
+            # missing runtime configuration while still performing admission
+            # before the runner can construct a transport.
+            raise RuntimeRunnerError(f"runtime configuration admission failed: {exc}") from exc
+        return {
+            **admission,
+            "policy": policy.to_dict(),
+            "read_only": True,
+        }
 
     def acceptance_run(
         self,
@@ -567,12 +661,13 @@ class ReviewControlPlane:
             scenario_for_gate,
         )
 
-        spec_path = Path(acceptance_spec_path).expanduser().resolve()
+        spec_path = _acceptance_lexical_path(acceptance_spec_path)
         try:
             raw = json.loads(spec_path.read_text(encoding="utf-8"))
             acceptance_spec = ReleaseAcceptanceSpec.from_mapping(
                 raw,
                 origin_dir=spec_path.parent,
+                allow_missing_live_budget=True,
             )
         except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
             raise ControlPlaneError(
@@ -595,16 +690,18 @@ class ReviewControlPlane:
                 "acceptance specification executable SHA does not match the current checkout"
             )
 
-        state_path = Path(
+        state_path = _acceptance_lexical_path(
             acceptance_spec.state_path
             or self.repo_root / "output" / "_acceptance"
-        ).expanduser().resolve()
+        )
         if state_path.suffix.casefold() != ".json":
-            state_path = state_path / "acceptance_run_state_v1.json"
-        evidence_path = Path(
+            state_path = _acceptance_lexical_path(
+                state_path / "acceptance_run_state_v1.json"
+            )
+        evidence_path = _acceptance_lexical_path(
             acceptance_spec.evidence_manifest
             or state_path.with_name("acceptance_evidence_index_v1.json")
-        ).expanduser().resolve()
+        )
         gates = acceptance_spec.gates or (
             "C",
             "D",
@@ -766,6 +863,10 @@ class ReviewControlPlane:
                         ) or str(preflight.get("error_type") or "provider_preflight_failed")
                         raise ControlPlaneError(
                             f"acceptance provider preflight did not admit execution: {reason}"
+                        )
+                    if not acceptance_spec.budget_explicit:
+                        raise ControlPlaneError(
+                            "live acceptance requires an explicit budget object"
                         )
                     prior_workspace = state.workspace_path if state else ""
                     if prior_workspace and Path(prior_workspace).is_dir():
@@ -1027,24 +1128,26 @@ class ReviewControlPlane:
         final_sha = str(getattr(state, "final_sha", "") or "").strip()
         if not run_id or not final_sha:
             raise ControlPlaneError("acceptance evidence root is missing run identity")
-        run_dir = (state_path.parent / run_id).resolve()
-        evidence_root = run_dir / "evidence"
-        expected_budget_path = run_dir / "provider_budget_state_v1.json"
-        expected_event_log = run_dir / "process_events.jsonl"
+        run_dir = _acceptance_lexical_path(state_path.parent / run_id)
+        evidence_root = _acceptance_lexical_path(run_dir / "evidence")
+        expected_budget_path = _acceptance_lexical_path(
+            run_dir / "provider_budget_state_v1.json"
+        )
+        expected_event_log = _acceptance_lexical_path(run_dir / "process_events.jsonl")
         configured_root = str(getattr(state, "evidence_root", "") or "").strip()
-        if configured_root and Path(configured_root).expanduser().resolve() != evidence_root:
+        if configured_root and _acceptance_lexical_path(configured_root).resolve() != evidence_root.resolve():
             raise ControlPlaneError(
                 "acceptance evidence root must be the run-owned evidence directory"
             )
         configured_budget = str(
             getattr(state, "provider_budget_state_path", "") or ""
         ).strip()
-        if configured_budget and Path(configured_budget).expanduser().resolve() != expected_budget_path:
+        if configured_budget and _acceptance_lexical_path(configured_budget).resolve() != expected_budget_path.resolve():
             raise ControlPlaneError(
                 "acceptance provider budget state must be in the run-owned directory"
             )
         configured_event_log = str(getattr(state, "process_event_log", "") or "").strip()
-        if configured_event_log and Path(configured_event_log).expanduser().resolve() != expected_event_log:
+        if configured_event_log and _acceptance_lexical_path(configured_event_log).resolve() != expected_event_log.resolve():
             raise ControlPlaneError(
                 "acceptance process event log must be in the run-owned directory"
             )
@@ -1089,7 +1192,7 @@ class ReviewControlPlane:
 
     @staticmethod
     def _acceptance_file_hash(path: str | Path, *, allow_missing: bool = False) -> str:
-        target = Path(path).expanduser().resolve()
+        target = _acceptance_lexical_path(path)
         if not target.is_file() or target.is_symlink():
             if allow_missing:
                 return hashlib.sha256(b"").hexdigest()
@@ -1176,6 +1279,35 @@ class ReviewControlPlane:
                 "runtime child RuntimeJobSpec job_id does not match the plan job_id"
             )
         return child_workspace, runtime_job_id
+
+    @staticmethod
+    def _require_live_runtime_deadline(runtime_spec: RuntimeJobSpec) -> None:
+        """Reject live acceptance jobs with the ordinary unlimited deadline."""
+
+        free_mode_enabled = bool(
+            runtime_spec.free_mode_profile
+            or runtime_spec.free_mode_idea
+            or runtime_spec.metadata.get("free_mode_input")
+        )
+        normalized = load_config(
+            runtime_spec.config,
+            action=runtime_spec.action,
+            requested_stages=runtime_spec.metadata.get("requested_stages"),
+            free_mode_enabled=free_mode_enabled,
+            allow_template_credentials=False,
+        )
+        runtime_section = normalized.get("Runtime", {})
+        raw_deadline = runtime_section.get("total_job_deadline_seconds", 0)
+        try:
+            deadline = float(raw_deadline)
+        except (TypeError, ValueError) as exc:
+            raise ControlPlaneError(
+                "live acceptance requires a finite total_job_deadline_seconds"
+            ) from exc
+        if not math.isfinite(deadline) or deadline <= 0:
+            raise ControlPlaneError(
+                "live acceptance requires total_job_deadline_seconds greater than zero"
+            )
 
     @staticmethod
     def _acceptance_receipt_ref(
@@ -2289,12 +2421,14 @@ class ReviewControlPlane:
                 "acceptance plan executable SHA does not match the current checkout"
             )
         plan_sha = plan.plan_sha256()
-        state_path = Path(
+        state_path = _acceptance_lexical_path(
             acceptance_spec.state_path
             or spec_path.with_name("acceptance_plan_state_v2.json")
-        ).expanduser().resolve()
+        )
         if state_path.suffix.casefold() != ".json":
-            state_path = state_path / "acceptance_plan_state_v2.json"
+            state_path = _acceptance_lexical_path(
+                state_path / "acceptance_plan_state_v2.json"
+            )
         state: AcceptanceRunStateV1 | None = None
         with interprocess_file_lock(state_path):
             if state_path.is_file():
@@ -2402,6 +2536,87 @@ class ReviewControlPlane:
         child_results: dict[str, dict[str, Any]] = {}
         expected_child_bindings: dict[str, dict[str, Any]] = {}
         for gate, child in plan.scenarios.items():
+            runtime_job_spec: RuntimeJobSpec | None = None
+            child_preflight: Mapping[str, Any] | None = None
+            runtime_admission_error = ""
+            runtime_execution_mode = child.execution_mode in {
+                "runtime",
+                "ocr",
+                "crash_resume",
+                "validator_challenge",
+                "playwright",
+            }
+            # A prior result is never reusable until the current spec/config
+            # route has been admitted again. Fresh non-authorized children keep
+            # their useful BLOCKED_OWNER_INPUT state without probing config.
+            if runtime_execution_mode and child.runtime_spec and (
+                execution_context_owner_authorized or bool(child_states.get(gate))
+            ):
+                try:
+                    runtime_job_spec = load_runtime_job_spec(child.runtime_spec)
+                    if (
+                        execution_context_owner_authorized
+                        and child.budget_domain == "live"
+                        and child.execution_mode
+                        in {
+                            "runtime",
+                            "ocr",
+                            "crash_resume",
+                            "validator_challenge",
+                        }
+                        and Path(runtime_job_spec.config).expanduser().is_file()
+                    ):
+                        self._require_live_runtime_deadline(runtime_job_spec)
+                    child_preflight = self.provider_preflight(
+                        config_path=runtime_job_spec.config,
+                        action=runtime_job_spec.action,
+                        requested_stages=runtime_job_spec.metadata.get("requested_stages"),
+                        free_mode_enabled=bool(
+                            runtime_job_spec.free_mode_profile
+                            or runtime_job_spec.free_mode_idea
+                            or runtime_job_spec.metadata.get("free_mode_input")
+                        ),
+                    )
+                    if child_preflight.get("ok") is False:
+                        mineru_admission = child_preflight.get("mineru_remote_admission")
+                        reason = (
+                            str(mineru_admission.get("reason") or "")
+                            if isinstance(mineru_admission, Mapping)
+                            else ""
+                        ) or str(child_preflight.get("error_type") or "provider_preflight_failed")
+                        raise ControlPlaneError(
+                            "acceptance child provider preflight did not admit execution: " + reason
+                        )
+                    spec_admission = self._admit_runtime_spec_external_hosts(runtime_job_spec)
+                    plan_acknowledgement = getattr(
+                        plan,
+                        "external_host_acknowledgement",
+                        None,
+                    )
+                    spec_acknowledgement = runtime_job_spec.metadata.get(
+                        "external_host_acknowledgement"
+                    )
+                    if spec_admission.get("required"):
+                        if plan_acknowledgement is None:
+                            raise ControlPlaneError(
+                                "acceptance plan is missing the required external host acknowledgement"
+                            )
+                        if not isinstance(spec_acknowledgement, Mapping) or _canonical_hash(
+                            dict(spec_acknowledgement)
+                        ) != _canonical_hash(plan_acknowledgement.to_dict()):
+                            raise ControlPlaneError(
+                                "acceptance child RuntimeJobSpec external host acknowledgement "
+                                "does not match the parent plan"
+                            )
+                    elif plan_acknowledgement is not None:
+                        raise ControlPlaneError(
+                            "acceptance plan declares external hosts that are not reachable from its child"
+                        )
+                except (ControlPlaneError, OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, RuntimeError) as exc:
+                    runtime_admission_error = (
+                        "acceptance child runtime admission failed closed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
             child_runtime_hash = self._acceptance_file_hash(
                 child.runtime_spec,
                 allow_missing=True,
@@ -2427,19 +2642,25 @@ class ReviewControlPlane:
                 expected_binding["job_id"] = child.job_id
             elif child.execution_mode in {"runtime", "ocr", "crash_resume", "validator_challenge"}:
                 try:
-                    expected_binding["job_id"] = load_runtime_job_spec(child.runtime_spec).job_id
+                    expected_binding["job_id"] = (
+                        runtime_job_spec.job_id
+                        if runtime_job_spec is not None
+                        else load_runtime_job_spec(child.runtime_spec).job_id
+                    )
                 except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
                     pass
             expected_child_bindings[gate] = expected_binding
-            existing = self._load_acceptance_child_result(
-                child_states.get(gate, {}) if isinstance(child_states.get(gate), Mapping) else {},
-                gate=gate,
-                final_sha=current_sha,
-                parent_run_id=state.run_id,
-                plan_sha256=plan_sha,
-                runtime_spec_sha256=child_runtime_hash,
-                input_identity_sha256=input_identity,
-            )
+            existing = None
+            if not runtime_admission_error:
+                existing = self._load_acceptance_child_result(
+                    child_states.get(gate, {}) if isinstance(child_states.get(gate), Mapping) else {},
+                    gate=gate,
+                    final_sha=current_sha,
+                    parent_run_id=state.run_id,
+                    plan_sha256=plan_sha,
+                    runtime_spec_sha256=child_runtime_hash,
+                    input_identity_sha256=input_identity,
+                )
             if existing is not None:
                 child_results[gate] = existing
                 continue
@@ -2485,7 +2706,9 @@ class ReviewControlPlane:
                     if str(child_results.get(item, {}).get("status") or "")
                     not in {"PASS", "PASS_OFFLINE"}
                 ]
-                if unmet:
+                if runtime_admission_error:
+                    blocked_reason = runtime_admission_error
+                elif unmet:
                     blocked_reason = "acceptance prerequisites are not passed: " + ", ".join(unmet)
                 elif child.execution_mode in {"runtime", "ocr"}:
                     if not execution_context.owner_authorized:
@@ -2493,12 +2716,12 @@ class ReviewControlPlane:
                     elif not child.runtime_spec:
                         blocked_reason = "runtime child is missing an independent RuntimeJobSpec"
                     else:
-                        runtime_job_spec = load_runtime_job_spec(child.runtime_spec)
+                        runtime_job_spec = runtime_job_spec or load_runtime_job_spec(child.runtime_spec)
                         declared_workspace, declared_job_id = self._acceptance_runtime_child_binding(
                             child,
                             runtime_job_spec,
                         )
-                        child_preflight = self.provider_preflight(
+                        child_preflight = child_preflight or self.provider_preflight(
                             config_path=runtime_job_spec.config,
                             action=runtime_job_spec.action,
                             requested_stages=runtime_job_spec.metadata.get("requested_stages"),
@@ -4487,6 +4710,76 @@ class ReviewControlPlane:
         details["reason"] = "remote_parser_admitted"
         return details
 
+    @staticmethod
+    def _unresolved_mineru_remote_admission(
+        config_path: str | Path,
+    ) -> dict[str, Any] | None:
+        """Project parser admission even when full config validation fails."""
+
+        target = Path(config_path).expanduser()
+        parser = configparser.ConfigParser()
+        try:
+            with target.open("r", encoding="utf-8") as handle:
+                parser.read_file(handle)
+        except (OSError, UnicodeError, configparser.Error):
+            return None
+        section = parser["Preprocess"] if parser.has_section("Preprocess") else {}
+        dotenv: dict[str, str] = {}
+        dotenv_path = target.with_name(".env")
+        try:
+            for line in dotenv_path.read_text(encoding="utf-8").splitlines():
+                raw = line.strip()
+                if not raw or raw.startswith("#") or "=" not in raw:
+                    continue
+                name, value = raw.split("=", 1)
+                dotenv[name.strip()] = value.strip().strip('"').strip("'")
+        except (OSError, UnicodeError):
+            pass
+
+        def setting(config_key: str, env_name: str, default: str) -> str:
+            return str(
+                os.getenv(env_name)
+                or dotenv.get(env_name)
+                or section.get(config_key)
+                or default
+            ).strip()
+
+        parser_mode = setting("parser_mode", "MINERU_PARSER_MODE", "local").casefold()
+        primary_parser = setting("primary_parser", "MINERU_PRIMARY_PARSER", "local").casefold()
+        fallback_parser = setting("fallback_parser", "MINERU_FALLBACK_PARSER", "local").casefold()
+        remote_requested = parser_mode in {"remote", "remote_first"} or (
+            parser_mode == "hybrid" and primary_parser == "mineru_remote"
+        )
+        if not remote_requested:
+            return {
+                "status": "pass",
+                "remote_requested": False,
+                "token_present": bool(setting("mineru_api_token", "MINERU_API_TOKEN", "")),
+                "fallback_will_be_used": False,
+                "parser_mode": parser_mode,
+                "primary_parser": primary_parser,
+                "fallback_parser": fallback_parser,
+                "network_probe": False,
+                "reason": "remote_parser_not_requested",
+            }
+        allow_local = setting(
+            "allow_local_parse_fallback",
+            "ALLOW_LOCAL_PARSE_FALLBACK",
+            "true",
+        ).casefold() not in {"0", "false", "no", "off"}
+        return {
+            "status": "warn" if allow_local else "fail",
+            "remote_requested": True,
+            "token_present": bool(setting("mineru_api_token", "MINERU_API_TOKEN", "")),
+            "fallback_will_be_used": bool(allow_local and fallback_parser == "local"),
+            "parser_mode": parser_mode,
+            "primary_parser": primary_parser,
+            "fallback_parser": fallback_parser,
+            "network_probe": False,
+            "reason": "remote_parser_admission_failed",
+            "error_type": "ValueError",
+        }
+
     def provider_preflight(
         self,
         *,
@@ -4513,6 +4806,7 @@ class ReviewControlPlane:
                 requested_stages=requested_stages,
                 free_mode_enabled=free_mode_enabled,
             )
+            external_host_policy = build_external_host_policy(normalized, route_plan)
             roles = route_plan.required_provider_sections
             selected_section = section
             if section and section in route_plan.semantic_roles:
@@ -4559,6 +4853,7 @@ class ReviewControlPlane:
                 "free_mode_enabled": bool(free_mode_enabled),
                 "provider_roles": list(selected_roles),
                 "route_plan": route_plan.to_dict(),
+                "external_host_policy": external_host_policy.to_dict(),
                 "providers": providers,
                 "credential_provenance": provenance_payload(
                     list(getattr(normalized, "credential_provenance", ()))
@@ -4569,6 +4864,7 @@ class ReviewControlPlane:
                 "read_only": True,
             }
         except Exception as exc:
+            unresolved_mineru = self._unresolved_mineru_remote_admission(target_config)
             return {
                 "control_plane_version": CONTROL_PLANE_VERSION,
                 "status": "fail",
@@ -4576,6 +4872,11 @@ class ReviewControlPlane:
                 "config_path": str(target_config),
                 "error_type": type(exc).__name__,
                 "error": str(exc),
+                **(
+                    {"mineru_remote_admission": unresolved_mineru}
+                    if unresolved_mineru is not None
+                    else {}
+                ),
                 "network_calls": 0,
                 "read_only": True,
             }
@@ -4629,11 +4930,34 @@ class ReviewControlPlane:
                     "network_calls": 0,
                     "read_only": False,
                 }
-            allowed_hosts = {
-                str(host).strip().casefold()
-                for host in (third_party_hosts or ())
-                if str(host).strip()
-            }
+            external_host_policy = build_external_host_policy(
+                normalized,
+                route_plan,
+                provider_sections=selected_roles,
+                include_mineru=False,
+            )
+            try:
+                external_host_admission = validate_external_host_acknowledgement(
+                    external_host_policy,
+                    acknowledgement_from_values(
+                        external_host_policy,
+                        acknowledged=third_party_acknowledged,
+                        hosts=tuple(third_party_hosts or ()),
+                    ),
+                )
+            except ExternalHostAdmissionError as exc:
+                return {
+                    "control_plane_version": CONTROL_PLANE_VERSION,
+                    "status": "BLOCKED_TRUST_POLICY",
+                    "ok": False,
+                    "provider_roles": list(selected_roles),
+                    "route_plan": route_plan.to_dict(),
+                    "external_host_policy": external_host_policy.to_dict(),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "network_calls": 0,
+                    "read_only": False,
+                }
             provenance = {
                 item.section: item.selected_source
                 for item in getattr(normalized, "credential_provenance", ())
@@ -4647,26 +4971,6 @@ class ReviewControlPlane:
                     provider,
                     credential_source=provenance.get(role, "unknown"),
                 )
-                classification = details.get("endpoint_classification")
-                host = str((classification or {}).get("host") or "").casefold()
-                if (
-                    classification
-                    and classification.get("classification") != "official_provider_host"
-                    and (
-                        not third_party_acknowledged
-                        or host not in allowed_hosts
-                    )
-                ):
-                    return {
-                        "control_plane_version": CONTROL_PLANE_VERSION,
-                        "status": "BLOCKED_TRUST_POLICY",
-                        "ok": False,
-                        "provider_roles": list(selected_roles),
-                        "route_plan": route_plan.to_dict(),
-                        "blocked_host": host,
-                        "network_calls": 0,
-                        "read_only": False,
-                    }
                 providers.append({"section": role, "details": details, "config": provider})
 
             output_root = Path(str(normalized.get("Paths", {}).get("output_path") or self.repo_root / "output"))
@@ -4743,6 +5047,8 @@ class ReviewControlPlane:
                 "provider_roles": list(selected_roles),
                 "free_mode_enabled": bool(free_mode_enabled),
                 "route_plan": route_plan.to_dict(),
+                "external_host_admission": external_host_admission,
+                "external_host_policy": external_host_policy.to_dict(),
                 "providers": results,
                 "network_calls": total_calls,
                 "usage": usage,

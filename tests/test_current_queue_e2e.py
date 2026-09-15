@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from reviewctl import main
+from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
 from services.queue_service import (
     JobCancelledError,
     PersistentQueueService,
@@ -18,6 +19,31 @@ from services.queue_service import (
 
 def _last_json(output: str) -> dict:
     return json.loads(output.strip().splitlines()[-1])
+
+
+def _strict_queue_parameters(
+    tmp_path: Path,
+    *,
+    project_name: str,
+    action: str = "analyze",
+    pdf_dir: Path | None = None,
+) -> tuple[dict, Path]:
+    config_path = tmp_path / "queue-config.ini"
+    if not config_path.exists():
+        config_path.write_text("[Paths]\noutput_path = ./output\n", encoding="utf-8")
+    source_dir = pdf_dir or (tmp_path / "queue-pdfs")
+    source_dir.mkdir(exist_ok=True)
+    pdf_path = source_dir / "paper.pdf"
+    if not pdf_path.exists():
+        pdf_path.write_bytes(b"%PDF-1.4\nqueue input\n")
+    spec = RuntimeJobSpec(
+        project_name=project_name,
+        source=RuntimeSourceSpec(mode="direct", pdf_folder=str(source_dir)),
+        config=str(config_path),
+        action=action,
+        metadata={},
+    )
+    return spec.to_dict(), pdf_path
 
 
 def test_current_queue_cli_supports_mixed_inputs_restart_retry_cancel_and_export(
@@ -99,6 +125,46 @@ def test_current_queue_cli_supports_mixed_inputs_restart_retry_cancel_and_export
     assert {item["job_id"] for item in imported["jobs"]} == {"cli-job", "file-job"}
 
 
+def test_queue_run_reports_selected_terminal_states_and_returns_nonzero_for_failure_or_cancel(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    failed_queue = tmp_path / "failed-queue.json"
+    failed_service = PersistentQueueService(failed_queue)
+    # No strict runtime spec means the job is rejected before JobRunner can
+    # construct a provider/runtime; this stays an offline CLI test.
+    failed_service.add_job(
+        QueueJobSpec(
+            job_id="invalid-inputs",
+            job_type="analyze",
+            project_name="offline",
+            parameters={"action": "analyze"},
+        )
+    )
+
+    assert main(["queue-run", "--queue-file", str(failed_queue)]) == 1
+    failed_payload = _last_json(capsys.readouterr().out)
+    assert failed_payload["status"] == "failed"
+    assert failed_payload["selected_job_ids"] == ["invalid-inputs"]
+    failed_result = failed_payload["job_results"][0]
+    assert failed_result["job_id"] == "invalid-inputs"
+    assert failed_result["state"] == "failed"
+    assert failed_result["exit_code"] is None
+    assert failed_result["result_summary"]["status"] == "rejected_input_drift"
+
+    cancelled_queue = tmp_path / "cancelled-queue.json"
+    cancelled_service = PersistentQueueService(cancelled_queue)
+    cancelled_service.add_job(
+        QueueJobSpec(job_id="cancelled", job_type="test", project_name="offline")
+    )
+    assert cancelled_service.request_cancel("cancelled", reason="test") is True
+
+    assert main(["queue-run", "--queue-file", str(cancelled_queue), "--all"]) == 1
+    cancelled_payload = _last_json(capsys.readouterr().out)
+    assert cancelled_payload["status"] == "cancelled"
+    assert cancelled_payload["job_results"][0]["state"] == "cancelled"
+
+
 def test_current_queue_runner_cooperatively_acknowledges_running_cancel(tmp_path: Path) -> None:
     queue_file = tmp_path / "queue.json"
     service = PersistentQueueService(queue_file)
@@ -144,25 +210,29 @@ def test_current_queue_runner_is_restart_safe_and_reruns_changed_fingerprints(tm
 
     queue_file = tmp_path / "output" / "_queue" / "queue.json"
     service = PersistentQueueService(queue_file)
+    job_a_parameters, source_pdf = _strict_queue_parameters(
+        tmp_path,
+        project_name="stage-a",
+    )
+    job_b_parameters, _ = _strict_queue_parameters(
+        tmp_path,
+        project_name="stage-b",
+    )
     service.add_job(
         QueueJobSpec(
             job_id="job-a",
             job_type="analyze",
             project_name="stage-a",
-            input_fingerprint="input-a-v1",
-            config_fingerprint="config-v1",
-            parameters={"action": "analyze"},
+            parameters=job_a_parameters,
         )
     )
     service.add_job(
         QueueJobSpec(
             job_id="job-b",
-            job_type="review",
+            job_type="analyze",
             project_name="stage-b",
             depends_on_job_ids=["job-a"],
-            input_fingerprint="input-b-v1",
-            config_fingerprint="config-v1",
-            parameters={"action": "analyze"},
+            parameters=job_b_parameters,
         )
     )
 
@@ -225,14 +295,13 @@ def test_current_queue_runner_is_restart_safe_and_reruns_changed_fingerprints(tm
 
     changed = restarted.get_job("job-b")
     assert changed is not None
+    source_pdf.write_bytes(b"%PDF-1.4\nqueue input changed\n")
     restarted.add_job(
         QueueJobSpec(
             job_id=changed.job_id,
             job_type=changed.job_type,
             project_name=changed.project_name,
             depends_on_job_ids=list(changed.depends_on_job_ids),
-            input_fingerprint="input-b-v2",
-            config_fingerprint=changed.config_fingerprint,
             parameters=dict(changed.parameters),
         )
     )
@@ -244,12 +313,13 @@ def test_current_queue_runner_is_restart_safe_and_reruns_changed_fingerprints(tm
 def test_current_queue_runner_acknowledges_running_cancellation_at_safe_boundary(tmp_path: Path) -> None:
     queue_file = tmp_path / "output" / "_queue" / "queue.json"
     service = PersistentQueueService(queue_file)
+    parameters, _ = _strict_queue_parameters(tmp_path, project_name="cancel-me")
     service.add_job(
         QueueJobSpec(
             job_id="job-cancel",
             job_type="analyze",
             project_name="cancel-me",
-            parameters={"action": "analyze"},
+            parameters=parameters,
         )
     )
     started = threading.Event()

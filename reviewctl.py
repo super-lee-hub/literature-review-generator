@@ -17,6 +17,7 @@ from runtime.runner import RuntimeRunnerError
 from services.console_io import configure_utf8_stdio, write_ascii_json_line
 from services.queue_service import (
     PersistentQueueService,
+    QueueError,
     QueueJobSpec,
     QueueRunner,
     QueueState,
@@ -53,6 +54,47 @@ def _queue_snapshot(service: PersistentQueueService) -> dict[str, Any]:
             for runtime in service.list_job_runtimes()
         ],
     }
+
+
+def _queue_terminal_results(
+    service: PersistentQueueService,
+    job_ids: list[str],
+) -> list[dict[str, Any]]:
+    """Report each selected job from its durable terminal/runtime record."""
+
+    results: list[dict[str, Any]] = []
+    for job_id in job_ids:
+        runtime = service.get_job_runtime(job_id)
+        if runtime is None:
+            results.append({"job_id": job_id, "state": "missing"})
+            continue
+        results.append(
+            {
+                "job_id": job_id,
+                "state": runtime.state.value,
+                "exit_code": (
+                    (runtime.result_summary or {}).get("exit_code")
+                    if isinstance(runtime.result_summary, dict)
+                    else None
+                ),
+                "error_message": runtime.error_message,
+                "result_summary": runtime.result_summary,
+            }
+        )
+    return results
+
+
+def _queue_run_status(results: list[dict[str, Any]]) -> str:
+    if not results:
+        return "idle"
+    states = {str(item.get("state") or "missing") for item in results}
+    if states == {QueueState.COMPLETED.value}:
+        return "completed"
+    if QueueState.FAILED.value in states or "missing" in states:
+        return "failed"
+    if QueueState.CANCELLED.value in states or QueueState.CANCEL_ACKNOWLEDGED.value in states:
+        return "cancelled"
+    return "pending"
 
 
 def _queue_command(args: argparse.Namespace) -> dict[str, Any]:
@@ -119,11 +161,26 @@ def _queue_command(args: argparse.Namespace) -> dict[str, Any]:
             ran = runner.run_single_job(args.job)
             if not ran:
                 raise ValueError(f"queue job cannot be run: {args.job}")
-            ran_job_ids = [args.job]
+            selected_job_ids = [args.job]
         else:
+            selected_job_ids = [
+                job.job_id
+                for job in (
+                    service.list_jobs()
+                    if args.all
+                    else service.list_jobs_by_state(QueueState.PENDING)
+                )
+            ]
             runner.run()
-            ran_job_ids = [job.job_id for job in service.list_jobs()]
-        return {"status": "completed", "command": command, "ran_job_ids": ran_job_ids, **_queue_snapshot(service)}
+        job_results = _queue_terminal_results(service, selected_job_ids)
+        return {
+            "status": _queue_run_status(job_results),
+            "command": command,
+            "selected_job_ids": selected_job_ids,
+            "ran_job_ids": selected_job_ids,
+            "job_results": job_results,
+            **_queue_snapshot(service),
+        }
     raise ControlPlaneError(f"unsupported queue command: {command}")
 
 
@@ -305,7 +362,10 @@ def _exit_code(command: str, payload: dict[str, Any]) -> int:
     if command == "config-migrate":
         return 0 if payload.get("status") == "ok" else 1
     if command in {"retry-node", "repair-apply", "repair-promote", "cancel", "adopt", "queue-add", "queue-run", "queue-retry", "queue-cancel", "queue-remove", "queue-export", "queue-import"}:
-        return 0 if payload.get("status") in {"available", "complete", "succeeded", "already_adopted", "planned", "requested", "added", "completed", "removed", "exported", "imported", "promoted", "already_promoted"} else 1
+        success_statuses = {"available", "complete", "succeeded", "already_adopted", "planned", "requested", "added", "removed", "exported", "imported", "promoted", "already_promoted"}
+        if command == "queue-run":
+            success_statuses.update({"completed", "idle"})
+        return 0 if payload.get("status") in success_statuses else 1
     if command in {"run", "resume"}:
         return 0 if payload.get("job_status") == "completed" and payload.get("completion_status") == "complete" else 1
     return 0
@@ -427,7 +487,7 @@ def main(argv: list[str] | None = None) -> int:
             payload = control.attest(job_id=args.job or None, workspace=args.workspace or None)
         else:  # pragma: no cover
             raise ControlPlaneError(f"unsupported command: {args.command}")
-    except (ControlPlaneError, RuntimeRunnerError, OSError, ValueError, TypeError) as exc:
+    except (ControlPlaneError, RuntimeRunnerError, QueueError, OSError, ValueError, TypeError) as exc:
         payload = {
             "control_plane_version": "reviewctl-v1",
             "status": "error",

@@ -6,13 +6,18 @@ non-empty JSONL ledger as proof that the current execution completed.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
 import hashlib
 import json
+from collections import Counter
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from runtime.provider_runtime import ProviderCallReceiptV1, compute_closure_epoch_id, hash_json
+from runtime.provider_runtime import (
+    ProviderCallReceiptV1,
+    compute_closure_epoch_id,
+    hash_json,
+)
 from services.artifact_registry import file_sha256
 
 
@@ -125,6 +130,7 @@ class ExpectedProviderCall:
 class ReceiptClosureResult:
     closure_epoch_id: str = ""
     expected_call_ids: tuple[str, ...] = ()
+    duplicate_expected_call_ids: tuple[str, ...] = ()
     observed_call_ids: tuple[str, ...] = ()
     missing_call_ids: tuple[str, ...] = ()
     stale_call_ids: tuple[str, ...] = ()
@@ -144,6 +150,7 @@ class ReceiptClosureResult:
     def __post_init__(self) -> None:
         for name in (
             "expected_call_ids",
+            "duplicate_expected_call_ids",
             "observed_call_ids",
             "missing_call_ids",
             "stale_call_ids",
@@ -167,6 +174,7 @@ class ReceiptClosureResult:
         payload = asdict(self)
         for key in (
             "expected_call_ids",
+            "duplicate_expected_call_ids",
             "observed_call_ids",
             "missing_call_ids",
             "stale_call_ids",
@@ -202,6 +210,10 @@ class ProviderReceiptClosure:
             item if isinstance(item, ProviderCallReceiptV1) else ProviderCallReceiptV1.from_dict(item)
             for item in out_of_scope
         ]
+        expected_call_counts = Counter(item.call_id for item in expected_items)
+        duplicate_expected_call_ids = tuple(
+            sorted(call_id for call_id, count in expected_call_counts.items() if count > 1)
+        )
         expected_by_id = {item.call_id: item for item in expected_items}
         expected_epochs = {str(item.closure_epoch_id) for item in expected_items if str(item.closure_epoch_id)}
         if len(expected_epochs) == 1:
@@ -454,11 +466,13 @@ class ProviderReceiptClosure:
                 unexpected,
                 retry_exceeded,
                 usage_incomplete,
+                duplicate_expected_call_ids,
             )
         )
         payload = {
             "closure_epoch_id": closure_epoch_id,
             "expected_call_ids": expected_ids,
+            "duplicate_expected_call_ids": duplicate_expected_call_ids,
             "observed_call_ids": observed_ids,
             "missing_call_ids": tuple(sorted(missing)),
             "stale_call_ids": tuple(sorted(stale)),

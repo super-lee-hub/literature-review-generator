@@ -369,12 +369,12 @@ def test_build_queue_job_spec_can_use_explicit_input_mode(gui_app_module) -> Non
         work_mode="normal",
     )
 
-    assert spec.parameters["pdf_folder"] is None
-    assert spec.parameters["zotero_report"] == "D:/zotero/report.md"
-    assert spec.parameters["library_path"] == "D:/ZoteroLibrary"
-    assert spec.parameters["source_mode"] == "zotero"
-    assert spec.parameters["free_mode_profile"] is None
-    assert spec.parameters["free_mode_idea"] is None
+    assert spec.parameters["source"]["pdf_folder"] == ""
+    assert spec.parameters["source"]["zotero_report"] == str(Path("D:/zotero/report.md").resolve())
+    assert spec.parameters["source"]["library_path"] == str(Path("D:/ZoteroLibrary").resolve())
+    assert spec.parameters["source"]["mode"] == "zotero"
+    assert spec.parameters["free_mode_profile"] == ""
+    assert spec.parameters["free_mode_idea"] == ""
 
 
 def test_stage1_reuse_defaults_to_analyze_only_actions(gui_app_module) -> None:
@@ -388,7 +388,9 @@ def test_stage1_reuse_defaults_to_analyze_only_actions(gui_app_module) -> None:
         "analyze",
     )
     assert analyze_spec.parameters["reuse_stage1"] is True
-    assert analyze_spec.parameters["reuse_summary_files"] == ["D:/reuse/a.json"]
+    assert analyze_spec.parameters["reuse_summary_files"] == [
+        str(Path("D:/reuse/a.json").resolve())
+    ]
 
     outline_spec = controller._build_queue_job_spec(
         "demo",
@@ -396,11 +398,12 @@ def test_stage1_reuse_defaults_to_analyze_only_actions(gui_app_module) -> None:
         "",
         "outline",
     )
+    assert outline_spec.parameters["action"] == "generate_outline"
     assert outline_spec.parameters["reuse_stage1"] is False
     assert outline_spec.parameters["reuse_summary_files"] == []
 
 
-def test_build_queue_job_spec_captures_immutable_source_snapshot(gui_app_module) -> None:
+def test_build_queue_job_spec_captures_immutable_source_snapshot(gui_app_module, tmp_path: Path) -> None:
     controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
     controller.state["workflow"].update(
         {
@@ -415,7 +418,9 @@ def test_build_queue_job_spec_captures_immutable_source_snapshot(gui_app_module)
         }
     )
     controller.state["paths"]["library_path"] = "D:/Library"
-    controller.free_mode_profile_path = "D:/profiles/original.json"
+    original_profile = tmp_path / "original-profile.json"
+    original_profile.write_text("{}", encoding="utf-8")
+    controller.free_mode_profile_path = str(original_profile)
 
     spec = controller._build_queue_job_spec(
         "original-project",
@@ -434,7 +439,7 @@ def test_build_queue_job_spec_captures_immutable_source_snapshot(gui_app_module)
             "section_number": "9",
         }
     )
-    controller.free_mode_profile_path = "D:/profiles/edited.json"
+    controller.free_mode_profile_path = str(tmp_path / "edited-profile.json")
 
     assert spec.source_snapshot == {
         "project_name": "original-project",
@@ -444,16 +449,19 @@ def test_build_queue_job_spec_captures_immutable_source_snapshot(gui_app_module)
         "pdf_folder": "D:/papers/original",
         "zotero_report": None,
         "library_path": None,
-        "summary_file": "D:/summaries/a.json",
+        "summary_file": str(Path("D:/summaries/a.json").resolve()),
         "summary_sources": ["D:/summaries/b.json", "D:/summaries/c.json"],
         "reuse_stage1": False,
         "reuse_summary_files": [],
         "concept": None,
-        "free_mode_profile": "D:/profiles/original.json",
+        "free_mode_profile": str(original_profile),
         "free_mode_idea": None,
         "generate_section": 3,
     }
-    assert spec.parameters["summary_sources"] == ["D:/summaries/b.json", "D:/summaries/c.json"]
+    assert spec.parameters["summary_sources"] == [
+        str(Path("D:/summaries/b.json").resolve()),
+        str(Path("D:/summaries/c.json").resolve()),
+    ]
     assert spec.parameters["reuse_summary_files"] == []
 
 
@@ -580,7 +588,7 @@ def test_validation_policy_is_derived_once_across_direct_cli_gui_and_queue_entri
     queue_round_trip = QueueJobSpec.from_dict(
         json.loads(json.dumps(gui_spec.to_dict(), ensure_ascii=False))
     )
-    gui_request = build_job_request_from_mapping(queue_round_trip.parameters)
+    gui_request = RuntimeJobSpec.from_dict(queue_round_trip.parameters).to_job_request()
     captured_requests = []
 
     class _CapturingRunner:
@@ -653,6 +661,80 @@ def test_persist_config_keeps_active_queue_service(gui_app_module, monkeypatch, 
     controller.persist_config(notify_user=False)
 
     assert controller._queue_service is original_service
+
+
+def test_persist_config_rejects_output_root_change_while_queue_has_pending_work(
+    gui_app_module,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.ini"
+    config_path.write_text((REPO_ROOT / "config.ini.example").read_text(encoding="utf-8"), encoding="utf-8")
+    parser = configparser.ConfigParser()
+    parser.read(config_path, encoding="utf-8")
+    original_output = tmp_path / "output"
+    parser["Paths"]["output_path"] = str(original_output)
+    with config_path.open("w", encoding="utf-8") as handle:
+        parser.write(handle)
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    monkeypatch.setenv("AUTO_GENERATE_ENV_PATH", str(env_path))
+
+    controller = gui_app_module.WorkspaceController(str(config_path))
+    controller._queue_service.add_job(  # type: ignore[union-attr]
+        QueueJobSpec(job_id="pending", job_type="test", project_name="pending")
+    )
+    controller.state["paths"]["output_path"] = str(tmp_path / "other-output")
+
+    with pytest.raises(ConfigurationPersistenceError, match="output_path"):
+        controller.persist_config(notify_user=False)
+    assert controller.state["paths"]["output_path"] == str(original_output.resolve())
+    persisted = configparser.ConfigParser()
+    persisted.read(config_path, encoding="utf-8")
+    assert persisted["Paths"]["output_path"] == str(original_output)
+
+
+def test_gui_retry_increments_count_and_schedules_processor(gui_app_module, monkeypatch, tmp_path: Path) -> None:
+    service = gui_app_module.PersistentQueueService(tmp_path / "queue.json")
+    service.add_job(QueueJobSpec(job_id="failed", job_type="test", project_name="failed"))
+    assert service.update_job_state("failed", gui_app_module.QueueState.RUNNING)
+    assert service.update_job_state("failed", gui_app_module.QueueState.FAILED)
+    controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
+    controller._queue_service = service
+    notifications: list[str] = []
+    schedule_calls: list[bool] = []
+    monkeypatch.setattr(gui_app_module.ui, "notify", lambda message, **_kwargs: notifications.append(message))
+    monkeypatch.setattr(controller, "_schedule_queue_processor", lambda: schedule_calls.append(True) or True)
+
+    controller.retry_job("failed")
+
+    runtime = service.get_job_runtime("failed")
+    assert runtime is not None
+    assert runtime.state is gui_app_module.QueueState.PENDING
+    assert runtime.retry_count == 1
+    assert schedule_calls == [True]
+    assert any("failed" in message for message in notifications)
+
+
+def test_save_config_from_ui_cleans_up_controls_after_persistence_error(gui_app_module, monkeypatch) -> None:
+    controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
+    button = _FakeElement()
+    controller.bindings.action_buttons = [button]
+    controller.set_workflow_running(True)
+    notifications: list[str] = []
+    monkeypatch.setattr(
+        controller,
+        "persist_config",
+        lambda **_kwargs: (_ for _ in ()).throw(ConfigurationPersistenceError("disk blocked")),
+    )
+    monkeypatch.setattr(controller, "notify", lambda message, **_kwargs: notifications.append(message))
+
+    controller.save_config_from_ui()
+
+    assert controller.workflow_running is False
+    assert button.disabled is False
+    assert "保存配置失败" in controller.status_message
+    assert notifications and "disk blocked" in notifications[-1]
 
 
 def test_clear_completed_jobs_keeps_failed_and_cancelled(gui_app_module, tmp_path) -> None:

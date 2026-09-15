@@ -1461,8 +1461,16 @@ class WorkspaceController:
             try:
                 runtime = self._queue_service.get_job_runtime(job_id)
                 if runtime and runtime.state in (QueueState.FAILED, QueueState.CANCELLED):
-                    self._queue_service.reset_job(job_id)
-                    ui.notify(self.tf("任务已重置并将重试: {job_id}", job_id=job_id), type="positive")
+                    if not self._queue_service.reset_job(job_id):
+                        raise RuntimeError("queue job could not be reset")
+                    retry_count = self._queue_service.increment_retry_count(job_id)
+                    scheduled = self._schedule_queue_processor()
+                    message = self.tf("任务已重置并将重试: {job_id}", job_id=job_id)
+                    if retry_count:
+                        message = f"{message} ({self.t('重试次数')} {retry_count})"
+                    if not scheduled and self._queue_processor_is_active():
+                        message = f"{message} {self.t('队列处理器正在运行。')}"
+                    ui.notify(message, type="positive")
                 else:
                     ui.notify(self.t("只能重试失败或已取消的任务"), type="warning")
             except Exception as e:
@@ -1504,6 +1512,7 @@ class WorkspaceController:
         work_mode: str | None = None,
     ) -> Any:
         from services.queue_service import QueueJobSpec, create_queue_job_id
+        from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
 
         workflow_state = self.state["workflow"]
         resolved_input_mode = str(input_mode or workflow_state.get("input_mode") or "pdf")
@@ -1523,8 +1532,21 @@ class WorkspaceController:
             if section_number_raw.isdigit() and int(section_number_raw) > 0:
                 generate_section = int(section_number_raw)
 
+        canonical_action = {
+            "outline": "generate_outline",
+            "review": "generate_review",
+            "validate": "validate_review",
+        }.get(action, action)
+
+        metadata: dict[str, Any] = {}
+        external_host_acknowledgement = self._build_durable_external_host_acknowledgement(
+            canonical_action
+        )
+        if external_host_acknowledgement is not None:
+            metadata["external_host_acknowledgement"] = external_host_acknowledgement
+
         stage1_reuse_actions = {"analyze", "run_all"}
-        reuse_stage1_enabled = bool(workflow_state.get("reuse_stage1")) and action in stage1_reuse_actions
+        reuse_stage1_enabled = bool(workflow_state.get("reuse_stage1")) and canonical_action in stage1_reuse_actions
         reuse_summary_files = [
             item.strip()
             for item in str(workflow_state.get("reuse_summary_files") or "").splitlines()
@@ -1535,45 +1557,61 @@ class WorkspaceController:
             for item in str(workflow_state.get("summary_sources") or "").splitlines()
             if item.strip()
         ]
-        parameters = {
-            "action": action,
-            "project_name": project_name,
-            "pdf_folder": effective_pdf_folder,
-            "zotero_report": effective_zotero_report,
-            "library_path": library_path,
-            "config": self.config_path,
-            "gui": True,
-            "run_all": action == "run_all",
-            "analyze_only": action == "analyze",
-            "generate_outline": action == "outline",
-            "generate_review": action == "review",
-            "generate_section": generate_section,
-            "validate_review": action == "validate",
-            "retry_failed": action == "retry_failed",
-            "retry_review_failed": action == "retry_review_failed",
-            "concept": str(workflow_state.get("concept") or "").strip() or None if resolved_work_mode == "concept" else None,
-            "free_mode_profile": free_mode_profile,
-            "free_mode_idea": free_mode_idea,
-            "summary_file": str(workflow_state.get("summary_file") or "").strip() or None,
-            "summary_sources": summary_sources,
-            "reuse_stage1": reuse_stage1_enabled,
-            "reuse_summary_files": reuse_summary_files,
-            "queue_file": str(Path(self.state["paths"]["output_path"]) / "_queue" / "queue.json"),
-            "source_mode": "zotero" if effective_zotero_report else "direct",
-        }
+        runtime_spec = RuntimeJobSpec(
+            project_name=project_name,
+            source=RuntimeSourceSpec(
+                mode="zotero" if effective_zotero_report else "direct",
+                pdf_folder=str(Path(effective_pdf_folder).expanduser().resolve()) if effective_pdf_folder else "",
+                zotero_report=str(Path(effective_zotero_report).expanduser().resolve()) if effective_zotero_report else "",
+                library_path=str(Path(library_path).expanduser().resolve()) if library_path else "",
+            ),
+            config=self.config_path,
+            action=canonical_action,
+            free_mode_profile=str(Path(free_mode_profile).expanduser().resolve()) if free_mode_profile else "",
+            free_mode_idea=free_mode_idea or "",
+            summary_file=str(Path(str(workflow_state.get("summary_file") or "").strip()).expanduser().resolve()) if str(workflow_state.get("summary_file") or "").strip() else "",
+            summary_sources=tuple(str(Path(item).expanduser().resolve()) for item in summary_sources),
+            reuse_stage1=reuse_stage1_enabled,
+            reuse_summary_files=tuple(str(Path(item).expanduser().resolve()) for item in reuse_summary_files),
+            generate_section=generate_section,
+            queue_file=str(self._queue_file_path()),
+            metadata=metadata,
+        )
+        runtime_spec.validate()
+        parameters = runtime_spec.to_dict()
+        # Keep the queue record's strict nested RuntimeJobSpec as the
+        # execution authority, while also emitting the legacy-shaped adapter
+        # fields consumed by ``build_job_request_from_mapping`` and older queue
+        # inspection tooling.  QueueRunner never reconstructs execution from
+        # these projections.
+        parameters.update(
+            {
+                "source_mode": runtime_spec.source.mode,
+                "pdf_folder": runtime_spec.source.pdf_folder,
+                "zotero_report": runtime_spec.source.zotero_report,
+                "library_path": runtime_spec.source.library_path,
+                "run_all": canonical_action == "run_all",
+                "analyze_only": canonical_action == "analyze",
+                "generate_outline": canonical_action == "generate_outline",
+                "generate_review": canonical_action == "generate_review",
+                "validate_review": canonical_action == "validate_review",
+                "retry_failed": canonical_action == "retry_failed",
+                "retry_review_failed": canonical_action == "retry_review_failed",
+            }
+        )
         source_snapshot = {
             "project_name": project_name,
             "input_mode": resolved_input_mode,
             "work_mode": resolved_work_mode,
-            "action": action,
+            "action": canonical_action,
             "pdf_folder": effective_pdf_folder,
             "zotero_report": effective_zotero_report,
             "library_path": library_path,
-            "summary_file": parameters["summary_file"],
+            "summary_file": runtime_spec.summary_file or None,
             "summary_sources": list(summary_sources),
             "reuse_stage1": parameters["reuse_stage1"],
             "reuse_summary_files": list(reuse_summary_files),
-            "concept": parameters["concept"],
+            "concept": None,
             "free_mode_profile": free_mode_profile,
             "free_mode_idea": free_mode_idea,
             "generate_section": generate_section,
@@ -1581,10 +1619,78 @@ class WorkspaceController:
 
         return QueueJobSpec(
             job_id=create_queue_job_id(),
-            job_type=action,
+            job_type=canonical_action,
             project_name=project_name,
             parameters=parameters,
             source_snapshot=source_snapshot,
+        )
+
+    def _build_durable_external_host_acknowledgement(
+        self,
+        action: str,
+    ) -> dict[str, Any] | None:
+        """Project GUI confirmation into the queued RuntimeJobSpec.
+
+        The in-memory button state is only an input.  The runner recomputes the
+        policy from the saved config and verifies this exact host set and route
+        fingerprint before constructing a transport.  Hosts without a GUI
+        acknowledgement surface (for example a newly discovered MinerU CDN)
+        intentionally remain unacknowledged so execution fails closed.
+        """
+
+        try:
+            from config_loader import load_config
+            from runtime.provider_routes import build_reachable_provider_route_plan
+            from runtime.trust_admission import (
+                acknowledgement_from_values,
+                build_external_host_policy,
+            )
+
+            free_mode_enabled = str(self.state["workflow"].get("work_mode") or "") == "free"
+            normalized = load_config(
+                str(self.config_path),
+                action=action,
+                requested_stages=None,
+                free_mode_enabled=free_mode_enabled,
+                allow_template_credentials=False,
+            )
+            route_plan = build_reachable_provider_route_plan(
+                normalized,
+                action=action,
+                requested_stages=None,
+                free_mode_enabled=free_mode_enabled,
+            )
+            policy = build_external_host_policy(normalized, route_plan)
+        except Exception:
+            return None
+
+        if not policy.required_hosts:
+            return None
+
+        acknowledged_hosts: set[str] = set()
+        for target in policy.targets:
+            if target.purpose != "provider":
+                continue
+            route = next(
+                (
+                    item
+                    for item in route_plan.routes
+                    if item.semantic_role == target.route and item.enabled
+                ),
+                None,
+            )
+            if route is not None and (
+                self.third_party_gateway_acknowledged.get(route.section_name)
+                == self._third_party_gateway_fingerprint(route.section_name)
+            ):
+                acknowledged_hosts.add(target.host)
+
+        if set(policy.required_hosts) != acknowledged_hosts:
+            return None
+        return acknowledgement_from_values(
+            policy,
+            acknowledged=True,
+            hosts=sorted(acknowledged_hosts),
         )
 
     def _ensure_queue_runner(self) -> Optional[Any]:
@@ -1686,7 +1792,12 @@ class WorkspaceController:
         return self.t(key).format(**kwargs)
 
     def action_label(self, action: str) -> str:
-        return action_label(self.language, action)
+        display_action = {
+            "generate_outline": "outline",
+            "generate_review": "review",
+            "validate_review": "validate",
+        }.get(action, action)
+        return action_label(self.language, display_action)
 
     def register_status_label(self, label: Any) -> None:
         self._prune_stale_bindings()
@@ -2673,6 +2784,44 @@ class WorkspaceController:
             )
         updated_sections, api_keys, extra_env_values = self._collect_config_payload()
         normalize_for_save(updated_sections)
+        current_queue_path = (
+            Path(getattr(self._queue_service, "queue_file_path", ""))
+            if self._queue_service is not None
+            else None
+        )
+        next_queue_path = self._queue_file_path()
+        if (
+            self._queue_service is not None
+            and current_queue_path is not None
+            and current_queue_path != next_queue_path
+        ):
+            active_states = {
+                QueueState.PENDING,
+                QueueState.RUNNING,
+                QueueState.CANCEL_REQUESTED,
+            }
+            active_jobs = [
+                runtime.job_id
+                for runtime in self._queue_service.list_job_runtimes()
+                if runtime.state in active_states
+            ]
+            if self._queue_processor_is_active() or active_jobs:
+                # Do this before either config file is written.  Reset only the
+                # changed root so the live page cannot point at an empty queue
+                # while the real work remains under the old root.
+                stable_root = Path(
+                    getattr(
+                        self._queue_service,
+                        "_canonical_output_root",
+                        current_queue_path.parent.parent,
+                    )
+                ).resolve()
+                self.state["paths"]["output_path"] = str(stable_root)
+                detail = ", ".join(active_jobs[:5])
+                suffix = f": {detail}" if detail else ""
+                raise ConfigurationPersistenceError(
+                    "cannot change output_path while queue work is active" + suffix
+                )
         save_config_and_env(
             updated_sections,
             api_keys,
@@ -2682,20 +2831,34 @@ class WorkspaceController:
         )
         self.sections = ensure_config_sections(updated_sections)
         self._sync_env_values_from_disk()
-        current_queue_path = Path(getattr(self._queue_service, "queue_file_path", "")) if self._queue_service else None
-        next_queue_path = self._queue_file_path()
         if self._queue_service is None or (current_queue_path != next_queue_path and not self._queue_processor_is_active()):
             self._init_queue_service()
         self.set_status(self.tf("配置已保存到 {config_path} 和 {env_path}", config_path=self.config_path, env_path=self.env_path))
         if notify_user:
             self.notify(self.t("配置已保存。"), color="positive")
 
+    def save_config_from_ui(self) -> None:
+        """Save through a UI-safe boundary that leaves controls usable on error."""
+
+        try:
+            self.persist_config()
+        except Exception as exc:
+            message = self.tf("保存配置失败: {error}", error=str(exc))
+            self.set_status(message)
+            self.set_workflow_running(False)
+            self.notify(message, color="negative", multi_line=True)
+
     def change_language(self, language: str) -> None:
         if language not in LANGUAGE_OPTIONS:
             return
         self.language = language
         self.latest_log_path, self.latest_log_excerpt = _latest_log_excerpt(self.language)
-        self.persist_config(notify_user=False)
+        try:
+            self.persist_config(notify_user=False)
+        except Exception as exc:
+            self.set_status(self.tf("保存配置失败: {error}", error=str(exc)))
+            self.notify(self.status_message, color="negative", multi_line=True)
+            return
         self.notify(self.t("界面语言已切换。"), color="positive")
         ui.run_javascript("window.location.reload()")
 
@@ -2861,7 +3024,10 @@ class WorkspaceController:
             self.notify(self.t("自由模式对话还没有应用到本次任务。请先应用当前规划，或清空对话后再运行。"), color="warning", multi_line=True)
             return False
 
-        if action in {"analyze", "run_all"}:
+        # Every current RuntimeJobSpec action has an explicit source contract;
+        # downstream actions may reuse Stage 1 results but still must bind the
+        # source that owns those artifacts.
+        if action:
             if input_mode == "pdf" and not pdf_folder:
                 self.notify(self.t("当前选择的是 PDF 文件夹模式，请先填写 PDF 文件夹。"), color="warning")
                 return False
@@ -2956,7 +3122,15 @@ class WorkspaceController:
         if not self._require_third_party_gateway_acknowledgement(action):
             return
 
-        self.persist_config(notify_user=False)
+        try:
+            self.persist_config(notify_user=False)
+        except Exception as exc:
+            message = self.tf("保存配置失败: {error}", error=str(exc))
+            self.set_status(message)
+            self.set_workflow_running(False)
+            self.notify(message, color="negative", multi_line=True)
+            self.refresh_queue(notify_user=False)
+            return
         action_label_text = self.action_label(action)
         self.last_submitted_job_id = ""
         self._update_workflow_submission_labels()
@@ -3441,8 +3615,8 @@ def _render_workflow_actions_card(controller: WorkspaceController) -> None:
     t = controller.t
     action_specs = [
         ("仅分析文献", "先检查文献提取、预处理和结构化结果是否稳定。", "analyze"),
-        ("生成大纲", "在分析结果基础上先搭出综述结构。", "outline"),
-        ("生成全文", "直接生成正文，适合已经确认过结构和素材的任务。", "review"),
+        ("生成大纲", "在分析结果基础上先搭出综述结构。", "generate_outline"),
+        ("生成全文", "直接生成正文，适合已经确认过结构和素材的任务。", "generate_review"),
         ("一键运行", "从分析到正文一口气跑完，适合稳定的批量流程。", "run_all"),
     ]
 
@@ -3673,21 +3847,21 @@ def _page_shell(controller: WorkspaceController, page_title: str, subtitle: str,
                         label=controller.t("语言"),
                         on_change=lambda event: controller.change_language(str(event.value)),
                     ).classes("min-w-[150px]")
-                    ui.button(controller.t("保存配置"), on_click=lambda: controller.persist_config()).props("unelevated")
-        with ui.column().classes("ag-page w-full gap-5"):
+                    ui.button(controller.t("保存配置"), on_click=controller.save_config_from_ui).props("unelevated")
+    with ui.column().classes("ag-page w-full gap-5"):
+        with ui.element("div").classes("ag-reminder ag-page-reminder"):
+            ui.icon("tips_and_updates").classes("text-lg")
+            status_label = ui.label("").classes("ag-reminder-text")
+            controller.register_status_label(status_label)
+        if controller.credential_error:
             with ui.element("div").classes("ag-reminder ag-page-reminder"):
-                ui.icon("tips_and_updates").classes("text-lg")
-                status_label = ui.label("").classes("ag-reminder-text")
-                controller.register_status_label(status_label)
-            if controller.credential_error:
-                with ui.element("div").classes("ag-reminder ag-page-reminder"):
-                    ui.icon("warning").classes("text-lg")
-                    ui.label(
-                        controller.t("配置来源存在冲突；请统一 process environment、.env 和 config.ini 后再保存或运行。")
-                    ).classes("ag-reminder-text")
-            with ui.column().classes("ag-page-head"):
-                ui.label(controller.t(page_title)).classes("ag-page-title")
-                ui.label(controller.t(subtitle)).classes("ag-page-subtitle")
+                ui.icon("warning").classes("text-lg")
+                ui.label(
+                    controller.t("配置来源存在冲突；请统一 process environment、.env 和 config.ini 后再保存或运行。")
+                ).classes("ag-reminder-text")
+        with ui.column().classes("ag-page-head"):
+            ui.label(controller.t(page_title)).classes("ag-page-title")
+            ui.label(controller.t(subtitle)).classes("ag-page-subtitle")
         yield
 
 
@@ -4068,7 +4242,7 @@ def launch_gui(
                             title="选择 Zotero 库目录",
                         )
                     with ui.row().classes("gap-2 q-mt-sm"):
-                        ui.button(t("保存配置"), on_click=lambda: controller.persist_config()).props("unelevated")
+                        ui.button(t("保存配置"), on_click=controller.save_config_from_ui).props("unelevated")
                         ui.button(t("打开输出目录"), on_click=lambda: _open_path(controller.state["paths"]["output_path"], controller.language)).props("outline")
                 with ui.card().classes("ag-card p-6"):
                     ui.label(t("首次使用建议")).classes("ag-section-title")

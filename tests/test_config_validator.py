@@ -118,29 +118,72 @@ def test_validate_all_config_rejects_unknown_preprocess_parser_values(
 
 
 @pytest.mark.parametrize(
-    ("field_name", "value"),
+    ("parser_mode", "primary_parser", "fallback_parser"),
     (
-        ("parser_mode", "local"),
-        ("parser_mode", "hybrid"),
-        ("parser_mode", "remote_first"),
-        ("parser_mode", "remote"),
-        ("primary_parser", "local"),
-        ("primary_parser", "mineru_remote"),
-        ("fallback_parser", "none"),
-        ("fallback_parser", "local"),
-        ("fallback_parser", "mineru_remote"),
+        ("local", "local", "none"),
+        ("local", "local", "local"),
+        ("hybrid", "local", "none"),
+        ("hybrid", "local", "local"),
+        ("hybrid", "mineru_remote", "none"),
+        ("hybrid", "mineru_remote", "local"),
+        ("remote_first", "mineru_remote", "none"),
+        ("remote_first", "mineru_remote", "local"),
+        ("remote", "mineru_remote", "none"),
+        ("remote", "mineru_remote", "local"),
     ),
 )
-def test_validate_all_config_accepts_gui_preprocess_parser_values(
-    field_name: str,
-    value: str,
+def test_validate_all_config_accepts_supported_preprocess_parser_policies(
+    parser_mode: str,
+    primary_parser: str,
+    fallback_parser: str,
 ) -> None:
     config = _base_config()
-    config["Preprocess"][field_name] = value
+    config["Preprocess"].update(
+        {
+            "parser_mode": parser_mode,
+            "primary_parser": primary_parser,
+            "fallback_parser": fallback_parser,
+        }
+    )
 
     valid, messages = validate_all_config(config)
 
     assert valid is True, messages
+
+
+@pytest.mark.parametrize(
+    ("parser_mode", "primary_parser", "fallback_parser", "allow_local_parse_fallback"),
+    (
+        ("local", "mineru_remote", "none", None),
+        ("remote_first", "local", "none", None),
+        ("remote", "local", "local", None),
+        ("hybrid", "mineru_remote", "mineru_remote", None),
+        ("remote_first", "mineru_remote", "local", "false"),
+    ),
+)
+def test_validate_all_config_rejects_ambiguous_preprocess_parser_policies(
+    parser_mode: str,
+    primary_parser: str,
+    fallback_parser: str,
+    allow_local_parse_fallback: str | None,
+) -> None:
+    config = _base_config()
+    config["Preprocess"].update(
+        {
+            "parser_mode": parser_mode,
+            "primary_parser": primary_parser,
+            "fallback_parser": fallback_parser,
+        }
+    )
+    if allow_local_parse_fallback is not None:
+        config["Preprocess"]["allow_local_parse_fallback"] = (
+            allow_local_parse_fallback
+        )
+
+    valid, messages = validate_all_config(config)
+
+    assert valid is False
+    assert any("Preprocess" in message for message in messages)
 
 
 def _anthropic_outline(config):

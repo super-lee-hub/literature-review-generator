@@ -5,7 +5,10 @@ from pathlib import Path
 
 import pytest
 
-from runtime.provider_receipt_closure import ExpectedProviderCall, ProviderReceiptClosure
+from runtime.provider_receipt_closure import (
+    ExpectedProviderCall,
+    ProviderReceiptClosure,
+)
 from runtime.provider_runtime import (
     ProviderBudgetV1,
     ProviderRuntime,
@@ -197,3 +200,14 @@ def test_missing_expected_call_blocks_with_explicit_reason(tmp_path: Path) -> No
 
     assert closure.complete is False
     assert closure.missing_call_ids == (expected.call_id,)
+
+
+def test_duplicate_expected_call_ids_cannot_collapse_to_a_complete_closure(tmp_path: Path) -> None:
+    receipt, expected = _bound_receipt(tmp_path, call_id="call-duplicate")
+    conflicting = replace(expected, node_id="different-node")
+
+    closure = ProviderReceiptClosure.evaluate([expected, conflicting], [receipt])
+
+    assert closure.complete is False
+    assert closure.duplicate_expected_call_ids == (expected.call_id,)
+    assert closure.expected_call_ids == (expected.call_id,)

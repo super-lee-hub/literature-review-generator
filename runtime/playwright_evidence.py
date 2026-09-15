@@ -8,20 +8,23 @@ bound resulting runtime job.
 
 from __future__ import annotations
 
+import configparser
 import hashlib
 import json
 import os
-import configparser
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from services.durable_io import InterProcessLockTimeout, interprocess_file_lock
 from services.job_workspace import atomic_write_json, is_reparse_path
 
 
@@ -327,7 +330,18 @@ class PlaywrightEvidenceCollector:
         workspace.mkdir(parents=True, exist_ok=True)
         if production_input:
             staging_id = hashlib.sha256(self.acceptance_run_id.encode("utf-8")).hexdigest()[:24]
-            evidence_root = workspace / "acceptance_gui_staging" / staging_id
+            staging_parent = workspace / "acceptance_gui_staging"
+            if staging_parent.exists() and (
+                not staging_parent.is_dir() or is_reparse_path(staging_parent)
+            ):
+                raise PlaywrightEvidenceError("Playwright production staging root is unsafe")
+            staging_parent.mkdir(parents=True, exist_ok=True)
+            # A run ID alone is not an exclusive lease: an operator can retry or
+            # resume the same acceptance run while a previous collector exits.
+            # Each browser process therefore gets its own staging root.
+            evidence_root = Path(
+                tempfile.mkdtemp(prefix=f"{staging_id}-", dir=str(staging_parent))
+            ).resolve()
         else:
             evidence_root = workspace / "acceptance_gui"
         evidence_root.mkdir(parents=True, exist_ok=True)
@@ -373,8 +387,6 @@ class PlaywrightEvidenceCollector:
         attempt_path: Path | None = None
         provider_ledger_path: Path | None = None
         trace_stopped = False
-        production_artifact_root: Path | None = None
-        production_artifacts_registered = False
         try:
             self._wait_for_server(gui_process)
             with sync_playwright() as playwright:
@@ -422,57 +434,38 @@ class PlaywrightEvidenceCollector:
                     raise PlaywrightEvidenceError(
                         "production GUI evidence has no resulting job workspace"
                     )
-                (
-                    browser_path,
-                    trace_path,
-                    screenshot_manifest_path,
-                    screenshot_path,
-                ) = self._relocate_production_artifacts(
+                return self._publish_production_artifacts(
                     staging_trace_path=trace_path,
                     staging_screenshot_path=screenshot_path,
                     job_workspace=job_workspace_path,
                     job_id=submitted_job_id,
+                    screenshots=screenshots,
+                    assertions=assertions,
+                    console_errors=console_errors,
+                    page_errors=page_errors,
+                    session_id=session_id,
+                    started_at=started_at,
+                    gui_pid=gui_process.pid,
+                    runtime_spec_path=runtime_spec_path,
+                    job_outcome_path=job_outcome_path,
+                    attempt_path=attempt_path,
+                    provider_ledger_path=provider_ledger_path,
                 )
-                production_artifact_root = trace_path.parent
-                for screenshot in screenshots:
-                    if screenshot.get("name") == "dashboard":
-                        screenshot["path"] = str(screenshot_path)
-            trace_sha = _sha256(trace_path)
-            atomic_write_json(
-                str(screenshot_manifest_path),
-                {
-                    "artifact_type": "playwright_screenshot_manifest",
-                    "artifact_version": "v1",
-                    "schema_version": "playwright-screenshot-manifest-v1",
-                    "acceptance_run_id": self.acceptance_run_id,
-                    "scenario_id": self.scenario_id,
-                    "job_id": submitted_job_id,
-                    "screenshots": screenshots,
-                },
+            self._write_evidence_metadata(
+                browser_path=browser_path,
+                trace_path=trace_path,
+                screenshot_manifest_path=screenshot_manifest_path,
+                screenshots=screenshots,
+                assertions=assertions,
+                console_errors=console_errors,
+                page_errors=page_errors,
+                job_id=submitted_job_id,
+                session_id=session_id,
+                started_at=started_at,
+                gui_pid=gui_process.pid,
+                execution_kind="page_smoke",
             )
-            atomic_write_json(
-                str(browser_path),
-                {
-                    "artifact_type": "playwright_run_evidence",
-                    "artifact_version": "v1",
-                    "schema_version": "playwright-run-evidence-v1",
-                    "run_id": self.acceptance_run_id,
-                    "session_id": session_id,
-                    "url": self.input.base_url,
-                    "resulting_job_id": submitted_job_id,
-                    "execution_kind": "production" if production_input else "page_smoke",
-                    "trace_sha256": trace_sha,
-                    "flow_assertions": assertions,
-                    "console_errors": console_errors,
-                    "page_errors": page_errors,
-                    "started_at": started_at,
-                    "completed_at": _now(),
-                    "gui_pid": gui_process.pid,
-                    "screenshot_manifest_path": str(screenshot_manifest_path),
-                },
-            )
-            if any(item.get("passed") is not True for item in assertions) or console_errors or page_errors:
-                raise PlaywrightEvidenceError("documented Playwright flow did not complete cleanly")
+            self._ensure_browser_flow_completed(assertions, console_errors, page_errors)
             self._register_artifacts(
                 browser_path=browser_path,
                 trace_path=trace_path,
@@ -481,7 +474,6 @@ class PlaywrightEvidenceCollector:
                 workspace=job_workspace_path or workspace,
                 job_id=submitted_job_id,
             )
-            production_artifacts_registered = True
             return PlaywrightEvidenceResultV1(
                 browser_evidence_path=browser_path,
                 trace_path=trace_path,
@@ -494,16 +486,6 @@ class PlaywrightEvidenceCollector:
                 provider_ledger_path=provider_ledger_path,
             )
         except BaseException:
-            if (
-                production_input
-                and production_artifact_root is not None
-                and not production_artifacts_registered
-            ):
-                self._cleanup_unregistered_production_artifacts(
-                    production_artifact_root,
-                    job_workspace=job_workspace_path,
-                    job_id=submitted_job_id,
-                )
             if production_input:
                 self._cleanup_production_staging_artifacts(evidence_root)
             if trace_path.is_file() and not trace_stopped:
@@ -524,7 +506,182 @@ class PlaywrightEvidenceCollector:
                     gui_process.wait(timeout=10)
 
     @staticmethod
+    @contextmanager
+    def _production_artifact_publication_lock(job_workspace: Path):
+        """Serialize one job workspace's Gate I evidence publication."""
+
+        workspace = Path(job_workspace).expanduser().resolve()
+        if not workspace.is_dir() or is_reparse_path(workspace):
+            raise PlaywrightEvidenceError("job workspace is missing or unsafe")
+        try:
+            with interprocess_file_lock(
+                workspace / ".playwright_evidence_publication",
+                timeout_seconds=30.0,
+            ):
+                yield workspace
+        except InterProcessLockTimeout as exc:
+            raise PlaywrightEvidenceError(
+                "timed out acquiring Gate I evidence publication lock"
+            ) from exc
+
+    def _publish_production_artifacts(
+        self,
+        *,
+        staging_trace_path: Path,
+        staging_screenshot_path: Path,
+        job_workspace: Path,
+        job_id: str,
+        screenshots: list[dict[str, Any]],
+        assertions: list[dict[str, Any]],
+        console_errors: list[str],
+        page_errors: list[str],
+        session_id: str,
+        started_at: str,
+        gui_pid: int,
+        runtime_spec_path: Path | None,
+        job_outcome_path: Path | None,
+        attempt_path: Path | None,
+        provider_ledger_path: Path | None,
+    ) -> PlaywrightEvidenceResultV1:
+        """Publish one production browser run as one locked workspace transaction."""
+
+        with self._production_artifact_publication_lock(job_workspace) as workspace:
+            production_artifact_root: Path | None = None
+            production_artifacts_registered = False
+            try:
+                (
+                    browser_path,
+                    trace_path,
+                    screenshot_manifest_path,
+                    screenshot_path,
+                ) = self._relocate_production_artifacts_locked(
+                    staging_trace_path=staging_trace_path,
+                    staging_screenshot_path=staging_screenshot_path,
+                    workspace=workspace,
+                    job_id=job_id,
+                )
+                production_artifact_root = trace_path.parent
+                for screenshot in screenshots:
+                    if screenshot.get("name") == "dashboard":
+                        screenshot["path"] = str(screenshot_path)
+                self._write_evidence_metadata(
+                    browser_path=browser_path,
+                    trace_path=trace_path,
+                    screenshot_manifest_path=screenshot_manifest_path,
+                    screenshots=screenshots,
+                    assertions=assertions,
+                    console_errors=console_errors,
+                    page_errors=page_errors,
+                    job_id=job_id,
+                    session_id=session_id,
+                    started_at=started_at,
+                    gui_pid=gui_pid,
+                    execution_kind="production",
+                )
+                self._ensure_browser_flow_completed(
+                    assertions,
+                    console_errors,
+                    page_errors,
+                )
+                self._register_artifacts(
+                    browser_path=browser_path,
+                    trace_path=trace_path,
+                    screenshot_manifest_path=screenshot_manifest_path,
+                    screenshot_path=screenshot_path,
+                    workspace=workspace,
+                    job_id=job_id,
+                )
+                production_artifacts_registered = True
+                return PlaywrightEvidenceResultV1(
+                    browser_evidence_path=browser_path,
+                    trace_path=trace_path,
+                    screenshot_manifest_path=screenshot_manifest_path,
+                    submitted_job_id=job_id,
+                    job_workspace_path=workspace,
+                    runtime_spec_path=runtime_spec_path,
+                    job_outcome_path=job_outcome_path,
+                    attempt_path=attempt_path,
+                    provider_ledger_path=provider_ledger_path,
+                )
+            except BaseException:
+                if (
+                    production_artifact_root is not None
+                    and not production_artifacts_registered
+                ):
+                    self._cleanup_unregistered_production_artifacts_locked(
+                        production_artifact_root,
+                        workspace=workspace,
+                        job_id=job_id,
+                    )
+                raise
+
+    def _write_evidence_metadata(
+        self,
+        *,
+        browser_path: Path,
+        trace_path: Path,
+        screenshot_manifest_path: Path,
+        screenshots: list[dict[str, Any]],
+        assertions: list[dict[str, Any]],
+        console_errors: list[str],
+        page_errors: list[str],
+        job_id: str,
+        session_id: str,
+        started_at: str,
+        gui_pid: int,
+        execution_kind: str,
+    ) -> None:
+        trace_sha = _sha256(trace_path)
+        atomic_write_json(
+            str(screenshot_manifest_path),
+            {
+                "artifact_type": "playwright_screenshot_manifest",
+                "artifact_version": "v1",
+                "schema_version": "playwright-screenshot-manifest-v1",
+                "acceptance_run_id": self.acceptance_run_id,
+                "scenario_id": self.scenario_id,
+                "job_id": job_id,
+                "screenshots": screenshots,
+            },
+        )
+        atomic_write_json(
+            str(browser_path),
+            {
+                "artifact_type": "playwright_run_evidence",
+                "artifact_version": "v1",
+                "schema_version": "playwright-run-evidence-v1",
+                "run_id": self.acceptance_run_id,
+                "session_id": session_id,
+                "url": self.input.base_url,
+                "resulting_job_id": job_id,
+                "execution_kind": execution_kind,
+                "trace_sha256": trace_sha,
+                "flow_assertions": assertions,
+                "console_errors": console_errors,
+                "page_errors": page_errors,
+                "started_at": started_at,
+                "completed_at": _now(),
+                "gui_pid": gui_pid,
+                "screenshot_manifest_path": str(screenshot_manifest_path),
+            },
+        )
+
+    @staticmethod
+    def _ensure_browser_flow_completed(
+        assertions: list[dict[str, Any]],
+        console_errors: list[str],
+        page_errors: list[str],
+    ) -> None:
+        if (
+            any(item.get("passed") is not True for item in assertions)
+            or console_errors
+            or page_errors
+        ):
+            raise PlaywrightEvidenceError("documented Playwright flow did not complete cleanly")
+
+    @classmethod
     def _relocate_production_artifacts(
+        cls,
         *,
         staging_trace_path: Path,
         staging_screenshot_path: Path,
@@ -540,9 +697,24 @@ class PlaywrightEvidenceCollector:
         recoverable interrupted publication.
         """
 
-        workspace = Path(job_workspace).expanduser().resolve()
-        if not workspace.is_dir() or is_reparse_path(workspace):
-            raise PlaywrightEvidenceError("job workspace is missing or unsafe")
+        with cls._production_artifact_publication_lock(job_workspace) as workspace:
+            return cls._relocate_production_artifacts_locked(
+                staging_trace_path=staging_trace_path,
+                staging_screenshot_path=staging_screenshot_path,
+                workspace=workspace,
+                job_id=job_id,
+            )
+
+    @staticmethod
+    def _relocate_production_artifacts_locked(
+        *,
+        staging_trace_path: Path,
+        staging_screenshot_path: Path,
+        workspace: Path,
+        job_id: str,
+    ) -> tuple[Path, Path, Path, Path]:
+        """Move artifacts while the caller owns the workspace publication lock."""
+
         destination_root = workspace / "acceptance_gui"
         if destination_root.exists():
             if is_reparse_path(destination_root):
@@ -685,17 +857,32 @@ class PlaywrightEvidenceCollector:
     ) -> None:
         if job_workspace is None:
             return
-        workspace = Path(job_workspace).expanduser().resolve()
+        with cls._production_artifact_publication_lock(job_workspace) as workspace:
+            cls._cleanup_unregistered_production_artifacts_locked(
+                artifact_root,
+                workspace=workspace,
+                job_id=job_id,
+            )
+
+    @staticmethod
+    def _cleanup_unregistered_production_artifacts_locked(
+        artifact_root: Path,
+        *,
+        workspace: Path,
+        job_id: str,
+    ) -> None:
         if artifact_root.parent != workspace:
             return
-        if cls._has_registered_production_artifacts(
+        if PlaywrightEvidenceCollector._has_registered_production_artifacts(
             artifact_root,
             workspace=workspace,
             job_id=job_id,
         ):
             return
         try:
-            cls._remove_unregistered_artifact_directory(artifact_root)
+            PlaywrightEvidenceCollector._remove_unregistered_artifact_directory(
+                artifact_root
+            )
         except PlaywrightEvidenceError:
             # Preserve unexpected remnants for manual investigation rather
             # than deleting a path whose ownership cannot be established.

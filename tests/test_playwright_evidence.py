@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
+from launch_gui import _pick_available_port
 from runtime.playwright_evidence import (
     PlaywrightEvidenceCollector,
     PlaywrightEvidenceError,
@@ -14,7 +17,89 @@ from runtime.playwright_evidence import (
     _runtime_source_mode_for_gui_input,
 )
 from services.artifact_registry import ArtifactRegistry
-from launch_gui import _pick_available_port
+
+
+def _write_concurrent_trace(path: Path, payload: bytes) -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("trace.trace", payload)
+
+
+def _concurrent_production_publication_worker(
+    workspace_path: str,
+    staging_path: str,
+    label: str,
+    first_ready: object,
+    second_lock_attempted: object,
+    release_first: object,
+    results: object,
+) -> None:
+    """Run one real publication transaction in a spawned Python process."""
+
+    import runtime.playwright_evidence as evidence_module
+
+    workspace = Path(workspace_path)
+    staging = Path(staging_path)
+    collector = PlaywrightEvidenceCollector(
+        PlaywrightProductionScenarioInputV2(
+            base_url="http://127.0.0.1:8123",
+            config_path=str(workspace / "config.ini"),
+            repo_root=str(workspace),
+            output_root=str(workspace.parent),
+            input_mode="pdf",
+            pdf_folder=str(workspace / "pdfs"),
+            zotero_report="",
+            library_path="",
+            project_name="concurrency",
+            work_mode="normal",
+            action="analyze",
+            port=8123,
+        ),
+        acceptance_run_id="acceptance-concurrent",
+        scenario_id="I",
+        final_executable_sha="a" * 40,
+    )
+
+    if label == "first":
+        def fail_after_metadata(**_kwargs: object) -> None:
+            first_ready.set()  # type: ignore[attr-defined]
+            if not release_first.wait(15):  # type: ignore[attr-defined]
+                raise RuntimeError("test did not release first publication")
+            raise PlaywrightEvidenceError("controlled first registration failure")
+
+        collector._register_artifacts = fail_after_metadata  # type: ignore[method-assign]
+    else:
+        real_lock = evidence_module.interprocess_file_lock
+
+        @contextmanager
+        def announce_lock_attempt(*args: object, **kwargs: object):
+            second_lock_attempted.set()  # type: ignore[attr-defined]
+            with real_lock(*args, **kwargs):
+                yield
+
+        evidence_module.interprocess_file_lock = announce_lock_attempt
+
+    try:
+        result = collector._publish_production_artifacts(
+            staging_trace_path=staging / "trace.zip",
+            staging_screenshot_path=staging / "dashboard.png",
+            job_workspace=workspace,
+            job_id="job-concurrent",
+            screenshots=[{"name": "dashboard", "path": str(staging / "dashboard.png")}],
+            assertions=[{"name": "browser_flow", "passed": True}],
+            console_errors=[],
+            page_errors=[],
+            session_id=f"session-{label}",
+            started_at="2026-09-15T00:00:00Z",
+            gui_pid=1,
+            runtime_spec_path=None,
+            job_outcome_path=None,
+            attempt_path=None,
+            provider_ledger_path=None,
+        )
+    except PlaywrightEvidenceError as exc:
+        results.put((label, "error", str(exc)))  # type: ignore[attr-defined]
+    else:
+        results.put((label, "success", str(result.trace_path)))  # type: ignore[attr-defined]
 
 
 def _input_payload(**overrides: object) -> dict[str, object]:
@@ -265,6 +350,96 @@ def test_production_artifact_relocation_refuses_registry_published_destination(
         assert archive.read("trace.trace") == b"published"
     assert trace.read_bytes() == b"fresh"
     assert screenshot.read_bytes() == b"fresh"
+
+
+def test_concurrent_production_publication_keeps_second_collectors_evidence(
+    tmp_path: Path,
+) -> None:
+    """A failed collector must clean its own transaction before a waiter publishes."""
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    first_staging = tmp_path / "first-staging"
+    second_staging = tmp_path / "second-staging"
+    first_staging.mkdir()
+    second_staging.mkdir()
+    _write_concurrent_trace(first_staging / "trace.zip", b"first")
+    _write_concurrent_trace(second_staging / "trace.zip", b"second")
+    (first_staging / "dashboard.png").write_bytes(b"first-dashboard")
+    (second_staging / "dashboard.png").write_bytes(b"second-dashboard")
+
+    context = multiprocessing.get_context("spawn")
+    first_ready = context.Event()
+    second_lock_attempted = context.Event()
+    release_first = context.Event()
+    results = context.Queue()
+    first = context.Process(
+        target=_concurrent_production_publication_worker,
+        args=(
+            str(workspace),
+            str(first_staging),
+            "first",
+            first_ready,
+            second_lock_attempted,
+            release_first,
+            results,
+        ),
+    )
+    second = context.Process(
+        target=_concurrent_production_publication_worker,
+        args=(
+            str(workspace),
+            str(second_staging),
+            "second",
+            first_ready,
+            second_lock_attempted,
+            release_first,
+            results,
+        ),
+    )
+    first.start()
+    try:
+        assert first_ready.wait(15), "first collector did not reach locked registration"
+        second.start()
+        assert second_lock_attempted.wait(15), "second collector did not attempt the workspace lock"
+        release_first.set()
+        first.join(20)
+        second.join(20)
+        assert not first.is_alive(), "first collector did not stop"
+        assert not second.is_alive(), "second collector did not stop"
+    finally:
+        release_first.set()
+        for process in (first, second):
+            if process.pid is not None and process.is_alive():
+                process.terminate()
+                process.join(10)
+
+    # Pull both reports without depending on OS scheduling or queue order.
+    reports = [results.get(timeout=10) for _ in range(2)]
+    outcomes = {label: (state, detail) for label, state, detail in reports}
+    assert outcomes["first"] == ("error", "controlled first registration failure")
+    assert outcomes["second"][0] == "success"
+
+    destination = workspace / "acceptance_gui"
+    with zipfile.ZipFile(destination / "trace.zip") as archive:
+        assert archive.read("trace.trace") == b"second"
+    assert (destination / "dashboard.png").read_bytes() == b"second-dashboard"
+    browser_evidence = json.loads((destination / "playwright_run_evidence.json").read_text(encoding="utf-8"))
+    screenshot_manifest = json.loads((destination / "screenshot_manifest.json").read_text(encoding="utf-8"))
+    assert browser_evidence["execution_kind"] == "production"
+    assert screenshot_manifest["screenshots"] == [
+        {"name": "dashboard", "path": str(destination / "dashboard.png")}
+    ]
+    registry = ArtifactRegistry(workspace / "artifact_registry.json", "job-concurrent")
+    assert {
+        record.artifact_type
+        for record in registry.list_records()
+    } == {
+        "playwright_run_evidence",
+        "playwright_trace",
+        "playwright_screenshot_manifest",
+        "playwright_screenshot",
+    }
 
 
 def test_production_staging_cleanup_only_removes_expected_regular_files(tmp_path: Path) -> None:

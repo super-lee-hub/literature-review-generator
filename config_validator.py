@@ -22,6 +22,7 @@ from services.settings import (
     PREPROCESS_FALLBACK_PARSERS,
     PREPROCESS_PARSER_MODES,
     PREPROCESS_PRIMARY_PARSERS,
+    resolve_preprocess_parser_policy,
     validate_config_keys,
 )
 
@@ -453,6 +454,58 @@ def validate_all_config(
         if value and value not in allowed_values:
             allowed = "/".join(sorted(allowed_values))
             return False, [f"[Preprocess] {field_name} 应为 {allowed} 之一"]
+    try:
+        resolve_preprocess_parser_policy(
+            preprocess.get("parser_mode", "local"),
+            preprocess.get("primary_parser", "local"),
+            preprocess.get("fallback_parser", "local"),
+            allow_local_parse_fallback=(
+                preprocess.get("allow_local_parse_fallback")
+                if "allow_local_parse_fallback" in preprocess
+                else None
+            ),
+        )
+    except ValueError as exc:
+        return False, [str(exc)]
+
+    preprocess_integer_bounds = {
+        "mineru_poll_timeout_seconds": (1, 3600),
+        "mineru_request_timeout_seconds": (1, 600),
+        "mineru_upload_timeout_seconds": (1, 900),
+        "mineru_download_timeout_seconds": (1, 900),
+        "mineru_request_max_retries": (0, 5),
+        "mineru_max_remote_tasks": (1, 1000),
+        "mineru_max_remote_http_calls": (1, 10000),
+        "mineru_max_remote_upload_bytes": (1, 10_000_000_000),
+        "docling_timeout_seconds": (1, 900),
+        "ocr_timeout_seconds": (1, 600),
+    }
+    for field_name, (minimum, maximum) in preprocess_integer_bounds.items():
+        if field_name not in preprocess:
+            continue
+        valid, error = validate_numeric_range(
+            str(preprocess[field_name]), minimum, maximum
+        )
+        if not valid:
+            return False, [f"[Preprocess] {field_name} {error}"]
+
+    preprocess_float_bounds = {
+        "mineru_poll_interval_seconds": (0.1, 60.0),
+        "mineru_retry_backoff_seconds": (0.0, 60.0),
+    }
+    for field_name, (minimum, maximum) in preprocess_float_bounds.items():
+        if field_name not in preprocess:
+            continue
+        try:
+            value = float(str(preprocess[field_name]).strip())
+        except (TypeError, ValueError):
+            return False, [f"[Preprocess] {field_name} 请输入一个有效的数字"]
+        if not value == value or value in {float("inf"), float("-inf")}:
+            return False, [f"[Preprocess] {field_name} 请输入一个有限数字"]
+        if value < minimum or value > maximum:
+            return False, [
+                f"[Preprocess] {field_name} 值应在{minimum:g}-{maximum:g}之间"
+            ]
     if str(preprocess.get("ocr_mode", "auto")).lower() not in {"auto", "off", "always"}:
         return False, ["[Preprocess] ocr_mode 应为 auto/off/always 之一"]
     if "local_rag_retain_recent_identities" in preprocess:

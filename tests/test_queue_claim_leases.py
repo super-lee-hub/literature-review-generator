@@ -11,6 +11,7 @@ import zipfile
 
 import pytest
 
+from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
 from services.artifact_registry import ArtifactRegistry, CurrentArtifactSetV1
 from services.job_workspace import atomic_write_json
 from services.queue_service import PersistentQueueService, QueueJobSpec, QueueLease, QueueState
@@ -790,17 +791,24 @@ def test_queue_runner_heartbeats_while_job_runner_is_blocked(tmp_path) -> None:
     queue_file = tmp_path / "queue.json"
     service = PersistentQueueService(queue_file)
     job_id = "job-heartbeat"
+    config_path = tmp_path / "config.ini"
+    config_path.write_text("[Paths]\noutput_path = ./output\n", encoding="utf-8")
+    pdf_dir = tmp_path / "papers"
+    pdf_dir.mkdir()
+    (pdf_dir / "paper.pdf").write_bytes(b"%PDF-1.4\nlease test\n")
+    parameters = RuntimeJobSpec(
+        project_name="lease-test",
+        source=RuntimeSourceSpec(mode="direct", pdf_folder=str(pdf_dir)),
+        config=str(config_path),
+        action="generate_review",
+        metadata={},
+    ).to_dict()
     service.add_job(
         QueueJobSpec(
             job_id=job_id,
-            job_type="review",
+            job_type="generate_review",
             project_name="lease-test",
-            parameters={
-                "config": "config.ini",
-                "project_name": "lease-test",
-                "pdf_folder": "D:/papers",
-                "action": "review",
-            },
+            parameters=parameters,
         )
     )
     started = threading.Event()
@@ -815,6 +823,7 @@ def test_queue_runner_heartbeats_while_job_runner_is_blocked(tmp_path) -> None:
                 (),
                 {
                     "job_status": "completed",
+                    "success": True,
                     "exit_code": 0,
                     "message": "ok",
                     "workspace_path": str(tmp_path / "workspace"),

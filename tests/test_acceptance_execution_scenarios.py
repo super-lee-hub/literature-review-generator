@@ -16,6 +16,7 @@ from runtime.provider_runtime import (
     acceptance_context_environment,
     bind_acceptance_execution_context,
 )
+from runtime.f1_corpus import F1CorpusManifestV1, F1CorpusSourceRecordV1
 from runtime.release_acceptance import (
     AcceptanceScenarioResultV1,
     ParentAcceptanceResultV2,
@@ -90,7 +91,87 @@ def _child(gate: str, runtime_spec: str) -> dict[str, object]:
     }
 
 
-def _plan_payload() -> dict[str, object]:
+def _f1_manifest_fixture(tmp_path: Path) -> tuple[Path, F1CorpusManifestV1]:
+    source_root = tmp_path / "f1-papers"
+    source_root.mkdir(exist_ok=True)
+    sources: list[F1CorpusSourceRecordV1] = []
+    for number in range(1, 16):
+        source_id = f"F1-{number:02d}"
+        relative_path = f"{source_id}.pdf"
+        raw = f"%PDF-1.4\n{source_id}\n".encode("ascii")
+        (source_root / relative_path).write_bytes(raw)
+        sources.append(
+            F1CorpusSourceRecordV1(
+                source_id=source_id,
+                relative_path=relative_path,
+                sha256=hashlib.sha256(raw).hexdigest(),
+                size_bytes=len(raw),
+            )
+        )
+    manifest_path = tmp_path / "f1-corpus-manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "artifact_type": "f1_corpus_manifest",
+                "artifact_version": "v1",
+                "schema_version": "f1-corpus-manifest-v1",
+                "corpus_id": "test-f1",
+                "source_root": source_root.name,
+                "sources": [source.to_dict() for source in sources],
+                "content_sha256": F1CorpusManifestV1.content_hash_for("test-f1", sources),
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return manifest_path, F1CorpusManifestV1.from_file(
+        manifest_path,
+        verify_source_files=True,
+    )
+
+
+def _plan_payload(tmp_path: Path) -> dict[str, object]:
+    manifest_path, manifest = _f1_manifest_fixture(tmp_path)
+    selections = {
+        "C": ["F1-01"],
+        "D": ["F1-01", "F1-02", "F1-03"],
+        "Q": [f"F1-{number:02d}" for number in range(1, 16)],
+    }
+    scenarios: dict[str, dict[str, object]] = {}
+    for gate, source_ids in selections.items():
+        workspace = tmp_path / f"workspace-{gate}"
+        workspace.mkdir(exist_ok=True)
+        runtime_path = tmp_path / f"{gate.lower()}-runtime.json"
+        runtime_path.write_text(
+            json.dumps(
+                {
+                    "project_name": f"acceptance-{gate.lower()}",
+                    "job_id": f"job-{gate.lower()}",
+                    "workspace_path": str(workspace),
+                    "source": {"mode": "direct", "pdf_folder": manifest.source_root},
+                    "metadata": {
+                        "f1_corpus_binding": {
+                            "schema_version": "f1-corpus-binding-v1",
+                            "manifest_path": str(manifest_path),
+                            "manifest_sha256": manifest.manifest_sha256,
+                            "source_ids": source_ids,
+                        }
+                    },
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        child = _child(gate, str(runtime_path))
+        child.update(
+            {
+                "workspace": str(workspace),
+                "job_id": f"job-{gate.lower()}",
+                "input_manifest": str(manifest_path),
+                "f1_source_ids": source_ids,
+            }
+        )
+        scenarios[gate] = child
     return {
         "schema_version": "release-acceptance-plan-v2",
         "parent_run_id": "parent-acceptance-1",
@@ -100,16 +181,12 @@ def _plan_payload() -> dict[str, object]:
             "max_retry_attempts_total": 1,
             "max_wall_seconds": 900,
         },
-        "scenarios": {
-            "C": _child("C", "c-runtime.json"),
-            "D": _child("D", "d-runtime.json"),
-            "Q": _child("Q", "q-runtime.json"),
-        },
+        "scenarios": scenarios,
     }
 
 
-def test_parent_plan_requires_independent_child_specs_for_incompatible_gates() -> None:
-    plan = ReleaseAcceptancePlanV2.from_mapping(_plan_payload())
+def test_parent_plan_requires_independent_child_specs_for_incompatible_gates(tmp_path: Path) -> None:
+    plan = ReleaseAcceptancePlanV2.from_mapping(_plan_payload(tmp_path))
 
     assert plan.parent_run_id == "parent-acceptance-1"
     assert plan.child("C").runtime_spec != plan.child("D").runtime_spec
@@ -126,7 +203,16 @@ def test_parent_plan_requires_independent_child_specs_for_incompatible_gates() -
 
 def test_single_acceptance_spec_preserves_and_validates_executable_sha() -> None:
     spec = ReleaseAcceptanceSpec.from_mapping(
-        {"final_executable_sha": "a" * 40, "gates": ["C"]}
+        {
+            "final_executable_sha": "a" * 40,
+            "gates": ["C"],
+            "budget": {
+                "max_provider_calls_total": 1,
+                "max_output_tokens_total": 1,
+                "max_retry_attempts_total": 1,
+                "max_wall_seconds": 1,
+            },
+        }
     )
     assert spec.final_executable_sha == "a" * 40
 
@@ -141,11 +227,11 @@ def test_single_acceptance_spec_preserves_and_validates_executable_sha() -> None
 
 
 @pytest.mark.parametrize("field", ("workspace", "job_id"))
-def test_parent_plan_rejects_shared_child_identity(field: str) -> None:
-    payload = _plan_payload()
+def test_parent_plan_rejects_shared_child_identity(tmp_path: Path, field: str) -> None:
+    payload = _plan_payload(tmp_path)
     payload["scenarios"] = {
-        "C": _child("C", "c-runtime.json"),
-        "D": _child("D", "d-runtime.json"),
+        "C": payload["scenarios"]["C"],
+        "D": payload["scenarios"]["D"],
     }
     payload["scenarios"]["D"][field] = payload["scenarios"]["C"][field] = (
         "shared-child-identity" if field == "workspace" else "shared-job"
@@ -328,7 +414,7 @@ def test_parent_acceptance_plan_persists_independent_blocked_children_without_ow
     from runtime.control_plane import ReviewControlPlane
 
     monkeypatch.delenv("AUTO_GENERATE_RUN_LIVE_ACCEPTANCE", raising=False)
-    payload = _plan_payload()
+    payload = _plan_payload(tmp_path)
     payload["state_path"] = "acceptance-state.json"
     plan_path = tmp_path / "acceptance-plan.json"
     plan_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -357,25 +443,17 @@ def test_parent_acceptance_plan_dispatches_each_runtime_child_independently(
     from runtime.control_plane import ReviewControlPlane
 
     monkeypatch.setenv("AUTO_GENERATE_RUN_LIVE_ACCEPTANCE", "1")
-    payload = _plan_payload()
+    payload = _plan_payload(tmp_path)
     payload["state_path"] = "acceptance-state.json"
-    for gate in ("C", "D", "Q"):
-        workspace = tmp_path / f"workspace-{gate}"
-        (tmp_path / f"{gate.lower()}-runtime.json").write_text(
-            json.dumps(
-                {
-                    "project_name": f"acceptance-{gate.lower()}",
-                    "job_id": f"job-{gate.lower()}",
-                    "workspace_path": str(workspace),
-                    "source": {"mode": "direct", "pdf_folder": "missing-papers"},
-                }
-            ),
-            encoding="utf-8",
-        )
     calls: list[str] = []
     control = ReviewControlPlane(repo_root=Path.cwd())
     monkeypatch.setattr(control, "_acceptance_checkout_sha", lambda *_args, **_kwargs: "a" * 40)
     monkeypatch.setattr(control, "provider_preflight", lambda **_kwargs: {"ok": True, "route_plan": {}})
+    monkeypatch.setattr(
+        control,
+        "_admit_runtime_spec_external_hosts",
+        lambda _spec: {"required": False},
+    )
 
     def fake_run(runtime_spec: str | Path) -> dict[str, object]:
         calls.append(str(runtime_spec))
@@ -415,47 +493,31 @@ def test_parent_acceptance_resumes_child_with_durable_workspace_marker(
     from runtime.control_plane import ReviewControlPlane
 
     monkeypatch.setenv("AUTO_GENERATE_RUN_LIVE_ACCEPTANCE", "1")
+    payload = _plan_payload(tmp_path)
     workspace = tmp_path / "workspace-c"
-    workspace.mkdir()
+    workspace.mkdir(exist_ok=True)
     (workspace / "artifact_registry.json").write_text("{}", encoding="utf-8")
-    runtime_path = tmp_path / "c-runtime.json"
-    runtime_path.write_text(
-        json.dumps(
-            {
-                "project_name": "acceptance-c",
-                "job_id": "job-c",
-                "workspace_path": str(workspace),
-                "source": {"mode": "direct", "pdf_folder": str(tmp_path / "papers")},
-            }
-        ),
-        encoding="utf-8",
-    )
+    child = payload["scenarios"]["C"]
+    runtime_path = Path(child["runtime_spec"])
+    runtime_payload = json.loads(runtime_path.read_text(encoding="utf-8"))
+    runtime_payload["workspace_path"] = str(workspace)
+    runtime_path.write_text(json.dumps(runtime_payload), encoding="utf-8")
+    child["workspace"] = str(workspace)
+    child["job_id"] = "job-c"
+    payload["parent_run_id"] = "parent-resume"
+    payload["state_path"] = "state.json"
+    payload["scenarios"] = {"C": child}
     plan_path = tmp_path / "acceptance-plan.json"
-    plan_path.write_text(
-        json.dumps(
-            {
-                "schema_version": "release-acceptance-plan-v2",
-                "parent_run_id": "parent-resume",
-                "state_path": "state.json",
-                "scenarios": {
-                    "C": {
-                        "scenario_id": "C",
-                        "gate": "C",
-                        "runtime_spec": "c-runtime.json",
-                        "workspace": str(workspace),
-                        "job_id": "job-c",
-                        "execution_mode": "runtime",
-                        "budget_domain": "live",
-                    }
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
+    plan_path.write_text(json.dumps(payload), encoding="utf-8")
     control = ReviewControlPlane(repo_root=Path.cwd())
     calls: list[str] = []
     monkeypatch.setattr(control, "_acceptance_checkout_sha", lambda *_args, **_kwargs: "a" * 40)
     monkeypatch.setattr(control, "provider_preflight", lambda **_kwargs: {"ok": True, "route_plan": {}})
+    monkeypatch.setattr(
+        control,
+        "_admit_runtime_spec_external_hosts",
+        lambda _spec: {"required": False},
+    )
     monkeypatch.setattr(
         control,
         "resume",
@@ -487,42 +549,17 @@ def test_parent_acceptance_blocks_runtime_child_after_failed_preflight(
     from runtime.control_plane import ReviewControlPlane
 
     monkeypatch.setenv("AUTO_GENERATE_RUN_LIVE_ACCEPTANCE", "1")
-    workspace = tmp_path / "workspace-c"
-    runtime_path = tmp_path / "c-runtime.json"
-    runtime_path.write_text(
-        json.dumps(
-            {
-                "project_name": "acceptance-c",
-                "job_id": "job-c",
-                "workspace_path": str(workspace),
-                "source": {"mode": "direct", "pdf_folder": str(tmp_path / "papers")},
-                "config": str(tmp_path / "config.ini"),
-            }
-        ),
-        encoding="utf-8",
-    )
+    payload = _plan_payload(tmp_path)
+    child = payload["scenarios"]["C"]
+    runtime_path = Path(child["runtime_spec"])
+    runtime_payload = json.loads(runtime_path.read_text(encoding="utf-8"))
+    runtime_payload["config"] = str(tmp_path / "config.ini")
+    runtime_path.write_text(json.dumps(runtime_payload), encoding="utf-8")
+    payload["parent_run_id"] = "parent-preflight"
+    payload["state_path"] = "state.json"
+    payload["scenarios"] = {"C": child}
     plan_path = tmp_path / "acceptance-plan.json"
-    plan_path.write_text(
-        json.dumps(
-            {
-                "schema_version": "release-acceptance-plan-v2",
-                "parent_run_id": "parent-preflight",
-                "state_path": "state.json",
-                "scenarios": {
-                    "C": {
-                        "scenario_id": "C",
-                        "gate": "C",
-                        "runtime_spec": "c-runtime.json",
-                        "workspace": str(workspace),
-                        "job_id": "job-c",
-                        "execution_mode": "runtime",
-                        "budget_domain": "live",
-                    }
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
+    plan_path.write_text(json.dumps(payload), encoding="utf-8")
     control = ReviewControlPlane(repo_root=Path.cwd())
     monkeypatch.setattr(control, "_acceptance_checkout_sha", lambda *_args, **_kwargs: "a" * 40)
     monkeypatch.setattr(
@@ -561,45 +598,23 @@ def test_gate_d_plan_carries_production_modality_refs_into_child_evidence(
     from runtime.release_acceptance import GateEvidenceProducer
 
     monkeypatch.setenv("AUTO_GENERATE_RUN_LIVE_ACCEPTANCE", "1")
-    source_dir = tmp_path / "papers"
-    source_dir.mkdir()
-    workspace = tmp_path / "workspace-d"
-    workspace.mkdir()
-    runtime_spec = tmp_path / "d-runtime.json"
-    runtime_spec.write_text(
-        json.dumps(
-            {
-                "project_name": "acceptance-d",
-                "job_id": "job-d",
-                "workspace_path": str(workspace),
-                "source": {"mode": "direct", "pdf_folder": str(source_dir)},
-            }
-        ),
-        encoding="utf-8",
-    )
-    payload = {
-        "schema_version": "release-acceptance-plan-v2",
-        "parent_run_id": "parent-d",
-        "budget": {"max_provider_calls_total": 1},
-        "state_path": "acceptance-state.json",
-        "scenarios": {
-            "D": {
-                "scenario_id": "D",
-                "gate": "D",
-                "runtime_spec": "d-runtime.json",
-                "workspace": str(workspace),
-                "job_id": "job-d",
-                "execution_mode": "runtime",
-                "budget_domain": "live",
-                "prerequisites": [],
-            }
-        },
-    }
+    payload = _plan_payload(tmp_path)
+    child = payload["scenarios"]["D"]
+    workspace = Path(child["workspace"])
+    runtime_spec = Path(child["runtime_spec"])
+    payload["parent_run_id"] = "parent-d"
+    payload["state_path"] = "acceptance-state.json"
+    payload["scenarios"] = {"D": child}
     plan_path = tmp_path / "acceptance-plan.json"
     plan_path.write_text(json.dumps(payload), encoding="utf-8")
     control = ReviewControlPlane(repo_root=Path.cwd())
     monkeypatch.setattr(control, "_acceptance_checkout_sha", lambda *_args, **_kwargs: "a" * 40)
     monkeypatch.setattr(control, "provider_preflight", lambda **_kwargs: {"ok": True, "route_plan": {}})
+    monkeypatch.setattr(
+        control,
+        "_admit_runtime_spec_external_hosts",
+        lambda _spec: {"required": False},
+    )
     final_sha = control._acceptance_checkout_sha(control.repo_root)
     modality_path = tmp_path / "modality-profile.json"
     modality_path.write_text("{}", encoding="utf-8")
@@ -674,53 +689,36 @@ def test_runtime_child_rejects_plan_to_runtime_identity_mismatch_before_executio
     from runtime.control_plane import ReviewControlPlane
 
     monkeypatch.setenv("AUTO_GENERATE_RUN_LIVE_ACCEPTANCE", "1")
-    source_dir = tmp_path / "papers"
-    source_dir.mkdir()
+    payload = _plan_payload(tmp_path)
+    child = payload["scenarios"]["D"]
     expected_workspace = tmp_path / "workspace-d"
+    expected_workspace.mkdir(exist_ok=True)
     runtime_workspace = (
         tmp_path / "other-workspace" if mismatch == "workspace" else expected_workspace
     )
     expected_job_id = "job-d"
     runtime_job_id = "other-job" if mismatch == "job_id" else expected_job_id
-    runtime_spec = tmp_path / "d-runtime.json"
-    runtime_spec.write_text(
-        json.dumps(
-            {
-                "project_name": "acceptance-d",
-                "job_id": runtime_job_id,
-                "workspace_path": str(runtime_workspace),
-                "source": {"mode": "direct", "pdf_folder": str(source_dir)},
-            }
-        ),
-        encoding="utf-8",
-    )
+    runtime_spec = Path(child["runtime_spec"])
+    runtime_payload = json.loads(runtime_spec.read_text(encoding="utf-8"))
+    runtime_payload["job_id"] = runtime_job_id
+    runtime_payload["workspace_path"] = str(runtime_workspace)
+    runtime_spec.write_text(json.dumps(runtime_payload), encoding="utf-8")
+    child["workspace"] = str(expected_workspace)
+    child["job_id"] = expected_job_id
+    payload["parent_run_id"] = f"parent-{mismatch}"
+    payload["state_path"] = "acceptance-state.json"
+    payload["scenarios"] = {"D": child}
     plan_path = tmp_path / "acceptance-plan.json"
-    plan_path.write_text(
-        json.dumps(
-            {
-                "schema_version": "release-acceptance-plan-v2",
-                "parent_run_id": f"parent-{mismatch}",
-                "state_path": "acceptance-state.json",
-                "scenarios": {
-                    "D": {
-                        "scenario_id": "D",
-                        "gate": "D",
-                        "runtime_spec": "d-runtime.json",
-                        "workspace": str(expected_workspace),
-                        "job_id": expected_job_id,
-                        "execution_mode": "runtime",
-                        "budget_domain": "live",
-                        "prerequisites": [],
-                    }
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
+    plan_path.write_text(json.dumps(payload), encoding="utf-8")
     calls: list[str] = []
     control = ReviewControlPlane(repo_root=Path.cwd())
     monkeypatch.setattr(control, "_acceptance_checkout_sha", lambda *_args, **_kwargs: "a" * 40)
     monkeypatch.setattr(control, "provider_preflight", lambda **_kwargs: {"ok": True, "route_plan": {}})
+    monkeypatch.setattr(
+        control,
+        "_admit_runtime_spec_external_hosts",
+        lambda _spec: {"required": False},
+    )
     monkeypatch.setattr(
         control,
         "run",
