@@ -155,14 +155,61 @@ def claim_verdict_for_result(value: Any) -> ClaimVerdict:
     ).strip().lower()
     conclusion = _conclusion_text(value).strip().upper()
     low_confidence = bool(_field(value, "low_confidence", False))
+    # A manual-review marker or low-confidence result cannot be promoted by a
+    # supported status.  Treat confidence as present when either the result
+    # or its structured evidence carries a numeric confidence value; legacy
+    # alignment confidence is also a valid source of this evidence.
     claim_unit_results = details.get("claim_unit_results") or []
+    raw_confidence = _field(value, "confidence", None)
+    if raw_confidence is None:
+        ai_validation = details.get("ai_validation")
+        if isinstance(ai_validation, Mapping):
+            raw_confidence = ai_validation.get("confidence")
+    if raw_confidence is None and claim_unit_results:
+        raw_confidence = claim_unit_results[0].get("alignment_confidence")
+    has_confidence = raw_confidence is not None
+    # Older locally-produced results predate the Validator response envelope
+    # and legitimately have no confidence field.  Missing confidence is a
+    # review blocker when an adjudicator response was actually supplied (the
+    # dangerous case found in the audit), while preserving compatibility for
+    # pre-envelope legacy records that carry no such claim.
+    confidence_required = isinstance(details.get("ai_validation"), Mapping)
+    support_like = status in {"supported", "clean_supported"} or (
+        not status and conclusion == "SUPPORTED"
+    )
+    missing_confidence_requires_review = (
+        support_like
+        and not has_confidence
+        and (
+            confidence_required
+            or not claim_unit_results
+        )
+    )
+    evidence_gap_requires_review = (
+        status == "evidence_gap"
+        and (
+            low_confidence
+            or disposition in {"manual_review", "needs_review"}
+            or conclusion == "UNSUPPORTED"
+        )
+    )
     ambiguous_alignment = any(
         isinstance(item, Mapping)
         and str(item.get("reason") or "") == "ambiguous_claim_paper_alignment"
         for item in claim_unit_results
     )
 
-    if ambiguous_alignment or status in {"needs_review", "low_confidence", "uncertain"}:
+    if (
+        ambiguous_alignment
+        or low_confidence
+        or (
+            support_like
+            and disposition in {"manual_review", "needs_review"}
+        )
+        or missing_confidence_requires_review
+        or evidence_gap_requires_review
+        or status in {"needs_review", "low_confidence", "uncertain"}
+    ):
         return ClaimVerdict.NEEDS_REVIEW
     if status in {"wrong_source", "mapping_error"} or conclusion == "WRONG_SOURCE":
         return ClaimVerdict.WRONG_SOURCE
@@ -256,6 +303,19 @@ class ValidationInputArtifactsV1:
     citation_manifest_hash: str = ""
     evidence_manifest_ids: Tuple[str, ...] = ()
     evidence_manifest_hashes: Tuple[str, ...] = ()
+    validation_source_binding_id: str = ""
+    # The stable public hash field now carries the path-independent semantic
+    # binding identity.  The explicit alias makes the contract self-documenting
+    # for new producers while keeping older callers source-compatible.
+    validation_source_binding_hash: str = ""
+    validation_source_binding_semantic_hash: str = ""
+    # Physical Registry content_hash for the binding JSON.  It is retained for
+    # dependency closure and audit, but is not a checkpoint identity.
+    validation_source_binding_content_hash: str = ""
+    validation_source_authority_hash: str = ""
+    validation_source_authority_fingerprint: Mapping[str, Any] = field(
+        default_factory=dict
+    )
 
     def validate(self) -> None:
         if bool(self.review_draft_id) != bool(self.review_draft_hash):
@@ -274,9 +334,46 @@ class ValidationInputArtifactsV1:
             raise ValidationRunResultError("evidence manifest artifact ids must be non-empty")
         if any(not item for item in self.evidence_manifest_hashes):
             raise ValidationRunResultError("evidence manifest artifact hashes must be non-empty")
+        semantic_binding_hash = (
+            self.validation_source_binding_semantic_hash
+            or self.validation_source_binding_hash
+        )
+        if bool(self.validation_source_binding_id) != bool(semantic_binding_hash):
+            raise ValidationRunResultError(
+                "validation source binding identity requires both id and hash"
+            )
+        if (
+            self.validation_source_binding_hash
+            and self.validation_source_binding_semantic_hash
+            and self.validation_source_binding_hash
+            != self.validation_source_binding_semantic_hash
+        ):
+            raise ValidationRunResultError(
+                "validation source binding semantic hashes must match"
+            )
+        if self.validation_source_binding_content_hash and not self.validation_source_binding_id:
+            raise ValidationRunResultError(
+                "validation source binding content hash requires an artifact id"
+            )
+        if not isinstance(self.validation_source_authority_fingerprint, Mapping):
+            raise ValidationRunResultError(
+                "validation source authority fingerprint must be an object"
+            )
+        if bool(self.validation_source_authority_hash) != bool(
+            self.validation_source_authority_fingerprint
+        ):
+            raise ValidationRunResultError(
+                "validation source authority hash and fingerprint must be paired"
+            )
         hashes = (
             ("review draft", self.review_draft_hash),
             ("citation manifest", self.citation_manifest_hash),
+            ("validation source binding", semantic_binding_hash),
+            (
+                "validation source binding content",
+                self.validation_source_binding_content_hash,
+            ),
+            ("validation source authority", self.validation_source_authority_hash),
             *(
                 (f"evidence manifest[{index}]", content_hash)
                 for index, content_hash in enumerate(self.evidence_manifest_hashes)
@@ -304,6 +401,28 @@ class ValidationInputArtifactsV1:
         if value is not None and not isinstance(value, Mapping):
             raise ValidationRunResultError("input_artifacts must be an object")
         payload: Mapping[str, Any] = value if isinstance(value, Mapping) else {}
+        legacy_binding_hash = str(
+            payload.get("validation_source_binding_hash") or ""
+        ).strip()
+        explicit_semantic_binding_hash = str(
+            payload.get("validation_source_binding_semantic_hash") or ""
+        ).strip()
+        explicit_content_binding_hash = str(
+            payload.get("validation_source_binding_content_hash")
+            or payload.get("validation_source_binding_physical_hash")
+            or ""
+        ).strip()
+        # v1 records used the single hash field for the physical Registry
+        # content hash.  Preserve their ability to be parsed, while new
+        # records carry an explicit semantic/content pair.
+        semantic_binding_hash = explicit_semantic_binding_hash or legacy_binding_hash
+        content_binding_hash = explicit_content_binding_hash
+        if (
+            legacy_binding_hash
+            and not explicit_semantic_binding_hash
+            and not content_binding_hash
+        ):
+            content_binding_hash = legacy_binding_hash
         instance = cls(
             review_draft_id=str(payload.get("review_draft_id") or "").strip(),
             review_draft_hash=str(payload.get("review_draft_hash") or "").strip(),
@@ -317,6 +436,18 @@ class ValidationInputArtifactsV1:
                 str(item).strip()
                 for item in (payload.get("evidence_manifest_hashes") or ())
             ),
+            validation_source_binding_id=str(
+                payload.get("validation_source_binding_id") or ""
+            ).strip(),
+            validation_source_binding_hash=semantic_binding_hash,
+            validation_source_binding_semantic_hash=semantic_binding_hash,
+            validation_source_binding_content_hash=content_binding_hash,
+            validation_source_authority_hash=str(
+                payload.get("validation_source_authority_hash") or ""
+            ).strip(),
+            validation_source_authority_fingerprint=dict(
+                payload.get("validation_source_authority_fingerprint") or {}
+            ),
         )
         instance.validate()
         return instance
@@ -329,6 +460,16 @@ class ValidationInputArtifactsV1:
             "citation_manifest_hash": self.citation_manifest_hash,
             "evidence_manifest_ids": list(self.evidence_manifest_ids),
             "evidence_manifest_hashes": list(self.evidence_manifest_hashes),
+            "validation_source_binding_id": self.validation_source_binding_id,
+            "validation_source_binding_hash": self.validation_source_binding_hash
+            or self.validation_source_binding_semantic_hash,
+            "validation_source_binding_semantic_hash": self.validation_source_binding_semantic_hash
+            or self.validation_source_binding_hash,
+            "validation_source_binding_content_hash": self.validation_source_binding_content_hash,
+            "validation_source_authority_hash": self.validation_source_authority_hash,
+            "validation_source_authority_fingerprint": dict(
+                self.validation_source_authority_fingerprint
+            ),
         }
 
 

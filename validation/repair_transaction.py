@@ -1775,7 +1775,6 @@ class RepairTransactionService:
             current_set,
             prepared_promotion_record=promotion_record,
         )
-        pointer_records = {"current_artifact_set": current_set_pointer_record}
         pointer_ids = {
             "current_artifact_set": current_set_pointer_record.artifact_id,
             "current_artifact_set_id": current_set.set_id,

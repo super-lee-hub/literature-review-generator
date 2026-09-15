@@ -269,8 +269,12 @@ def pytest_terminal_summary(terminalreporter):
 
 
 def pytest_sessionfinish(session, exitstatus):
-    if (
-        _UNEXPECTED_SKIPS
-        and os.environ.get("AUTO_GENERATE_FAIL_ON_UNEXPECTED_SKIP", "1") == "1"
-    ):
+    if _UNEXPECTED_SKIPS:
+        terminalreporter = session.config.pluginmanager.get_plugin("terminalreporter")
+        if terminalreporter is not None:
+            terminalreporter.write_line(
+                "unexpected required-test skips: "
+                + ", ".join(sorted(set(_UNEXPECTED_SKIPS)))
+            )
+    if _UNEXPECTED_SKIPS and os.environ.get("AUTO_GENERATE_FAIL_ON_UNEXPECTED_SKIP", "1") == "1":
         session.exitstatus = pytest.ExitCode.TESTS_FAILED

@@ -127,6 +127,31 @@ def test_checkpoint_identity_uses_canonical_key_not_manifest_alias(tmp_path):
     assert key.canonical_paper_key == "paper-a"
 
 
+def test_checkpoint_identity_includes_source_authority_hash(tmp_path):
+    baseline_validator = _validator(ValidationEdgeCheckpointStore(tmp_path / "edges"))
+    authority_validator = ReviewValidator(
+        {"content": {"sections": []}},
+        _manifest(1),
+        [_paper()],
+        edge_checkpoint_store=ValidationEdgeCheckpointStore(tmp_path / "authority-edges"),
+        validation_source_authority_hash="a" * 64,
+    )
+    claim_unit = _manifest(1)["citation_sets"][0]["claim_units"][0]
+    kwargs = {
+        "claim_unit": claim_unit,
+        "paper_id": "alias-a",
+        "paper_artifact": _paper(),
+        "retrieval_queries": [claim_unit["claim_text"]],
+        "segment_coverages": [],
+    }
+
+    baseline = baseline_validator._edge_key(**kwargs)
+    bound = authority_validator._edge_key(**kwargs)
+
+    assert bound.validation_source_authority_hash == "a" * 64
+    assert bound.checkpoint_key != baseline.checkpoint_key
+
+
 @pytest.mark.parametrize(
     ("field_name", "replacement"),
     [

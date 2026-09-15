@@ -885,7 +885,7 @@ class Stage1VisualArtifactBuilder:
         reasons: List[str] = []
         total = len(pages)
         scanned_pages = sum(1 for item in pages if bool(item.get("scanned_candidate")))
-        low_quality_pages = sum(1 for item in pages if bool(item.get("low_quality")))
+        sum(1 for item in pages if bool(item.get("low_quality")))
         low_quality_text_only_pages = sum(
             1
             for item in pages
@@ -965,7 +965,7 @@ class Stage1VisualArtifactBuilder:
                 continue
             text = str(item.get("text") or "")
             image_count = int(item.get("image_count", 0) or 0)
-            cue_hits = _count_keyword_hits(text)
+            _count_keyword_hits(text)
             layout_hits = _count_cues(text, _PAGE_LAYOUT_CUES)
             figure_caption_hits = len(_FIGURE_CAPTION_RE.findall(text))
             score = float(min(image_count, 4) * 1.5 + layout_hits * 3.0 + figure_caption_hits * 2.0)
@@ -1163,7 +1163,7 @@ class Stage1VisualArtifactBuilder:
     ) -> List[Dict[str, Any]]:
         """Find deterministic table/formula regions from text layout metadata."""
 
-        page_text_by_no = {
+        {
             int(item.get("page_number", 0) or 0): str(item.get("text") or "")
             for item in page_index
             if int(item.get("page_number", 0) or 0) > 0

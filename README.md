@@ -153,7 +153,7 @@ optional Repair + Recheck
 ### 1. 安装
 
 ```bash
-pip install -r requirements.txt
+python -m pip install --require-hashes -r requirements-py311-windows-prod.lock
 ```
 
 推荐使用独立 Python 环境。
@@ -293,7 +293,7 @@ auto-generate 想解决的不是"让 AI 替你思考"，而是把最耗时间、
 如果这是你第一次接触项目：
 
 ```bash
-pip install -r requirements.txt
+python -m pip install --require-hashes -r requirements-py311-windows-prod.lock
 python setup_wizard.py
 python launch_gui.py
 ```

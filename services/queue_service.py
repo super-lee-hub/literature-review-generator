@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import configparser
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -21,12 +22,16 @@ from services.artifact_registry import (
     ArtifactRegistry,
     PublicationFenceRejected,
     RegistryError,
+    file_sha256,
 )
+from services.durable_io import AtomicReplaceTimeoutError, atomic_replace_with_retry
 
 T = TypeVar("T")
 
 _QUEUE_PROCESS_LOCKS_GUARD = threading.Lock()
 _QUEUE_PROCESS_LOCKS: dict[str, threading.RLock] = {}
+DEFAULT_QUEUE_LOCK_TIMEOUT_SECONDS = 5.0
+DEFAULT_QUEUE_LOCK_RETRY_INTERVAL_MS = 50
 
 
 def _queue_process_lock(path: Path) -> threading.RLock:
@@ -39,8 +44,44 @@ class JobCancelledError(RuntimeError):
     pass
 
 
+class QueueError(RuntimeError):
+    """Base class for durable queue failures."""
+
+
+class QueueCorruption(QueueError):
+    """Raised when the canonical queue cannot be decoded safely."""
+
+    def __init__(self, queue_path: str | Path, quarantine_path: str | Path | None, reason: str) -> None:
+        self.queue_path = str(queue_path)
+        self.quarantine_path = str(quarantine_path or "")
+        detail = f"persistent queue is corrupt: {self.queue_path}: {reason}"
+        if self.quarantine_path:
+            detail += f"; preserved copy: {self.quarantine_path}"
+        super().__init__(detail)
+
+
+class QueueLockTimeout(QueueError):
+    """Raised when a queue file lock cannot be acquired before the deadline."""
+
+
+class QueueAtomicReplaceTimeout(QueueError):
+    """Raised when the queue file remains blocked during atomic publication."""
+
+
 class QueuePublicationRejected(PublicationFenceRejected):
     """Raised when a queue-owned canonical publication loses its lease fence."""
+
+
+class QueueActiveLeaseError(QueueError):
+    """Raised when a mutation would replace or erase a live worker claim."""
+
+
+class QueueInputDriftError(QueueError):
+    """Raised when a queued job's frozen execution inputs no longer match disk."""
+
+
+class QueueDependencyError(QueueError):
+    """Raised when the durable dependency graph is not runnable."""
 
 
 @dataclass(frozen=True)
@@ -77,6 +118,37 @@ def _safe_publication_component(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "")).strip("._") or "publication"
 
 
+def _quarantine_queue_bytes(queue_path: Path, raw_bytes: bytes, error: BaseException) -> Path | None:
+    """Preserve corrupt queue bytes without replacing the canonical file."""
+
+    quarantine_path: Path | None = None
+    try:
+        quarantine_path = queue_path.with_name(
+            f"{queue_path.name}.corrupt-{uuid.uuid4().hex}.bin"
+        )
+        with quarantine_path.open("wb") as handle:
+            handle.write(raw_bytes)
+            handle.flush()
+            os.fsync(handle.fileno())
+        diagnostic_path = quarantine_path.with_suffix(quarantine_path.suffix + ".json")
+        diagnostic_path.write_text(
+            json.dumps(
+                {
+                    "queue_path": str(queue_path),
+                    "quarantine_path": str(quarantine_path),
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        return None
+    return quarantine_path
+
+
 def _write_staged_bytes(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
@@ -85,7 +157,7 @@ def _write_staged_bytes(path: Path, payload: bytes) -> None:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp_path, path)
+        atomic_replace_with_retry(temp_path, path, timeout_seconds=5.0)
     finally:
         if os.path.exists(temp_path):
             try:
@@ -142,6 +214,9 @@ class QueueJobSpec:
     created_at: str = ""
     depends_on_job_ids: List[str] = field(default_factory=list)
     source_snapshot: Dict[str, Any] = field(default_factory=dict)
+    # The source_snapshot is a UI-facing description of what the user selected.
+    # execution_snapshot is the authoritative, content-addressed runtime input.
+    execution_snapshot: Dict[str, Any] = field(default_factory=dict)
     input_fingerprint: str = ""
     config_fingerprint: str = ""
     current_stage: str = ""
@@ -160,8 +235,11 @@ class QueueJobSpec:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "QueueJobSpec":
+        # Do not mutate decoded queue JSON while supplying schema-v1 defaults.
+        data = dict(data)
         # 处理可能不存在的字段
         data.setdefault('source_snapshot', {})
+        data.setdefault('execution_snapshot', {})
         data.setdefault('input_fingerprint', '')
         data.setdefault('config_fingerprint', '')
         data.setdefault('current_stage', '')
@@ -314,9 +392,17 @@ class InProcessQueueService:
             handle.status = "running"
             try:
                 token.check_cancelled()
+                accepts_cancel_token = True
                 try:
+                    signature = inspect.signature(func)
+                    signature.bind_partial(*args, cancel_token=token, **kwargs)
+                except (TypeError, ValueError):
+                    accepts_cancel_token = False
+                if accepts_cancel_token:
+                    # Do not catch TypeError here: it may come from inside the
+                    # callable and must never cause a second side-effecting run.
                     handle.result = func(*args, cancel_token=token, **kwargs)
-                except TypeError:
+                else:
                     handle.result = func(*args, **kwargs)
                 handle.status = "completed"
             except JobCancelledError as exc:
@@ -329,7 +415,14 @@ class InProcessQueueService:
 
 
 class PersistentQueueService:
-    def __init__(self, queue_file_path: str | Path) -> None:
+    def __init__(
+        self,
+        queue_file_path: str | Path,
+        *,
+        lock_timeout_seconds: float = DEFAULT_QUEUE_LOCK_TIMEOUT_SECONDS,
+        lock_retry_interval_ms: int = DEFAULT_QUEUE_LOCK_RETRY_INTERVAL_MS,
+        atomic_replace_timeout_seconds: float | None = None,
+    ) -> None:
         self.queue_file_path = Path(queue_file_path).expanduser().resolve()
         queue_parent = self.queue_file_path.parent
         self._canonical_output_root = (
@@ -342,6 +435,16 @@ class PersistentQueueService:
         self._runtimes: Dict[str, QueueJobRuntime] = {}
         self._revision = 0
         self._lock_path = self.queue_file_path.with_name(self.queue_file_path.name + ".lock")
+        self.lock_timeout_seconds = max(0.0, float(lock_timeout_seconds))
+        self.lock_retry_interval_ms = max(1, int(lock_retry_interval_ms))
+        self.atomic_replace_timeout_seconds = max(
+            0.0,
+            float(
+                self.lock_timeout_seconds
+                if atomic_replace_timeout_seconds is None
+                else atomic_replace_timeout_seconds
+            ),
+        )
         self._load()
 
     @contextmanager
@@ -349,8 +452,14 @@ class PersistentQueueService:
         """Hold the process and OS lock for one read/modify/write transaction."""
 
         self.queue_file_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._lock:
-            with _queue_process_lock(self._lock_path):
+        process_lock = _queue_process_lock(self._lock_path)
+        if not process_lock.acquire(timeout=self.lock_timeout_seconds):
+            raise QueueLockTimeout(
+                f"timed out acquiring in-process queue lock after {self.lock_timeout_seconds:.3f}s: "
+                f"{self._lock_path}"
+            )
+        try:
+            with self._lock:
                 with self._lock_path.open("a+b") as handle:
                     handle.seek(0, os.SEEK_END)
                     if handle.tell() == 0:
@@ -358,33 +467,52 @@ class PersistentQueueService:
                         handle.flush()
                         os.fsync(handle.fileno())
                     handle.seek(0)
+                    acquired_os_lock = False
+                    deadline = time.monotonic() + self.lock_timeout_seconds
                     if os.name == "nt":
                         import msvcrt
 
-                        acquired = False
-                        while not acquired:
+                        while not acquired_os_lock:
                             try:
                                 msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                                acquired = True
-                            except OSError:
-                                time.sleep(0.01)
+                                acquired_os_lock = True
+                            except OSError as exc:
+                                if time.monotonic() >= deadline:
+                                    raise QueueLockTimeout(
+                                        f"timed out acquiring queue lock after {self.lock_timeout_seconds:.3f}s: "
+                                        f"{self._lock_path}"
+                                    ) from exc
+                                time.sleep(self.lock_retry_interval_ms / 1000.0)
                     else:
                         import fcntl
 
-                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                        while not acquired_os_lock:
+                            try:
+                                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                acquired_os_lock = True
+                            except (BlockingIOError, OSError) as exc:
+                                if time.monotonic() >= deadline:
+                                    raise QueueLockTimeout(
+                                        f"timed out acquiring queue lock after {self.lock_timeout_seconds:.3f}s: "
+                                        f"{self._lock_path}"
+                                    ) from exc
+                                time.sleep(self.lock_retry_interval_ms / 1000.0)
                     try:
                         self._load_unlocked()
                         yield
                     finally:
-                        handle.seek(0)
-                        if os.name == "nt":
-                            import msvcrt
+                        if acquired_os_lock:
+                            handle.seek(0)
+                            if os.name == "nt":
+                                import msvcrt
 
-                            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-                        else:
-                            import fcntl
+                                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                            else:
+                                import fcntl
 
-                            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            process_lock.release()
 
     def _load(self) -> None:
         with self._store_lock():
@@ -392,8 +520,15 @@ class PersistentQueueService:
 
     def _load_unlocked(self) -> None:
         if self.queue_file_path.exists():
+            raw_bytes = self.queue_file_path.read_bytes()
             try:
-                data = json.loads(self.queue_file_path.read_text(encoding="utf-8"))
+                data = json.loads(raw_bytes.decode("utf-8"))
+                if not isinstance(data, dict):
+                    raise TypeError("queue root must be an object")
+                if not isinstance(data.get("jobs", {}), dict) or not isinstance(
+                    data.get("runtimes", {}), dict
+                ):
+                    raise TypeError("queue jobs/runtimes must be objects")
                 self._jobs = {
                     job_id: QueueJobSpec.from_dict(job_data)
                     for job_id, job_data in data.get("jobs", {}).items()
@@ -404,10 +539,9 @@ class PersistentQueueService:
                 }
                 self._revision = max(0, int(data.get("revision") or 0))
                 self._normalize_loaded_jobs()
-            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-                self._jobs = {}
-                self._runtimes = {}
-                self._revision = 0
+            except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError, OSError) as exc:
+                quarantine_path = _quarantine_queue_bytes(self.queue_file_path, raw_bytes, exc)
+                raise QueueCorruption(self.queue_file_path, quarantine_path, str(exc)) from exc
         else:
             self._jobs = {}
             self._runtimes = {}
@@ -488,6 +622,282 @@ class PersistentQueueService:
                 )
                 runtime.log_path = runtime.log_path or job.log_path
 
+    @staticmethod
+    def _snapshot_hash(payload: Mapping[str, Any]) -> str:
+        """Hash a queue-owned input receipt without depending on dict order."""
+
+        encoded = json.dumps(
+            dict(payload),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _file_snapshot(path_value: str, *, label: str) -> dict[str, str]:
+        path = Path(path_value).expanduser()
+        resolved = str(path.resolve()) if path_value else ""
+        if not resolved:
+            return {"label": label, "path": "", "status": "not_requested", "sha256": ""}
+        target = Path(resolved)
+        if not target.is_file():
+            return {"label": label, "path": resolved, "status": "missing", "sha256": ""}
+        try:
+            return {
+                "label": label,
+                "path": resolved,
+                "status": "ready",
+                "sha256": file_sha256(target),
+            }
+        except OSError:
+            return {"label": label, "path": resolved, "status": "unreadable", "sha256": ""}
+
+    def _strict_runtime_spec(self, job_spec: QueueJobSpec):
+        """Build the only runtime contract a queue worker is allowed to execute."""
+
+        # Delayed imports avoid the runtime/job_runner -> queue_service import
+        # cycle during module initialization.
+        from runtime.job_spec import RuntimeJobSpec
+
+        raw = dict(job_spec.parameters or {})
+        compatibility_flags = {
+            field_name: raw.get(field_name)
+            for field_name in (
+                "run_all",
+                "analyze_only",
+                "generate_outline",
+                "generate_review",
+                "validate_review",
+                "retry_failed",
+                "retry_review_failed",
+            )
+        }
+        if "source" in raw:
+            # GUI/CLI parity projections are intentionally retained in the
+            # durable queue record, but the structured RuntimeJobSpec parser
+            # must not receive those legacy adapter fields as unknown JSON
+            # keys.  They are never consulted for execution.
+            for compatibility_field in (
+                "source_mode",
+                "pdf_folder",
+                "zotero_report",
+                "library_path",
+                "run_all",
+                "analyze_only",
+                "generate_outline",
+                "generate_review",
+                "validate_review",
+                "retry_failed",
+                "retry_review_failed",
+            ):
+                raw.pop(compatibility_field, None)
+        raw["project_name"] = job_spec.project_name
+        raw["job_id"] = job_spec.job_id
+        raw["workspace_path"] = job_spec.workspace_path
+        raw["queue_file"] = str(self.queue_file_path)
+        runtime_spec = RuntimeJobSpec.from_mapping(raw).resolved_from(
+            self._canonical_output_root
+        )
+        if (
+            runtime_spec.summary_file
+            and runtime_spec.summary_file not in runtime_spec.summary_sources
+        ):
+            runtime_spec = replace(
+                runtime_spec,
+                summary_sources=(
+                    runtime_spec.summary_file,
+                    *runtime_spec.summary_sources,
+                ),
+            )
+        runtime_spec = replace(
+            runtime_spec,
+            project_name=job_spec.project_name,
+            job_id=job_spec.job_id,
+            workspace_path=job_spec.workspace_path,
+            queue_file=str(self.queue_file_path),
+        )
+        runtime_spec.validate()
+
+        expected_actions = {
+            "run_all": "run_all",
+            "analyze_only": "analyze",
+            "generate_outline": "generate_outline",
+            "generate_review": "generate_review",
+            "validate_review": "validate_review",
+            "retry_failed": "retry_failed",
+            "retry_review_failed": "retry_review_failed",
+        }
+        for field_name, expected_action in expected_actions.items():
+            if compatibility_flags.get(field_name) is True and runtime_spec.action != expected_action:
+                raise ValueError(
+                    "queue compatibility action flag contradicts RuntimeJobSpec.action: "
+                    f"{field_name}={runtime_spec.action!r}"
+                )
+
+        # ``job_type`` remains a display/filter field for older queue files,
+        # but it may not contradict a canonical runtime action.
+        canonical_actions = {
+            "analyze",
+            "derive_review_batch",
+            "generate_outline",
+            "generate_review",
+            "generate_section",
+            "validate_review",
+            "retry_failed",
+            "retry_review_failed",
+            "run_all",
+        }
+        if job_spec.job_type in canonical_actions and job_spec.job_type != runtime_spec.action:
+            raise ValueError(
+                "queue job_type/action mismatch: "
+                f"{job_spec.job_type!r} != {runtime_spec.action!r}"
+            )
+        return runtime_spec
+
+    def _capture_execution_snapshot(self, runtime_spec: Any) -> dict[str, Any]:
+        """Capture local, content-addressed queue inputs without provider I/O."""
+
+        from runtime.source_intake import build_source_bundle_for_request
+        from services.source_inventory import build_source_inventory
+
+        request = runtime_spec.to_job_request()
+        config_snapshot = self._file_snapshot(str(runtime_spec.config), label="config")
+        auxiliary_paths: list[tuple[str, str]] = [
+            ("free_mode_profile", str(runtime_spec.free_mode_profile or "")),
+            ("summary_file", str(runtime_spec.summary_file or "")),
+        ]
+        auxiliary_paths.extend(
+            ("summary_source", str(path)) for path in runtime_spec.summary_sources
+        )
+        auxiliary_paths.extend(
+            ("reuse_summary_file", str(path)) for path in runtime_spec.reuse_summary_files
+        )
+        auxiliary_files = [
+            self._file_snapshot(path, label=label)
+            for label, path in auxiliary_paths
+            if str(path).strip()
+        ]
+
+        source_bundle = build_source_bundle_for_request(
+            request,
+            project_name=str(runtime_spec.project_name),
+        )
+        inventory = build_source_inventory(
+            source_mode=request.source_mode,  # type: ignore[arg-type]
+            project_name=str(runtime_spec.project_name),
+            source_bundle=source_bundle,
+            pdf_root=request.pdf_folder if request.source_mode == "direct" else None,
+            zotero_report=request.zotero_report if request.source_mode == "zotero" else None,
+            zotero_root=request.library_path if request.source_mode == "zotero" else None,
+            external_summary_paths=tuple(
+                dict.fromkeys(
+                    str(path)
+                    for path in (*request.summary_sources, *request.reuse_summary_files)
+                    if str(path).strip()
+                )
+            ),
+        )
+        source_errors = [
+            diagnostic.code
+            for diagnostic in inventory.diagnostics
+            if diagnostic.severity == "error"
+        ]
+        snapshot: dict[str, Any] = {
+            "schema_version": "queue-execution-snapshot-v1",
+            "runtime_spec": runtime_spec.to_dict(),
+            "config": config_snapshot,
+            "auxiliary_files": auxiliary_files,
+            "source_inventory": inventory.to_dict(),
+            "source_inventory_fingerprint": inventory.fingerprint(),
+        }
+        valid = (
+            config_snapshot["status"] == "ready"
+            and all(item["status"] == "ready" for item in auxiliary_files)
+            and not source_errors
+        )
+        snapshot["status"] = "ready" if valid else "invalid"
+        if not valid:
+            snapshot["reason_code"] = "queue_execution_inputs_not_ready"
+        fingerprint_payload = dict(snapshot)
+        snapshot["fingerprint"] = self._snapshot_hash(fingerprint_payload)
+        return snapshot
+
+    def _freeze_execution_snapshot(self, job_spec: QueueJobSpec) -> QueueJobSpec:
+        """Bind a queued job to a strict spec plus all current local inputs."""
+
+        try:
+            runtime_spec = self._strict_runtime_spec(job_spec)
+            snapshot = self._capture_execution_snapshot(runtime_spec)
+        except Exception as exc:
+            snapshot = {
+                "schema_version": "queue-execution-snapshot-v1",
+                "status": "invalid",
+                "reason_code": f"queue_execution_input_freeze_failed:{type(exc).__name__}",
+            }
+            snapshot["fingerprint"] = self._snapshot_hash(snapshot)
+        config_snapshot = snapshot.get("config")
+        return replace(
+            job_spec,
+            execution_snapshot=snapshot,
+            input_fingerprint=str(snapshot.get("fingerprint") or ""),
+            config_fingerprint=(
+                str(config_snapshot.get("sha256") or "")
+                if isinstance(config_snapshot, Mapping)
+                else ""
+            ),
+        )
+
+    @classmethod
+    def _has_active_lease(cls, runtime: QueueJobRuntime | None) -> bool:
+        return bool(
+            runtime
+            and runtime.state in {QueueState.RUNNING, QueueState.CANCEL_REQUESTED}
+            and runtime.lease_id
+            and not cls._lease_is_expired(runtime.lease_expires_at)
+        )
+
+    def execution_runtime_spec(self, job_id: str):
+        """Return a verified frozen runtime spec or reject changed queue inputs."""
+
+        from runtime.job_spec import RuntimeJobSpec
+
+        with self._store_lock():
+            job_spec = self._jobs.get(job_id)
+            if job_spec is None:
+                raise QueueInputDriftError(f"queue job does not exist: {job_id}")
+            snapshot = dict(job_spec.execution_snapshot or {})
+
+        if snapshot.get("schema_version") != "queue-execution-snapshot-v1":
+            raise QueueInputDriftError("queue execution snapshot is missing or unsupported")
+        if snapshot.get("status") != "ready":
+            raise QueueInputDriftError(
+                str(snapshot.get("reason_code") or "queue execution inputs were not ready")
+            )
+        raw_runtime_spec = snapshot.get("runtime_spec")
+        if not isinstance(raw_runtime_spec, Mapping):
+            raise QueueInputDriftError("queue execution snapshot has no strict runtime spec")
+        try:
+            runtime_spec = RuntimeJobSpec.from_dict(raw_runtime_spec)
+            runtime_spec.validate()
+            observed = self._capture_execution_snapshot(runtime_spec)
+        except QueueInputDriftError:
+            raise
+        except Exception as exc:
+            raise QueueInputDriftError(
+                f"queue execution input verification failed: {type(exc).__name__}"
+            ) from exc
+        if observed.get("status") != "ready":
+            raise QueueInputDriftError(
+                str(observed.get("reason_code") or "queue execution inputs are no longer ready")
+            )
+        expected_fingerprint = str(snapshot.get("fingerprint") or "")
+        observed_fingerprint = str(observed.get("fingerprint") or "")
+        if not expected_fingerprint or expected_fingerprint != observed_fingerprint:
+            raise QueueInputDriftError("queue execution inputs changed after enqueue")
+        return runtime_spec
+
     def _save(self) -> None:
         """Write the already-locked in-memory snapshot atomically."""
 
@@ -500,9 +910,30 @@ class PersistentQueueService:
             "revision": self._revision,
             "last_updated": self._utc_now(),
         }
-        temp_path = self.queue_file_path.with_suffix(".tmp")
-        temp_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        temp_path.replace(self.queue_file_path)
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{self.queue_file_path.name}.",
+            suffix=".tmp",
+            dir=str(self.queue_file_path.parent),
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump(data, handle, indent=2, ensure_ascii=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                atomic_replace_with_retry(
+                    temp_name,
+                    self.queue_file_path,
+                    timeout_seconds=self.atomic_replace_timeout_seconds,
+                )
+            except AtomicReplaceTimeoutError as exc:
+                raise QueueAtomicReplaceTimeout(str(exc)) from exc
+        finally:
+            if os.path.exists(temp_name):
+                try:
+                    os.unlink(temp_name)
+                except OSError:
+                    pass
 
     @staticmethod
     def _now_datetime() -> datetime:
@@ -554,6 +985,11 @@ class PersistentQueueService:
         with self._store_lock():
             normalized = self._normalize_job_spec(job_spec)
             previous = self._jobs.get(normalized.job_id)
+            if self._has_active_lease(self._runtimes.get(normalized.job_id)):
+                raise QueueActiveLeaseError(
+                    f"cannot replace queue job with an active lease: {normalized.job_id}"
+                )
+            normalized = self._freeze_execution_snapshot(normalized)
             fingerprints_changed = bool(
                 previous is not None
                 and (
@@ -693,6 +1129,26 @@ class PersistentQueueService:
             self._save()
         return True
 
+    def fail_job(self, job_id: str, error_message: str) -> bool:
+        """Atomically transition a non-running job to FAILED with its cause."""
+        with self._store_lock():
+            runtime = self._runtimes.get(job_id)
+            if runtime is None or runtime.state not in {QueueState.PENDING, QueueState.CANCEL_REQUESTED}:
+                return False
+            if runtime.state == QueueState.CANCEL_REQUESTED or runtime.cancel_requested:
+                return False
+            runtime.state = QueueState.FAILED
+            runtime.error_message = str(error_message or "job failed")
+            runtime.completed_at = self._utc_now()
+            runtime.lease_id = ""
+            runtime.worker_id = ""
+            runtime.lease_expires_at = None
+            runtime.heartbeat_at = None
+            runtime.fence_token = ""
+            runtime.revision += 1
+            self._save()
+            return True
+
     def claim_job(
         self,
         job_id: str,
@@ -765,7 +1221,14 @@ class PersistentQueueService:
 
         with self._store_lock():
             runtime = self._runtimes.get(job_id)
-            if runtime is None or runtime.state != QueueState.RUNNING:
+            # A cancellation request keeps the same owner's lease alive until
+            # that owner reaches its cooperative checkpoint. Treating this
+            # state as lease loss strands long-running jobs in
+            # CANCEL_REQUESTED even though the worker is still alive.
+            if runtime is None or runtime.state not in {
+                QueueState.RUNNING,
+                QueueState.CANCEL_REQUESTED,
+            }:
                 return False
             if runtime.lease_id != str(lease_id) or runtime.worker_id != str(worker_id):
                 return False
@@ -1013,15 +1476,20 @@ class PersistentQueueService:
             return True
 
     def recover_expired_leases(self) -> list[str]:
-        """Move crashed workers' expired RUNNING jobs back to PENDING."""
+        """Recover expired work, or finalize a cancellation with no worker left."""
 
         recovered: list[str] = []
         with self._store_lock():
             for job_id, runtime in self._runtimes.items():
-                if runtime.state != QueueState.RUNNING or not self._lease_is_expired(runtime.lease_expires_at):
+                if runtime.state not in {QueueState.RUNNING, QueueState.CANCEL_REQUESTED} or not self._lease_is_expired(runtime.lease_expires_at):
                     continue
-                runtime.state = QueueState.PENDING
-                runtime.error_message = "worker lease expired; job available for recovery"
+                if runtime.state == QueueState.CANCEL_REQUESTED or runtime.cancel_requested:
+                    runtime.state = QueueState.CANCELLED
+                    runtime.error_message = runtime.error_message or "cancellation finalized after worker lease expired"
+                else:
+                    runtime.state = QueueState.PENDING
+                    runtime.error_message = "worker lease expired; job available for recovery"
+                runtime.completed_at = self._utc_now() if runtime.state == QueueState.CANCELLED else None
                 runtime.lease_id = ""
                 runtime.worker_id = ""
                 runtime.lease_expires_at = None
@@ -1067,6 +1535,14 @@ class PersistentQueueService:
             if job_id not in self._runtimes:
                 return False
             previous = self._runtimes[job_id]
+            if self._has_active_lease(previous):
+                return False
+            if previous.state not in {
+                QueueState.PENDING,
+                QueueState.FAILED,
+                QueueState.CANCELLED,
+            }:
+                return False
             self._runtimes[job_id] = QueueJobRuntime(
                 job_id=job_id,
                 retry_count=previous.retry_count,
@@ -1144,12 +1620,94 @@ class PersistentQueueService:
 
     def remove_job(self, job_id: str) -> bool:
         with self._store_lock():
-            if job_id in self._jobs:
-                del self._jobs[job_id]
-            if job_id in self._runtimes:
-                del self._runtimes[job_id]
+            if job_id not in self._jobs:
+                return False
+            if self._has_active_lease(self._runtimes.get(job_id)):
+                raise QueueActiveLeaseError(
+                    f"cannot remove queue job with an active lease: {job_id}"
+                )
+            del self._jobs[job_id]
+            self._runtimes.pop(job_id, None)
             self._save()
         return True
+
+    def reject_invalid_pending_dependencies(self) -> dict[str, str]:
+        """Persist terminal failures for missing/self/cyclic pending dependencies.
+
+        Queue entries may be added in any order, so missing dependencies are
+        not rejected at enqueue time.  Once a drain starts, however, there is
+        no safe reason to leave an impossible graph pending forever.
+        """
+
+        with self._store_lock():
+            invalid: dict[str, str] = {}
+            pending_ids = {
+                job_id
+                for job_id, runtime in self._runtimes.items()
+                if runtime.state == QueueState.PENDING and not runtime.cancel_requested
+            }
+            for job_id in sorted(pending_ids):
+                job = self._jobs.get(job_id)
+                if job is None:
+                    continue
+                missing = sorted(
+                    dependency
+                    for dependency in job.depends_on_job_ids
+                    if dependency not in self._jobs or dependency not in self._runtimes
+                )
+                if missing:
+                    invalid[job_id] = "missing dependency: " + ", ".join(missing)
+
+            color: dict[str, int] = {}
+            stack: list[str] = []
+
+            def visit(job_id: str) -> None:
+                color[job_id] = 1
+                stack.append(job_id)
+                job = self._jobs.get(job_id)
+                for dependency in job.depends_on_job_ids if job else ():
+                    if dependency not in pending_ids or dependency in invalid:
+                        continue
+                    state = color.get(dependency, 0)
+                    if state == 0:
+                        visit(dependency)
+                    elif state == 1:
+                        try:
+                            start = stack.index(dependency)
+                        except ValueError:
+                            start = 0
+                        cycle = stack[start:]
+                        detail = "dependency cycle: " + " -> ".join([*cycle, dependency])
+                        for member in cycle:
+                            invalid.setdefault(member, detail)
+                stack.pop()
+                color[job_id] = 2
+
+            for job_id in sorted(pending_ids):
+                if color.get(job_id, 0) == 0 and job_id not in invalid:
+                    visit(job_id)
+
+            if not invalid:
+                return {}
+            for job_id, reason in invalid.items():
+                runtime = self._runtimes.get(job_id)
+                if runtime is None or runtime.state != QueueState.PENDING:
+                    continue
+                runtime.state = QueueState.FAILED
+                runtime.error_message = reason
+                runtime.result_summary = {
+                    "status": "rejected_dependency_graph",
+                    "reason": reason,
+                }
+                runtime.completed_at = self._utc_now()
+                runtime.lease_id = ""
+                runtime.worker_id = ""
+                runtime.lease_expires_at = None
+                runtime.heartbeat_at = None
+                runtime.fence_token = ""
+                runtime.revision += 1
+            self._save()
+            return invalid
 
     def get_failed_jobs(self) -> List[QueueJobSpec]:
         return self.list_jobs_by_state(QueueState.FAILED)
@@ -1175,30 +1733,95 @@ class PersistentQueueService:
                 "runtimes": {job_id: runtime.to_dict() for job_id, runtime in self._runtimes.items()},
                 "last_updated": self._utc_now(),
             }
-            temp_path = save_path.with_suffix(".tmp")
-            temp_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-            temp_path.replace(save_path)
+            fd, temp_name = tempfile.mkstemp(
+                prefix=f".{save_path.name}.", suffix=".tmp", dir=str(save_path.parent)
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                    json.dump(data, handle, indent=2, ensure_ascii=False)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                try:
+                    atomic_replace_with_retry(
+                        temp_name,
+                        save_path,
+                        timeout_seconds=self.atomic_replace_timeout_seconds,
+                    )
+                except AtomicReplaceTimeoutError as exc:
+                    raise QueueAtomicReplaceTimeout(str(exc)) from exc
+            finally:
+                if os.path.exists(temp_name):
+                    try:
+                        os.unlink(temp_name)
+                    except OSError:
+                        pass
 
     def load_queue(self, file_path: str | Path) -> None:
         """从文件加载队列"""
         load_path = Path(file_path)
         if load_path.exists():
+            raw_bytes = load_path.read_bytes()
             try:
-                data = json.loads(load_path.read_text(encoding="utf-8"))
+                data = json.loads(raw_bytes.decode("utf-8"))
                 if not isinstance(data, dict):
                     raise ValueError("queue export must be an object")
+                if not isinstance(data.get("jobs", {}), dict) or not isinstance(
+                    data.get("runtimes", {}), dict
+                ):
+                    raise ValueError("queue export jobs/runtimes must be objects")
+                imported_jobs = {
+                    str(job_id): QueueJobSpec.from_dict(job_data)
+                    for job_id, job_data in data.get("jobs", {}).items()
+                }
+                imported_runtimes = {
+                    str(job_id): QueueJobRuntime.from_dict(runtime_data)
+                    for job_id, runtime_data in data.get("runtimes", {}).items()
+                }
+                unknown_runtime_ids = sorted(set(imported_runtimes) - set(imported_jobs))
+                if unknown_runtime_ids:
+                    raise ValueError(
+                        "queue export has runtimes without jobs: "
+                        + ", ".join(unknown_runtime_ids)
+                    )
                 with self._store_lock():
-                    # 加载任务
-                    for job_id, job_data in data.get("jobs", {}).items():
-                        self._jobs[job_id] = QueueJobSpec.from_dict(job_data)
-                    # 加载运行时信息
-                    for job_id, runtime_data in data.get("runtimes", {}).items():
-                        self._runtimes[job_id] = QueueJobRuntime.from_dict(runtime_data)
+                    collisions = sorted(
+                        job_id
+                        for job_id in imported_jobs
+                        if self._has_active_lease(self._runtimes.get(job_id))
+                    )
+                    imported_active = sorted(
+                        job_id
+                        for job_id, runtime in imported_runtimes.items()
+                        if self._has_active_lease(runtime)
+                    )
+                    if collisions or imported_active:
+                        details: list[str] = []
+                        if collisions:
+                            details.append("target active lease: " + ", ".join(collisions))
+                        if imported_active:
+                            details.append("imported active lease: " + ", ".join(imported_active))
+                        raise QueueActiveLeaseError(
+                            "cannot import queue records with active leases; " + "; ".join(details)
+                        )
+                    # Validate all incoming data before publishing any portion
+                    # of the merge.  The store lock makes this collision check
+                    # and the replacement one fenced transaction.
+                    normalized_jobs: dict[str, QueueJobSpec] = {}
+                    for job_id, imported_job in imported_jobs.items():
+                        normalized = self._normalize_job_spec(imported_job)
+                        normalized_jobs[job_id] = (
+                            normalized
+                            if normalized.execution_snapshot
+                            else self._freeze_execution_snapshot(normalized)
+                        )
+                    self._jobs.update(normalized_jobs)
+                    self._runtimes.update(imported_runtimes)
                     self._normalize_loaded_jobs()
                     # 保存到当前队列文件
                     self._save()
-            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-                pass
+            except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError, OSError) as exc:
+                quarantine_path = _quarantine_queue_bytes(load_path, raw_bytes, exc)
+                raise QueueCorruption(load_path, quarantine_path, str(exc)) from exc
 
     def reorder_jobs(self, job_ids: List[str]) -> None:
         """重排任务顺序"""
@@ -1499,7 +2122,14 @@ class QueuePublicationContext:
                 )
             manifest_staging.unlink(missing_ok=True)
         else:
-            os.replace(str(manifest_staging), str(manifest_final))
+            try:
+                atomic_replace_with_retry(
+                    manifest_staging,
+                    manifest_final,
+                    timeout_seconds=self.queue_service.atomic_replace_timeout_seconds,
+                )
+            except AtomicReplaceTimeoutError as exc:
+                raise QueuePublicationRejected(str(exc)) from exc
         return manifest_final, {
             "artifact_role": "lease_publication_manifest",
             "artifact_type": "lease_publication_manifest",
@@ -1560,7 +2190,14 @@ class QueuePublicationContext:
                 # publication-boundary-implementation: this is the one
                 # immutable byte move inside QueuePublicationContext; its
                 # target and lease evidence are registered atomically below.
-                os.replace(str(staging), str(final_path))
+                try:
+                    atomic_replace_with_retry(
+                        staging,
+                        final_path,
+                        timeout_seconds=self.queue_service.atomic_replace_timeout_seconds,
+                    )
+                except AtomicReplaceTimeoutError as exc:
+                    raise QueuePublicationRejected(str(exc)) from exc
             artifact = None
             if register_kwargs is not None:
                 if registry is None:
@@ -1938,13 +2575,11 @@ class QueueRunner:
                 dep_runtime = self.queue_service.get_job_runtime(dep_job_id)
                 # Missing dependency
                 if not dep_runtime:
-                    self.queue_service.update_job_state(job_spec.job_id, QueueState.FAILED)
-                    self.queue_service.set_job_error(job_spec.job_id, f"Dependency job {dep_job_id} not found")
+                    self.queue_service.fail_job(job_spec.job_id, f"Dependency job {dep_job_id} not found")
                     return
                 # Failed dependency → propagate failure
                 if dep_runtime.state == QueueState.FAILED:
-                    self.queue_service.update_job_state(job_spec.job_id, QueueState.FAILED)
-                    self.queue_service.set_job_error(
+                    self.queue_service.fail_job(
                         job_spec.job_id,
                         f"Dependency job {dep_job_id} failed: {dep_runtime.error_message or 'no error details'}",
                     )
@@ -1984,18 +2619,58 @@ class QueueRunner:
                 self._acknowledge_cancelled(job_spec.job_id)
                 return
             
+            # Verify the frozen input receipt after the lease claim and before
+            # any runtime/provider construction.  Mutable parameters are never
+            # consulted here: execution is driven only by the strict spec that
+            # was persisted at enqueue time.
+            self._update_job_stage(job_spec.job_id, "verifying_inputs")
+            try:
+                runtime_spec = self.queue_service.execution_runtime_spec(job_spec.job_id)
+            except QueueInputDriftError as exc:
+                reason = str(exc)
+                self._set_job_result(
+                    job_spec.job_id,
+                    {
+                        "status": "rejected_input_drift",
+                        "reason": reason,
+                        "execution_snapshot_fingerprint": str(
+                            (job_spec.execution_snapshot or {}).get("fingerprint") or ""
+                        ),
+                    },
+                )
+                self._release_job(
+                    job_spec.job_id,
+                    QueueState.FAILED,
+                    error_message=reason,
+                )
+                return
+
             # 更新当前阶段
             self._update_job_stage(job_spec.job_id, "initializing")
-            
-            # 从job_spec参数构建JobRunRequest
-            params = dict(job_spec.parameters)
-            params.setdefault("project_name", job_spec.project_name)
-            params.setdefault("job_id", job_spec.job_id)
-            params["workspace_path"] = job_spec.workspace_path
-            params["queue_file"] = str(self.queue_service.queue_file_path)
-            # Build JobRunRequest from queued parameters
+            # Validate the compatibility projection at the adapter boundary,
+            # but keep the strict RuntimeJobSpec as the sole execution input.
+            # This preserves CLI/GUI/queue contract parity without reviving
+            # legacy boolean inference as the queue authority.
             from services.job_runner import build_job_request_from_mapping
-            request = build_job_request_from_mapping(params)
+
+            compatibility_mapping = runtime_spec.to_dict()
+            compatibility_mapping.update(
+                {
+                    "source_mode": runtime_spec.source.mode,
+                    "pdf_folder": runtime_spec.source.pdf_folder,
+                    "zotero_report": runtime_spec.source.zotero_report,
+                    "library_path": runtime_spec.source.library_path,
+                    "run_all": runtime_spec.action == "run_all",
+                    "analyze_only": runtime_spec.action == "analyze",
+                    "generate_outline": runtime_spec.action == "generate_outline",
+                    "generate_review": runtime_spec.action == "generate_review",
+                    "validate_review": runtime_spec.action == "validate_review",
+                    "retry_failed": runtime_spec.action == "retry_failed",
+                    "retry_review_failed": runtime_spec.action == "retry_review_failed",
+                }
+            )
+            build_job_request_from_mapping(compatibility_mapping)
+            request = runtime_spec.to_job_request()
             progress_tracker = QueueRuntimeProgressTracker(
                 lambda snapshot, jid=job_spec.job_id: self._update_job_progress_snapshot(jid, snapshot)
             )
@@ -2038,17 +2713,33 @@ class QueueRunner:
             })
             
             job_status = str(getattr(result, "job_status", "failed") or "failed")
-            if job_status == "completed":
+            raw_exit_code = getattr(result, "exit_code", None)
+            try:
+                result_exit_code = 1 if raw_exit_code is None else int(raw_exit_code)
+            except (TypeError, ValueError):
+                result_exit_code = 1
+            result_success = bool(getattr(result, "success", False))
+            result_disposition = str(getattr(result, "job_disposition", "") or "")
+            completed = (
+                job_status == "completed"
+                and result_exit_code == 0
+                and (result_success or result_disposition in {"completed", "needs_review"})
+            )
+            result_summary = {
+                "exit_code": result_exit_code,
+                "message": str(getattr(result, "message", "") or ""),
+                "workspace_path": str(getattr(result, "workspace_path", "") or ""),
+                "job_id": str(getattr(result, "job_id", "") or ""),
+                "resume_state": str(getattr(result, "resume_state", "") or ""),
+                "job_status": job_status,
+                "success": result_success,
+                "canonical_ready": bool(getattr(result, "canonical_ready", result_success)),
+                "requires_attention": bool(getattr(result, "requires_attention", not result_success)),
+            }
+            if completed:
                 # Persist the result while the producing worker still owns
                 # the lease; a reclaimed worker must not publish a late
                 # result after the terminal transition.
-                result_summary = {
-                    "exit_code": result.exit_code,
-                    "message": result.message,
-                    "workspace_path": result.workspace_path,
-                    "job_id": result.job_id,
-                    "resume_state": result.resume_state,
-                }
                 if not self._set_job_result(job_spec.job_id, result_summary):
                     raise RuntimeError(f"queue lease lost before result publication for {job_spec.job_id}")
                 # 更新任务状态为完成
@@ -2058,12 +2749,19 @@ class QueueRunner:
                 # Queue lifecycle follows canonical execution status.  The
                 # legacy success projection describes canonical readiness.
                 if job_status == "cancelled":
+                    self._set_job_result(job_spec.job_id, result_summary)
                     self._release_job(job_spec.job_id, QueueState.CANCELLED)
                 else:
+                    self._set_job_result(job_spec.job_id, result_summary)
+                    failure_summary = str(
+                        getattr(result, "failure_summary", "")
+                        or getattr(result, "message", "")
+                        or "runtime execution did not complete successfully"
+                    )
                     self._release_job(
                         job_spec.job_id,
                         QueueState.FAILED,
-                        error_message=str(getattr(result, "message", "") or ""),
+                        error_message=failure_summary,
                     )
         except JobCancelledError:
             self._acknowledge_cancelled(job_spec.job_id)
@@ -2198,6 +2896,7 @@ class QueueRunner:
 
         try:
             self.queue_service.recover_expired_leases()
+            self.queue_service.reject_invalid_pending_dependencies()
             processed_ids: set = set()
             max_passes = len(self.queue_service.list_jobs()) * 2 + 10  # safety bound
             passes = 0
@@ -2208,6 +2907,7 @@ class QueueRunner:
                         break
 
                 # 获取待处理的任务
+                self.queue_service.reject_invalid_pending_dependencies()
                 pending_jobs = self.queue_service.list_jobs_by_state(QueueState.PENDING)
                 active_jobs = [j for j in pending_jobs if j.job_id not in processed_ids]
 
@@ -2281,8 +2981,16 @@ class QueueRunner:
             return False
         
         # 重置任务状态
-        self.queue_service.reset_job(job_id)
+        if not self.queue_service.reset_job(job_id):
+            return False
         self.queue_service.clear_cancel_request(job_id)
         self._clear_external_cancel(job)
+        self.queue_service.reject_invalid_pending_dependencies()
+        runtime = self.queue_service.get_job_runtime(job_id)
+        if runtime is None or runtime.state != QueueState.PENDING:
+            # The selected job was durably rejected (for example, a missing
+            # dependency or a cycle).  It was handled even though no runtime
+            # worker was started.
+            return True
         self._process_job(job)
         return True

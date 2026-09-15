@@ -18,6 +18,27 @@ validated by `services.settings`.
 - `[Multimodal]` is read once for migration warning compatibility and is no
   longer written or used as a second API-key authority.
 
+## MinerU Configuration Admission
+
+MinerU route settings are resolved once from the process environment, the
+adjacent `.env`, and `[Preprocess]`. When more than one meaningful source is
+present, the values must agree. A conflicting `MINERU_API_TOKEN`,
+`MINERU_BASE_URL`, upload route, resource limit, or fallback policy fails
+before document upload; diagnostics name sources and fields but never reveal a
+value.
+
+The current parser values are strict:
+
+- `parser_mode = local|hybrid|remote_first|remote`
+- `primary_parser = local|mineru_remote`
+- `fallback_parser = none|local|mineru_remote`
+
+`reviewctl doctor` and `reviewctl preflight` remain zero-network checks. When
+the selected parser requests MinerU, they report whether remote parsing was
+requested, whether a token is present, and whether an allowed local fallback
+would be used. A missing or invalid remote route is a failure when fallback is
+disabled and a warning when a local fallback is explicitly permitted.
+
 ## Stage 1 Input
 
 `[Stage1_Input]` controls the evidence path:

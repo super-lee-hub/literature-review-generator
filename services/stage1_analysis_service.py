@@ -9,29 +9,39 @@ runtime, and only a substantive canonical summary is returned to the runtime
 checkpoint.
 """
 
-from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 import logging
-from pathlib import Path
+import os
 import re
-from typing import Any, Callable, Mapping, Sequence, cast
+import shutil
+import tempfile
+import uuid
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence, cast
 
-from preprocess.service import PreprocessManager
-from preprocess.visual_artifacts import Stage1VisualArtifactBuilder
 from models import APIConfig
+from preprocess.service import MineruRemoteBudget, PreprocessManager
+from preprocess.visual_artifacts import Stage1VisualArtifactBuilder
+from runtime.provider_receipt_closure import (
+    ExpectedProviderCall,
+    ProviderReceiptClosure,
+)
 from runtime.provider_runtime import (
-    ProviderBudgetV1,
     ProviderBudgetExceeded,
+    ProviderBudgetV1,
+    ProviderCallReceiptV1,
     ProviderRuntime,
     ProviderRuntimeLedger,
+    PROVIDER_RECEIPT_ARTIFACT_VERSION,
     _redact_mapping,
-    compute_closure_epoch_id,
     canonical_provider_request_payload,
+    compute_closure_epoch_id,
     hash_json,
     hash_text,
 )
-from runtime.provider_receipt_closure import ExpectedProviderCall, ProviderReceiptClosure
 from runtime.stage_contracts import PaperWorkItem, SourceBundle
 from services.artifact_registry import (
     ArtifactDependencyRefV2,
@@ -40,57 +50,65 @@ from services.artifact_registry import (
     RegistryError,
     file_sha256,
 )
+from services.config_values import parse_strict_bool
+from services.durable_io import atomic_replace_with_retry
 from services.evidence_manifest import build_evidence_manifest_v1
 from services.job_workspace import (
     JobWorkspace,
     atomic_write_json,
+    is_reparse_path,
     publish_bytes_artifact,
     publish_json_artifact,
     utc_now_iso,
 )
+from services.multimodal_capability import detect_multimodal_capability
+from services.prompt_registry import PromptRegistry
 from services.settings import ApplicationSettings
 from services.stage1_input_builder import Stage1InputBuilder
-from services.stage1_input_completeness import build_completeness_metrics, has_blocking_stage1_reason
+from services.stage1_input_completeness import (
+    build_completeness_metrics,
+    has_blocking_stage1_reason,
+)
 from services.stage1_output_budget import (
     stage1_output_budget_sequence,
     stage1_output_budget_snapshot,
     stage1_request_timeout_seconds,
     stage1_semantic_retry_max_attempts,
 )
-from services.stage1_visual_schema import VISUAL_EVIDENCE_KINDS
-from services.prompt_registry import PromptRegistry
+from services.stage1_reuse import (
+    STAGE1_REUSE_POLICY,
+    Stage1ReusableSummaryBindingV1,
+    Stage1ReusableSummaryManifestV1,
+    Stage1ReuseEligibilityV1,
+    Stage1VisualEvidenceQualificationV1,
+    build_binding_hash,
+    evaluate_stage1_reuse,
+    verify_stage1_typed_manifest_authority,
+)
+from services.stage1_visual_contract import SELECTIVE_VISUAL_CONTRACT_VERSION
 from services.stage1_visual_scan import (
-    VisualScanBatch,
     VISUAL_EVIDENCE_ARTIFACT_TYPE,
     VISUAL_EVIDENCE_VERSION,
     VISUAL_EXTRACT_PROMPT_ID,
     VISUAL_OBSERVATIONS_VERSION,
     VISUAL_SCAN_PROMPT_ID,
+    VisualScanBatch,
     build_visual_extract_prompt,
     build_visual_scan_prompt,
     build_visual_scan_user_content,
     estimate_encoded_image_bytes,
     normalize_visual_byte_budgets,
+    select_final_visual_refs_after_scan,
     summarize_raw_reinspection_groups,
     validate_current_visual_observations_v2,
     validate_selected_visual_evidence_v3,
-    select_final_visual_refs_after_scan,
 )
-from services.config_values import parse_strict_bool
-from services.multimodal_capability import detect_multimodal_capability
-from services.stage1_visual_contract import SELECTIVE_VISUAL_CONTRACT_VERSION
-from services.stage1_reuse import (
-    STAGE1_REUSE_POLICY,
-    Stage1ReusableSummaryBindingV1,
-    Stage1ReusableSummaryManifestV1,
-    Stage1VisualEvidenceQualificationV1,
-    Stage1ReuseEligibilityV1,
-    build_binding_hash,
-    evaluate_stage1_reuse,
-    verify_stage1_typed_manifest_authority,
+from services.stage1_visual_schema import VISUAL_EVIDENCE_KINDS
+from summary_schema import (
+    build_summary_schema_contract,
+    is_canonical_ai_summary,
+    normalize_ai_summary,
 )
-from summary_schema import build_summary_schema_contract, is_canonical_ai_summary, normalize_ai_summary
-
 
 ReaderCallable = Callable[..., Mapping[str, Any]]
 
@@ -100,6 +118,10 @@ _PLACEHOLDER_RE = re.compile(
     re.IGNORECASE,
 )
 _PAGE_MARKER_ONLY_RE = re.compile(r"(?m)^\s*(?:--- Page \d+ ---|## Page \d+)\s*$")
+_STAGE1_GENERATION_LEASE_CLEANUP_ARTIFACT_TYPE = (
+    "stage1_generation_lease_cleanup_failure"
+)
+_STAGE1_GENERATION_LEASE_CLEANUP_ARTIFACT_VERSION = "v1"
 
 
 def _has_substantive_stage1_text(value: Any) -> bool:
@@ -136,6 +158,37 @@ class _PreparedStage1Item:
     visual_bundle: dict[str, Any]
     reuse_eligibility: Stage1ReuseEligibilityV1 | None = None
     current_binding: Stage1ReusableSummaryBindingV1 = Stage1ReusableSummaryBindingV1()
+    predeclared_preprocess_authority: "_PredeclaredPreprocessAuthority | None" = None
+    mineru_receipt_record: ArtifactRecord | None = None
+
+
+@dataclass(frozen=True)
+class _PredeclaredPreprocessAuthority:
+    """Small, job-owned pointer set reused after expected-call declaration.
+
+    The declaration pass may need every paper's extracted input to freeze the
+    provider graph. Keeping the full input in memory defeats that purpose, so
+    only immutable snapshot paths and the Registry evidence record survive to
+    the JIT pass.
+    """
+
+    preprocess_metadata: Mapping[str, Any]
+    evidence_record: ArtifactRecord
+
+
+@dataclass(frozen=True)
+class _Stage1ItemDeclaration:
+    """Lightweight predeclaration retained while the provider graph is frozen."""
+
+    item: PaperWorkItem
+    previous: dict[str, Any] | None
+    current_binding: Stage1ReusableSummaryBindingV1
+    current_binding_hash: str
+    reuse_eligibility: Stage1ReuseEligibilityV1 | None
+    primary_config: dict[str, Any]
+    backup_config: dict[str, Any]
+    stage1_input_settings: dict[str, Any]
+    predeclared_preprocess_authority: _PredeclaredPreprocessAuthority | None = None
 
 
 class Stage1AnalysisService:
@@ -160,6 +213,12 @@ class Stage1AnalysisService:
         self.attempt_id = str(attempt_id or "stage1")
         self.workspace = workspace
         self.registry = artifact_registry
+        # ConfigDict carries this provenance bit outside its mapping payload.
+        # Preserve it before making the defensive mapping copy below so the
+        # preprocess manager cannot later fall back to ambient process values.
+        self._preprocess_environment_resolved = bool(
+            getattr(config, "preprocess_environment_resolved", False)
+        )
         self.config = {
             str(section): dict(values) if isinstance(values, Mapping) else values
             for section, values in config.items()
@@ -205,6 +264,9 @@ class Stage1AnalysisService:
         self._final_source_manifests: dict[str, ArtifactRecord] = {}
         self._visual_observation_records: dict[str, list[ArtifactRecord]] = {}
         self._visual_coverage_records: dict[str, ArtifactRecord] = {}
+        self._mineru_budget = MineruRemoteBudget()
+        self._mineru_receipt_records: dict[str, ArtifactRecord] = {}
+        self._mineru_receipt_payloads: dict[str, dict[str, Any]] = {}
 
     def run(
         self,
@@ -219,31 +281,59 @@ class Stage1AnalysisService:
         reused_count = 0
         generated_count = 0
 
-        # Preprocess and bind every work item before the first provider call.
-        # The expected graph is therefore independent of whichever item or
-        # retry happens to execute first.
-        prepared = [
-            self._prepare_item(item, existing.get(self._paper_key(item)))
-            for item in bundle.paper_work_items
-        ]
-        self._predeclare_expected_calls(bundle, prepared)
-        prepared = [
-            replace(item, current_binding=self._bind_execution_provenance(item.current_binding))
-            for item in prepared
-        ]
-        for item in prepared:
+        # Freeze the complete expected graph before any provider transport,
+        # while retaining only lightweight declarations.  Each heavy
+        # ``_PreparedStage1Item`` produced by the generator is released as
+        # soon as its call identities have been projected into the graph.
+        declarations = self._predeclare_expected_calls(
+            bundle,
+            (
+                self._prepare_item(item, existing.get(self._paper_key(item)))
+                for item in bundle.paper_work_items
+            ),
+        )
+        declarations = tuple(
+            replace(
+                declaration,
+                current_binding=self._bind_execution_provenance(declaration.current_binding),
+            )
+            for declaration in declarations
+        )
+        for declaration in declarations:
             self._check_cancelled()
-            summary, receipt_ids = self._execute_prepared(item)
+            # Reuse adjudication already happened during predeclaration.  The
+            # JIT pass rebuilds the provider input from the immutable
+            # job-owned preprocess snapshot, rather than rerunning an expensive
+            # parser under force_rebuild. It then restores the frozen reuse
+            # adjudication before the provider/reuse executor runs.
+            prepared = self._prepare_item(
+                declaration.item,
+                None,
+                predeclared_preprocess_authority=(
+                    declaration.predeclared_preprocess_authority
+                ),
+            )
+            prepared = replace(
+                prepared,
+                previous=declaration.previous,
+                reuse_eligibility=declaration.reuse_eligibility,
+            )
+            self._assert_jit_declaration_matches(declaration, prepared)
+            prepared = replace(
+                prepared,
+                current_binding=self._bind_execution_provenance(prepared.current_binding),
+            )
+            summary, receipt_ids = self._execute_prepared(prepared)
             summaries.append(summary)
-            paper_key = self._paper_key(item.item)
+            paper_key = self._paper_key(prepared.item)
             preprocess = summary.get("preprocess") if isinstance(summary, Mapping) else None
-            preprocess = preprocess if isinstance(preprocess, Mapping) else item.preprocess_metadata
+            preprocess = preprocess if isinstance(preprocess, Mapping) else prepared.preprocess_metadata
             source_items.append(
                 {
                     "canonical_paper_key": paper_key,
-                    "source_paper_id": item.item.source_paper_id,
-                    "source_pdf": item.item.source_pdf,
-                    "disposition": "reused" if item.previous is not None else "provider_generated",
+                    "source_paper_id": prepared.item.source_paper_id,
+                    "source_pdf": prepared.item.source_pdf,
+                    "disposition": "reused" if prepared.previous is not None else "provider_generated",
                     "provider_receipt_ids": list(receipt_ids),
                     "reuse_evidence_id": str(
                         (summary.get("reuse_metadata") or {}).get("reuse_evidence_id") or ""
@@ -254,10 +344,15 @@ class Stage1AnalysisService:
                     "evidence_manifest_hash": str(preprocess.get("evidence_manifest_hash") or ""),
                 }
             )
-            if item.previous is not None:
+            if prepared.previous is not None:
                 reused_count += 1
             else:
                 generated_count += 1
+
+            # Drop references to large prompt/content structures before the
+            # next paper is materialized.  The loop variable is rebound on the
+            # next iteration and declarations contain no heavy inputs.
+            del prepared
 
         if len(summaries) != len(bundle.paper_work_items):
             raise RuntimeError("Stage 1 did not produce one result for every source work item")
@@ -328,61 +423,49 @@ class Stage1AnalysisService:
         self,
         item: PaperWorkItem,
         previous: dict[str, Any] | None,
+        *,
+        predeclared_preprocess_authority: _PredeclaredPreprocessAuthority | None = None,
     ) -> _PreparedStage1Item:
         source_pdf = str(item.source_pdf or "").strip()
         if not source_pdf or not Path(source_pdf).is_file():
             raise RuntimeError(
                 f"Stage 1 source PDF is missing for {self._paper_key(item)}: {source_pdf or '<empty>'}"
             )
-        preprocess = self._preprocess(
-            source_pdf,
-            source_role=str(item.paper_info.get("source_attachment_role") or ""),
-        )
-        preprocess_metadata = self._preprocess_metadata(preprocess)
-        evidence_manifest = build_evidence_manifest_v1(
-            job_id=self.job_id,
-            canonical_paper_key=item.canonical_paper_key,
-            preprocess=preprocess_metadata,
-        )
-        existing_evidence = self.registry.get(
-            f"evidence_manifest:{item.canonical_paper_key}"
-        )
-        if existing_evidence is not None and existing_evidence.status == "ready":
-            try:
-                existing_payload = json.loads(
-                    Path(existing_evidence.path).read_text(encoding="utf-8")
+        if predeclared_preprocess_authority is None:
+            with self._preprocess(
+                source_pdf,
+                paper_key=item.canonical_paper_key,
+                source_role=str(item.paper_info.get("source_attachment_role") or ""),
+            ) as preprocess:
+                preprocess_metadata, evidence_record = self._publish_preprocess_evidence(
+                    item=item,
+                    preprocess=preprocess,
+                    preserve_existing_created_at=True,
                 )
-                if (
-                    isinstance(existing_payload, Mapping)
-                    and str(existing_payload.get("created_at") or "")
-                    and hash_json(existing_payload.get("artifacts") or [])
-                    == hash_json(
-                        [item.to_dict() for item in evidence_manifest.artifacts]
-                    )
-                ):
-                    evidence_manifest = replace(
-                        evidence_manifest,
-                        created_at=str(existing_payload["created_at"]),
-                    )
-            except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
-                pass
-        evidence_manifest_path = self.workspace.artifact_path(
-            "evidence_manifests/"
-            f"{hashlib.sha256(item.canonical_paper_key.encode('utf-8')).hexdigest()[:24]}_v1.json"
-        )
-        evidence_record = publish_json_artifact(
-            self.publication_context,
-            self.registry,
-            evidence_manifest_path,
-            evidence_manifest.to_dict(),
-            artifact_role="evidence_manifest",
-            artifact_type="evidence_manifest",
-            artifact_version="v1",
-            producer="services.stage1_analysis_service.Stage1AnalysisService",
-            artifact_id=f"evidence_manifest:{item.canonical_paper_key}",
-        )
-        preprocess_metadata["evidence_manifest_path"] = evidence_record.path
-        preprocess_metadata["evidence_manifest_hash"] = evidence_record.content_hash
+            self._publish_ocr_artifacts(
+                paper_key=item.canonical_paper_key,
+                preprocess_metadata=preprocess_metadata,
+                evidence_record=evidence_record,
+            )
+            mineru_receipt_record = self._publish_mineru_receipt_artifact(
+                item=item,
+                preprocess_metadata=preprocess_metadata,
+                evidence_record=evidence_record,
+            )
+            authority = self._compact_predeclared_preprocess_authority(
+                item=item,
+                preprocess_metadata=preprocess_metadata,
+                evidence_record=evidence_record,
+            )
+        else:
+            preprocess_metadata, evidence_record = self._hydrate_predeclared_preprocess_authority(
+                item=item,
+                authority=predeclared_preprocess_authority,
+            )
+            authority = predeclared_preprocess_authority
+            mineru_receipt_record = self._mineru_receipt_records.get(
+                self._mineru_call_id(item)
+            )
         visual_bundle = self._build_visual_bundle(item, preprocess_metadata)
         stage1_settings = dict(self.settings.section("Stage1_Input"))
         if not stage1_settings:
@@ -394,7 +477,7 @@ class Stage1AnalysisService:
         primary_config = dict(self.settings.section("Primary_Reader_API"))
         built_input = Stage1InputBuilder(logger=self.logger).build(
             prompt_template=self._prompt_template(),
-            paper_text=preprocess.stage1_input_text,
+            paper_text=str(preprocess_metadata.get("stage1_input_text") or ""),
             reader_api_config=primary_config,
             visual_bundle=visual_bundle,
             pdf_path=source_pdf,
@@ -433,7 +516,391 @@ class Stage1AnalysisService:
             visual_bundle=dict(visual_bundle),
             reuse_eligibility=reuse_eligibility,
             current_binding=current_binding,
+            predeclared_preprocess_authority=authority,
+            mineru_receipt_record=mineru_receipt_record,
         )
+
+    @staticmethod
+    def _compact_predeclared_preprocess_authority(
+        *,
+        item: PaperWorkItem,
+        preprocess_metadata: Mapping[str, Any],
+        evidence_record: ArtifactRecord,
+    ) -> _PredeclaredPreprocessAuthority:
+        """Drop large text/index values after they have frozen the call graph."""
+
+        compact = {
+            str(key): value
+            for key, value in preprocess_metadata.items()
+            if str(key)
+            not in {
+                "markdown_text",
+                "plain_text",
+                "stage1_input_text",
+                "page_index",
+                "page_diagnostics",
+            }
+        }
+        compact["canonical_paper_key"] = str(item.canonical_paper_key)
+        compact["source_pdf_sha256"] = file_sha256(str(item.source_pdf))
+        return _PredeclaredPreprocessAuthority(
+            preprocess_metadata=compact,
+            evidence_record=evidence_record,
+        )
+
+    def _hydrate_predeclared_preprocess_authority(
+        self,
+        *,
+        item: PaperWorkItem,
+        authority: _PredeclaredPreprocessAuthority,
+    ) -> tuple[dict[str, Any], ArtifactRecord]:
+        """Reload only the immutable snapshot inputs needed for JIT materialization."""
+
+        metadata = dict(authority.preprocess_metadata)
+        if str(metadata.get("canonical_paper_key") or "") != str(
+            item.canonical_paper_key
+        ):
+            raise RuntimeError("Stage 1 predeclared preprocess authority paper key changed")
+        if str(metadata.get("source_pdf_sha256") or "") != file_sha256(
+            str(item.source_pdf)
+        ):
+            raise RuntimeError("Stage 1 predeclared preprocess authority source hash changed")
+        evidence = authority.evidence_record
+        current_evidence = self.registry.get(evidence.artifact_id)
+        if (
+            current_evidence is None
+            or current_evidence.status != "ready"
+            or current_evidence.content_hash != evidence.content_hash
+            or not Path(current_evidence.path).is_file()
+        ):
+            raise RuntimeError("Stage 1 predeclared preprocess evidence is no longer authoritative")
+
+        text_paths = {
+            "markdown_text": "markdown_path",
+            "plain_text": "plain_text_path",
+            "stage1_input_text": "stage1_input_path",
+        }
+        for metadata_key, path_key in text_paths.items():
+            path = Path(str(metadata.get(path_key) or ""))
+            if not path.is_file():
+                raise RuntimeError(
+                    f"Stage 1 predeclared preprocess snapshot is missing {path_key}"
+                )
+            try:
+                metadata[metadata_key] = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError) as exc:
+                raise RuntimeError(
+                    f"Stage 1 predeclared preprocess snapshot cannot read {path_key}"
+                ) from exc
+
+        page_index_path = Path(str(metadata.get("page_index_path") or ""))
+        diagnostics_path = Path(str(metadata.get("diagnostics_path") or ""))
+        try:
+            page_index = json.loads(page_index_path.read_text(encoding="utf-8"))
+            diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                "Stage 1 predeclared preprocess snapshot cannot read page evidence"
+            ) from exc
+        if not isinstance(page_index, list) or not isinstance(diagnostics, Mapping):
+            raise RuntimeError("Stage 1 predeclared preprocess snapshot has invalid page evidence")
+        raw_diagnostics = diagnostics.get("page_diagnostics") or []
+        if not isinstance(raw_diagnostics, list):
+            raise RuntimeError("Stage 1 predeclared preprocess snapshot has invalid diagnostics")
+        metadata["page_index"] = page_index
+        metadata["page_diagnostics"] = [
+            dict(entry) for entry in raw_diagnostics if isinstance(entry, Mapping)
+        ]
+        return metadata, current_evidence
+
+    @staticmethod
+    def _mineru_call_id(item: PaperWorkItem) -> str:
+        return f"stage1_mineru_parse:{item.canonical_paper_key}"
+
+    def _record_mineru_receipt_snapshot(self, receipt: Mapping[str, Any]) -> None:
+        """Persist a redacted remote-parser receipt before downstream work."""
+
+        receipt_id = str(receipt.get("receipt_id") or "").strip()
+        if not re.fullmatch(r"mineru-receipt-[0-9a-f]{32}", receipt_id):
+            raise RuntimeError("MinerU receipt has an invalid durable identity")
+        atomic_write_json(
+            self.workspace.artifact_path(
+                f".publication-staging/mineru-receipts/{receipt_id}.json"
+            ),
+            dict(receipt),
+        )
+
+    def _publish_mineru_receipt_artifact(
+        self,
+        *,
+        item: PaperWorkItem,
+        preprocess_metadata: dict[str, Any],
+        evidence_record: ArtifactRecord,
+    ) -> ArtifactRecord | None:
+        """Turn a remote parse side effect into a Registry-owned Stage 1 node."""
+
+        receipt = preprocess_metadata.get("mineru_receipt")
+        if not isinstance(receipt, Mapping) or not receipt:
+            return None
+        call_id = self._mineru_call_id(item)
+        source_hash = str(receipt.get("source_pdf_sha256") or "")
+        if source_hash != file_sha256(str(item.source_pdf)):
+            raise RuntimeError("MinerU receipt source identity does not match Stage 1 input")
+        required_hashes = ("request_hash", "config_hash", "schema_hash")
+        for field_name in required_hashes:
+            value = str(receipt.get(field_name) or "")
+            if not re.fullmatch(r"[0-9a-f]{64}", value):
+                raise RuntimeError(f"MinerU receipt {field_name} is invalid")
+        status = str(receipt.get("status") or "")
+        if status not in {"remote_success", "remote_failed_fallback_local"}:
+            raise RuntimeError(
+                "Stage 1 cannot publish a non-terminal MinerU receipt as a successful parser authority"
+            )
+        try:
+            network_calls = int(receipt.get("network_calls") or 0)
+            upload_bytes = int(receipt.get("upload_bytes") or 0)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("MinerU receipt accounting is invalid") from exc
+        if network_calls < 1 or upload_bytes < 0:
+            raise RuntimeError("MinerU receipt accounting is outside its bounds")
+        budget = receipt.get("budget")
+        if not isinstance(budget, Mapping):
+            raise RuntimeError("MinerU receipt is missing its budget snapshot")
+        try:
+            max_calls = int(budget.get("max_http_calls") or 0)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("MinerU receipt HTTP-call budget is invalid") from exc
+        if max_calls < network_calls or max_calls < 1:
+            raise RuntimeError("MinerU receipt exceeds its configured HTTP-call budget")
+
+        analysis = {
+            "receipt_id": str(receipt.get("receipt_id") or ""),
+            "source_pdf_sha256": source_hash,
+            "task_id_hash": str(receipt.get("task_id_hash") or ""),
+            "remote_response_hash": str(receipt.get("response_hash") or ""),
+            "outcome": status,
+            "network_calls": network_calls,
+            "upload_bytes": upload_bytes,
+            "transport_events": list(receipt.get("transport_events") or []),
+            "budget": dict(budget),
+            "error_type": str(receipt.get("error_type") or ""),
+            "error_hash": str(receipt.get("error_hash") or ""),
+        }
+        record = publish_json_artifact(
+            self.publication_context,
+            self.registry,
+            self.workspace.artifact_path(
+                "stage1/mineru_receipts/"
+                f"{hashlib.sha256(item.canonical_paper_key.encode('utf-8')).hexdigest()[:24]}.json"
+            ),
+            {
+                "artifact_type": "mineru_remote_receipt",
+                "artifact_version": "v1",
+                "job_id": self.job_id,
+                "stage_name": "stage1_analyze",
+                "canonical_paper_key": item.canonical_paper_key,
+                "analysis": analysis,
+            },
+            artifact_role="mineru_remote_receipt",
+            artifact_type="mineru_remote_receipt",
+            artifact_version="v1",
+            producer="services.stage1_analysis_service.Stage1AnalysisService",
+            artifact_id=call_id,
+            depends_on=[ArtifactDependencyRefV2.from_record(evidence_record)],
+            metadata={"canonical_paper_key": item.canonical_paper_key},
+        )
+        preprocess_metadata.update(
+            {
+                "mineru_receipt_artifact_id": record.artifact_id,
+                "mineru_receipt_artifact_hash": record.content_hash,
+                "mineru_receipt_artifact_path": record.path,
+            }
+        )
+        self._mineru_receipt_records[call_id] = record
+        self._mineru_receipt_payloads[call_id] = {
+            **dict(receipt),
+            "analysis": analysis,
+        }
+        return record
+
+    def _mineru_expected_call(self, item: _PreparedStage1Item) -> dict[str, Any] | None:
+        record = item.mineru_receipt_record
+        call_id = self._mineru_call_id(item.item)
+        receipt = self._mineru_receipt_payloads.get(call_id)
+        if record is None or receipt is None:
+            return None
+        analysis = receipt.get("analysis")
+        budget = receipt.get("budget")
+        if not isinstance(analysis, Mapping) or not isinstance(budget, Mapping):
+            raise RuntimeError("MinerU receipt authority is incomplete")
+        return {
+            "call_id": call_id,
+            "job_id": self.job_id,
+            "attempt_id": self.attempt_id,
+            "stage_name": "stage1_analyze",
+            "node_id": f"{self._paper_key(item.item)}:mineru_parse",
+            "logical_attempt_identity": self.attempt_id,
+            "prompt_hash": str(receipt["request_hash"]),
+            "prompt_id": "mineru.remote.parse.v1",
+            "prompt_version": "v1",
+            "prompt_sha256": hash_text("mineru.remote.parse.v1"),
+            "input_hash": str(receipt["source_pdf_sha256"]),
+            "config_hash": str(receipt["config_hash"]),
+            "schema_hash": str(receipt["schema_hash"]),
+            "artifact_path": record.path,
+            "max_attempts": int(budget.get("max_http_calls") or 0),
+            "usage_required": False,
+            "provider": "mineru",
+            "model": str(self.config.get("Preprocess", {}).get("mineru_model_version") or "vlm"),
+            "endpoint": str(self.config.get("Preprocess", {}).get("mineru_base_url") or "mineru"),
+            "endpoint_type": "mineru_batch",
+            "request_variants": (
+                {
+                    "input_hash": str(receipt["source_pdf_sha256"]),
+                    "config_hash": str(receipt["config_hash"]),
+                },
+            ),
+        }
+
+    def _append_mineru_provider_receipts(self) -> None:
+        """Mirror durable parser receipts into the Stage 1 closure ledger."""
+
+        expected_by_id = {item.call_id: item for item in self.expected_calls}
+        for call_id, record in sorted(self._mineru_receipt_records.items()):
+            expected = expected_by_id.get(call_id)
+            receipt = self._mineru_receipt_payloads.get(call_id)
+            if expected is None or receipt is None:
+                continue
+            analysis = receipt.get("analysis")
+            budget = receipt.get("budget")
+            if not isinstance(analysis, Mapping) or not isinstance(budget, Mapping):
+                raise RuntimeError("MinerU closure receipt authority is incomplete")
+            existing = [
+                current
+                for current in self.receipt_ledger.list_receipts()
+                if current.call_id == call_id
+                and str(current.closure_epoch_id or "") == self.closure_epoch_id
+            ]
+            if existing:
+                continue
+            sequence = len(self.receipt_ledger.list_receipts()) + 1
+            endpoint = str(expected.endpoint or "mineru")
+            provider_receipt = ProviderCallReceiptV1(
+                artifact_type="provider_call_receipt",
+                artifact_version=PROVIDER_RECEIPT_ARTIFACT_VERSION,
+                receipt_id=f"provider-receipt-mineru-{hashlib.sha256(call_id.encode('utf-8')).hexdigest()[:24]}",
+                sequence=sequence,
+                job_id=self.job_id,
+                attempt_id=self.attempt_id,
+                stage_name="stage1_analyze",
+                route="MinerU",
+                provider="mineru",
+                model=str(expected.model or "vlm"),
+                endpoint=endpoint,
+                prompt_hash=str(receipt["request_hash"]),
+                input_hash=str(receipt["source_pdf_sha256"]),
+                config_hash=str(receipt["config_hash"]),
+                schema_hash=str(receipt["schema_hash"]),
+                status="success",
+                error_kind=None,
+                http_status=None,
+                provider_code=None,
+                attempts=max(1, int(receipt.get("network_calls") or 0)),
+                retry_after_seconds=None,
+                input_tokens=None,
+                output_tokens=None,
+                total_tokens=None,
+                response_hash=hash_json(dict(analysis)),
+                started_at=str(receipt.get("started_at") or utc_now_iso()),
+                finished_at=str(receipt.get("finished_at") or utc_now_iso()),
+                budget={
+                    "max_calls": int(budget.get("max_http_calls") or 0),
+                    "max_total_tokens": 0,
+                    "max_elapsed_seconds": self._mineru_budget.max_http_calls or 0,
+                    "max_retries_per_call": self._mineru_budget.max_http_calls or 0,
+                },
+                metadata={
+                    "transport_config": {
+                        "provider_family": "mineru",
+                        "endpoint_type": "mineru_batch",
+                        "api_base": endpoint,
+                        "model": str(expected.model or "vlm"),
+                    },
+                    "mineru_receipt_artifact_id": record.artifact_id,
+                    "mineru_receipt_artifact_hash": record.content_hash,
+                    "mineru_outcome": str(analysis.get("outcome") or ""),
+                    "task_id_hash": str(analysis.get("task_id_hash") or ""),
+                    "physical_network_calls": int(analysis.get("network_calls") or 0),
+                },
+                node_id=expected.node_id,
+                call_id=call_id,
+                closure_epoch_id=self.closure_epoch_id,
+                logical_attempt_identity=self.attempt_id,
+                endpoint_type="mineru_batch",
+                usage_status="provider_not_supported",
+                test_only=False,
+                prompt_id="mineru.remote.parse.v1",
+                prompt_version="v1",
+                prompt_sha256=hash_text("mineru.remote.parse.v1"),
+            )
+            self.receipt_ledger.append(provider_receipt)
+
+    @staticmethod
+    def _stage1_binding_identity_hash(
+        binding: Stage1ReusableSummaryBindingV1,
+    ) -> str:
+        """Hash the input binding used to prove JIT materialization parity."""
+
+        # Only immutable input semantics belong here. Evidence-manifest,
+        # Registry, receipt-closure, graph, and ``extra`` fields are execution
+        # provenance and may legitimately change when a scanned generation is
+        # rebuilt during JIT materialization.
+        identity_fields = (
+            "canonical_paper_key",
+            "source_mode",
+            "source_pdf_content_sha256",
+            "stage1_extracted_text_hash",
+            "stage1_semantic_input_hash",
+            "preprocess_contract_hash",
+            "prompt_id",
+            "prompt_version",
+            "prompt_sha256",
+            "prompt_template_hash",
+            "input_builder_policy_hash",
+            "provider",
+            "model",
+            "endpoint_type",
+            "provider_config_hash",
+            "summary_schema_hash",
+            "visual_input_manifest_hash",
+            "visual_coverage_hash",
+            "visual_scan_schema_hash",
+        )
+        payload = {
+            field_name: getattr(binding, field_name)
+            for field_name in identity_fields
+        }
+        return hash_json(payload)
+
+    def _assert_jit_declaration_matches(
+        self,
+        declaration: _Stage1ItemDeclaration,
+        prepared: _PreparedStage1Item,
+    ) -> None:
+        current_hash = self._stage1_binding_identity_hash(prepared.current_binding)
+        if current_hash != declaration.current_binding_hash:
+            raise RuntimeError(
+                "Stage 1 JIT materialization identity mismatch for "
+                f"{self._paper_key(declaration.item)}: "
+                f"declared={declaration.current_binding_hash}, current={current_hash}"
+            )
+        declared_reuse = declaration.previous is not None
+        current_reuse = prepared.previous is not None
+        if declared_reuse != current_reuse:
+            raise RuntimeError(
+                "Stage 1 JIT reuse disposition changed after expected-call graph "
+                f"freeze for {self._paper_key(declaration.item)}"
+            )
 
     def _build_current_binding(
         self,
@@ -1165,14 +1632,55 @@ class Stage1AnalysisService:
     def _predeclare_expected_calls(
         self,
         bundle: SourceBundle,
-        prepared: Sequence[_PreparedStage1Item],
-    ) -> None:
+        prepared: Iterable[_PreparedStage1Item],
+    ) -> tuple[_Stage1ItemDeclaration, ...]:
         source_bundle_hash, runtime_spec_hash = self._ensure_durable_input_records(bundle)
         # Exact summary reuse is evidence, not provider work. The expected
         # graph contains only items that can genuinely produce a receipt.
         graph_seed: list[dict[str, Any]] = []
+        declarations: list[_Stage1ItemDeclaration] = []
+        config_facts: list[dict[str, Any]] = []
         for item in prepared:
+            config_facts.append(
+                {
+                    "primary_reader": dict(item.primary_config),
+                    "stage1_input": _redact_mapping(item.stage1_input_settings),
+                    "stage1_output_budget_plans": {
+                        "visual_scan": stage1_output_budget_snapshot(
+                            "visual_scan",
+                            item.stage1_input_settings,
+                            provider_config=item.primary_config,
+                        ),
+                        "synthesis": stage1_output_budget_snapshot(
+                            "synthesis",
+                            item.stage1_input_settings,
+                            provider_config=item.primary_config,
+                        ),
+                        "timeout_seconds": stage1_request_timeout_seconds(
+                            item.stage1_input_settings,
+                        ),
+                        "semantic_retry_max_attempts": stage1_semantic_retry_max_attempts(
+                            item.stage1_input_settings,
+                        ),
+                    },
+                }
+            )
+            declaration = _Stage1ItemDeclaration(
+                item=item.item,
+                previous=item.previous,
+                current_binding=item.current_binding,
+                current_binding_hash=self._stage1_binding_identity_hash(item.current_binding),
+                reuse_eligibility=item.reuse_eligibility,
+                primary_config=dict(item.primary_config),
+                backup_config=dict(item.backup_config),
+                stage1_input_settings=dict(item.stage1_input_settings),
+                predeclared_preprocess_authority=item.predeclared_preprocess_authority,
+            )
+            mineru_expected = self._mineru_expected_call(item)
+            if mineru_expected is not None:
+                graph_seed.append(mineru_expected)
             if item.previous is not None:
+                declarations.append(declaration)
                 continue
             paper_key = self._paper_key(item.item)
             vision_enabled = detect_multimodal_capability(item.primary_config).supports_image_input
@@ -1310,11 +1818,14 @@ class Stage1AnalysisService:
                 if scan_call_planned
                 else primary_variants[0]["input_hash"]
             )
-            backup_hash = backup_variants[0]["input_hash"]
+            backup_variants[0]["input_hash"]
             variants = []
             if primary_hash:
                 variants.extend(primary_variants)
             variants.extend(backup_variants[:1])
+            semantic_retry_limit = stage1_semantic_retry_max_attempts(
+                item.stage1_input_settings
+            )
             primary_config_hash = primary_variants[0]["config_hash"]
             graph_seed.append(
                 {
@@ -1332,11 +1843,16 @@ class Stage1AnalysisService:
                     "config_hash": primary_config_hash,
                     "schema_hash": self._schema_hash(),
                     "artifact_path": self._paper_artifact_path(item.item),
-                    "max_attempts": len(primary_variants) + 1 if primary_hash else 1,
+                    "max_attempts": (
+                        len(primary_variants) + semantic_retry_limit + 1
+                        if primary_hash
+                        else 1
+                    ),
                     "usage_required": False,
                     "request_variants": tuple(variants),
                 }
             )
+            declarations.append(declaration)
         graph_hash = hash_json({
             "identity_version": "stage1_expected_call_graph/v2",
             "job_id": self.job_id,
@@ -1357,35 +1873,16 @@ class Stage1AnalysisService:
                 for item in graph_seed
             ],
         })
-        config_hash = hash_json({
-            "primary_reader": [item.primary_config for item in prepared],
-            "stage1_input": [
-                _redact_mapping(item.stage1_input_settings)
-                for item in prepared
-            ],
-            "stage1_output_budget_plans": [
-                {
-                    "visual_scan": stage1_output_budget_snapshot(
-                        "visual_scan",
-                        item.stage1_input_settings,
-                        provider_config=item.primary_config,
-                    ),
-                    "synthesis": stage1_output_budget_snapshot(
-                        "synthesis",
-                        item.stage1_input_settings,
-                        provider_config=item.primary_config,
-                    ),
-                    "timeout_seconds": stage1_request_timeout_seconds(
-                        item.stage1_input_settings,
-                    ),
-                    "semantic_retry_max_attempts": stage1_semantic_retry_max_attempts(
-                        item.stage1_input_settings,
-                    ),
-                }
-                for item in prepared
-            ],
-            "stage": "stage1_analyze",
-        })
+        config_hash = hash_json(
+            {
+                "primary_reader": [item["primary_reader"] for item in config_facts],
+                "stage1_input": [item["stage1_input"] for item in config_facts],
+                "stage1_output_budget_plans": [
+                    item["stage1_output_budget_plans"] for item in config_facts
+                ],
+                "stage": "stage1_analyze",
+            }
+        )
         self._expected_provider_config_hash = config_hash
         epoch = compute_closure_epoch_id(
             job_id=self.job_id,
@@ -1411,8 +1908,10 @@ class Stage1AnalysisService:
             )
             for item in graph_seed
         )
+        self._append_mineru_provider_receipts()
         self.expected_call_graph_path = self.workspace.artifact_path("stage1/provider_expected_calls.json")
         self._publish_expected_call_graph()
+        return tuple(declarations)
 
     @staticmethod
     def _text_only_content(content: Any) -> Any:
@@ -1524,6 +2023,7 @@ class Stage1AnalysisService:
         output_tokens: int,
         timeout_seconds: int,
         retry_index: int,
+        semantic_retry_index: int = 0,
     ) -> dict[str, Any]:
         """Bind one stage budget/timeout to provider identity without changing route."""
 
@@ -1534,6 +2034,7 @@ class Stage1AnalysisService:
                 "stage1_output_stage": str(stage),
                 "stage1_output_budget_tokens": str(int(output_tokens)),
                 "stage1_length_retry_index": str(int(retry_index)),
+                "stage1_semantic_retry_index": str(int(semantic_retry_index)),
                 "stage1_request_timeout_seconds": str(int(timeout_seconds)),
             }
         )
@@ -1902,13 +2403,16 @@ class Stage1AnalysisService:
         primary_hash = primary_variants[0]["input_hash"]
         primary_config_hash = primary_variants[0]["config_hash"]
         request_variants = (*primary_variants, *backup_variants[:1])
+        semantic_retry_limit = stage1_semantic_retry_max_attempts(
+            prepared.stage1_input_settings
+        )
         self.expected_calls = tuple(
             replace(
                 expected,
                 input_hash=primary_hash if expected.call_id == self._synthesis_call_id(paper_key) else expected.input_hash,
                 config_hash=primary_config_hash if expected.call_id == self._synthesis_call_id(paper_key) else expected.config_hash,
                 prompt_hash=hash_text(prompt) if expected.call_id == self._synthesis_call_id(paper_key) else expected.prompt_hash,
-                max_attempts=(len(request_variants)
+                max_attempts=(len(request_variants) + semantic_retry_limit
                               if expected.call_id == self._synthesis_call_id(paper_key)
                               else expected.max_attempts),
                 request_variants=request_variants
@@ -2355,7 +2859,7 @@ class Stage1AnalysisService:
             for value in (transport_metadata.get("sent_visual_ids") or [])
             if str(value)
         ]
-        planned_visual_ids = [
+        [
             str(value)
             for value in (coverage.get("planned_visual_ids") or [])
             if str(value)
@@ -2587,8 +3091,13 @@ class Stage1AnalysisService:
                 "canonical_paper_key": item.canonical_paper_key,
                 "source_paper_id": item.source_paper_id,
                 "source_pdf": str(item.source_pdf),
+                "source_pdf_sha256": file_sha256(str(item.source_pdf)),
                 "source_mode": item.source_mode,
             },
+            "ocr_lineage": self._ocr_lineage(
+                prepared.preprocess_metadata,
+                source_pdf=str(item.source_pdf),
+            ),
             "source_mode": item.source_mode,
             "text_length": int(prepared.preprocess_metadata.get("selected_text_length") or 0),
             "processing_time": "",
@@ -2643,8 +3152,13 @@ class Stage1AnalysisService:
                 "length_retries": int(
                     provider_result.get("stage1_length_retries") or 0
                 ),
+                "schema_retries": int(
+                    provider_result.get("stage1_schema_retries") or 0
+                ),
                 "semantic_retries": int(
-                    coverage.get("semantic_retries") or 0
+                    coverage.get("semantic_retries")
+                    or provider_result.get("stage1_semantic_retries")
+                    or 0
                 ),
                 "terminal_output_tokens": int(
                     provider_result.get("stage1_terminal_output_tokens")
@@ -3295,7 +3809,7 @@ class Stage1AnalysisService:
                 ],
             }
         )
-        coverage_record = self._publish_visual_coverage(
+        self._publish_visual_coverage(
             prepared=prepared,
             coverage=coverage,
             observation_records=observation_records,
@@ -4501,7 +5015,8 @@ class Stage1AnalysisService:
                 ))
                 else None
             )
-            output_record = source_record or visual_record or paper_record
+            mineru_record = self._mineru_receipt_records.get(expected.call_id)
+            output_record = mineru_record or source_record or visual_record or paper_record
             if output_record is not None:
                 try:
                     output_is_intact = (
@@ -4588,6 +5103,9 @@ class Stage1AnalysisService:
             "reuse_evidence_count": len(reuse_records),
             "expected_provider_transport_count": len(self.expected_calls),
             "actual_provider_transport_count": len(receipts),
+            "mineru_receipt_artifact_ids": sorted(
+                record.artifact_id for record in self._mineru_receipt_records.values()
+            ),
         }
         dependency_ids = (
             "source_bundle",
@@ -4597,6 +5115,9 @@ class Stage1AnalysisService:
             *sorted(set(paper_ids)),
             *sorted(set(stable_source_ids)),
             *sorted(set(expected_output_ids)),
+            *sorted(
+                record.artifact_id for record in self._mineru_receipt_records.values()
+            ),
             *[record.artifact_id for record in reuse_records],
         )
         if self.expected_calls:
@@ -4804,33 +5325,21 @@ class Stage1AnalysisService:
                 f"Stage 1 source PDF is missing for {self._paper_key(item)}: {source_pdf or '<empty>'}"
             )
 
-        preprocess = self._preprocess(
+        with self._preprocess(
             source_pdf,
+            paper_key=item.canonical_paper_key,
             source_role=str(item.paper_info.get("source_attachment_role") or ""),
+        ) as preprocess:
+            preprocess_metadata, evidence_record = self._publish_preprocess_evidence(
+                item=item,
+                preprocess=preprocess,
+                preserve_existing_created_at=False,
+            )
+        self._publish_ocr_artifacts(
+            paper_key=item.canonical_paper_key,
+            preprocess_metadata=preprocess_metadata,
+            evidence_record=evidence_record,
         )
-        preprocess_metadata = self._preprocess_metadata(preprocess)
-        evidence_manifest = build_evidence_manifest_v1(
-            job_id=self.job_id,
-            canonical_paper_key=item.canonical_paper_key,
-            preprocess=preprocess_metadata,
-        )
-        evidence_manifest_path = self.workspace.artifact_path(
-            "evidence_manifests/"
-            f"{hashlib.sha256(item.canonical_paper_key.encode('utf-8')).hexdigest()[:24]}_v1.json"
-        )
-        evidence_record = publish_json_artifact(
-            self.publication_context,
-            self.registry,
-            evidence_manifest_path,
-            evidence_manifest.to_dict(),
-            artifact_role="evidence_manifest",
-            artifact_type="evidence_manifest",
-            artifact_version="v1",
-            producer="services.stage1_analysis_service.Stage1AnalysisService",
-            artifact_id=f"evidence_manifest:{item.canonical_paper_key}",
-        )
-        preprocess_metadata["evidence_manifest_path"] = evidence_record.path
-        preprocess_metadata["evidence_manifest_hash"] = evidence_record.content_hash
         visual_bundle = self._build_visual_bundle(item, preprocess_metadata)
         stage1_settings = dict(self.settings.section("Stage1_Input"))
         if not stage1_settings:
@@ -4859,7 +5368,11 @@ class Stage1AnalysisService:
         )
         runtime = ProviderRuntime(
             budget=ProviderBudgetV1(
-                max_calls=len(synthesis_budgets) + 1,
+                max_calls=(
+                    len(synthesis_budgets)
+                    + stage1_semantic_retry_max_attempts(stage1_settings)
+                    + 1
+                ),
                 max_retries_per_call=self.settings.runtime.node_retry_limit,
             ),
             ledger=self.receipt_ledger,
@@ -4900,7 +5413,7 @@ class Stage1AnalysisService:
         )
         legacy_retry_index = max(
             0,
-            len(provider_result.get("stage1_requested_output_budgets") or ()) - 1,
+            int(provider_result.get("stage1_length_retries") or 0),
         )
         legacy_config = self._stage1_provider_config(
             legacy_base_config,
@@ -4942,8 +5455,13 @@ class Stage1AnalysisService:
                     "canonical_paper_key": item.canonical_paper_key,
                     "source_paper_id": item.source_paper_id,
                     "source_pdf": source_pdf,
+                    "source_pdf_sha256": file_sha256(source_pdf),
                     "source_mode": item.source_mode,
                 },
+                "ocr_lineage": self._ocr_lineage(
+                    preprocess_metadata,
+                    source_pdf=source_pdf,
+                ),
                 "source_mode": item.source_mode,
                 "text_length": len(preprocess.stage1_input_text),
                 "processing_time": "",
@@ -4960,7 +5478,14 @@ class Stage1AnalysisService:
             tuple(receipt.receipt_id for receipt in runtime.receipts),
         )
 
-    def _preprocess(self, source_pdf: str, *, source_role: str = "") -> Any:
+    @contextmanager
+    def _preprocess(
+        self,
+        source_pdf: str,
+        *,
+        paper_key: str = "",
+        source_role: str = "",
+    ) -> Iterator[Any]:
         preprocess_config = {
             str(section): dict(values) if isinstance(values, Mapping) else values
             for section, values in self.config.items()
@@ -4970,31 +5495,487 @@ class Stage1AnalysisService:
             "cache_dir", self.workspace.artifact_path("preprocess_cache")
         )
         preprocess_config["Preprocess"] = preprocess_section
-        result = PreprocessManager(preprocess_config, logger=self.logger).prepare_pdf(source_pdf)
-        if result is None:
-            raise RuntimeError(f"Stage 1 preprocessing failed or was disabled for {source_pdf}")
-        reasons = list(getattr(result, "stage1_quality_reasons", []) or [])
-        scanned_primary = str(source_role or "").strip() == "SCANNED_PRIMARY"
-        if has_blocking_stage1_reason(reasons) and not scanned_primary:
-            raise RuntimeError(
-                f"Stage 1 preprocessing is incomplete for {source_pdf}: {', '.join(reasons)}"
+        manager = PreprocessManager(
+            preprocess_config,
+            logger=self.logger,
+            # A few narrow lifecycle callers construct this service with
+            # ``object.__new__`` to exercise cleanup without running the full
+            # constructor.  Keep those callers on the same safe defaults while
+            # retaining the resolved-environment and shared-budget bindings for
+            # production instances.
+            preprocess_environment_resolved=getattr(
+                self, "_preprocess_environment_resolved", False
+            ),
+            mineru_budget=getattr(self, "_mineru_budget", None),
+            mineru_receipt_sink=self._record_mineru_receipt_snapshot,
+        )
+        owner_paper_key = str(paper_key or source_pdf)
+        lease_id = (
+            f"stage1:{self.job_id}:{self.attempt_id}:{owner_paper_key}:"
+            f"{uuid.uuid4().hex}"
+        )
+        result = None
+        generation_id = ""
+        try:
+            result = manager.prepare_pdf(
+                source_pdf,
+                lease_id=lease_id,
+                lease_job_id=self.job_id,
+                lease_paper_key=owner_paper_key,
             )
-        if not str(result.stage1_input_text or "").strip():
-            fallback_text = str(result.plain_text or result.markdown_text or "").strip()
-            if fallback_text and _has_substantive_stage1_text(fallback_text):
-                result = replace(
-                    result,
-                    stage1_input_text=fallback_text,
-                    selected_text_source="plain_text_fallback",
-                    stage1_quality_level="fallback",
+            if result is None:
+                raise RuntimeError(f"Stage 1 preprocessing failed or was disabled for {source_pdf}")
+            generation_id = Path(str(result.manifest_path)).parent.name
+            reasons = list(getattr(result, "stage1_quality_reasons", []) or [])
+            scanned_primary = str(source_role or "").strip() == "SCANNED_PRIMARY"
+            visual_scan_planned = self._full_visual_scan_planned()
+            if has_blocking_stage1_reason(reasons) and not scanned_primary and not visual_scan_planned:
+                raise RuntimeError(
+                    f"Stage 1 preprocessing is incomplete for {source_pdf}: {', '.join(reasons)}"
                 )
-        if not str(result.stage1_input_text or "").strip() and not scanned_primary:
-            raise RuntimeError(f"Stage 1 preprocessing produced empty input for {source_pdf}")
-        if scanned_primary and not list(getattr(result, "page_index", []) or []):
-            raise RuntimeError(
-                f"SCANNED_PRIMARY preprocessing produced no page index for {source_pdf}"
+            if not str(result.stage1_input_text or "").strip():
+                fallback_text = str(result.plain_text or result.markdown_text or "").strip()
+                if fallback_text and _has_substantive_stage1_text(fallback_text):
+                    # The compatibility fallback changes the authoritative
+                    # Stage 1 input. Persist the same bytes that the in-memory
+                    # result exposes so the predeclaration pass and JIT
+                    # hydration hash identical text.
+                    fallback_path = str(result.stage1_input_path or "").strip()
+                    if fallback_path:
+                        PreprocessManager._write_text_durable(
+                            fallback_path,
+                            fallback_text,
+                        )
+                    result = replace(
+                        result,
+                        stage1_input_text=fallback_text,
+                        selected_text_source="plain_text_fallback",
+                        stage1_quality_level="fallback",
+                    )
+            if not str(result.stage1_input_text or "").strip() and not scanned_primary:
+                raise RuntimeError(f"Stage 1 preprocessing produced empty input for {source_pdf}")
+            if scanned_primary and not list(getattr(result, "page_index", []) or []):
+                raise RuntimeError(
+                    f"SCANNED_PRIMARY preprocessing produced no page index for {source_pdf}"
+                )
+            yield self._snapshot_preprocess_authority(
+                result,
+                paper_key=owner_paper_key,
             )
-        return result
+        except BaseException as primary_error:
+            if result is not None:
+                try:
+                    self._release_generation_lease(
+                        manager,
+                        cache_dir=str(result.cache_dir),
+                        lease_id=lease_id,
+                        generation_id=generation_id,
+                    )
+                except BaseException as cleanup_error:
+                    self._handle_generation_lease_cleanup_failure(
+                        primary_error,
+                        cleanup_error,
+                        source_pdf=source_pdf,
+                        paper_key=owner_paper_key,
+                        cache_dir=str(result.cache_dir),
+                        lease_id=lease_id,
+                        generation_id=generation_id,
+                    )
+            raise
+        else:
+            if result is not None:
+                self._release_generation_lease(
+                    manager,
+                    cache_dir=str(result.cache_dir),
+                    lease_id=lease_id,
+                    generation_id=generation_id,
+                )
+
+    def _full_visual_scan_planned(self) -> bool:
+        """Allow short text only when the configured visual gate will verify it.
+
+        Adaptive all-page scanning is a downstream completeness authority: the
+        visual executor must still prove full coverage before synthesis closes.
+        Other visual modes do not justify bypassing the text completeness gate.
+        """
+
+        settings_obj = getattr(self, "settings", None)
+        if settings_obj is not None and hasattr(settings_obj, "section"):
+            settings = settings_obj.section("Stage1_Visual")
+            input_settings = settings_obj.section("Stage1_Input")
+            primary_settings = settings_obj.section("Primary_Reader_API")
+        else:
+            raw_config = getattr(self, "config", {})
+            raw_settings = raw_config.get("Stage1_Visual", {}) if isinstance(raw_config, Mapping) else {}
+            settings = raw_settings if isinstance(raw_settings, Mapping) else {}
+            raw_input_settings = raw_config.get("Stage1_Input", {}) if isinstance(raw_config, Mapping) else {}
+            input_settings = raw_input_settings if isinstance(raw_input_settings, Mapping) else {}
+            raw_primary_settings = raw_config.get("Primary_Reader_API", {}) if isinstance(raw_config, Mapping) else {}
+            primary_settings = raw_primary_settings if isinstance(raw_primary_settings, Mapping) else {}
+        enabled = str(settings.get("enabled", "false")).strip().casefold() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        selection_mode = str(settings.get("selection_mode") or "").strip().casefold()
+        render_all = str(settings.get("render_all_nonblank_pages") or "false").strip().casefold() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        send_visuals = str(input_settings.get("send_selected_visuals", "true")).strip().casefold() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        supports_visuals = detect_multimodal_capability(primary_settings).supports_image_input
+        return (
+            enabled
+            and selection_mode == "adaptive_page_scan"
+            and render_all
+            and send_visuals
+            and supports_visuals
+        )
+
+    @staticmethod
+    def _release_generation_lease(
+        manager: Any,
+        *,
+        cache_dir: str,
+        lease_id: str,
+        generation_id: str,
+    ) -> None:
+        released = manager.release_generation_lease(
+            cache_dir,
+            lease_id=lease_id,
+            generation_id=generation_id,
+        )
+        if released != 1:
+            raise RuntimeError(
+                "Stage 1 generation lease cleanup failed: expected exactly one "
+                f"lease release, removed {released!r} for generation "
+                f"{generation_id or '<unknown>'}"
+            )
+
+    def _handle_generation_lease_cleanup_failure(
+        self,
+        primary_error: BaseException,
+        cleanup_error: BaseException,
+        *,
+        source_pdf: str,
+        paper_key: str,
+        cache_dir: str,
+        lease_id: str,
+        generation_id: str,
+    ) -> None:
+        record_path = ""
+        record_error: BaseException | None = None
+        try:
+            record_path = self._record_generation_lease_cleanup_failure(
+                source_pdf=source_pdf,
+                paper_key=paper_key,
+                cache_dir=cache_dir,
+                lease_id=lease_id,
+                generation_id=generation_id,
+                cleanup_error=cleanup_error,
+            )
+        except BaseException as persistence_error:
+            record_error = persistence_error
+
+        cleanup_summary = f"{type(cleanup_error).__name__}: {cleanup_error}"
+        note = "Stage 1 generation lease cleanup integrity failure: " + cleanup_summary
+        if record_path:
+            note += f"; durable record: {record_path}"
+        if record_error is not None:
+            note += (
+                "; durable record persistence also failed: "
+                f"{type(record_error).__name__}: {record_error}"
+            )
+        try:
+            primary_error.add_note(note)
+        except BaseException:
+            pass
+        try:
+            setattr(
+                primary_error,
+                "stage1_generation_lease_cleanup_error",
+                cleanup_error,
+            )
+        except BaseException:
+            pass
+
+    def _record_generation_lease_cleanup_failure(
+        self,
+        *,
+        source_pdf: str,
+        paper_key: str,
+        cache_dir: str,
+        lease_id: str,
+        generation_id: str,
+        cleanup_error: BaseException,
+    ) -> str:
+        failure_id = hash_json(
+            {
+                "job_id": self.job_id,
+                "attempt_id": self.attempt_id,
+                "paper_key": paper_key,
+                "lease_id": lease_id,
+                "generation_id": generation_id,
+            }
+        )[:24]
+        path = self.workspace.artifact_path(
+            "stage1/generation_lease_cleanup_failures/"
+            f"{failure_id}.json"
+        )
+        atomic_write_json(
+            path,
+            {
+                "artifact_type": _STAGE1_GENERATION_LEASE_CLEANUP_ARTIFACT_TYPE,
+                "artifact_version": _STAGE1_GENERATION_LEASE_CLEANUP_ARTIFACT_VERSION,
+                "schema_version": "stage1-generation-lease-cleanup-failure-v1",
+                "status": "integrity_blocked",
+                "job_id": self.job_id,
+                "attempt_id": self.attempt_id,
+                "stage_name": "stage1_analyze",
+                "paper_key": paper_key,
+                "source_pdf": source_pdf,
+                "cache_dir": cache_dir,
+                "lease_id": lease_id,
+                "generation_id": generation_id,
+                "cleanup_error_type": type(cleanup_error).__name__,
+                "cleanup_error": str(cleanup_error),
+                "failure_id": failure_id,
+                "recorded_at": utc_now_iso(),
+            },
+        )
+        return path
+
+    def _snapshot_preprocess_authority(self, result: Any, *, paper_key: str) -> Any:
+        """Move formal Stage 1 authority into the job-owned workspace.
+
+        The shared preprocess cache remains an acceleration layer. Registry and
+        EvidenceManifest references must survive cache generation GC, so every
+        path consumed by Stage 1 is copied into an immutable job-owned snapshot.
+        """
+
+        manifest_lexical = Path(str(result.manifest_path)).expanduser()
+        generation_root_lexical = Path(os.path.abspath(str(manifest_lexical.parent)))
+        if is_reparse_path(generation_root_lexical):
+            raise RuntimeError(
+                f"preprocess authority generation root is a reparse point: {generation_root_lexical}"
+            )
+        generation_root = generation_root_lexical.resolve()
+        generation_id = generation_root.name
+        paper_digest = hashlib.sha256(str(paper_key).encode("utf-8")).hexdigest()[:24]
+        snapshot_root = Path(
+            self.workspace.artifact_path(
+                f"source_evidence/{paper_digest}/{generation_id}"
+            )
+        ).expanduser().resolve()
+        snapshot_root.mkdir(parents=True, exist_ok=True)
+        path_fields = (
+            "markdown_path",
+            "plain_text_path",
+            "page_index_path",
+            "chunks_path",
+            "diagnostics_path",
+            "ocr_diagnostics_path",
+            "ocr_artifact_path",
+            "structured_json_path",
+            "manifest_path",
+            "stage1_input_path",
+            "stage1_input_manifest_path",
+            "stage1_quality_report_path",
+        )
+        replacements: dict[str, str] = {}
+        for field_name in path_fields:
+            raw_source = Path(str(getattr(result, field_name))).expanduser()
+            lexical_source = Path(os.path.abspath(str(raw_source)))
+            try:
+                common = os.path.commonpath(
+                    [str(generation_root_lexical), str(lexical_source)]
+                )
+            except ValueError:
+                common = ""
+            if os.path.normcase(common) != os.path.normcase(str(generation_root_lexical)):
+                raise RuntimeError(
+                    f"preprocess authority source escapes its generation: {lexical_source}"
+                )
+            current = lexical_source
+            while os.path.normcase(str(current)) != os.path.normcase(
+                str(generation_root_lexical)
+            ):
+                if current.exists() and is_reparse_path(current):
+                    raise RuntimeError(
+                        f"preprocess authority source path contains a reparse point: {current}"
+                    )
+                parent = current.parent
+                if parent == current:
+                    raise RuntimeError(
+                        f"preprocess authority source generation boundary is invalid: {lexical_source}"
+                    )
+                current = parent
+            if lexical_source.is_symlink() or is_reparse_path(lexical_source):
+                raise RuntimeError(
+                    f"preprocess authority source is a reparse leaf: {lexical_source}"
+                )
+            source = lexical_source.resolve()
+            if not source.is_file() or is_reparse_path(source):
+                raise RuntimeError(
+                    f"preprocess authority leaf is missing before snapshot: {source}"
+                )
+            relative_target = (
+                f"source_evidence/{paper_digest}/{generation_id}/{source.name}"
+            )
+            target = Path(self.workspace.artifact_path(relative_target)).expanduser().resolve()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if is_reparse_path(target) or any(
+                is_reparse_path(parent)
+                for parent in (target.parent, target.parent.parent, target.parent.parent.parent)
+                if parent.exists()
+            ):
+                raise RuntimeError(
+                    f"preprocess authority snapshot path contains a reparse point: {target}"
+                )
+            source_hash = file_sha256(str(source))
+            if target.is_file() and not is_reparse_path(target) and file_sha256(str(target)) == source_hash:
+                replacements[field_name] = str(target)
+                continue
+            descriptor, temp_name = tempfile.mkstemp(
+                prefix=f".{target.name}.",
+                suffix=".tmp",
+                dir=str(target.parent),
+            )
+            try:
+                with os.fdopen(descriptor, "wb") as handle, source.open("rb") as source_handle:
+                    shutil.copyfileobj(source_handle, handle, length=1024 * 1024)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                if file_sha256(temp_name) != source_hash:
+                    raise RuntimeError(
+                        f"preprocess authority snapshot temp hash mismatch: {source.name}"
+                    )
+                atomic_replace_with_retry(temp_name, str(target), timeout_seconds=5.0)
+                try:
+                    directory_fd = os.open(str(target.parent), os.O_RDONLY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+                except OSError:
+                    # Windows does not allow fsync on every directory handle;
+                    # file durability and atomic replacement remain mandatory.
+                    pass
+            finally:
+                try:
+                    Path(temp_name).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            if source_hash != file_sha256(str(target)):
+                raise RuntimeError(f"preprocess authority snapshot hash mismatch: {source.name}")
+            replacements[field_name] = str(target)
+        return replace(result, **replacements)
+
+    def _publish_preprocess_evidence(
+        self,
+        *,
+        item: PaperWorkItem,
+        preprocess: Any,
+        preserve_existing_created_at: bool,
+    ) -> tuple[dict[str, Any], ArtifactRecord]:
+        """Publish the Registry authority before releasing the cache lease."""
+
+        preprocess_metadata = self._preprocess_metadata(preprocess)
+        evidence_manifest = build_evidence_manifest_v1(
+            job_id=self.job_id,
+            canonical_paper_key=item.canonical_paper_key,
+            preprocess=preprocess_metadata,
+        )
+        # A second Stage 1 pass may materialize an equivalent preprocess
+        # generation under a different cache-generation directory.  Preserve
+        # the existing Registry authority when the evidence bytes are the same
+        # even though their machine-local paths differ; replacing the fixed
+        # artifact ID would make immutable summary-source dependencies point at
+        # a stale path and would incorrectly disable exact reuse.
+        existing_evidence = self.registry.get(
+            f"evidence_manifest:{item.canonical_paper_key}"
+        )
+        if existing_evidence is not None and existing_evidence.status == "ready":
+            try:
+                existing_payload = json.loads(
+                    Path(existing_evidence.path).read_text(encoding="utf-8")
+                )
+                current_signature = sorted(
+                    (artifact.artifact_type, artifact.content_hash)
+                    for artifact in evidence_manifest.artifacts
+                )
+                existing_signature = sorted(
+                    (str(artifact.get("artifact_type") or ""), str(artifact.get("content_hash") or ""))
+                    for artifact in (existing_payload.get("artifacts") or [])
+                    if isinstance(artifact, Mapping)
+                )
+                if (
+                    isinstance(existing_payload, Mapping)
+                    and existing_payload.get("job_id") == self.job_id
+                    and existing_payload.get("canonical_paper_key")
+                    == item.canonical_paper_key
+                    and existing_signature == current_signature
+                    and file_sha256(existing_evidence.path) == existing_evidence.content_hash
+                ):
+                    preprocess_metadata["evidence_manifest_path"] = existing_evidence.path
+                    preprocess_metadata["evidence_manifest_hash"] = existing_evidence.content_hash
+                    preprocess_metadata["evidence_manifest_artifact_id"] = existing_evidence.artifact_id
+                    return preprocess_metadata, existing_evidence
+            except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+                pass
+        if preserve_existing_created_at:
+            if existing_evidence is not None and existing_evidence.status == "ready":
+                try:
+                    existing_payload = json.loads(
+                        Path(existing_evidence.path).read_text(encoding="utf-8")
+                    )
+                    if (
+                        isinstance(existing_payload, Mapping)
+                        and str(existing_payload.get("created_at") or "")
+                        and hash_json(existing_payload.get("artifacts") or [])
+                        == hash_json(
+                            [entry.to_dict() for entry in evidence_manifest.artifacts]
+                        )
+                    ):
+                        evidence_manifest = replace(
+                            evidence_manifest,
+                            created_at=str(existing_payload["created_at"]),
+                        )
+                except (
+                    OSError,
+                    UnicodeError,
+                    json.JSONDecodeError,
+                    TypeError,
+                    ValueError,
+                ):
+                    pass
+        evidence_manifest_path = self.workspace.artifact_path(
+            "evidence_manifests/"
+            f"{hashlib.sha256(item.canonical_paper_key.encode('utf-8')).hexdigest()[:24]}_v1.json"
+        )
+        evidence_record = publish_json_artifact(
+            self.publication_context,
+            self.registry,
+            evidence_manifest_path,
+            evidence_manifest.to_dict(),
+            artifact_role="evidence_manifest",
+            artifact_type="evidence_manifest",
+            artifact_version="v1",
+            producer="services.stage1_analysis_service.Stage1AnalysisService",
+            artifact_id=f"evidence_manifest:{item.canonical_paper_key}",
+        )
+        preprocess_metadata["evidence_manifest_path"] = evidence_record.path
+        preprocess_metadata["evidence_manifest_hash"] = evidence_record.content_hash
+        preprocess_metadata["evidence_manifest_artifact_id"] = evidence_record.artifact_id
+        return preprocess_metadata, evidence_record
 
     def _preprocess_metadata(self, result: Any) -> dict[str, Any]:
         metadata = asdict(result)
@@ -5016,6 +5997,101 @@ class Stage1AnalysisService:
             chunk_count=int(result.chunk_count or 0),
         )
         return metadata
+
+    def _publish_ocr_artifacts(
+        self,
+        *,
+        paper_key: str,
+        preprocess_metadata: dict[str, Any],
+        evidence_record: ArtifactRecord,
+    ) -> tuple[ArtifactRecord, ArtifactRecord] | None:
+        """Publish OCR diagnostics/output as Registry-owned lineage nodes."""
+
+        diagnostics_path = Path(
+            str(preprocess_metadata.get("ocr_diagnostics_path") or "")
+        ).expanduser().resolve()
+        artifact_path = Path(
+            str(preprocess_metadata.get("ocr_artifact_path") or "")
+        ).expanduser().resolve()
+        if not diagnostics_path.is_file() or not artifact_path.is_file():
+            return None
+        try:
+            diagnostics_payload = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+            artifact_payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("preprocess OCR artifacts are not valid JSON") from exc
+        if not isinstance(diagnostics_payload, Mapping) or not isinstance(artifact_payload, Mapping):
+            raise RuntimeError("preprocess OCR artifacts must be JSON objects")
+        digest = hashlib.sha256(str(paper_key).encode("utf-8")).hexdigest()[:24]
+        diagnostics_digest = file_sha256(str(diagnostics_path))[:24]
+        artifact_digest = file_sha256(str(artifact_path))[:24]
+        dependency = ArtifactDependencyRefV2.from_record(evidence_record)
+        diagnostics_record = publish_json_artifact(
+            self.publication_context,
+            self.registry,
+            self.workspace.artifact_path(f"ocr/{digest}/diagnostics.json"),
+            diagnostics_payload,
+            artifact_role="ocr_diagnostics",
+            artifact_type="ocr_diagnostics",
+            artifact_version="v1",
+            producer="services.stage1_analysis_service.Stage1AnalysisService",
+            artifact_id=f"ocr_diagnostics:{paper_key}:{diagnostics_digest}",
+            depends_on=[dependency],
+            metadata={"canonical_paper_key": paper_key},
+        )
+        artifact_record = publish_json_artifact(
+            self.publication_context,
+            self.registry,
+            self.workspace.artifact_path(f"ocr/{digest}/artifact.json"),
+            artifact_payload,
+            artifact_role="ocr_artifact",
+            artifact_type="ocr_artifact",
+            artifact_version="v1",
+            producer="services.stage1_analysis_service.Stage1AnalysisService",
+            artifact_id=f"ocr_artifact:{paper_key}:{artifact_digest}",
+            depends_on=[dependency, ArtifactDependencyRefV2.from_record(diagnostics_record)],
+            metadata={"canonical_paper_key": paper_key},
+        )
+        preprocess_metadata.update(
+            {
+                "ocr_diagnostics_artifact_id": diagnostics_record.artifact_id,
+                "ocr_diagnostics_artifact_hash": diagnostics_record.content_hash,
+                "ocr_diagnostics_artifact_path": diagnostics_record.path,
+                "ocr_artifact_id": artifact_record.artifact_id,
+                "ocr_artifact_hash": artifact_record.content_hash,
+                "ocr_artifact_path_registered": artifact_record.path,
+            }
+        )
+        return diagnostics_record, artifact_record
+
+    @staticmethod
+    def _ocr_lineage(
+        preprocess_metadata: Mapping[str, Any],
+        *,
+        source_pdf: str,
+    ) -> dict[str, Any]:
+        source_hash = file_sha256(source_pdf)
+        stage1_input_path = str(preprocess_metadata.get("stage1_input_path") or "")
+        stage1_input_hash = file_sha256(stage1_input_path) if stage1_input_path and Path(stage1_input_path).is_file() else ""
+        diagnostics_hash = str(preprocess_metadata.get("ocr_diagnostics_artifact_hash") or "")
+        artifact_hash = str(preprocess_metadata.get("ocr_artifact_hash") or "")
+        dependency_ids = [
+            str(preprocess_metadata.get(name) or "").strip()
+            for name in (
+                "evidence_manifest_artifact_id",
+                "ocr_diagnostics_artifact_id",
+                "ocr_artifact_id",
+            )
+            if str(preprocess_metadata.get(name) or "").strip()
+        ]
+        return {
+            "source_pdf_sha256": source_hash,
+            "ocr_diagnostics_sha256": diagnostics_hash,
+            "ocr_artifact_sha256": artifact_hash,
+            "stage1_input_sha256": stage1_input_hash,
+            "registry_dependency_artifact_ids": dependency_ids,
+            "ocr_used": bool(preprocess_metadata.get("used_ocr")),
+        }
 
     def _build_visual_bundle(
         self,
@@ -5086,47 +6162,94 @@ class Stage1AnalysisService:
             "message": "primary Stage 1 reader did not run",
         }
         attempted_budgets: list[int] = []
+        length_retry_count = 0
+        schema_retry_count = 0
+        semantic_retry_count = 0
+        semantic_retry_limit = stage1_semantic_retry_max_attempts(stage1_input_settings)
         for retry_index, output_budget in enumerate(synthesis_budgets):
-            staged_primary_config = self._stage1_provider_config(
-                primary_config,
-                stage="synthesis",
-                output_tokens=output_budget,
-                timeout_seconds=request_timeout_seconds,
-                retry_index=retry_index,
-            )
-            primary_result = get_summary_from_ai_detailed(
-                built_input.prompt_text,
-                cast(APIConfig, staged_primary_config),
-                cast(APIConfig, dict(backup_config)),
-                engine_type="primary",
-                logger=self.logger,
-                config=self.config,
-                user_content=built_input.user_message_content,
-                retry_attempts=1,
-                timeout_seconds=request_timeout_seconds,
-                provider_runtime=runtime,
-                system_prompt=system_prompt,
-                normalize_summary=False,
-                max_single_image_bytes=visual_coverage.get("max_single_image_bytes"),
-                max_request_image_bytes=visual_coverage.get("max_request_image_bytes"),
-            )
-            attempted_budgets.append(output_budget)
-            if str(primary_result.get("status") or "").strip().casefold() == "success":
-                return {
-                    **dict(primary_result),
-                    "stage1_output_stage": "synthesis",
-                    "stage1_requested_output_budgets": attempted_budgets,
-                    "stage1_length_retries": max(0, len(attempted_budgets) - 1),
-                    "stage1_terminal_output_tokens": output_budget,
-                    "stage1_request_timeout_seconds": request_timeout_seconds,
-                }
-            if not self._is_length_result(primary_result) or retry_index >= len(synthesis_budgets) - 1:
-                break
-            if self.logger:
-                self.logger.warning(
-                    "Stage 1 synthesis response was truncated; escalating output budget "
-                    f"from {output_budget} to {synthesis_budgets[retry_index + 1]} tokens."
+            semantic_retry_index = 0
+            budget_retry_required = False
+            while True:
+                staged_primary_config = self._stage1_provider_config(
+                    primary_config,
+                    stage="synthesis",
+                    output_tokens=output_budget,
+                    timeout_seconds=request_timeout_seconds,
+                    retry_index=retry_index,
+                    semantic_retry_index=semantic_retry_index,
                 )
+                request_prompt = built_input.prompt_text
+                if semantic_retry_index:
+                    request_prompt = self._canonical_retry_prompt(
+                        built_input.prompt_text,
+                        str(primary_result.get("message") or "canonical validation failed"),
+                    )
+                primary_result = get_summary_from_ai_detailed(
+                    request_prompt,
+                    cast(APIConfig, staged_primary_config),
+                    cast(APIConfig, dict(backup_config)),
+                    engine_type="primary",
+                    logger=self.logger,
+                    config=self.config,
+                    user_content=built_input.user_message_content,
+                    retry_attempts=1,
+                    timeout_seconds=request_timeout_seconds,
+                    provider_runtime=runtime,
+                    system_prompt=system_prompt,
+                    normalize_summary=False,
+                    max_single_image_bytes=visual_coverage.get("max_single_image_bytes"),
+                    max_request_image_bytes=visual_coverage.get("max_request_image_bytes"),
+                )
+                attempted_budgets.append(output_budget)
+                if str(primary_result.get("status") or "").strip().casefold() == "success":
+                    try:
+                        self._canonical_substantive_summary(primary_result)
+                    except RuntimeError as exc:
+                        error_text = str(exc)
+                        primary_result = {
+                            **dict(primary_result),
+                            "status": "failed",
+                            "error_kind": "invalid_response",
+                            "message": error_text,
+                            "engine_type": "primary",
+                        }
+                        if semantic_retry_index < semantic_retry_limit:
+                            if self._is_schema_validation_error(error_text):
+                                schema_retry_count += 1
+                            else:
+                                semantic_retry_count += 1
+                            semantic_retry_index += 1
+                            if self.logger:
+                                self.logger.warning(
+                                    "Stage 1 synthesis response failed canonical validation; "
+                                    "retrying with a corrective prompt at the same output budget "
+                                    f"({semantic_retry_index}/{semantic_retry_limit})."
+                                )
+                            continue
+                    else:
+                        return {
+                            **dict(primary_result),
+                            "stage1_output_stage": "synthesis",
+                            "stage1_requested_output_budgets": attempted_budgets,
+                            "stage1_length_retries": length_retry_count,
+                            "stage1_schema_retries": schema_retry_count,
+                            "stage1_semantic_retries": semantic_retry_count,
+                            "stage1_terminal_output_tokens": output_budget,
+                            "stage1_request_timeout_seconds": request_timeout_seconds,
+                        }
+                if self._is_length_result(primary_result):
+                    if retry_index < len(synthesis_budgets) - 1:
+                        budget_retry_required = True
+                        length_retry_count += 1
+                        if self.logger:
+                            self.logger.warning(
+                                "Stage 1 synthesis response was truncated; escalating output budget "
+                                f"from {output_budget} to {synthesis_budgets[retry_index + 1]} tokens."
+                            )
+                    break
+                break
+            if not budget_retry_required:
+                break
 
         if self._is_length_result(primary_result):
             return {
@@ -5137,7 +6260,30 @@ class Stage1AnalysisService:
                 "engine_type": "primary",
                 "stage1_output_stage": "synthesis",
                 "stage1_requested_output_budgets": attempted_budgets,
-                "stage1_length_retries": max(0, len(attempted_budgets) - 1),
+                "stage1_length_retries": length_retry_count,
+                "stage1_schema_retries": schema_retry_count,
+                "stage1_semantic_retries": semantic_retry_count,
+                "stage1_terminal_output_tokens": (
+                    attempted_budgets[-1] if attempted_budgets else 0
+                ),
+                "stage1_request_timeout_seconds": request_timeout_seconds,
+            }
+
+        primary_reader_only = parse_strict_bool(
+            stage1_input_settings.get("primary_reader_only"),
+            field="Stage1_Input.primary_reader_only",
+            default=False,
+        )
+        if primary_reader_only:
+            return {
+                **dict(primary_result),
+                "engine_type": "primary",
+                "backup_fallback_disabled": True,
+                "stage1_output_stage": "synthesis",
+                "stage1_requested_output_budgets": attempted_budgets,
+                "stage1_length_retries": length_retry_count,
+                "stage1_schema_retries": schema_retry_count,
+                "stage1_semantic_retries": semantic_retry_count,
                 "stage1_terminal_output_tokens": (
                     attempted_budgets[-1] if attempted_budgets else 0
                 ),
@@ -5176,10 +6322,35 @@ class Stage1AnalysisService:
             )[:240],
             "stage1_output_stage": "synthesis",
             "stage1_requested_output_budgets": attempted_budgets,
-            "stage1_length_retries": max(0, len(attempted_budgets) - 1),
+            "stage1_length_retries": length_retry_count,
+            "stage1_schema_retries": schema_retry_count,
+            "stage1_semantic_retries": semantic_retry_count,
             "stage1_terminal_output_tokens": synthesis_budgets[0],
             "stage1_request_timeout_seconds": request_timeout_seconds,
         }
+
+    @staticmethod
+    def _is_schema_validation_error(error: str) -> bool:
+        text = str(error or "").casefold()
+        return any(
+            marker in text
+            for marker in (
+                "canonical summary schema",
+                "canonical core analysis",
+                "incomplete canonical summary",
+            )
+        )
+
+    @staticmethod
+    def _canonical_retry_prompt(prompt: str, error: str) -> str:
+        del error
+        return (
+            f"{prompt}\n\n"
+            "CORRECTIVE RETRY: The previous answer did not satisfy the required "
+            "canonical Stage 1 summary contract. Return only a complete JSON "
+            "object with substantive non-placeholder values for summary, "
+            "methodology, findings, and conclusions. Do not explain the retry."
+        )
 
     @staticmethod
     def _canonical_substantive_summary(provider_result: Mapping[str, Any]) -> dict[str, Any]:
@@ -5228,7 +6399,17 @@ class Stage1AnalysisService:
         if runtime.receipts and not force:
             return
         try:
-            admission = runtime.admit(estimated_tokens=max(1, len(prompt) // 4))
+            admission = runtime.admit(
+                estimated_tokens=max(1, len(prompt) // 4),
+                requested_output_tokens=max(
+                    0,
+                    int(input_payload.get("max_output_tokens") or 0),
+                ),
+                requested_retry_attempts=max(
+                    0,
+                    int(result.get("attempts") or 1) - 1,
+                ),
+            )
             receipt_metadata: dict[str, Any] = {
                 "execution_mode": "injected_reader",
                 "requested_output_tokens": int(

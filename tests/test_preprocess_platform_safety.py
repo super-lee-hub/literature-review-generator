@@ -8,7 +8,11 @@ import pytest
 import requests
 
 from preprocess.provider_circuit import ProviderCircuitBreaker, ProviderCircuitOpen
-from preprocess.service import PreprocessManager
+from preprocess.service import (
+    MineruConfigurationError,
+    MineruSubmissionUncertainError,
+    PreprocessManager,
+)
 from summary_schema import normalize_ai_summary
 
 
@@ -125,6 +129,116 @@ def test_mineru_transient_failure_still_uses_bounded_retry(monkeypatch: pytest.M
         manager._request_json("get", f"{manager.mineru_base_url}/status")
     assert calls == 2
     assert manager.mineru_circuit_breaker.snapshot.open is False
+
+
+def test_mineru_task_create_post_is_never_retried_after_an_ambiguous_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _remote_manager(monkeypatch, retries="5")
+    calls = 0
+
+    def ambiguous_post(**_kwargs):
+        nonlocal calls
+        calls += 1
+        raise requests.Timeout("response lost after submission")
+
+    monkeypatch.setattr(requests, "request", ambiguous_post)
+
+    with pytest.raises(MineruSubmissionUncertainError):
+        manager._request_json("post", f"{manager.mineru_base_url}/file-urls/batch", json={})
+
+    assert calls == 1
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    (
+        ("mineru_poll_interval_seconds", "0"),
+        ("mineru_poll_timeout_seconds", "3601"),
+        ("mineru_request_max_retries", "6"),
+        ("mineru_retry_backoff_seconds", "nan"),
+        ("docling_timeout_seconds", "0"),
+        ("ocr_timeout_seconds", "601"),
+    ),
+)
+def test_preprocess_manager_rejects_unbounded_mineru_and_local_worker_limits(
+    field_name: str,
+    value: str,
+) -> None:
+    with pytest.raises(MineruConfigurationError):
+        PreprocessManager(
+            config={"Preprocess": {field_name: value}},
+            preprocess_environment_resolved=True,
+        )
+
+
+def test_mineru_remote_transport_records_bounded_redacted_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manager = PreprocessManager(
+        config={
+            "Preprocess": {
+                "parser_mode": "remote_first",
+                "primary_parser": "mineru_remote",
+                "fallback_parser": "none",
+                "mineru_api_token": "configured-token",
+                "mineru_base_url": "https://mineru.example.test/api",
+                "mineru_allowed_url_hosts": "storage.example.test",
+                "mineru_request_max_retries": "2",
+                "mineru_max_remote_tasks": "1",
+                "mineru_max_remote_http_calls": "3",
+                "mineru_max_remote_upload_bytes": "1024",
+            }
+        },
+        preprocess_environment_resolved=True,
+    )
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_bytes(b"%PDF fixture")
+    request_methods: list[str] = []
+
+    def fake_request(**kwargs):
+        method = str(kwargs["method"])
+        request_methods.append(method)
+        if method == "POST":
+            return _Response(
+                200,
+                {
+                    "batch_id": "task-opaque-id",
+                    "upload_urls": ["https://storage.example.test/upload"],
+                },
+            )
+        return _Response(
+            200,
+            {
+                "status": "success",
+                "markdown_text": "# MinerU\n\ncomplete parsed document",
+                "plain_text": "complete parsed document",
+            },
+        )
+
+    monkeypatch.setattr(requests, "request", fake_request)
+    monkeypatch.setattr(requests, "put", lambda *_args, **_kwargs: _Response(200))
+
+    result = manager._extract_with_mineru_remote(
+        pdf_path=str(pdf_path),
+        baseline_page_diagnostics=[],
+        baseline_page_blocks=[],
+        baseline_page_index=[],
+    )
+    assert result is not None
+    receipt = manager._finish_mineru_trace(
+        status="remote_success",
+        response_identity=manager._mineru_response_identity(result),
+    )
+
+    assert request_methods == ["POST", "GET"]
+    assert receipt["network_calls"] == 3
+    assert receipt["upload_bytes"] == pdf_path.stat().st_size
+    assert receipt["task_id_hash"]
+    assert "task-opaque-id" not in json.dumps(receipt, ensure_ascii=False)
+    assert receipt["budget"]["tasks_used"] == 1
+    assert receipt["budget"]["http_calls_used"] == 3
 
 
 def test_mineru_result_asset_authorization_failure_opens_circuit_without_retry(

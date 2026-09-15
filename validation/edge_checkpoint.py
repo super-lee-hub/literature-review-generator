@@ -52,6 +52,10 @@ class ValidationEdgeKeyV1:
     model_route: str
     prompt_version: str = DEFAULT_PROMPT_VERSION
     adjudication_schema_version: str = DEFAULT_ADJUDICATION_SCHEMA_VERSION
+    # Full source-authority identity, including the current semantic binding
+    # and canonical evidence hashes.  Physical binding paths/content hashes do
+    # not belong in this checkpoint key.
+    validation_source_authority_hash: str = ""
     version: str = VALIDATION_EDGE_CHECKPOINT_VERSION
 
     @property
@@ -69,6 +73,7 @@ class ValidationEdgeKeyV1:
             "model_route": self.model_route,
             "prompt_version": self.prompt_version,
             "adjudication_schema_version": self.adjudication_schema_version,
+            "validation_source_authority_hash": self.validation_source_authority_hash,
         }
 
 

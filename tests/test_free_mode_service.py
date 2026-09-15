@@ -3,7 +3,12 @@ from pathlib import Path
 import pytest
 
 from free_mode.profile_manager import get_profile_path
-from free_mode.service import generate_free_mode_profile, plan_free_mode_chat_turn
+from free_mode.service import (
+    _new_free_mode_provider_runtime,
+    generate_free_mode_profile,
+    plan_free_mode_chat_turn,
+)
+from services.job_workspace import WorkspacePathError
 
 
 def test_plan_free_mode_chat_turn_uses_dedicated_api_and_normalizes_profile(monkeypatch) -> None:
@@ -207,3 +212,20 @@ def test_generate_free_mode_profile_rejects_partial_dedicated_route(
     assert profile is None
     assert called["value"] is False
     assert not Path(get_profile_path(str(tmp_path), "partial")).exists()
+
+
+def test_free_mode_receipt_path_rejects_project_path_escape(tmp_path: Path) -> None:
+    with pytest.raises(WorkspacePathError):
+        _new_free_mode_provider_runtime(
+            api_config={
+                "api_key": "free-key",
+                "model": "free-model",
+                "api_base": "https://free.example.com/v1",
+            },
+            output_dir=str(tmp_path),
+            project_name="..\\escape",
+            stage_name="profile",
+            prompt="test",
+            config={},
+            provider_runtime=None,
+        )

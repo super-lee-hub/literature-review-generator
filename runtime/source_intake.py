@@ -7,11 +7,12 @@ from pathlib import Path
 from typing import Any, Dict, Mapping
 
 from file_finder import create_file_index, resolve_pdf_match
-from runtime.stage_contracts import SourceBundle, build_source_bundle
 from runtime.canonical_attachment_selector import canonicalize_attachment_candidates
+from runtime.f1_corpus import F1CorpusManifestV1
+from runtime.stage_contracts import SourceBundle, build_source_bundle
 from runtime.zotero_attachment_resolver import ZoteroAttachmentIndex
-from services.source_identity import inspect_pdf_identity
 from services.paper_identity import build_canonical_paper_key
+from services.source_identity import inspect_pdf_identity
 from zotero_parser import parse_zotero_report_result
 
 
@@ -91,7 +92,7 @@ def _select_identity_candidate(
     if len(identity_matches) > 1:
         hashes = {str(item.get("sha256") or "") for item in identity_matches}
         if len(hashes) == 1 and "" not in hashes:
-            selected = sorted(identity_matches, key=lambda item: str(item["path"]).casefold())[0]
+            selected = min(identity_matches, key=lambda item: str(item["path"]).casefold())
             return "matched", "duplicate_identical_candidates", selected
         return "ambiguous", "multiple_identity_matches_with_different_hashes", None
     if candidates:
@@ -136,6 +137,81 @@ def build_direct_source_bundle(*, project_name: str, pdf_folder: str) -> SourceB
             "pdf_count": len(pdf_files),
             "source_paths": list(pdf_files),
         },
+    )
+
+
+def validate_f1_corpus_source_bundle(
+    bundle: SourceBundle,
+    *,
+    binding: Mapping[str, Any],
+    gate: str | None = None,
+) -> SourceBundle:
+    """Bind a resolved source bundle to an owner-supplied F1 manifest.
+
+    This is intentionally a source-intake operation: it reopens the selected
+    manifest PDFs and compares their resolved paths and content SHA-256 values
+    with the work items before Stage 1 can preprocess or send content to a
+    provider.  A caller may supply the acceptance gate; otherwise the strict
+    C/D/Q selection cardinality determines it.
+    """
+
+    if not isinstance(binding, Mapping):
+        raise TypeError("f1_corpus_binding must be a mapping")
+    manifest_path = str(binding.get("manifest_path") or "").strip()
+    manifest_sha256 = str(binding.get("manifest_sha256") or "").strip()
+    source_ids = binding.get("source_ids")
+    if not manifest_path or not manifest_sha256 or not isinstance(source_ids, (list, tuple)):
+        raise ValueError("f1_corpus_binding is incomplete")
+
+    resolved_gate = str(gate or "").strip().upper()
+    if not resolved_gate:
+        resolved_gate = {1: "C", 3: "D", 15: "Q"}.get(len(source_ids), "")
+    if not resolved_gate:
+        raise ValueError("f1_corpus_binding_source_count_has_no_acceptance_gate")
+
+    manifest = F1CorpusManifestV1.from_file(manifest_path, verify_source_files=False)
+    if manifest.manifest_sha256 != manifest_sha256:
+        raise ValueError("f1_corpus_binding_manifest_sha256_mismatch")
+    selected_sources = manifest.validate_selection(source_ids, gate=resolved_gate)
+    selected_paths = manifest.verify_source_files(source_ids)
+    expected_by_path = {
+        _abs(str(path)).casefold(): source
+        for source, path in zip(selected_sources, selected_paths)
+    }
+
+    bundle.validate()
+    actual_by_path: dict[str, str] = {}
+    for item in bundle.paper_work_items:
+        source_pdf = str(item.source_pdf or "").strip()
+        if not source_pdf or not Path(source_pdf).is_file():
+            raise ValueError("f1_corpus_binding_source_pdf_missing")
+        resolved_path = _abs(source_pdf).casefold()
+        if resolved_path in actual_by_path:
+            raise ValueError("f1_corpus_binding_duplicate_source_path")
+        actual_by_path[resolved_path] = _sha256_file(source_pdf)
+
+    if len(actual_by_path) != len(expected_by_path):
+        raise ValueError("f1_corpus_binding_source_count_mismatch")
+    if set(actual_by_path) != set(expected_by_path):
+        raise ValueError("f1_corpus_binding_source_paths_mismatch")
+    for path, expected_source in expected_by_path.items():
+        if actual_by_path[path] != expected_source.sha256:
+            raise ValueError("f1_corpus_binding_source_sha256_mismatch")
+
+    snapshot = dict(bundle.source_snapshot)
+    snapshot["f1_corpus_binding"] = {
+        "schema_version": "f1-corpus-binding-v1",
+        "manifest_path": manifest.manifest_path,
+        "manifest_sha256": manifest.manifest_sha256,
+        "manifest_content_sha256": manifest.content_sha256,
+        "source_ids": [source.source_id for source in selected_sources],
+        "gate": resolved_gate,
+    }
+    return SourceBundle(
+        source_mode=bundle.source_mode,
+        project_name=bundle.project_name,
+        paper_work_items=list(bundle.paper_work_items),
+        source_snapshot=snapshot,
     )
 
 
@@ -214,6 +290,13 @@ def build_zotero_source_bundle(*, project_name: str, zotero_report: str, library
                     "attachment_title": str(attachment.get("attachment_title") or ""),
                     "raw_path": str(attachment.get("raw_path") or ""),
                     "link_mode": int(attachment.get("link_mode") or 0),
+                    "attachment_source_type": str(
+                        attachment.get("attachment_source_type") or ""
+                    ),
+                    "external_to_library": bool(attachment.get("external_to_library")),
+                    "attachment_resolution_error": str(
+                        attachment.get("resolution_error") or ""
+                    ),
                 }
             )
             if candidate_payload["exists"]:
@@ -229,6 +312,15 @@ def build_zotero_source_bundle(*, project_name: str, zotero_report: str, library
                             "attachment_title": candidate_payload["attachment_title"],
                             "raw_path": candidate_payload["raw_path"],
                             "link_mode": candidate_payload["link_mode"],
+                            "attachment_source_type": candidate_payload.get(
+                                "attachment_source_type", ""
+                            ),
+                            "external_to_library": candidate_payload.get(
+                                "external_to_library", False
+                            ),
+                            "attachment_resolution_error": candidate_payload.get(
+                                "attachment_resolution_error", ""
+                            ),
                         }
                     )
                     sources = list(existing.get("source_labels") or [existing.get("source") or ""])
@@ -349,6 +441,22 @@ def build_zotero_source_bundle(*, project_name: str, zotero_report: str, library
             "canonical_attachment_key": str(selected_candidate.get("attachment_key") or ""),
             "selected_role": str(selected_candidate.get("role") or ""),
             "selected_version_class": str(selected_candidate.get("version_class") or ""),
+            "attachment_source_type": str(
+                selected_candidate.get("attachment_source_type") or ""
+            ),
+            "external_to_library": bool(selected_candidate.get("external_to_library")),
+            "attachment_resolution_error": str(
+                selected_candidate.get("attachment_resolution_error") or ""
+            ),
+            "source_provenance": {
+                "raw_path": str(selected_candidate.get("raw_path") or ""),
+                "canonical_resolved_path": str(selected_candidate.get("path") or ""),
+                "attachment_source_type": str(
+                    selected_candidate.get("attachment_source_type") or ""
+                ),
+                "external_to_library": bool(selected_candidate.get("external_to_library")),
+                "link_mode": int(selected_candidate.get("link_mode") or 0),
+            },
             "selection_reason": list(canonical_selection.get("selection_reason") or []),
             "auxiliary_attachment_keys": [
                 str(item.get("attachment_key") or "")

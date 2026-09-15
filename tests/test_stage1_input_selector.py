@@ -1,5 +1,8 @@
+import pytest
+
 from services.stage1_input_selector import select_stage1_input
 from services.stage1_input_completeness import is_blocked_stage1_quality
+from services.stage1_input_completeness import build_completeness_metrics
 
 
 def _repeat(text: str, count: int = 12) -> str:
@@ -120,6 +123,35 @@ def test_short_two_page_input_is_not_blocked_by_completeness_gate() -> None:
     assert selection.selected_source == "normalized_markdown"
     assert selection.quality_level in {"PASS", "WARN"}
     assert "incomplete_by_page_count" not in selection.stage1_quality_reasons
+
+
+@pytest.mark.parametrize("page_count", [13, 20, 50])
+def test_short_multpage_input_is_blocked_without_explicit_lineage(page_count: int) -> None:
+    metrics = build_completeness_metrics(
+        text="short extracted fragment",
+        page_count=page_count,
+    )
+
+    assert "incomplete_by_page_count" in metrics["blocking_reasons"]
+
+
+@pytest.mark.parametrize(
+    "lineage",
+    [
+        {"visual_coverage_complete": True},
+        {"scanned_primary": True},
+    ],
+)
+def test_short_multpage_input_requires_explicit_lineage_for_exception(lineage: dict[str, bool]) -> None:
+    metrics = build_completeness_metrics(
+        text="short extracted fragment",
+        page_count=50,
+        **lineage,
+    )
+
+    assert "incomplete_by_page_count" not in metrics["blocking_reasons"]
+    assert metrics["visual_coverage_complete"] is lineage.get("visual_coverage_complete", False)
+    assert metrics["scanned_primary"] is lineage.get("scanned_primary", False)
 
 
 def test_manifest_and_report_include_candidates_and_final_reason() -> None:

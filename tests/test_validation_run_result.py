@@ -88,7 +88,7 @@ def test_no_source_grounded_evidence_never_becomes_unsupported() -> None:
         disposition="manual_review",
     )
 
-    assert claim_verdict_for_result(result) is ClaimVerdict.EVIDENCE_GAP
+    assert claim_verdict_for_result(result) is ClaimVerdict.NEEDS_REVIEW
 
 
 def test_unknown_adjudication_status_fails_closed_to_needs_review() -> None:
@@ -101,6 +101,24 @@ def test_ambiguous_claim_paper_alignment_is_needs_review() -> None:
         reason="ambiguous_claim_paper_alignment",
     )
 
+    assert claim_verdict_for_result(result) is ClaimVerdict.NEEDS_REVIEW
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        _legacy_result("supported", low_confidence=True),
+        _legacy_result("supported", disposition="manual_review"),
+        SimpleNamespace(
+            evidence_status="supported",
+            disposition="keep_as_is",
+            low_confidence=False,
+            details={},
+            conclusion=SimpleNamespace(value="SUPPORTED"),
+        ),
+    ],
+)
+def test_supported_result_with_review_marker_or_no_confidence_needs_review(result) -> None:
     assert claim_verdict_for_result(result) is ClaimVerdict.NEEDS_REVIEW
 
 

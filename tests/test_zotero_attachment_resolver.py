@@ -114,6 +114,18 @@ def _create_zotero_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
 def test_zotero_attachment_index_reads_parent_relation_read_only(tmp_path: Path) -> None:
     storage, _database, linked = _create_zotero_fixture(tmp_path)
 
+    connection = sqlite3.connect(_database)
+    connection.execute(
+        "INSERT INTO items(itemID, itemTypeID, key) VALUES (102, 1, 'STANDALONE01')"
+    )
+    connection.execute(
+        "INSERT INTO itemAttachments(itemID, parentItemID, linkMode, contentType, path) "
+        "VALUES (102, NULL, 2, 'application/pdf', ?)",
+        (str(linked),),
+    )
+    connection.commit()
+    connection.close()
+
     index = ZoteroAttachmentIndex(storage)
     resolution = index.resolve(
         {

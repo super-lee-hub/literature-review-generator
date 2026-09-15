@@ -205,7 +205,7 @@ def _write_summary_authority(path: Path, summary: dict[str, Any]) -> None:
 
 
 def test_architecture_guard_pdf_byte_hash_never_receives_semantic_input_hash() -> None:
-    service_tree = _tree("services/stage1_analysis_service.py")
+    _tree("services/stage1_analysis_service.py")
     semantic_names = {
         "semantic_source_hash",
         "stage1_semantic_input_hash",

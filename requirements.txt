@@ -1,3 +1,7 @@
+# Source requirements for the production runtime.
+# Release installations use the generated Windows/Python 3.11 lock:
+# requirements-py311-windows-prod.lock
+
 # Core runtime
 pandas
 openpyxl
@@ -13,7 +17,6 @@ typing_extensions
 # GUI
 nicegui
 
-# Local RAG / advanced PDF rescue
-chromadb
-sentence-transformers
+# Advanced PDF rescue. Optional local-RAG dependencies live in
+# requirements-optional-rag.txt and are excluded from the release lock.
 docling

@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, Literal, Mapping, Sequence
 from runtime.attempt_store import AttemptAlreadyRunningError, AttemptExecutionLease
 from runtime.reconcile import RuntimeReconciler, validate_canonical_ai_summary
 from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRecord, ArtifactRegistry, file_sha256
-from services.job_workspace import JobWorkspace, atomic_write_json, utc_now_iso
+from services.job_workspace import JobWorkspace, WorkspacePathError, atomic_write_json, utc_now_iso
 from services.summary_reuse import SummaryCatalog, SummarySource
 
 
@@ -1868,15 +1868,20 @@ def validate_review_batch_layout(
             f"review batch child job IDs conflict with reserved jobs: {conflicts}"
         )
 
-    child_workspaces = tuple(
-        JobWorkspace(
-            workspace.base_output_dir,
-            variant.project_name,
-            child_job_id,
+    try:
+        child_workspaces = tuple(
+            JobWorkspace(
+                workspace.base_output_dir,
+                variant.project_name,
+                child_job_id,
+            )
+            for variant, child_job_id in zip(variants, resolved_child_job_ids)
         )
-        for variant, child_job_id in zip(variants, resolved_child_job_ids)
-    )
-    manifest_dir = Path(workspace.artifact_path("review_batch_manifests"))
+        manifest_dir = Path(workspace.artifact_path("review_batch_manifests"))
+    except WorkspacePathError as exc:
+        raise SummarySelectionError(
+            "review batch workspace path contains a symlink or reparse point"
+        ) from exc
     coordinator_paths = (
         Path(workspace.root_dir),
         Path(workspace.paths.artifacts_dir),
@@ -1891,16 +1896,21 @@ def validate_review_batch_layout(
         raise SummarySelectionError(
             "review batch manifest directory is outside the coordinator workspace"
         )
-    child_sensitive_paths = tuple(
-        (
-            Path(child.root_dir),
-            Path(child.paths.artifacts_dir),
-            Path(child.paths.registry_path),
-            Path(child.artifact_path("job_attempts")),
-            Path(child.artifact_path("paper_artifacts")),
+    try:
+        child_sensitive_paths = tuple(
+            (
+                Path(child.root_dir),
+                Path(child.paths.artifacts_dir),
+                Path(child.paths.registry_path),
+                Path(child.artifact_path("job_attempts")),
+                Path(child.artifact_path("paper_artifacts")),
+            )
+            for child in child_workspaces
         )
-        for child in child_workspaces
-    )
+    except WorkspacePathError as exc:
+        raise SummarySelectionError(
+            "review batch child workspace path contains a symlink or reparse point"
+        ) from exc
     if any(
         _is_reparse_path(path)
         for child_paths in child_sensitive_paths
