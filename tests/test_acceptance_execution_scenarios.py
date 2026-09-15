@@ -601,7 +601,6 @@ def test_gate_d_plan_carries_production_modality_refs_into_child_evidence(
     payload = _plan_payload(tmp_path)
     child = payload["scenarios"]["D"]
     workspace = Path(child["workspace"])
-    runtime_spec = Path(child["runtime_spec"])
     payload["parent_run_id"] = "parent-d"
     payload["state_path"] = "acceptance-state.json"
     payload["scenarios"] = {"D": child}
