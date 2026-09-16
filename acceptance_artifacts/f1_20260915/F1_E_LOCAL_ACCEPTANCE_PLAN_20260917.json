@@ -1,8 +1,8 @@
 {
   "schema_version": "release-acceptance-plan-v2",
-  "parent_run_id": "f1-e-local-acceptance-20260917-r8",
+  "parent_run_id": "f1-e-local-acceptance-20260917-r9",
   "final_executable_sha": "",
-  "state_path": "F1_E_LOCAL_ACCEPTANCE_PLAN_STATE_20260917_R8.json",
+  "state_path": "F1_E_LOCAL_ACCEPTANCE_PLAN_STATE_20260917_R9.json",
   "budget": {
     "max_provider_calls_total": 4,
     "max_output_tokens_total": 8000,
@@ -17,13 +17,13 @@
       "scenario_id": "E",
       "gate": "E",
       "runtime_spec": "../../tmp/gate-e-local/runtime.json",
-      "workspace": "../../tmp/gate-e-local/runs/gate-e-local__gate-e-local-job-r8",
+      "workspace": "../../tmp/gate-e-local/runs/gate-e-local__gate-e-local-job-r9",
       "input_manifest": "",
       "f1_source_ids": [],
       "execution_mode": "crash_resume",
       "budget_domain": "live",
       "prerequisites": [],
-      "job_id": "gate-e-local-job-r8"
+      "job_id": "gate-e-local-job-r9"
     }
   }
 }
