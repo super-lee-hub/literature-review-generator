@@ -61,6 +61,25 @@ the F1 modality or OCR disposition:
 This is a machine-only page-format check, not human semantic ground truth. The
 rendered intermediates were temporary and were removed after inspection.
 
+## Independent machine-assisted structural readback (2026-09-17)
+
+An independent bounded readback was run directly against the 15 staged PDFs
+using PyMuPDF 1.28.2, separate from the Stage 1 summaries and Provider
+outputs. It reopened all 15 files, recorded their page/text/image counts, and
+located raw structural signals such as abstract, method/data, result/finding,
+discussion/conclusion, and limitation sections with page numbers. Four
+representative first pages (F1-01, F1-07, F1-11, and F1-14) were also rendered
+and visually inspected for clipping, overlap, missing glyphs, and layout
+breakage; no such defect was observed in those sampled pages. F1-07's mostly
+blank repository metadata page is an intentional source front-matter page, not
+a rendering failure.
+
+This readback is an independent extraction and page-format check only. It does
+not establish the research question, method validity, sample, result direction,
+numeric claim, limitation, or citation truth for any paper. The semantic
+ground-truth fields and human review status therefore remain
+`NOT_REVIEWED_BY_HUMAN`.
+
 A bounded recursive inventory of the user-material `02_文献/` directory found
 only one all-pages-zero-text PDF candidate: the already labelled
 `F1-AUX-SCAN-01` auxiliary translation (19 pages, 0 extracted text chars, 75
