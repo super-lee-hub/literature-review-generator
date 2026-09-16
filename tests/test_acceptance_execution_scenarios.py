@@ -201,6 +201,73 @@ def test_parent_plan_requires_independent_child_specs_for_incompatible_gates(tmp
         )
 
 
+def test_gate_j_finds_ocr_lineage_across_all_canonical_refs() -> None:
+    from runtime.release_acceptance import GateEvidenceVerifier
+
+    source_hash = "a" * 64
+    diagnostics_hash = "b" * 64
+    ocr_artifact_hash = "c" * 64
+    refs = [
+        SimpleNamespace(role="source_pdf", ref_id="source", sha256=source_hash),
+        SimpleNamespace(role="ocr_diagnostics", ref_id="diagnostics", sha256=diagnostics_hash),
+        SimpleNamespace(role="ocr_artifact", ref_id="ocr", sha256=ocr_artifact_hash),
+        SimpleNamespace(role="registry", ref_id="registry", sha256="d" * 64),
+        SimpleNamespace(role="canonical_stage1", ref_id="paper", sha256="e" * 64),
+        SimpleNamespace(role="canonical_stage1", ref_id="summary", sha256="f" * 64),
+    ]
+    lineage = {
+        "source_pdf_sha256": source_hash,
+        "ocr_diagnostics_sha256": diagnostics_hash,
+        "ocr_artifact_sha256": ocr_artifact_hash,
+        "stage1_input_sha256": "1" * 64,
+        "registry_dependency_artifact_ids": ["ocr-diagnostics", "ocr-artifact"],
+        "ocr_used": True,
+    }
+    payloads = {
+        "diagnostics": {
+            "artifact_type": "ocr_diagnostics",
+            "schema_version": "ocr-diagnostics-v1",
+            "source_pdf_sha256": source_hash,
+            "ocr_engine": "rapidocr",
+            "ocr_engine_version": "runtime-detected",
+            "page_numbers": [1],
+            "ocr_page_count": 1,
+        },
+        "ocr": {
+            "artifact_type": "ocr_artifact",
+            "schema_version": "ocr-artifact-v1",
+            "source_pdf_sha256": source_hash,
+            "diagnostics_sha256": diagnostics_hash,
+            "page_numbers": [1],
+            "page_text_hashes": {"1": "2" * 64},
+        },
+        "registry": {
+            "artifacts": [
+                {"artifact_id": "ocr-diagnostics"},
+                {"artifact_id": "ocr-artifact"},
+            ]
+        },
+        # The first canonical ref is a paper artifact without OCR lineage;
+        # the later summary ref carries the authoritative Stage 1 lineage.
+        "paper": {"artifact_type": "paper_artifact", "paper_info": {}},
+        "summary": [{"source_pdf_sha256": source_hash, "ocr_lineage": lineage}],
+    }
+
+    facts, error = GateEvidenceVerifier()._derive_semantic_facts(
+        "J",
+        refs,
+        payloads,
+        {},
+        origin_dir=None,
+        expected_job_id="job-j",
+    )
+
+    assert error is None
+    assert facts["ocr_actually_used"] is True
+    assert facts["stage1_consumed"] is True
+    assert facts["lineage"] is True
+
+
 def test_single_acceptance_spec_preserves_and_validates_executable_sha() -> None:
     spec = ReleaseAcceptanceSpec.from_mapping(
         {

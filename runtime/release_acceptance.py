@@ -5186,13 +5186,20 @@ class GateEvidenceVerifier:
             source_hash = source_refs[0].sha256
             diagnostics = payloads.get(diagnostics_refs[0].ref_id)
             ocr_artifact = payloads.get(artifact_refs[0].ref_id)
-            canonical = payloads.get(canonical_refs[0].ref_id)
             registry = payloads.get(registry_refs[0].ref_id)
-            if not all(isinstance(item, Mapping) for item in (diagnostics, ocr_artifact, canonical, registry)):
+            canonical_payloads = [payloads.get(ref.ref_id) for ref in canonical_refs]
+            if (
+                not isinstance(diagnostics, Mapping)
+                or not isinstance(ocr_artifact, Mapping)
+                or not isinstance(registry, Mapping)
+                or any(
+                    not isinstance(item, (Mapping, list))
+                    for item in canonical_payloads
+                )
+            ):
                 return {}, "OCR lineage artifacts must be JSON objects"
             diagnostics = cast(Mapping[str, Any], diagnostics)
             ocr_artifact = cast(Mapping[str, Any], ocr_artifact)
-            canonical = cast(Mapping[str, Any], canonical)
             registry = cast(Mapping[str, Any], registry)
             if diagnostics.get("artifact_type") != "ocr_diagnostics" or diagnostics.get("schema_version") != "ocr-diagnostics-v1":
                 return {}, "OCR diagnostics type or schema is invalid"
@@ -5218,15 +5225,29 @@ class GateEvidenceVerifier:
             artifact_pages = self._string_list(ocr_artifact.get("page_numbers"))
             if artifact_pages != page_numbers or not isinstance(ocr_artifact.get("page_text_hashes"), Mapping):
                 return {}, "OCR output artifact page lineage is incomplete"
-            if isinstance(canonical, list):
-                canonical_items = [item for item in canonical if isinstance(item, Mapping)]
-            else:
-                nested_canonical = canonical.get("payload")
-                canonical_items = [
-                    cast(Mapping[str, Any], nested_canonical)
-                    if isinstance(nested_canonical, Mapping)
-                    else canonical
-                ]
+            canonical_items: list[Mapping[str, Any]] = []
+            for canonical_payload in canonical_payloads:
+                if isinstance(canonical_payload, list):
+                    canonical_items.extend(
+                        item for item in canonical_payload if isinstance(item, Mapping)
+                    )
+                    continue
+                if not isinstance(canonical_payload, Mapping):
+                    continue
+                nested_payload = canonical_payload.get("payload")
+                summaries = canonical_payload.get("summaries")
+                if isinstance(nested_payload, list):
+                    canonical_items.extend(
+                        item for item in nested_payload if isinstance(item, Mapping)
+                    )
+                elif isinstance(summaries, list):
+                    canonical_items.extend(
+                        item for item in summaries if isinstance(item, Mapping)
+                    )
+                elif isinstance(nested_payload, Mapping):
+                    canonical_items.append(nested_payload)
+                else:
+                    canonical_items.append(canonical_payload)
             lineage = next(
                 (
                     item.get("ocr_lineage")
