@@ -1841,6 +1841,9 @@ class ReviewControlPlane:
             diagnostic = {
                 key: resume_payload.get(key)
                 for key in (
+                    "status",
+                    "error_type",
+                    "error",
                     "job_status",
                     "completion_status",
                     "completion_reasons",
@@ -1849,6 +1852,8 @@ class ReviewControlPlane:
                 )
                 if key in resume_payload
             }
+            if isinstance(diagnostic.get("error"), str):
+                diagnostic["error"] = diagnostic["error"][-1000:]
             raise ControlPlaneError(
                 "fresh resume process exited unsuccessfully: "
                 f"{resume_exit}; diagnostic={json.dumps(diagnostic, sort_keys=True)}"
