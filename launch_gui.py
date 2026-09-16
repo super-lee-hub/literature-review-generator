@@ -6,12 +6,15 @@
 from __future__ import annotations
 
 import argparse
+import os
 import socket
+import ssl
 import sys
 import threading
 import time
 import urllib.request
 import webbrowser
+from typing import Any
 
 from services.environment_service import (
     detect_runtime_environment,
@@ -93,6 +96,29 @@ def _print_environment_notice() -> None:
         print(f'  {recommended_conda_activate_command()}', file=sys.stderr)
 
 
+def _configure_certifi_ssl_fallback() -> None:
+    """Opt into a CA-bundle fallback for broken Windows certificate stores."""
+
+    if os.environ.get("AUTO_GENERATE_GUI_CERTIFI_FALLBACK") != "1":
+        return
+    try:
+        ssl.create_default_context()
+        return
+    except ssl.SSLError:
+        pass
+    try:
+        import certifi  # type: ignore[import-not-found]
+    except ImportError:
+        return
+    original_create_default_context = ssl.create_default_context
+
+    def create_default_context(*args: Any, **kwargs: Any) -> ssl.SSLContext:
+        kwargs.setdefault("cafile", certifi.where())
+        return original_create_default_context(*args, **kwargs)
+
+    setattr(ssl, "create_default_context", create_default_context)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description='Launch the local GUI for auto-generate.')
     parser.add_argument('--config', type=str, default='config.ini', help='Path to config.ini')
@@ -147,6 +173,7 @@ def launch_gui(
     reload: bool = False,
     show: bool = True,
 ) -> None:
+    _configure_certifi_ssl_fallback()
     from gui.app import BUILD_STAMP, launch_gui as _launch_gui
 
     print(f'GUI build: {BUILD_STAMP}', file=sys.stderr)
