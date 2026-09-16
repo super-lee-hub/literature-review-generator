@@ -704,6 +704,64 @@ def test_gate_i_parent_binds_runtime_spec_created_by_production_gui_flow(
     assert "binding mismatch" not in result["parent_result"]["reason"]
 
 
+def test_gate_k_acceptance_binds_contention_receipt_from_evidence_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gate K must consume the receipt published by its contention executor."""
+
+    from runtime.control_plane import ReviewControlPlane
+
+    monkeypatch.delenv("AUTO_GENERATE_RUN_LIVE_ACCEPTANCE", raising=False)
+    plan_path = tmp_path / "k-acceptance-plan.json"
+    plan_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "release-acceptance-plan-v2",
+                "parent_run_id": "k-contention-receipt-binding",
+                "state_path": "k-acceptance-state.json",
+                "budget": {
+                    "max_provider_calls_total": 4,
+                    "max_output_tokens_total": 1000,
+                    "max_retry_attempts_total": 1,
+                    "max_wall_seconds": 300,
+                },
+                "scenarios": {
+                    "K": {
+                        "scenario_id": "K",
+                        "gate": "K",
+                        "runtime_spec": "",
+                        "workspace": str(tmp_path / "k-workspace"),
+                        "input_manifest": "",
+                        "execution_mode": "offline-k",
+                        "budget_domain": "offline-k",
+                        "prerequisites": [],
+                        "job_id": "",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = ReviewControlPlane(repo_root=Path.cwd()).acceptance_run(plan_path)
+    gate = result["scenarios"]["K"]
+
+    assert result["parent_result"]["status"] == "PASS_OFFLINE"
+    assert gate["status"] == "PASS_OFFLINE"
+    receipt_path = Path(gate["receipt_path"])
+    assert receipt_path.is_file()
+    assert receipt_path.parent.name == "K"
+    assert receipt_path.parent.parent.name == "evidence"
+    facts = gate["verified"]["derived_facts"]
+    assert facts["process_count"] == 2
+    assert facts["offline_contention_calls"] == 2
+    assert facts["bounded_wait"] is True
+    assert facts["no_corrupt_json"] is True
+    assert facts["no_lost_update"] is True
+    assert facts["live_budget_unchanged"] is True
+
+
 def test_parent_acceptance_resumes_child_with_durable_workspace_marker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
