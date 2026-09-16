@@ -61,6 +61,13 @@ the F1 modality or OCR disposition:
 This is a machine-only page-format check, not human semantic ground truth. The
 rendered intermediates were temporary and were removed after inspection.
 
+A bounded recursive inventory of the user-material `02_文献/` directory found
+only one all-pages-zero-text PDF candidate: the already labelled
+`F1-AUX-SCAN-01` auxiliary translation (19 pages, 0 extracted text chars, 75
+embedded images). No additional scan-like PDF was promoted into the F1
+manifest; this inventory is evidence for the blocker, not owner approval to
+replace an F1 primary.
+
 ## Open quality work
 
 1. An independent reader must fill the semantic fields against the original
