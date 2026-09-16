@@ -13,6 +13,10 @@ SKIP_DIRS = {
     "output",
     "tmp",
     "venv",
+    # Live acceptance inputs and generated evidence are deliberately kept
+    # outside the source-text hygiene surface; their provider/OCR text is
+    # validated by the typed acceptance gates instead.
+    "acceptance_artifacts",
 }
 TEXT_EXTENSIONS = {
     ".bat",
