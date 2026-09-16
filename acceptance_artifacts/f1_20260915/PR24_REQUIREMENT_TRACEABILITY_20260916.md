@@ -1,6 +1,6 @@
 # PR24 final-fix requirement traceability
 
-Executable freeze: `12bf400d3cf6fd7711da8750856e25ebc7d0da85` on `codex/f1-validation-authority-closure`.
+Live acceptance executable freeze: `387bb72398767ab90268189e53b708fe94ae3441` on `codex/f1-validation-authority-closure`.
 
 The code result below is `PASS_OFFLINE` only where the current repository checks prove it. It is not a claim that live Provider, MinerU, GUI, OCR, or semantic F1 acceptance passed. The separate [F1 acceptance report](F1_LIVE_ACCEPTANCE_REPORT_20260916.md) records those boundaries.
 
@@ -26,6 +26,7 @@ The code result below is `PASS_OFFLINE` only where the current repository checks
 - Full clean pytest command: `python -m pytest -q --maxfail=1` → `1687 passed, 28 skipped`.
 - Focused PR24 regression: `29 passed`.
 - F1 corpus source binding: `11 passed, 1 skipped` across manifest/source-intake/runner tests.
+- Latest acceptance source-selection/durable-reference regression: `62 passed, 1 skipped`.
 - Pyright on changed production modules: `0 errors, 0 warnings, 0 informations`.
 - Ruff fatal checks (`E9,F`) on changed production/test files: `All checks passed!`.
 - `python -m py_compile` on changed modules/tests: passed.
@@ -37,20 +38,11 @@ The code result below is `PASS_OFFLINE` only where the current repository checks
 - Formal manifest: [F1_CORPUS_MANIFEST_20260915.json](F1_CORPUS_MANIFEST_20260915.json), content SHA `ebaf5c2a9220ed23b527e279c0fd82a6770fa70e5d4ab5d1e1e64f2150ce4319`, file SHA `f741776ea2eda6b5937f4fc13e40569216eb3173ff597fb80eeea2e46dab3e90`.
 - The controlled staging root contains 15 copied PDFs; all 15 current bytes match the prior canonical-resolution manifest. The original Zotero PDFs were not modified or deleted.
 - Machine-only source ledger: [F1_SOURCE_GROUND_TRUTH_20260915.md](F1_SOURCE_GROUND_TRUTH_20260915.md). It deliberately marks semantic ground truth and human review as not done.
-- The latest no-network acceptance dry-run bound all C/D/Q receipts to checkout SHA `f392c847...` and manifest file SHA `f741776e...`, then stopped at owner authorization before Provider transport. The production code was fully tested at its preceding code commit `12bf400d...`; the intervening commit is evidence-only. Therefore C, D, and Q are `NOT_VERIFIED`, not PASS.
+- The authorized live acceptance parent `f1-acceptance-20260916-r3-387bb7239876` bound C/D/Q evidence to executable SHA `387bb72398767ab90268189e53b708fe94ae3441`, plan identity SHA `3184ac7b...`, and manifest file SHA `f741776e...`. C passed with one DeepSeek transport; D completed three DeepSeek transports but failed the required three-way modality criterion; Q stopped before transport for missing custom-host ACK.
 - A fresh Q `run_all` preflight resolved the configured model roles with zero network calls and computed required custom hosts `ai.saigou.work,chat.178266.xyz` plus route fingerprint `ab98b7233f2ac6bb205d6a6992260880fd66a684f0cb47570a328c1869ab7a1d`; configuration does not substitute for their explicit v2 ACK.
 
 ## Delivery state
 
-- Local executable commit exists at the SHA above.
-- The stored F1 plan is executable-SHA-neutral for future authorized runs; the control plane records the exact current checkout SHA at run time. The latest dry-run is the separate `f392c847...` evidence; production code was verified at `12bf400d...`.
-- The prior evidence commit before the hygiene-only relocation was
-  `74006daa70b92dd888c09f65aa05820b14c2e962`; the relocation was pushed as
-  `45d8c355e8879185f8d739209bcdc485f61bb2f1`.
-- PR #24 was read back as `OPEN`, `isDraft=false`, with local and remote head
-  matching `45d8c355e8879185f8d739209bcdc485f61bb2f1`. Hosted CI run
-  `35060285751` passed all six jobs after the report relocation. No merge or
-  force-push was performed.
-- This report update is documentation-only and does not change the frozen
-  executable SHA; any live receipt must continue to bind to the frozen SHA
-  explicitly.
+- The stored F1 plan is executable-SHA-neutral; the control plane records the exact clean checkout SHA at each run. The live evidence is frozen to `387bb72398767ab90268189e53b708fe94ae3441`; later report-only commits do not change it.
+- PR #24 remains `OPEN`, `isDraft=false`, and no merge or force-push was performed. Hosted CI run `35079384646` passed all six jobs for the live evidence checkout.
+- The acceptance-only budget copy is bounded at 4 Provider calls and 128,000 output tokens; the live C/D ledgers record 4 successful DeepSeek calls and 49,787 output tokens.

@@ -1,6 +1,6 @@
 # F1 C→D→Q acceptance report
 
-Status: `BLOCKED_AUTHORIZATION / NOT_VERIFIED`.
+Status: `C=PASS / D=FAIL_MODALITY / Q=BLOCKED_EXTERNAL_HOST_ACK`.
 
 This report records the current executable and the exact evidence boundary. It
 does not upgrade historical F1 outputs, local fixtures, or no-call preflight
@@ -8,12 +8,14 @@ into live acceptance.
 
 ## Frozen identities
 
-- Code executable SHA: `12bf400d3cf6fd7711da8750856e25ebc7d0da85`
-- Current evidence checkout at the latest dry-run: `f392c8475686b7c28204c967b0a699b98fcd2e2d`.
-- The stored plan intentionally leaves `final_executable_sha` blank so a future authorized run binds the exact clean checkout at execution time. The latest dry-run below is bound to the current evidence checkout; a later evidence-only commit does not change production code but will require a fresh receipt for any live claim.
+- Live evidence checkout: `387bb72398767ab90268189e53b708fe94ae3441`.
+- Live acceptance parent run: `f1-acceptance-20260916-r3-387bb7239876`.
+- The stored plan intentionally leaves `final_executable_sha` blank so each authorized run binds the exact clean checkout at execution time. The live receipts below remain bound to the SHA above; later documentation-only commits do not change this runtime evidence.
 - Branch: `codex/f1-validation-authority-closure`
 - Acceptance plan: [F1_ACCEPTANCE_PLAN_20260915.json](F1_ACCEPTANCE_PLAN_20260915.json)
-- Plan SHA-256 at the latest dry-run: `9640c9fa1228e8be983db939b804520ed6a422b5e89dde9b1c862b445c03a6cc`
+- Plan identity SHA-256: `3184ac7b6cfc3d8b74121303da10aa08efb9ed33eb5257260de7b6628ee31c09`
+- Plan file SHA-256: `2e234c87bef3d5599a9ea97e36fbfe9a40b93edb26e8b696cb36f202cf7f8202`
+- Acceptance budget: at most 4 Provider calls, 128,000 output tokens, 4 retry attempts, and 7,200 wall-clock seconds.
 - Corpus manifest: [F1_CORPUS_MANIFEST_20260915.json](F1_CORPUS_MANIFEST_20260915.json)
 - Corpus manifest file SHA-256: `f741776ea2eda6b5937f4fc13e40569216eb3173ff597fb80eeea2e46dab3e90`
 - Corpus content SHA-256: `ebaf5c2a9220ed23b527e279c0fd82a6770fa70e5d4ab5d1e1e64f2150ce4319`
@@ -82,58 +84,67 @@ DeepSeek vision capability probe reports image input and base64 support, but no
 PDF file-input support. Stage 1 therefore constructs rendered image inputs;
 the chat adapter encodes those images as `data:image/...;base64` values in
 `image_url` fields alongside extracted text. No original PDF file is sent by
-this F1 route, and this run sent no live payload.
+this F1 route.
 
-## C/D/Q plan and dry-run
+## C/D/Q live execution
 
-| Gate | Selection | Runtime spec SHA-256 | Dry-run status | Provider calls |
+| Gate | Selection | Runtime spec SHA-256 | Live result | Provider calls |
 |---|---|---|---|---:|
-| C | F1-01 | `38918dc7734caadbc9333900c094595f80cd42f59dcc4666b4cf2123d930fdb9` | BLOCKED: owner authorization required | 0 |
-| D | F1-01, F1-03, F1-14 | `0031c9091e13632897fdaa2d3aa61ed6e4346b487275f02bfdd62213b0708483` | BLOCKED: prerequisite C not passed | 0 |
-| Q | F1-01…F1-15 exact set | `3fb64ab7ce960955d09a80f36a0e217d56803bdca3838eba493e255011b1b891` | BLOCKED: prerequisite D not passed | 0 |
+| C | F1-01 | `e0d0f5815c371bf691c6ca71f585b00720ab33227691f0a3bbe255a5d6e37827` | PASS: one source, canonical Stage 1, closure complete | 1 |
+| D | F1-01, F1-03, F1-14 | `8a0c4633f4305abd62aab826c12d53e4b72e96227287e864144240d7644fe6d6` | FAIL: no `ocr_scanned` production-derived profile | 3 |
+| Q | F1-01…F1-15 exact set | `eb5571268ca0c9911cd5c94132c6205c292009a6fcbfba72bae9e9e599ad5380` | BLOCKED: custom-host v2 acknowledgement required | 0 |
 
-The no-network command was:
+The live command used the same control-plane entrypoint with owner authorization
+and the root dotenv loaded only into the child process. The durable parent result
+is [parent_acceptance_result_v2.json](f1-acceptance-20260916-r3-387bb7239876/parent_acceptance_result_v2.json).
+The child receipts are:
 
-```text
-python -m reviewctl acceptance-run --acceptance-spec acceptance_artifacts/f1_20260915/F1_ACCEPTANCE_PLAN_20260915.json
-```
+- C: [scenario_execution_receipt.json](f1-acceptance-20260916-r3-387bb7239876/C/scenario_execution_receipt.json)
+- D: [scenario_execution_receipt.json](f1-acceptance-20260916-r3-387bb7239876/D/scenario_execution_receipt.json)
+- Q: [scenario_execution_receipt.json](f1-acceptance-20260916-r3-387bb7239876/Q/scenario_execution_receipt.json)
 
-Its latest durable parent result is [parent_acceptance_result_v2.json](f1-acceptance-20260915-f392c8475686/parent_acceptance_result_v2.json).
 The result binds every child receipt to checkout SHA
-`f392c8475686b7c28204c967b0a699b98fcd2e2d`, corpus manifest SHA `f741776e...`, and the plan SHA above. The
-child receipts are:
+`387bb72398767ab90268189e53b708fe94ae3441`, corpus manifest SHA
+`f741776ea2eda6b5937f4fc13e40569216eb3173ff597fb80eeea2e46dab3e90`, and
+the plan identity above. C recorded one successful HTTP 200 DeepSeek
+`Primary_Reader_API` call. D recorded three successful HTTP 200 calls on the
+same route; the four calls consumed 49,787 output tokens in total.
 
-- C: [scenario_execution_receipt.json](f1-acceptance-20260915-f392c8475686/C/scenario_execution_receipt.json)
-- D: [scenario_execution_receipt.json](f1-acceptance-20260915-f392c8475686/D/scenario_execution_receipt.json)
-- Q: [scenario_execution_receipt.json](f1-acceptance-20260915-f392c8475686/Q/scenario_execution_receipt.json)
+The D production-derived profiles were:
 
-All three are `status=BLOCKED`; the parent is `status=BLOCKED`,
-`live_pass=false`, `ready_to_merge=false`. The acceptance budget was not
-started (`provider_budget_state_path` is empty in the dry-run result), and no
-Provider, Writer, Outline, Validator, or MinerU transport occurred.
+- F1-01: `text_heavy` (27 pages; 6 image pages; 0 OCR pages).
+- F1-14: `visual_table_heavy` (11 pages; 11 image pages; 0 OCR pages).
+- F1-03: `text_heavy` (20 pages; 9 image pages; 0 OCR pages).
 
-## Why live C/D/Q did not run
+Therefore C is a verified live gate, but D is not a PASS: the runtime and
+Provider receipts are valid while the required three-way modality criterion is
+not met. Q was stopped before any Provider call because the configured custom
+Outline/Writer hosts lack the required current v2 acknowledgement.
 
-The security boundary rejected the attempted live command because it would
-export private F1 source content (the selected text and rendered-image payload
-derived from the PDFs) to `api.deepseek.com` using credentials loaded from
-`.env`, without an explicit direct user approval for that payload and
-destination. No workaround or indirect network path was used.
+## Why the full parent remains blocked
 
-To resume, the owner must explicitly authorize the bounded C/D payload and
-destination, then run the acceptance plan with its live authorization in a
-network-enabled environment. Q additionally needs a fresh exact v2 external
-host acknowledgement covering the current custom Outline/Writer route
-fingerprint; the code must not synthesize `acknowledged=true`.
+The earlier live attempt was correctly rejected before transport because owner
+authorization had not yet been given. After the explicit authorization, C and D
+did run using only extracted text and rendered images; no original PDF file was
+sent. The current blocker is corpus modality, not authorization or PDF format.
+
+To make D pass, the owner must provide an approved source selection whose
+production-derived profiles include an actual `ocr_scanned` member, or approve a
+revised acceptance corpus/criterion. The existing machine-only source ledger
+states that no scan-primary source was established in the current 15-paper
+corpus, so the gate must not be weakened or promoted. Q additionally needs a
+fresh exact v2 external-host acknowledgement covering the current custom
+Outline/Writer route fingerprint; the code must not synthesize
+`acknowledged=true`.
 
 ## Acceptance items not verified
 
-- C/D real Provider execution and Provider receipts.
-- Q full 15-paper chain: Outline v3, evidence packets, Writer, validation,
-  citation/source closure, DOCX output, and canonical JobOutcome.
+- D heterogeneous modality gate and Q full 15-paper chain: Outline v3, evidence
+  packets, Writer, validation, citation/source closure, DOCX output, and
+  canonical JobOutcome.
 - Human original-PDF ground truth, claim-level citation review, negative
   validator challenge, repair/revalidation, and DOCX visual QA.
 - Production GUI/Playwright flow and real OCR/scanned-primary flow.
 - Real MinerU create→upload→poll→download→parse and kill/resume.
-- Hosted CI run `35060285751` for pushed checkout SHA `45d8c355...` completed
+- Hosted CI run `35079384646` for pushed checkout SHA `387bb723...` completed
   successfully across all six jobs. The PR remains open and unmerged.
