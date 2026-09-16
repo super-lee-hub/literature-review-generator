@@ -4,7 +4,7 @@
   "schema_version": "acceptance-gui-input-v2",
   "execution_kind": "production",
   "base_url": "http://127.0.0.1:8101",
-  "config_path": "gui_production_20260917/GUI_ACCEPTANCE_CONFIG_20260917.ini",
+  "config_path": "gui_production_20260917/GUI_PRIMARY_ONLY_CONFIG_20260917.ini",
   "repo_root": "../..",
   "output_root": "gui_production_20260917/runs",
   "input_mode": "pdf",
