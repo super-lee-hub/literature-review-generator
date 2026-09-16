@@ -1,0 +1,29 @@
+{
+  "schema_version": "release-acceptance-plan-v2",
+  "parent_run_id": "f1-e-local-acceptance-20260917-positive",
+  "final_executable_sha": "",
+  "state_path": "D:\\auto-generate\\.worktrees\\f1-hardening-20260906\\acceptance_artifacts\\f1_20260915\\f1-e-local-acceptance-20260917-r14\\acceptance-state.json",
+  "budget": {
+    "max_provider_calls_total": 4,
+    "max_output_tokens_total": 8000,
+    "max_retry_attempts_total": 1,
+    "max_wall_seconds": 600
+  },
+  "third_party_acknowledged": false,
+  "third_party_hosts": [],
+  "external_host_acknowledgement": null,
+  "scenarios": {
+    "E": {
+      "scenario_id": "E",
+      "gate": "E",
+      "runtime_spec": "D:\\auto-generate\\.worktrees\\f1-hardening-20260906\\acceptance_artifacts\\f1_20260915\\f1-e-local-acceptance-20260917-r14\\runtime.json",
+      "workspace": "D:\\auto-generate\\.worktrees\\f1-hardening-20260906\\acceptance_artifacts\\f1_20260915\\f1-e-local-acceptance-20260917-r14\\runs\\gate-e-local-positive__gate-e-local-positive-job",
+      "input_manifest": "",
+      "f1_source_ids": [],
+      "execution_mode": "crash_resume",
+      "budget_domain": "live",
+      "prerequisites": [],
+      "job_id": "gate-e-local-positive-job"
+    }
+  }
+}

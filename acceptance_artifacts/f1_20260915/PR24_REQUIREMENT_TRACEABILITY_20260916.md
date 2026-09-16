@@ -3,7 +3,7 @@
 C/D/Q live acceptance executable freeze: `09477d666a0f31c2b1d95a2a6cb25c00b4e7bfca`.
 Gate I live acceptance executable freeze: `24884c2adaeac2d98af85349dbbccc6980d2c814` on `codex/f1-validation-authority-closure`.
 Gate K offline acceptance executable freeze: `96e6f829e4fc0b99d636190b742129e74226c8b0`.
-Gate E local controlled-probe executable freeze: `0699ddc2fc160f820af3d424dd52655ed44eb8a6`.
+Gate E current local controlled-probe executable freeze: `a2c934081e93834338249f44e17d4e9af89b2ddc`.
 
 The code result below is `PASS_OFFLINE` only where the current repository checks prove it. Gate I is separately recorded as a scoped live acceptance. This is not a claim that live Provider, MinerU, OCR, or semantic full-F1 acceptance passed. The separate [F1 acceptance report](F1_LIVE_ACCEPTANCE_REPORT_20260916.md) records those boundaries.
 
@@ -27,6 +27,7 @@ The code result below is `PASS_OFFLINE` only where the current repository checks
 | I01 | SCOPED_PASS_LIVE | `GateIScenario` executes the production-v2 localhost GUI/Playwright collector and binds the GUI-created RuntimeJobSpec hash and job ID into the parent acceptance binding. | `f1-gui-acceptance-20260917-r2`: real browser evidence, trace archive, screenshot manifest, completed canonical JobOutcome, one non-test Primary Reader receipt; `tests/test_acceptance_execution_scenarios.py::test_gate_i_parent_binds_runtime_spec_created_by_production_gui_flow`. | Scoped to one F1-01 PDF analyze flow; it does not prove F1 scanned-primary OCR, D, Q, Outline v3, Writer, validation, or DOCX closure. |
 | K01 | PASS_OFFLINE | Gate K runs two independent Windows/Python contention workers and verifies bounded lock waiting, atomic JSON/Registry/Queue updates, conflict handling, and non-mutation of the live parent budget. | `F1_K_OFFLINE_ACCEPTANCE_PLAN_20260917.json`; current-SHA parent `f1-k-offline-acceptance-20260917-96e6f829e4fc` with `process_count=2`, `bounded_wait=true`, `no_corrupt_json=true`, `no_lost_update=true`, `offline_contention_calls=2`, and `live_budget_unchanged=true`; `tests/test_acceptance_execution_scenarios.py::test_gate_k_acceptance_binds_contention_receipt_from_evidence_root`. | Offline supporting evidence only; real live crash/resume and MinerU recovery remain unverified. |
 | E03 | NOT_VERIFIED_FAIL_CLOSED | Gate E's local controlled probe reached a durable receipt, terminated the initial process, and refused resume when a transport-started aggregate reservation had no matching receipt. | `F1_E_LOCAL_ACCEPTANCE_PLAN_20260917.json`; parent `f1-e-local-acceptance-20260917-r13`; interruption receipt and safe resume diagnostic show the ambiguous reservation; no external calls. | Positive resume at a known completed boundary remains unverified; this result is not a live F1 PASS. |
+| E04 | PASS_OFFLINE_SCOPED | Gate E now terminates immediately after observing the durable receipt/Registry boundary, and counts a provider call as completed for resume purposes only after explicit semantic `passed`. | `F1_E_LOCAL_ACCEPTANCE_PLAN_20260917_R14.json`; parent `f1-e-local-acceptance-20260917-positive`; current executable `a2c934081e93834338249f44e17d4e9af89b2ddc`; interruption/resume evidence records 1 receipt before and 2 after, `duplicate_receipts=0`, `reexecuted_completed_call_ids=[]`, and zero nonlocal calls. | Local stub only; live-provider crash/resume and MinerU recovery remain unverified. |
 
 ## Current repository verification
 
@@ -41,6 +42,8 @@ The code result below is `PASS_OFFLINE` only where the current repository checks
 - `python -m py_compile` on changed modules/tests: passed.
 - `python -m pip check`: `No broken requirements found.`
 - `git diff --check`: passed.
+- Current Hosted Windows CI: run `35152733232` at head `426d654e90999d42e21e4b2c99d6a00aefeaa61c`, `SUCCESS`, 6/6 jobs.
+- Current Gate E local r14: `PASS_OFFLINE_SCOPED` at executable `a2c934081e93834338249f44e17d4e9af89b2ddc`; two local stub calls, positive interruption/resume, no duplicate receipt or semantically completed-call reexecution.
 
 ## F1 evidence boundary
 
@@ -51,11 +54,12 @@ The code result below is `PASS_OFFLINE` only where the current repository checks
 - The authorized Gate I parent `f1-gui-acceptance-20260917-r2` bound one real GUI submission and one successful non-test `Primary_Reader_API` transport to executable SHA `24884c2adaeac2d98af85349dbbccc6980d2c814`; its parent projection is `SCOPED_PASS` because the plan contains only Gate I.
 - The authorized Gate K parent `f1-k-offline-acceptance-20260917-96e6f829e4fc` passed as `PASS_OFFLINE` on executable SHA `96e6f829e4fc0b99d636190b742129e74226c8b0`; it used two independent local workers and zero external calls.
 - The Gate E local controlled probe `f1-e-local-acceptance-20260917-r13` reached interruption but remained `NOT_VERIFIED` because resume fail-closed on an ambiguous transport-started reservation; it used only a local stub and is not a live-provider PASS.
+- The current Gate E r14 local probe `f1-e-local-acceptance-20260917-positive` passed the positive interruption/resume contract offline at executable SHA `a2c934081e93834338249f44e17d4e9af89b2ddc`; the parent remains `NOT_VERIFIED` for live acceptance because all transport was localhost.
 - The separate authorized Gate J parent `f1-ocr-aux-20260916-r5-09477d666a0f` passed the clearly labelled auxiliary OCR sample. It does not alter the Q 15-paper set.
 - The current Q child and parent plan carry a recorded v2 ACK for `ai.saigou.work,chat.178266.xyz` with route fingerprint `344765ad52227adc74d73030a8c0942f527bc84bf136babf0c873144c30392a9`; it expired at `2026-09-17T11:51:39Z`. Q made zero custom-host calls because D did not pass.
 
 ## Delivery state
 
 - The stored F1 plan is executable-SHA-neutral; the control plane records the exact clean checkout SHA at each run. C/D/Q evidence is frozen to `09477d666a0f31c2b1d95a2a6cb25c00b4e7bfca`; Gate I evidence is frozen to `24884c2adaeac2d98af85349dbbccc6980d2c814`; later report-only commits do not change either runtime evidence set.
-- PR #24 remains `OPEN`, `isDraft=false`, and no merge or force-push was performed. Hosted CI for the post-fix branch head is checked after this documentation update and recorded with its exact head SHA.
+- PR #24 remains `OPEN`, `isDraft=false`, and no merge or force-push was performed. Hosted CI run `35152733232` is `SUCCESS` 6/6 for head `426d654e90999d42e21e4b2c99d6a00aefeaa61c`.
 - The acceptance-only budget copy is bounded at 4 Provider calls and 128,000 output tokens; the live C/D ledgers record 4 successful DeepSeek calls and 49,787 output tokens.
