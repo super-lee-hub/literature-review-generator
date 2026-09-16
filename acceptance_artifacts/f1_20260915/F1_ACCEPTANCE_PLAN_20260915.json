@@ -1,6 +1,6 @@
 {
   "schema_version": "release-acceptance-plan-v2",
-  "parent_run_id": "f1-acceptance-20260915",
+  "parent_run_id": "f1-acceptance-20260916-r2",
   "final_executable_sha": "",
   "state_path": "F1_ACCEPTANCE_PLAN_STATE_20260915.json",
   "budget": {
@@ -16,31 +16,31 @@
       "scenario_id": "C",
       "gate": "C",
       "runtime_spec": "C_RUNTIME_SPEC_20260915.json",
-      "workspace": "runs/f1_acceptance_C__f1-acceptance-C-20260915",
+      "workspace": "runs/f1_acceptance_C__f1-acceptance-C-20260916-r2",
       "input_manifest": "F1_CORPUS_MANIFEST_20260915.json",
       "f1_source_ids": ["F1-01"],
       "execution_mode": "runtime",
       "budget_domain": "live",
       "prerequisites": [],
-      "job_id": "f1-acceptance-C-20260915"
+      "job_id": "f1-acceptance-C-20260916-r2"
     },
     "D": {
       "scenario_id": "D",
       "gate": "D",
       "runtime_spec": "D_RUNTIME_SPEC_20260915.json",
-      "workspace": "runs/f1_acceptance_D__f1-acceptance-D-20260915",
+      "workspace": "runs/f1_acceptance_D__f1-acceptance-D-20260916-r2",
       "input_manifest": "F1_CORPUS_MANIFEST_20260915.json",
       "f1_source_ids": ["F1-01", "F1-03", "F1-14"],
       "execution_mode": "runtime",
       "budget_domain": "live",
       "prerequisites": ["C"],
-      "job_id": "f1-acceptance-D-20260915"
+      "job_id": "f1-acceptance-D-20260916-r2"
     },
     "Q": {
       "scenario_id": "Q",
       "gate": "Q",
       "runtime_spec": "Q_RUNTIME_SPEC_20260915.json",
-      "workspace": "runs/f1_acceptance_Q__f1-acceptance-Q-20260915",
+      "workspace": "runs/f1_acceptance_Q__f1-acceptance-Q-20260916-r2",
       "input_manifest": "F1_CORPUS_MANIFEST_20260915.json",
       "f1_source_ids": [
         "F1-01", "F1-02", "F1-03", "F1-04", "F1-05",
@@ -50,7 +50,7 @@
       "execution_mode": "runtime",
       "budget_domain": "live",
       "prerequisites": ["D"],
-      "job_id": "f1-acceptance-Q-20260915"
+      "job_id": "f1-acceptance-Q-20260916-r2"
     }
   }
 }

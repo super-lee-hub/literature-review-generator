@@ -1,9 +1,9 @@
 {
   "project_name": "f1_acceptance_D",
-  "job_id": "f1-acceptance-D-20260915",
+  "job_id": "f1-acceptance-D-20260916-r2",
   "config": "F1_ACCEPTANCE_CONFIG_20260915.ini",
   "action": "analyze",
-  "workspace_path": "runs/f1_acceptance_D__f1-acceptance-D-20260915",
+  "workspace_path": "runs/f1_acceptance_D__f1-acceptance-D-20260916-r2",
   "source": {
     "mode": "direct",
     "pdf_folder": "source_corpus"
@@ -14,7 +14,7 @@
     "require_clean_validation": false,
     "allow_unvalidated_when_validation_optional": true,
     "audit_actor": "Codex",
-    "audit_reason": "F1 Gate D current-SHA heterogeneous stage1 acceptance",
+    "audit_reason": "F1 Gate D current-SHA heterogeneous stage1 acceptance 20260916 isolated recovery workspace",
     "audit_scope": {
       "field": "F1",
       "gate": "D",
