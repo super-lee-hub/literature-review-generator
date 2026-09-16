@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import io
 import json
 import math
@@ -591,6 +592,7 @@ class PreprocessManager:
     ):
         self.config = config or {}
         self.logger = logger
+        self._ocr_engines_used: set[str] = set()
         self.cancellation_checker = cancellation_checker
         preprocess_section = self.config.get("Preprocess", {}) if isinstance(self.config, Mapping) else {}
         paths_section = self.config.get("Paths", {}) if isinstance(self.config, Mapping) else {}
@@ -1483,7 +1485,10 @@ class PreprocessManager:
             "artifact_version": "v1",
             "schema_version": "ocr-diagnostics-v1",
             "source_pdf_sha256": str(source_identity["sha256"]),
-            "ocr_engine": "tesseract" if ocr_page_numbers else "none",
+            "ocr_engine": str(
+                extraction.get("ocr_engine")
+                or (self._ocr_engine_label() if ocr_page_numbers else "none")
+            ),
             "ocr_engine_version": "runtime-detected" if ocr_page_numbers else "not-used",
             "page_numbers": ocr_page_numbers,
             "ocr_page_count": len(ocr_page_numbers),
@@ -3366,6 +3371,7 @@ class PreprocessManager:
             "layout_fidelity": "page_markdown" if extractor_used == "pymupdf4llm" else "page_text",
             "conversion_used": "native_pdf",
             "used_ocr": any(item.used_ocr for item in page_diagnostics),
+            "ocr_engine": self._ocr_engine_label(),
         }
 
     def _extract_local_page_data(
@@ -3375,6 +3381,7 @@ class PreprocessManager:
     ) -> tuple[str, List[PageDiagnostics], List[Dict[str, Any]]]:
         import warnings
         parser_warnings: List[str] = []
+        self._ocr_engines_used.clear()
         warning_markers = (
             "No common ancestor in structure tree",
             "OCR on page.number=",
@@ -4250,7 +4257,20 @@ class PreprocessManager:
         return hashlib.sha256(payload).hexdigest()
 
     def _ocr_available(self) -> bool:
-        return shutil.which("tesseract") is not None
+        if shutil.which("tesseract") is not None:
+            return True
+        return any(
+            importlib.util.find_spec(module_name) is not None
+            for module_name in ("rapidocr_onnxruntime", "rapidocr")
+        )
+
+    def _ocr_engine_label(self) -> str:
+        engines = sorted(self._ocr_engines_used)
+        if not engines:
+            return "none"
+        if len(engines) == 1:
+            return engines[0]
+        return "mixed"
 
     def _should_try_ocr(self, scanned_candidate: bool) -> bool:
         if self.ocr_mode == "off":
@@ -4296,6 +4316,9 @@ class PreprocessManager:
                     level="warning",
                 )
                 return ""
+            engine = str(payload.get("engine") or "").strip().lower()
+            if engine:
+                self._ocr_engines_used.add(engine)
             return str(payload.get("text") or "")
         except subprocess.TimeoutExpired:
             self._log(f"OCR timed out on page {page.number + 1}", level="warning")

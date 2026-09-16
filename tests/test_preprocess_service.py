@@ -33,6 +33,29 @@ def _make_text_pdf(path: Path) -> None:
     doc.close()
 
 
+def test_ocr_worker_normalizes_rapidocr_results() -> None:
+    from preprocess.ocr_worker import _extract_rapidocr_text
+
+    assert _extract_rapidocr_text(
+        [
+            [[[0, 0], [1, 0], [1, 1], [0, 1]], " first line ", 0.99],
+            {"txt": "second line"},
+        ]
+    ) == "first line\nsecond line"
+
+
+def test_preprocess_manager_detects_locked_rapidocr_without_tesseract(monkeypatch) -> None:
+    monkeypatch.setattr("preprocess.service.shutil.which", lambda _name: None)
+    monkeypatch.setattr(
+        "preprocess.service.importlib.util.find_spec",
+        lambda name: object() if name == "rapidocr_onnxruntime" else None,
+    )
+    manager = PreprocessManager(config={"Preprocess": {"ocr_mode": "auto"}})
+
+    assert manager._ocr_available() is True
+    assert manager._should_try_ocr(True) is True
+
+
 def test_preprocess_manager_generates_new_artifact_contract(tmp_path: Path, monkeypatch) -> None:
     pdf_path = tmp_path / "sample.pdf"
     cache_dir = tmp_path / "cache"
