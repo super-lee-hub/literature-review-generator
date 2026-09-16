@@ -1,6 +1,6 @@
 # F1 C→D→Q acceptance report
 
-Status: `C=PASS / D=FAIL_MODALITY / I=PASS_SCOPED / J_AUX=PASS / K=PASS_OFFLINE / Q=BLOCKED_D_PREREQUISITE`.
+Status: `C=PASS / D=FAIL_MODALITY / I=PASS_SCOPED / J_AUX=PASS / K=PASS_OFFLINE / E_LOCAL=NOT_VERIFIED / Q=BLOCKED_D_PREREQUISITE`.
 
 This report records the current executable and the exact evidence boundary. It
 does not upgrade historical F1 outputs, local fixtures, or no-call preflight
@@ -14,6 +14,8 @@ into live acceptance.
 - Gate I live acceptance parent run: `f1-gui-acceptance-20260917-r2`.
 - Gate K offline evidence checkout: `96e6f829e4fc0b99d636190b742129e74226c8b0`.
 - Gate K offline acceptance parent run: `f1-k-offline-acceptance-20260917-96e6f829e4fc`.
+- Gate E local controlled-probe executable checkout: `0699ddc2fc160f820af3d424dd52655ed44eb8a6`.
+- Gate E local controlled-probe parent run: `f1-e-local-acceptance-20260917-r13` (`NOT_VERIFIED`).
 - The stored plans intentionally leave `final_executable_sha` blank so each authorized run binds the exact clean checkout at execution time. Each acceptance receipt remains bound to the SHA recorded for its own parent; later documentation-only commits do not change the runtime evidence sets.
 - Branch: `codex/f1-validation-authority-closure`
 - Acceptance plan: [F1_ACCEPTANCE_PLAN_20260915.json](F1_ACCEPTANCE_PLAN_20260915.json)
@@ -108,6 +110,7 @@ this F1 route.
 | D | F1-01, F1-03, F1-14 | `8a0c4633f4305abd62aab826c12d53e4b72e96227287e864144240d7644fe6d6` | FAIL: no `ocr_scanned` production-derived profile | 3 |
 | I | F1-01 GUI PDF flow | `c0301f40006ae22d817b137167a3addc94360fe723cfd2c3e2db3bd76cf11423` | PASS: real localhost GUI submission, completed canonical job, browser/trace evidence | 1 |
 | K | two independent Windows/Python contention workers | `N/A (offline-k)` | PASS_OFFLINE: bounded lock wait, no corrupt JSON, no lost Registry/Queue updates, live budget unchanged | 0 |
+| E | local provider-stub crash/resume probe | `487ffea9748a4a941db8bac1a20ebbccfa1d22e384c871d302c53ae9567cb390` | NOT_VERIFIED: terminate boundary reached; resume fail-closed on an ambiguous transport-started reservation | 1 persisted failed local call; no external calls |
 | Q | F1-01…F1-15 exact set | `cb7541d40e627bf9017649773e82b3ffb476731429f4b8e6c3e95a173f9013d7` | BLOCKED: D prerequisite not passed; recorded custom-host v2 ACK is now expired | 0 |
 
 The live command used the same control-plane entrypoint with owner authorization
@@ -137,6 +140,18 @@ projection is `PASS_OFFLINE`, and its receipt is bound to the current test SHA
 - Gate K evidence index: [evidence_index_v1.json](f1-k-offline-acceptance-20260917-96e6f829e4fc/K/evidence_index_v1.json)
 - Contention result: [contention_result.json](f1-k-offline-acceptance-20260917-96e6f829e4fc/K/evidence/K/contention_result.json)
 - Durable facts: two independent processes, bounded wait, no corrupt JSON, no lost Registry/Queue update, two offline contention receipts, and unchanged live parent budget.
+
+Gate E was exercised only against a local provider stub, never against an
+external F1 route. The latest controlled probe reached the durable provider
+receipt boundary and terminated the initial process. Resume then stopped at
+aggregate-budget binding because the transport-started reservation had no
+matching receipt yet; this is the required fail-closed treatment of an
+unknown POST, not a successful resume. The durable probe state is:
+
+- Parent result: [parent_acceptance_result_v2.json](f1-e-local-acceptance-20260917-r13/parent_acceptance_result_v2.json)
+- Gate E receipt: [scenario_execution_receipt.json](f1-e-local-acceptance-20260917-r13/E/scenario_execution_receipt.json)
+- The process interruption was recorded, but no positive `resume=true` verdict
+  exists; no external provider call was made.
 
 The C/D/Q result binds every child receipt to checkout SHA
 `09477d666a0f31c2b1d95a2a6cb25c00b4e7bfca`, corpus manifest SHA
@@ -173,6 +188,11 @@ its recorded attempt time but is now expired.
 Gate K passing offline does not lift the live F1 prerequisite chain: it proves
 the local contention/locking boundary only, not a live Provider, MinerU, or
 15-paper Q execution.
+
+The Gate E local probe likewise does not lift the live F1 chain. It proves that
+an ambiguous transport-started reservation blocks rather than silently retrying
+an unknown request; a positive durable resume at a known completed boundary
+remains unverified.
 
 ## Separate auxiliary OCR acceptance (Gate J)
 
@@ -231,6 +251,8 @@ custom-host content was sent.
 - Real MinerU create→upload→poll→download→parse and kill/resume.
 - Gate K covers offline contention, but a real production crash/resume boundary
   and live cumulative-budget recovery remain unverified.
+- Gate E's positive crash/resume acceptance remains unverified; its latest local
+  probe is an explicit fail-closed ambiguity result, not a PASS.
 - Hosted CI for the post-K branch head is checked after this report update. The
   current K evidence freeze is `96e6f829e4fc0b99d636190b742129e74226c8b0`; the
   PR remains open and unmerged.
