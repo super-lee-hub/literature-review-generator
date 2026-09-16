@@ -1,6 +1,6 @@
 # F1 C→D→Q acceptance report
 
-Status: `C=PASS / D=FAIL_MODALITY / Q=BLOCKED_D_PREREQUISITE`.
+Status: `C=PASS / D=FAIL_MODALITY / Q=BLOCKED_D_PREREQUISITE / J_AUX=PASS`.
 
 This report records the current executable and the exact evidence boundary. It
 does not upgrade historical F1 outputs, local fixtures, or no-call preflight
@@ -8,8 +8,8 @@ into live acceptance.
 
 ## Frozen identities
 
-- Live evidence checkout: `ff58c4000d3350436b322d5cdd9b27223b62125c`.
-- Live acceptance parent run: `f1-acceptance-20260916-r3-ff58c4000d33`.
+- Live evidence checkout: `09477d666a0f31c2b1d95a2a6cb25c00b4e7bfca`.
+- Live acceptance parent run: `f1-acceptance-20260916-r3-09477d666a0f`.
 - The stored plan intentionally leaves `final_executable_sha` blank so each authorized run binds the exact clean checkout at execution time. The live receipts below remain bound to the SHA above; later documentation-only commits do not change this runtime evidence.
 - Branch: `codex/f1-validation-authority-closure`
 - Acceptance plan: [F1_ACCEPTANCE_PLAN_20260915.json](F1_ACCEPTANCE_PLAN_20260915.json)
@@ -96,15 +96,15 @@ this F1 route.
 
 The live command used the same control-plane entrypoint with owner authorization
 and the root dotenv loaded only into the child process. The durable parent result
-is [parent_acceptance_result_v2.json](f1-acceptance-20260916-r3-ff58c4000d33/parent_acceptance_result_v2.json).
+is [parent_acceptance_result_v2.json](f1-acceptance-20260916-r3-09477d666a0f/parent_acceptance_result_v2.json).
 The child receipts are:
 
-- C: [scenario_execution_receipt.json](f1-acceptance-20260916-r3-ff58c4000d33/C/scenario_execution_receipt.json)
-- D: [scenario_execution_receipt.json](f1-acceptance-20260916-r3-ff58c4000d33/D/scenario_execution_receipt.json)
-- Q: [scenario_execution_receipt.json](f1-acceptance-20260916-r3-ff58c4000d33/Q/scenario_execution_receipt.json)
+- C: [scenario_execution_receipt.json](f1-acceptance-20260916-r3-09477d666a0f/C/scenario_execution_receipt.json)
+- D: [scenario_execution_receipt.json](f1-acceptance-20260916-r3-09477d666a0f/D/scenario_execution_receipt.json)
+- Q: [scenario_execution_receipt.json](f1-acceptance-20260916-r3-09477d666a0f/Q/scenario_execution_receipt.json)
 
 The result binds every child receipt to checkout SHA
-`ff58c4000d3350436b322d5cdd9b27223b62125c`, corpus manifest SHA
+`09477d666a0f31c2b1d95a2a6cb25c00b4e7bfca`, corpus manifest SHA
 `f741776ea2eda6b5937f4fc13e40569216eb3173ff597fb80eeea2e46dab3e90`, and
 the plan identity above. C recorded one successful HTTP 200 DeepSeek
 `Primary_Reader_API` call. D recorded three successful HTTP 200 calls on the
@@ -121,6 +121,31 @@ Provider receipts are valid while the required three-way modality criterion is
 not met. Q was stopped before any Provider call because the configured custom
 Outline/Writer hosts have a valid current v2 acknowledgement, but D remains an
 unmet prerequisite.
+
+## Separate auxiliary OCR acceptance (Gate J)
+
+The authoritative F1 corpus contains no scan-primary member, so the D
+three-way modality gate remains strict. A clearly labelled auxiliary scan was
+therefore tested through the existing Gate J contract without entering the Q
+15-paper manifest:
+
+- Source label: `F1-AUX-SCAN-01`; staged SHA-256
+  `b0ba815d4ddb39944bd3f7ef491661e5a2ad98042eda704bd77388b4eb3feaca`;
+  4,307,157 bytes; source is the user-material translation PDF and is not an
+  authoritative F1 primary attachment.
+- Current-SHA parent: `f1-ocr-aux-20260916-r5-09477d666a0f`; Gate J result:
+  `PASS` / parent projection `SCOPED_PASS_OFFLINE`.
+- Evidence: [Gate J evidence index](f1-ocr-aux-20260916-r5-09477d666a0f/J/evidence_index_v1.json)
+  and [Gate J receipt](f1-ocr-aux-20260916-r5-09477d666a0f/J/scenario_execution_receipt.json).
+- Production OCR diagnostics record `ocr_engine=rapidocr`, 17 actual OCR
+  pages (`1,2,4,5,6,7,8,9,11,12,13,14,15,16,17,18,19`), matching OCR output
+  page/text hashes and the Stage 1 OCR lineage. Stage 1 consumed the OCR text
+  and Registry dependency identities were verified. The current-SHA resume
+  made no additional Provider call.
+
+This proves the project's OCR step is automatic and operational when a real
+scan is present; it does not change the authoritative F1 corpus or make D
+pass.
 
 ## Why the full parent remains blocked
 
@@ -144,9 +169,10 @@ the unmet D prerequisite; no custom-host content was sent.
   canonical JobOutcome.
 - Human original-PDF ground truth, claim-level citation review, negative
   validator challenge, repair/revalidation, and DOCX visual QA.
-- Production GUI/Playwright flow and real OCR/scanned-primary flow.
+- Full production GUI/Playwright submission flow and F1 primary OCR/scanned-primary
+  flow. A read-only GUI smoke did reach the real localhost pages and exposed the
+  automatic OCR settings/queue/result views, but it did not submit a task.
 - Real MinerU create→upload→poll→download→parse and kill/resume.
-- Hosted CI run `35079384646` for the prior live-evidence checkout
-  `387bb723...` completed successfully across all six jobs. This report-only
-  ACK update is pushed separately and has its own CI run; the PR remains open
-  and unmerged.
+- Hosted CI run `35115650237` for executable SHA `09477d666a0f31c2b1d95a2a6cb25c00b4e7bfca`
+  completed successfully across all six jobs. The PR remains open and
+  unmerged.
