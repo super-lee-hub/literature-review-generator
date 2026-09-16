@@ -260,6 +260,7 @@ custom-host content was sent.
   and live cumulative-budget recovery remain unverified.
 - Live-provider crash/resume and MinerU recovery remain unverified; Gate E's
   current local r14 evidence is explicitly scoped to `PASS_OFFLINE_SCOPED`.
-- Hosted CI for the post-K branch head is checked after this report update. The
-  current K evidence freeze is `96e6f829e4fc0b99d636190b742129e74226c8b0`; the
-  PR remains open and unmerged.
+- Hosted CI for the current branch head is run `35159017730`, `SUCCESS`, 6/6,
+  at head `e8b6837ec1165b65c3dce124a3bcd20bfbae6c78`; the current K evidence
+  freeze is `96e6f829e4fc0b99d636190b742129e74226c8b0`; the PR remains open and
+  unmerged.
