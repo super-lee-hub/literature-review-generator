@@ -189,6 +189,9 @@ acceptance_artifacts/f1_*/F1_GUI_ACCEPTANCE_PLAN_STATE*.json*
 acceptance_artifacts/f1_*/f1-gui-acceptance-*/
 acceptance_artifacts/f1_*/F1_K_OFFLINE_ACCEPTANCE_PLAN_STATE*.json*
 acceptance_artifacts/f1_*/f1-k-offline-*/
+acceptance_artifacts/f1_*/F1_E_LOCAL_ACCEPTANCE_PLAN_STATE*.json*
+acceptance_artifacts/f1_*/f1-e-local-*/
+tmp/gate-e-local/
 
 # iFlow CLI generated files
 IFLOW.md
