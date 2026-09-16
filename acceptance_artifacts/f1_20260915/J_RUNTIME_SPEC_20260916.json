@@ -1,9 +1,9 @@
 {
   "project_name": "f1_acceptance_J",
-  "job_id": "f1-acceptance-J-20260916-r2",
+  "job_id": "f1-acceptance-J-20260916-r3",
   "config": "auxiliary_ocr_scan_20260916/J_ACCEPTANCE_CONFIG_20260916.ini",
   "action": "analyze",
-  "workspace_path": "runs/f1_acceptance_J__f1-auxiliary-ocr-20260916-r2",
+  "workspace_path": "runs/f1_acceptance_J__f1-acceptance-J-20260916-r3",
   "source": {
     "mode": "direct",
     "pdf_folder": "auxiliary_ocr_scan_20260916/source_corpus"
