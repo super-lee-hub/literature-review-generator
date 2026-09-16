@@ -44,6 +44,23 @@ original PDFs.
 | F1-14 | 王昊男等（2024），`10.3969/j.issn.1672-0334.2024.04.003` | `source_corpus/F1-14.pdf` | 23588616 | `7f25ebf74ae87f92bba3a626c1a787a4aebd32e1e4cc17347a2b78fa01cd8e0f` | 11 | 30235 | 11 | 0 | RESOLVED / primary candidate / role NOT_DECLARED | NOT_REVIEWED |
 | F1-15 | Zhou et al. (2021), `10.1016/j.jbusres.2021.05.011` | `source_corpus/F1-15.pdf` | 5576072 | `925c8e45b0370ac23ef36783338cb9f8c1eb5cd3f57ecce12610c1916fe4d9ed` | 22 | 128526 | 8 | 1 | RESOLVED / primary candidate / role NOT_DECLARED | NOT_REVIEWED |
 
+## Low-text-page visual adjudication (machine-only)
+
+The two sources with isolated low-text pages were rendered and visually
+checked. These pages are not scan-primary inputs and do not justify changing
+the F1 modality or OCR disposition:
+
+| Source/page | Bounded diagnostic | Visual finding | Modality decision |
+|---|---|---|---|
+| F1-10 / p21 | 0 extracted text chars; 1 embedded image | Academy of Management copyright notice on an otherwise blank page | not `ocr_scanned` |
+| F1-15 / p1 | 1,060 extracted text chars; 2 embedded images | Repository cover/citation page with selectable text and links | not `ocr_scanned` |
+| F1-15 / p10 | 770 extracted text chars; 1 embedded image | Figure 2 with selectable labels and body text | not `ocr_scanned` |
+| F1-15 / p12 | 70 extracted text chars; 1 embedded image | Figure 3 and surrounding selectable text | not `ocr_scanned` |
+| F1-15 / p16-p17 | 1,473/877 extracted text chars; 2/1 embedded images | Figures 4-6 with surrounding selectable text | not `ocr_scanned` |
+
+This is a machine-only page-format check, not human semantic ground truth. The
+rendered intermediates were temporary and were removed after inspection.
+
 ## Open quality work
 
 1. An independent reader must fill the semantic fields against the original

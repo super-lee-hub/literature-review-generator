@@ -142,6 +142,11 @@ The D production-derived profiles were:
 - F1-14: `visual_table_heavy` (11 pages; 11 image pages; 0 OCR pages).
 - F1-03: `text_heavy` (20 pages; 9 image pages; 0 OCR pages).
 
+The isolated low-text pages in F1-10 and F1-15 were also rendered and
+adjudicated in the machine-only [source ledger](F1_SOURCE_GROUND_TRUTH_20260915.md):
+they are a copyright notice, repository/front-matter pages, or selectable-text
+figure pages, not scan-primary material.
+
 Therefore C is a verified live gate, but D is not a PASS: the runtime and
 Provider receipts are valid while the required three-way modality criterion is
 not met. Q was stopped before any Provider call because the configured custom
