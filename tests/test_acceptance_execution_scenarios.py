@@ -553,6 +553,157 @@ def test_parent_acceptance_plan_dispatches_each_runtime_child_independently(
     }
 
 
+def test_gate_i_parent_binds_runtime_spec_created_by_production_gui_flow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A production-v2 GUI child must bind its generated spec into the parent."""
+
+    import runtime.release_acceptance as release_acceptance_module
+    from runtime.control_plane import ReviewControlPlane
+    from runtime.release_acceptance import GateEvidenceProducer
+
+    monkeypatch.setenv("AUTO_GENERATE_RUN_LIVE_ACCEPTANCE", "1")
+    input_manifest = tmp_path / "gui-input.json"
+    input_manifest.write_text(
+        json.dumps({"artifact_type": "acceptance_gui_input", "artifact_version": "v2"}),
+        encoding="utf-8",
+    )
+    plan_workspace = tmp_path / "plan-workspace"
+    job_id = "job-generated-by-gui"
+    plan_path = tmp_path / "acceptance-plan.json"
+    plan_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "release-acceptance-plan-v2",
+                "parent_run_id": "parent-gui-generated-spec",
+                "state_path": "acceptance-state.json",
+                "budget": {
+                    "max_provider_calls_total": 1,
+                    "max_output_tokens_total": 100,
+                    "max_retry_attempts_total": 1,
+                    "max_wall_seconds": 60,
+                },
+                "scenarios": {
+                    "I": {
+                        "scenario_id": "I",
+                        "gate": "I",
+                        "runtime_spec": "",
+                        "workspace": str(plan_workspace),
+                        "input_manifest": str(input_manifest),
+                        "execution_mode": "playwright",
+                        "budget_domain": "live",
+                        "prerequisites": [],
+                        "job_id": "",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class DynamicGateIScenario:
+        def execute(self, context, _refs, *, runtime_result):
+            del runtime_result
+            workspace = tmp_path / "generated-job-workspace"
+            workspace.mkdir()
+            runtime_spec_path = workspace / "runtime-spec.json"
+            runtime_spec_path.write_text(
+                json.dumps(
+                    {"job_id": job_id, "workspace_path": str(workspace)},
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            browser_path = workspace / "browser-evidence.json"
+            browser_path.write_text(
+                json.dumps({"resulting_job_id": job_id}),
+                encoding="utf-8",
+            )
+            producer = GateEvidenceProducer(final_sha=context.final_executable_sha)
+            runtime_hash = hashlib.sha256(runtime_spec_path.read_bytes()).hexdigest()
+            receipt = ScenarioExecutionReceiptV1(
+                parent_acceptance_run_id=context.acceptance_run_id,
+                scenario_id="I",
+                gate="I",
+                final_executable_sha=context.final_executable_sha,
+                plan_sha256=context.plan_sha256,
+                runtime_spec_sha256=runtime_hash,
+                input_identity_sha256=context.input_identity_sha256,
+                workspace_identity_sha256=ReviewControlPlane._acceptance_workspace_identity(
+                    workspace,
+                    job_id=job_id,
+                ),
+                executor_pid=os.getpid(),
+                executor_process_creation_identity="test-process",
+                executor_host_id="test-host",
+                started_at="2026-01-01T00:00:00Z",
+                completed_at="2026-01-01T00:00:01Z",
+                action_type="playwright-gui-production-flow",
+                workspace=str(workspace),
+                job_id=job_id,
+                attempt_id="attempt-generated-spec",
+                budget_domain="live",
+                status="PASSED",
+                exit_status=0,
+                produced_evidence_refs=(),
+            )
+            receipt_path = Path(context.scenario_execution_receipt_path)
+            receipt_path.parent.mkdir(parents=True, exist_ok=True)
+            receipt_path.write_text(json.dumps(receipt.to_dict()), encoding="utf-8")
+            return AcceptanceScenarioResultV1(
+                gate="I",
+                scenario_id="I",
+                status="READY_FOR_SEMANTIC_VERIFICATION",
+                reason="generated-spec test flow",
+                evidence_refs=(
+                    producer.reference(
+                        browser_path,
+                        role="browser_evidence",
+                        artifact_type="playwright_run_evidence",
+                        artifact_version="v1",
+                        job_id=job_id,
+                    ),
+                    producer.reference(
+                        runtime_spec_path,
+                        role="runtime_spec",
+                        artifact_type="runtime_job_spec",
+                        artifact_version="v1",
+                        job_id=job_id,
+                    ),
+                ),
+            )
+
+    class PassingVerifier:
+        def verify(self, *_args, **_kwargs):
+            return {"status": "PASS"}
+
+    monkeypatch.setattr(
+        release_acceptance_module,
+        "scenario_for_gate",
+        lambda _gate: DynamicGateIScenario(),
+    )
+    monkeypatch.setattr(release_acceptance_module, "GateEvidenceVerifier", PassingVerifier)
+    monkeypatch.setattr(
+        release_acceptance_module,
+        "_receipt_has_live_authority",
+        lambda _receipt: True,
+    )
+    control = ReviewControlPlane(repo_root=Path.cwd())
+    monkeypatch.setattr(control, "_acceptance_checkout_sha", lambda *_args, **_kwargs: "a" * 40)
+
+    result = control.acceptance_run(plan_path)
+
+    debug_result = json.dumps(
+        {"scenario": result["scenarios"]["I"], "parent": result["parent_result"]},
+        indent=2,
+        default=str,
+    )
+    assert result["scenarios"]["I"]["status"] == "PASS", debug_result
+    assert result["parent_result"]["status"] == "SCOPED_PASS", debug_result
+    assert "binding mismatch" not in result["parent_result"]["reason"]
+
+
 def test_parent_acceptance_resumes_child_with_durable_workspace_marker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -2982,11 +2982,35 @@ class ReviewControlPlane:
                                 raise ControlPlaneError(
                                     "Gate I production evidence lacks actual job or workspace identity"
                                 )
+                            # Production Gate I creates its RuntimeJobSpec while
+                            # the GUI flow is running.  The parent binding was
+                            # initially seeded from the plan (which deliberately
+                            # has no child spec for production-v2 input), so it
+                            # must be completed from the same durable reference
+                            # that the child receipt records.  Otherwise the
+                            # child can be independently verified while the
+                            # parent rejects its own receipt as cross-boundary.
+                            actual_runtime_spec_path = Path(
+                                str(runtime_ref.get("path") or "")
+                            ).expanduser().resolve()
+                            actual_runtime_spec_hash = self._acceptance_file_hash(
+                                actual_runtime_spec_path
+                            )
+                            if not actual_runtime_spec_hash:
+                                raise ControlPlaneError(
+                                    "Gate I production evidence lacks a readable RuntimeJobSpec"
+                                )
+                            child_runtime_hash = actual_runtime_spec_hash
+                            expected_child_bindings[gate] = {
+                                **expected_child_bindings.get(gate, {}),
+                                "runtime_spec_sha256": actual_runtime_spec_hash,
+                                "job_id": actual_job_id,
+                            }
                             child_context = replace(
                                 child_context,
                                 job_id=actual_job_id,
                                 workspace_path=actual_workspace,
-                                runtime_spec_path=str(runtime_ref.get("path") or ""),
+                                runtime_spec_path=str(actual_runtime_spec_path),
                             )
                         if scenario_result.status != "READY_FOR_SEMANTIC_VERIFICATION":
                             blocked_reason = scenario_result.reason
