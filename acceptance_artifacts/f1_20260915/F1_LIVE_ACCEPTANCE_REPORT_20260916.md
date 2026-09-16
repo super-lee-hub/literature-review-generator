@@ -65,9 +65,11 @@ with an explicit `ALLOW_LOCAL_PARSE_FALLBACK=true` child setting passed:
   values, with no secret value emitted
 
 The full `run_all` Q spec additionally reaches custom `Outline_API` and
-`Writer_API` hosts (`chat.178266.xyz` and `ai.saigou.work`). The current plan
-and Q RuntimeJobSpec carry a matching v2 ACK for those routes; Q still remains
-`provider_calls_allowed=false` until the D prerequisite is passed.
+`Writer_API` hosts (`chat.178266.xyz` and `ai.saigou.work`). The recorded plan
+and Q RuntimeJobSpec carry a matching v2 ACK for those routes, but that ACK
+expired at `2026-09-17T11:51:39Z`; any future Q attempt must generate a fresh
+ACK. Q remains `provider_calls_allowed=false` until both the D prerequisite and
+current ACK are satisfied.
 
 A fresh no-network `run_all` preflight of the acceptance config resolved all
 configured roles and reported `network_calls=0`, with the following exact
@@ -100,7 +102,7 @@ this F1 route.
 | C | F1-01 | `e0d0f5815c371bf691c6ca71f585b00720ab33227691f0a3bbe255a5d6e37827` | PASS: one source, canonical Stage 1, closure complete | 1 |
 | D | F1-01, F1-03, F1-14 | `8a0c4633f4305abd62aab826c12d53e4b72e96227287e864144240d7644fe6d6` | FAIL: no `ocr_scanned` production-derived profile | 3 |
 | I | F1-01 GUI PDF flow | `c0301f40006ae22d817b137167a3addc94360fe723cfd2c3e2db3bd76cf11423` | PASS: real localhost GUI submission, completed canonical job, browser/trace evidence | 1 |
-| Q | F1-01…F1-15 exact set | `cb7541d40e627bf9017649773e82b3ffb476731429f4b8e6c3e95a173f9013d7` | BLOCKED: D prerequisite not passed; custom-host v2 ACK is valid | 0 |
+| Q | F1-01…F1-15 exact set | `cb7541d40e627bf9017649773e82b3ffb476731429f4b8e6c3e95a173f9013d7` | BLOCKED: D prerequisite not passed; recorded custom-host v2 ACK is now expired | 0 |
 
 The live command used the same control-plane entrypoint with owner authorization
 and the root dotenv loaded only into the child process. The durable parent result
@@ -149,9 +151,9 @@ figure pages, not scan-primary material.
 
 Therefore C is a verified live gate, but D is not a PASS: the runtime and
 Provider receipts are valid while the required three-way modality criterion is
-not met. Q was stopped before any Provider call because the configured custom
-Outline/Writer hosts have a valid current v2 acknowledgement, but D remains an
-unmet prerequisite.
+not met. Q was stopped before any Provider call because D remains an unmet
+prerequisite; the previously recorded custom-host acknowledgement was valid at
+its recorded attempt time but is now expired.
 
 ## Separate auxiliary OCR acceptance (Gate J)
 
@@ -191,9 +193,11 @@ To make D pass, the owner must provide an approved source selection whose
 production-derived profiles include an actual `ocr_scanned` member, or approve a
 revised acceptance corpus/criterion. The existing machine-only source ledger
 states that no scan-primary source was established in the current 15-paper
-corpus, so the gate must not be weakened or promoted. Q's exact v2
-external-host acknowledgement is now valid, but Q remains correctly blocked by
-the unmet D prerequisite; no custom-host content was sent.
+corpus, so the gate must not be weakened or promoted. Q's recorded v2
+external-host acknowledgement was valid at the historical attempt time but is
+now expired. Q remains correctly blocked by the unmet D prerequisite and
+requires a fresh ACK before any custom-host content could be sent; no
+custom-host content was sent.
 
 ## Acceptance items not verified
 
