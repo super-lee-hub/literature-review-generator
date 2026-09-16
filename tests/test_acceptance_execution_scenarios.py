@@ -705,6 +705,27 @@ def test_f1_source_references_filter_shared_corpus_to_child_selection(
     ).source_by_id("F1-01").sha256
 
 
+def test_acceptance_scenario_deduplicates_repeated_durable_references(
+    tmp_path: Path,
+) -> None:
+    from runtime.release_acceptance import GateDScenario, GateEvidenceProducer
+
+    evidence = tmp_path / "runtime-spec.json"
+    evidence.write_text("{}", encoding="utf-8")
+    ref = GateEvidenceProducer(final_sha="a" * 40).reference(
+        evidence,
+        role="runtime_spec",
+        artifact_type="runtime_job_spec",
+        artifact_version="v1",
+        job_id="job-d",
+    )
+
+    selected, error = GateDScenario()._durable_refs((ref, ref))
+
+    assert error is None
+    assert len(selected) == 1
+
+
 @pytest.mark.parametrize("mismatch", ("workspace", "job_id"))
 def test_runtime_child_rejects_plan_to_runtime_identity_mismatch_before_execution(
     tmp_path: Path,

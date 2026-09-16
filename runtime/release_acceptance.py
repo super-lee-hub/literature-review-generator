@@ -1917,6 +1917,7 @@ class AcceptanceScenario:
 
         allowed = gate_evidence_roles(self.gate)
         selected: list[Mapping[str, Any]] = []
+        seen_ref_ids: set[str] = set()
         for raw_ref in refs:
             if not isinstance(raw_ref, Mapping) or str(raw_ref.get("role") or "") not in allowed:
                 continue
@@ -1928,6 +1929,9 @@ class AcceptanceScenario:
                 return (), f"{self.gate} scenario evidence reference is not durable: {type(exc).__name__}"
             if len(raw) != ref.size or hashlib.sha256(raw).hexdigest() != ref.sha256:
                 return (), f"{self.gate} scenario evidence reference hash or size is stale: {ref.ref_id}"
+            if ref.ref_id in seen_ref_ids:
+                continue
+            seen_ref_ids.add(ref.ref_id)
             selected.append(ref.to_dict())
         return tuple(selected), None
 
