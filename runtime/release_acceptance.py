@@ -5248,15 +5248,19 @@ class GateEvidenceVerifier:
                     canonical_items.append(nested_payload)
                 else:
                     canonical_items.append(canonical_payload)
-            lineage = next(
-                (
-                    item.get("ocr_lineage")
-                    for item in canonical_items
-                    if str(item.get("source_pdf_sha256") or "") == source_hash
-                    and isinstance(item.get("ocr_lineage"), Mapping)
-                ),
-                None,
-            )
+            lineage: Mapping[str, Any] | None = None
+            for item in canonical_items:
+                candidate_lineage = item.get("ocr_lineage")
+                if not isinstance(candidate_lineage, Mapping):
+                    continue
+                lineage_source_hash = str(
+                    candidate_lineage.get("source_pdf_sha256")
+                    or item.get("source_pdf_sha256")
+                    or ""
+                ).strip()
+                if lineage_source_hash == source_hash:
+                    lineage = candidate_lineage
+                    break
             if not isinstance(lineage, Mapping):
                 return {}, "canonical Stage 1 artifact lacks OCR lineage"
             if (
