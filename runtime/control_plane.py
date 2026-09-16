@@ -1867,8 +1867,9 @@ class ReviewControlPlane:
                 )
                 if key in resume_payload
             }
-            if isinstance(diagnostic.get("error"), str):
-                diagnostic["error"] = diagnostic["error"][-1000:]
+            error_value = diagnostic.get("error")
+            if isinstance(error_value, str):
+                diagnostic["error"] = error_value[-1000:]
             output_tail = self._acceptance_safe_resume_output(resume_output)
             if output_tail:
                 diagnostic["resume_output_tail"] = output_tail
