@@ -2612,10 +2612,11 @@ class ReviewControlPlane:
                                 "acceptance child RuntimeJobSpec external host acknowledgement "
                                 "does not match the parent plan"
                             )
-                    elif plan_acknowledgement is not None:
-                        raise ControlPlaneError(
-                            "acceptance plan declares external hosts that are not reachable from its child"
-                        )
+                    # A parent plan may carry one acknowledgement for a
+                    # subset of children. Children whose reachable route plan
+                    # has no external hosts must ignore that sibling-route
+                    # acknowledgement; only a child that actually reaches an
+                    # external host must prove the matching child metadata.
                 except (ControlPlaneError, OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, RuntimeError) as exc:
                     runtime_admission_error = (
                         "acceptance child runtime admission failed closed: "

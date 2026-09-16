@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -599,6 +599,16 @@ def test_gate_d_plan_carries_production_modality_refs_into_child_evidence(
 
     monkeypatch.setenv("AUTO_GENERATE_RUN_LIVE_ACCEPTANCE", "1")
     payload = _plan_payload(tmp_path)
+    now = datetime.now(timezone.utc)
+    payload["external_host_acknowledgement"] = {
+        "schema_version": "external-host-acknowledgement-v2",
+        "version": 2,
+        "acknowledged": True,
+        "hosts": ["gateway.example"],
+        "route_fingerprint": "a" * 64,
+        "issued_at": now.isoformat().replace("+00:00", "Z"),
+        "expires_at": (now + timedelta(days=1)).isoformat().replace("+00:00", "Z"),
+    }
     child = payload["scenarios"]["D"]
     workspace = Path(child["workspace"])
     payload["parent_run_id"] = "parent-d"
