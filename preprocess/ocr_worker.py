@@ -76,7 +76,8 @@ def _rapidocr_text(page: Any) -> str:
     )
     if channels == 4:
         image = image[:, :, :3]
-    result, _elapsed = RapidOCR()(image)
+    ocr_output: Any = RapidOCR()(image)
+    result = ocr_output[0] if isinstance(ocr_output, tuple) and ocr_output else ocr_output
     return _extract_rapidocr_text(result)
 
 
