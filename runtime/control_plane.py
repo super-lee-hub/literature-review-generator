@@ -2826,6 +2826,8 @@ class ReviewControlPlane:
                                     final_sha=current_sha,
                                     job_id=job_value,
                                     profile_root=evidence_root,
+                                    gate=gate,
+                                    f1_source_ids=child.f1_source_ids,
                                 )
                             )
                         if workspace and Path(workspace).is_dir():
@@ -2842,6 +2844,8 @@ class ReviewControlPlane:
                                 final_sha=current_sha,
                                 job_id=job_value,
                                 profile_root=evidence_root,
+                                gate=gate,
+                                f1_source_ids=child.f1_source_ids,
                             )
                         )
                         child_context = replace(
@@ -3488,6 +3492,8 @@ class ReviewControlPlane:
         final_sha: str,
         job_id: str,
         profile_root: str | Path | None = None,
+        gate: str = "",
+        f1_source_ids: Iterable[str] | None = None,
     ) -> list[dict[str, Any]]:
         from runtime.release_acceptance import GateEvidenceProducer
 
@@ -3496,11 +3502,22 @@ class ReviewControlPlane:
         folder = Path(spec.source.pdf_folder).expanduser().resolve()
         if not folder.is_dir():
             return []
+        selected_hashes = ReviewControlPlane._acceptance_f1_source_hashes(
+            spec,
+            gate=gate,
+            source_ids=f1_source_ids,
+        )
         producer = GateEvidenceProducer(final_sha=final_sha)
         refs: list[dict[str, Any]] = []
         for path in sorted(folder.glob("*.pdf")):
             if not path.is_file() or path.is_symlink():
                 continue
+            if selected_hashes is not None:
+                try:
+                    if file_sha256(str(path)) not in selected_hashes:
+                        continue
+                except OSError:
+                    continue
             try:
                 source_ref = producer.reference(
                     path,
@@ -3514,6 +3531,69 @@ class ReviewControlPlane:
         return refs
 
     @staticmethod
+    def _acceptance_f1_source_hashes(
+        spec: RuntimeJobSpec,
+        *,
+        gate: str,
+        source_ids: Iterable[str] | None,
+    ) -> set[str] | None:
+        """Return the exact manifest hashes selected by an F1 child.
+
+        A direct source folder is intentionally allowed to contain the full
+        fifteen-paper corpus so the same immutable staging root can serve C,
+        D, and Q. Acceptance evidence must nevertheless expose only the
+        child selection; otherwise the verifier mistakes valid extras for a
+        source-binding failure.
+        """
+
+        raw_binding = spec.metadata.get("f1_corpus_binding")
+        if not isinstance(raw_binding, Mapping):
+            return None
+        manifest_value = str(raw_binding.get("manifest_path") or "").strip()
+        raw_bound_ids = raw_binding.get("source_ids")
+        if not manifest_value or not isinstance(raw_bound_ids, (list, tuple)):
+            raise ControlPlaneError("F1 source binding is incomplete")
+        bound_ids = tuple(str(item).strip() for item in raw_bound_ids)
+        selected_ids = (
+            tuple(str(item).strip() for item in source_ids)
+            if source_ids is not None
+            else bound_ids
+        )
+        if (
+            not selected_ids
+            or any(not item for item in selected_ids)
+            or tuple(item.casefold() for item in selected_ids)
+            != tuple(item.casefold() for item in bound_ids)
+        ):
+            raise ControlPlaneError(
+                "F1 acceptance source selection does not match the RuntimeJobSpec binding"
+            )
+        normalized_gate = str(gate or "").strip().upper()
+        if not normalized_gate:
+            normalized_gate = {1: "C", 3: "D", 15: "Q"}.get(len(selected_ids), "")
+        if not normalized_gate:
+            raise ControlPlaneError("F1 acceptance source selection has no gate cardinality")
+        manifest_path = Path(manifest_value).expanduser()
+        if not manifest_path.is_absolute():
+            manifest_path = Path(spec.config).expanduser().resolve().parent / manifest_path
+        try:
+            from runtime.f1_corpus import F1CorpusManifestV1
+
+            manifest = F1CorpusManifestV1.from_file(
+                manifest_path,
+                verify_source_files=True,
+            )
+            selected = manifest.validate_selection(
+                selected_ids,
+                gate=normalized_gate,
+            )
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+            raise ControlPlaneError(
+                f"F1 acceptance source manifest could not be verified: {type(exc).__name__}"
+            ) from exc
+        return {source.sha256 for source in selected}
+
+    @staticmethod
     def _acceptance_production_modality_references(
         spec: RuntimeJobSpec,
         *,
@@ -3521,6 +3601,8 @@ class ReviewControlPlane:
         final_sha: str,
         job_id: str,
         profile_root: str | Path,
+        gate: str = "",
+        f1_source_ids: Iterable[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Derive Gate D profiles from published preprocess/Stage 1 artifacts.
 
@@ -3537,6 +3619,11 @@ class ReviewControlPlane:
         source_dir = Path(spec.source.pdf_folder).expanduser().resolve()
         if not source_dir.is_dir():
             raise ControlPlaneError("production modality profile source directory is missing")
+        selected_hashes = ReviewControlPlane._acceptance_f1_source_hashes(
+            spec,
+            gate=gate,
+            source_ids=f1_source_ids,
+        )
         workspace_path = Path(workspace).expanduser().resolve()
         registry_path = workspace_path / "artifact_registry.json"
         if not registry_path.is_file() or registry_path.is_symlink():
@@ -3553,6 +3640,8 @@ class ReviewControlPlane:
             if not source_pdf.is_file() or source_pdf.is_symlink():
                 continue
             source_hash = file_sha256(str(source_pdf))
+            if selected_hashes is not None and source_hash not in selected_hashes:
+                continue
             candidate: ArtifactRecord | None = None
             candidate_payload: Mapping[str, Any] | None = None
             for record in paper_records:

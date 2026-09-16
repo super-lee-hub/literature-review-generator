@@ -679,6 +679,32 @@ def test_gate_d_plan_carries_production_modality_refs_into_child_evidence(
     assert any(ref.get("role") == "modality_profile" for ref in collected)
 
 
+def test_f1_source_references_filter_shared_corpus_to_child_selection(
+    tmp_path: Path,
+) -> None:
+    from runtime.control_plane import ReviewControlPlane
+    from runtime.job_spec import load_runtime_job_spec
+
+    payload = _plan_payload(tmp_path)
+    child = payload["scenarios"]["C"]
+    runtime_spec = load_runtime_job_spec(str(child["runtime_spec"]))
+
+    refs = ReviewControlPlane._acceptance_source_references(
+        runtime_spec,
+        final_sha="a" * 40,
+        job_id="job-c",
+        gate="C",
+        f1_source_ids=tuple(str(item) for item in child["f1_source_ids"]),
+    )
+
+    assert len(refs) == 1
+    assert refs[0]["path"].endswith("F1-01.pdf")
+    assert refs[0]["sha256"] == F1CorpusManifestV1.from_file(
+        str(payload["scenarios"]["C"]["input_manifest"]),
+        verify_source_files=True,
+    ).source_by_id("F1-01").sha256
+
+
 @pytest.mark.parametrize("mismatch", ("workspace", "job_id"))
 def test_runtime_child_rejects_plan_to_runtime_identity_mismatch_before_execution(
     tmp_path: Path,
