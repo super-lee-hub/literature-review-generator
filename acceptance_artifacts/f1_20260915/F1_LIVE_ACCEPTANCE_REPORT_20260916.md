@@ -1,6 +1,6 @@
 # F1 C→D→Q acceptance report
 
-Status: `C=PASS / D=FAIL_MODALITY / I=PASS_SCOPED / Q=BLOCKED_D_PREREQUISITE / J_AUX=PASS`.
+Status: `C=PASS / D=FAIL_MODALITY / I=PASS_SCOPED / J_AUX=PASS / K=PASS_OFFLINE / Q=BLOCKED_D_PREREQUISITE`.
 
 This report records the current executable and the exact evidence boundary. It
 does not upgrade historical F1 outputs, local fixtures, or no-call preflight
@@ -12,7 +12,9 @@ into live acceptance.
 - C/D/Q live acceptance parent run: `f1-acceptance-20260916-r3-09477d666a0f`.
 - Gate I live evidence checkout: `24884c2adaeac2d98af85349dbbccc6980d2c814`.
 - Gate I live acceptance parent run: `f1-gui-acceptance-20260917-r2`.
-- The stored plans intentionally leave `final_executable_sha` blank so each authorized run binds the exact clean checkout at execution time. Each live receipt remains bound to the SHA recorded for its own parent; later documentation-only commits do not change either runtime evidence set.
+- Gate K offline evidence checkout: `96e6f829e4fc0b99d636190b742129e74226c8b0`.
+- Gate K offline acceptance parent run: `f1-k-offline-acceptance-20260917-96e6f829e4fc`.
+- The stored plans intentionally leave `final_executable_sha` blank so each authorized run binds the exact clean checkout at execution time. Each acceptance receipt remains bound to the SHA recorded for its own parent; later documentation-only commits do not change the runtime evidence sets.
 - Branch: `codex/f1-validation-authority-closure`
 - Acceptance plan: [F1_ACCEPTANCE_PLAN_20260915.json](F1_ACCEPTANCE_PLAN_20260915.json)
 - Plan identity SHA-256: `6cf51ea5b01a4986a4489b84f16addc8cf9e7672624afad5ea754db18d218f8d`
@@ -23,6 +25,9 @@ into live acceptance.
 - Gate I plan file SHA-256: `f8f28850ae89652c504942a2488fc924e6b1e1619c497eba865d64ee9f776287`
 - Gate I input manifest file SHA-256: `7bdfa3460e52ee41f971317cb52d56073273eb36a9451453940a73f0efd6694b`
 - Gate I acceptance budget: at most 2 Provider calls, 128,000 output tokens, 2 retry attempts, and 1,800 wall-clock seconds.
+- Gate K plan: [F1_K_OFFLINE_ACCEPTANCE_PLAN_20260917.json](F1_K_OFFLINE_ACCEPTANCE_PLAN_20260917.json)
+- Gate K plan identity SHA-256: `84bd93d50c0743f4b09edef6b51b0bd9b281ac8d8dda20d315701b5397b0df4d`
+- Gate K acceptance budget: at most 4 offline worker calls, 1,000 output tokens, 1 retry attempt, and 300 wall-clock seconds.
 - Corpus manifest: [F1_CORPUS_MANIFEST_20260915.json](F1_CORPUS_MANIFEST_20260915.json)
 - Corpus manifest file SHA-256: `f741776ea2eda6b5937f4fc13e40569216eb3173ff597fb80eeea2e46dab3e90`
 - Corpus content SHA-256: `ebaf5c2a9220ed23b527e279c0fd82a6770fa70e5d4ab5d1e1e64f2150ce4319`
@@ -95,13 +100,14 @@ the chat adapter encodes those images as `data:image/...;base64` values in
 `image_url` fields alongside extracted text. No original PDF file is sent by
 this F1 route.
 
-## C/D/Q live execution
+## F1 C/D/Q and supporting acceptance execution
 
 | Gate | Selection | Runtime spec SHA-256 | Live result | Provider calls |
 |---|---|---|---|---:|
 | C | F1-01 | `e0d0f5815c371bf691c6ca71f585b00720ab33227691f0a3bbe255a5d6e37827` | PASS: one source, canonical Stage 1, closure complete | 1 |
 | D | F1-01, F1-03, F1-14 | `8a0c4633f4305abd62aab826c12d53e4b72e96227287e864144240d7644fe6d6` | FAIL: no `ocr_scanned` production-derived profile | 3 |
 | I | F1-01 GUI PDF flow | `c0301f40006ae22d817b137167a3addc94360fe723cfd2c3e2db3bd76cf11423` | PASS: real localhost GUI submission, completed canonical job, browser/trace evidence | 1 |
+| K | two independent Windows/Python contention workers | `N/A (offline-k)` | PASS_OFFLINE: bounded lock wait, no corrupt JSON, no lost Registry/Queue updates, live budget unchanged | 0 |
 | Q | F1-01…F1-15 exact set | `cb7541d40e627bf9017649773e82b3ffb476731429f4b8e6c3e95a173f9013d7` | BLOCKED: D prerequisite not passed; recorded custom-host v2 ACK is now expired | 0 |
 
 The live command used the same control-plane entrypoint with owner authorization
@@ -122,6 +128,15 @@ The submitted job was `job_f725f32d4ef0`, and the durable evidence is:
 - Gate I receipt: [scenario_execution_receipt.json](f1-gui-acceptance-20260917-r2/I/scenario_execution_receipt.json)
 - Gate I evidence index: [evidence_index_v1.json](f1-gui-acceptance-20260917-r2/I/evidence_index_v1.json)
 - Browser evidence, trace archive, screenshot manifest, RuntimeJobSpec, completed JobOutcome, attempt, and one non-test `Primary_Reader_API` receipt are all bound to the same job and current executable SHA.
+
+Gate K was executed separately as an offline supporting acceptance. Its parent
+projection is `PASS_OFFLINE`, and its receipt is bound to the current test SHA
+`96e6f829e4fc0b99d636190b742129e74226c8b0`:
+
+- Parent result: [parent_acceptance_result_v2.json](f1-k-offline-acceptance-20260917-96e6f829e4fc/parent_acceptance_result_v2.json)
+- Gate K evidence index: [evidence_index_v1.json](f1-k-offline-acceptance-20260917-96e6f829e4fc/K/evidence_index_v1.json)
+- Contention result: [contention_result.json](f1-k-offline-acceptance-20260917-96e6f829e4fc/K/evidence/K/contention_result.json)
+- Durable facts: two independent processes, bounded wait, no corrupt JSON, no lost Registry/Queue update, two offline contention receipts, and unchanged live parent budget.
 
 The C/D/Q result binds every child receipt to checkout SHA
 `09477d666a0f31c2b1d95a2a6cb25c00b4e7bfca`, corpus manifest SHA
@@ -154,6 +169,10 @@ Provider receipts are valid while the required three-way modality criterion is
 not met. Q was stopped before any Provider call because D remains an unmet
 prerequisite; the previously recorded custom-host acknowledgement was valid at
 its recorded attempt time but is now expired.
+
+Gate K passing offline does not lift the live F1 prerequisite chain: it proves
+the local contention/locking boundary only, not a live Provider, MinerU, or
+15-paper Q execution.
 
 ## Separate auxiliary OCR acceptance (Gate J)
 
@@ -210,6 +229,8 @@ custom-host content was sent.
   GUI/Playwright path for one F1-01 PDF analyze job, but it does not prove a
   scanned-primary F1 route.
 - Real MinerU create→upload→poll→download→parse and kill/resume.
-- Hosted CI for the current executable SHA `24884c2adaeac2d98af85349dbbccc6980d2c814`.
-  The PR remains open and unmerged; the current post-push CI identity is checked
-  separately below.
+- Gate K covers offline contention, but a real production crash/resume boundary
+  and live cumulative-budget recovery remain unverified.
+- Hosted CI for the post-K branch head is checked after this report update. The
+  current K evidence freeze is `96e6f829e4fc0b99d636190b742129e74226c8b0`; the
+  PR remains open and unmerged.
