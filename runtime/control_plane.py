@@ -1837,8 +1837,21 @@ class ReviewControlPlane:
         resume_exit = int(resume_process.returncode or 0)
         resumed_at = self._utc_now()
         if resume_exit != 0:
+            resume_payload = self._acceptance_last_json(resume_output) or {}
+            diagnostic = {
+                key: resume_payload.get(key)
+                for key in (
+                    "job_status",
+                    "completion_status",
+                    "completion_reasons",
+                    "failed_stage",
+                    "requires_attention",
+                )
+                if key in resume_payload
+            }
             raise ControlPlaneError(
-                f"fresh resume process exited unsuccessfully: {resume_exit}"
+                "fresh resume process exited unsuccessfully: "
+                f"{resume_exit}; diagnostic={json.dumps(diagnostic, sort_keys=True)}"
             )
         after = self._acceptance_ledger_snapshot(workspace, job_id=job_id)
         budget_after = self._acceptance_budget_state_snapshot(
