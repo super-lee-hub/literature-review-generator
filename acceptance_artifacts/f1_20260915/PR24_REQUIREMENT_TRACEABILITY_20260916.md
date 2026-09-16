@@ -44,6 +44,13 @@ The code result below is `PASS_OFFLINE` only where the current repository checks
 
 - Local executable commit exists at the SHA above.
 - The stored F1 plan is executable-SHA-neutral for future authorized runs; the control plane records the exact current checkout SHA at run time. The latest dry-run is the separate `f392c847...` evidence; production code was verified at `12bf400d...`.
-- Evidence commit before this hygiene-only relocation: `74006daa70b92dd888c09f65aa05820b14c2e962`.
-- PR #24 was read back as `OPEN`, `isDraft=false`, with local and remote head matching `74006daa70b92dd888c09f65aa05820b14c2e962`. Hosted CI run `35059194572` had five jobs pass and `test (3)` fail because this report was incorrectly at repository root; the fix relocates it under the acceptance artifact directory. No merge or force-push was performed.
-- The code and evidence remain locally available. This hygiene-only commit changes PR HEAD without changing the frozen executable SHA; any live receipt must continue to bind to the frozen SHA explicitly.
+- The prior evidence commit before the hygiene-only relocation was
+  `74006daa70b92dd888c09f65aa05820b14c2e962`; the relocation was pushed as
+  `45d8c355e8879185f8d739209bcdc485f61bb2f1`.
+- PR #24 was read back as `OPEN`, `isDraft=false`, with local and remote head
+  matching `45d8c355e8879185f8d739209bcdc485f61bb2f1`. Hosted CI run
+  `35060285751` passed all six jobs after the report relocation. No merge or
+  force-push was performed.
+- This report update is documentation-only and does not change the frozen
+  executable SHA; any live receipt must continue to bind to the frozen SHA
+  explicitly.

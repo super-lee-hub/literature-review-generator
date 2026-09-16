@@ -75,6 +75,15 @@ Those model and endpoint settings are configuration facts, not an automatic
 external-host acknowledgement. The v2 ACK must still be supplied explicitly
 for the two custom hosts before Q can send review content.
 
+The selected DeepSeek transport was also checked directly from the acceptance
+configuration and current input builder: `send_original_pdf=never`,
+`image_transport=base64`, and `force_pdf_file_input_for_provider=false`. The
+DeepSeek vision capability probe reports image input and base64 support, but no
+PDF file-input support. Stage 1 therefore constructs rendered image inputs;
+the chat adapter encodes those images as `data:image/...;base64` values in
+`image_url` fields alongside extracted text. No original PDF file is sent by
+this F1 route, and this run sent no live payload.
+
 ## C/D/Q plan and dry-run
 
 | Gate | Selection | Runtime spec SHA-256 | Dry-run status | Provider calls |
@@ -106,8 +115,9 @@ Provider, Writer, Outline, Validator, or MinerU transport occurred.
 ## Why live C/D/Q did not run
 
 The security boundary rejected the attempted live command because it would
-export private F1 PDF contents to `api.deepseek.com` using credentials loaded
-from `.env`, without an explicit direct user approval for that payload and
+export private F1 source content (the selected text and rendered-image payload
+derived from the PDFs) to `api.deepseek.com` using credentials loaded from
+`.env`, without an explicit direct user approval for that payload and
 destination. No workaround or indirect network path was used.
 
 To resume, the owner must explicitly authorize the bounded C/D payload and
@@ -125,8 +135,5 @@ fingerprint; the code must not synthesize `acknowledged=true`.
   validator challenge, repair/revalidation, and DOCX visual QA.
 - Production GUI/Playwright flow and real OCR/scanned-primary flow.
 - Real MinerU create→upload→poll→download→parse and kill/resume.
-- Hosted CI run `35059194572` for pushed checkout SHA `74006daa...` completed with
-  five jobs passing and `test (3)` failing at the repository-hygiene check because
-  this traceability report was temporarily stored at repository root. The report
-  relocation is an evidence-only correction; a fresh CI run is required after it
-  is pushed. The PR remains open and unmerged.
+- Hosted CI run `35060285751` for pushed checkout SHA `45d8c355...` completed
+  successfully across all six jobs. The PR remains open and unmerged.
