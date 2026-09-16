@@ -125,5 +125,8 @@ fingerprint; the code must not synthesize `acknowledged=true`.
   validator challenge, repair/revalidation, and DOCX visual QA.
 - Production GUI/Playwright flow and real OCR/scanned-primary flow.
 - Real MinerU create→upload→poll→download→parse and kill/resume.
-- Hosted CI for the new checkout SHA `f392c847...` (the remote PR still has the old
-  head because push was unavailable).
+- Hosted CI run `35059194572` for pushed checkout SHA `74006daa...` completed with
+  five jobs passing and `test (3)` failing at the repository-hygiene check because
+  this traceability report was temporarily stored at repository root. The report
+  relocation is an evidence-only correction; a fresh CI run is required after it
+  is pushed. The PR remains open and unmerged.

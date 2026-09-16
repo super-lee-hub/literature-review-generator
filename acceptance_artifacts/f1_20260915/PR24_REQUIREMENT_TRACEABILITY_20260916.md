@@ -2,7 +2,7 @@
 
 Executable freeze: `12bf400d3cf6fd7711da8750856e25ebc7d0da85` on `codex/f1-validation-authority-closure`.
 
-The code result below is `PASS_OFFLINE` only where the current repository checks prove it. It is not a claim that live Provider, MinerU, GUI, OCR, or semantic F1 acceptance passed. The separate [F1 acceptance report](acceptance_artifacts/f1_20260915/F1_LIVE_ACCEPTANCE_REPORT_20260916.md) records those boundaries.
+The code result below is `PASS_OFFLINE` only where the current repository checks prove it. It is not a claim that live Provider, MinerU, GUI, OCR, or semantic F1 acceptance passed. The separate [F1 acceptance report](F1_LIVE_ACCEPTANCE_REPORT_20260916.md) records those boundaries.
 
 | ID | Current judgment | Implementation / authoritative boundary | Fresh evidence | Remaining boundary |
 |---|---|---|---|---|
@@ -34,9 +34,9 @@ The code result below is `PASS_OFFLINE` only where the current repository checks
 
 ## F1 evidence boundary
 
-- Formal manifest: [F1_CORPUS_MANIFEST_20260915.json](acceptance_artifacts/f1_20260915/F1_CORPUS_MANIFEST_20260915.json), content SHA `ebaf5c2a9220ed23b527e279c0fd82a6770fa70e5d4ab5d1e1e64f2150ce4319`, file SHA `f741776ea2eda6b5937f4fc13e40569216eb3173ff597fb80eeea2e46dab3e90`.
+- Formal manifest: [F1_CORPUS_MANIFEST_20260915.json](F1_CORPUS_MANIFEST_20260915.json), content SHA `ebaf5c2a9220ed23b527e279c0fd82a6770fa70e5d4ab5d1e1e64f2150ce4319`, file SHA `f741776ea2eda6b5937f4fc13e40569216eb3173ff597fb80eeea2e46dab3e90`.
 - The controlled staging root contains 15 copied PDFs; all 15 current bytes match the prior canonical-resolution manifest. The original Zotero PDFs were not modified or deleted.
-- Machine-only source ledger: [F1_SOURCE_GROUND_TRUTH_20260915.md](acceptance_artifacts/f1_20260915/F1_SOURCE_GROUND_TRUTH_20260915.md). It deliberately marks semantic ground truth and human review as not done.
+- Machine-only source ledger: [F1_SOURCE_GROUND_TRUTH_20260915.md](F1_SOURCE_GROUND_TRUTH_20260915.md). It deliberately marks semantic ground truth and human review as not done.
 - The latest no-network acceptance dry-run bound all C/D/Q receipts to checkout SHA `f392c847...` and manifest file SHA `f741776e...`, then stopped at owner authorization before Provider transport. The production code was fully tested at its preceding code commit `12bf400d...`; the intervening commit is evidence-only. Therefore C, D, and Q are `NOT_VERIFIED`, not PASS.
 - A fresh Q `run_all` preflight resolved the configured model roles with zero network calls and computed required custom hosts `ai.saigou.work,chat.178266.xyz` plus route fingerprint `ab98b7233f2ac6bb205d6a6992260880fd66a684f0cb47570a328c1869ab7a1d`; configuration does not substitute for their explicit v2 ACK.
 
@@ -44,6 +44,6 @@ The code result below is `PASS_OFFLINE` only where the current repository checks
 
 - Local executable commit exists at the SHA above.
 - The stored F1 plan is executable-SHA-neutral for future authorized runs; the control plane records the exact current checkout SHA at run time. The latest dry-run is the separate `f392c847...` evidence; production code was verified at `12bf400d...`.
-- Evidence commit currently in the checkout: `f392c8475686b7c28204c967b0a699b98fcd2e2d`.
-- PR #24 was read back as `OPEN`, `isDraft=false`, with remote head still `1fcc5b5a4c4f78de9378419d9a981f149edc5a08` and the previously reported six Hosted CI successes. The push of `12bf400d...` failed over both SSH and HTTPS; the branch was not force-pushed and no merge was performed.
-- The code and evidence remain locally available. A later evidence-only commit may change PR HEAD without changing the frozen executable SHA; any live receipt must continue to bind to the frozen SHA explicitly.
+- Evidence commit before this hygiene-only relocation: `74006daa70b92dd888c09f65aa05820b14c2e962`.
+- PR #24 was read back as `OPEN`, `isDraft=false`, with local and remote head matching `74006daa70b92dd888c09f65aa05820b14c2e962`. Hosted CI run `35059194572` had five jobs pass and `test (3)` fail because this report was incorrectly at repository root; the fix relocates it under the acceptance artifact directory. No merge or force-push was performed.
+- The code and evidence remain locally available. This hygiene-only commit changes PR HEAD without changing the frozen executable SHA; any live receipt must continue to bind to the frozen SHA explicitly.
