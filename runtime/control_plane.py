@@ -1718,7 +1718,11 @@ class ReviewControlPlane:
                     boundary_reached = True
                     break
                 time.sleep(0.2)
-            if initial.poll() is None and not boundary_reached:
+            # Terminate as soon as the durable receipt/Registry boundary is
+            # observed.  Waiting in ``communicate`` first lets a fast child
+            # finish gracefully, turning the intended crash/resume probe into
+            # a false timing failure.
+            if initial.poll() is None:
                 initial.terminate()
             try:
                 initial_output = initial.communicate(timeout=15.0)[0] or ""
