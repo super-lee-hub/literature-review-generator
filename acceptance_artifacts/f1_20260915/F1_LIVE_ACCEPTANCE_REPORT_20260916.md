@@ -60,6 +60,21 @@ The full `run_all` Q spec would additionally reach custom `Outline_API` and
 for those routes is present in the acceptance plan, and the Q runtime spec is
 marked `provider_calls_allowed=false` until that route authority is provided.
 
+A fresh no-network `run_all` preflight of the acceptance config resolved all
+configured roles and reported `network_calls=0`, with the following exact
+external set and route identity:
+
+- required external hosts: `ai.saigou.work`, `chat.178266.xyz`
+- route fingerprint: `ab98b7233f2ac6bb205d6a6992260880fd66a684f0cb47570a328c1869ab7a1d`
+- reachable role routes: Primary Reader on DeepSeek; Outline candidate/
+  arbitration on Anthropic; Writer and structure/evidence critique on the
+  configured OpenAI-compatible gateway; Validator and Free Mode on DeepSeek
+- MinerU: `remote_parser_not_requested`
+
+Those model and endpoint settings are configuration facts, not an automatic
+external-host acknowledgement. The v2 ACK must still be supplied explicitly
+for the two custom hosts before Q can send review content.
+
 ## C/D/Q plan and dry-run
 
 | Gate | Selection | Runtime spec SHA-256 | Dry-run status | Provider calls |

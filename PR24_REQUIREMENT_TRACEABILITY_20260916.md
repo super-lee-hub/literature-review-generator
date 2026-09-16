@@ -38,6 +38,7 @@ The code result below is `PASS_OFFLINE` only where the current repository checks
 - The controlled staging root contains 15 copied PDFs; all 15 current bytes match the prior canonical-resolution manifest. The original Zotero PDFs were not modified or deleted.
 - Machine-only source ledger: [F1_SOURCE_GROUND_TRUTH_20260915.md](acceptance_artifacts/f1_20260915/F1_SOURCE_GROUND_TRUTH_20260915.md). It deliberately marks semantic ground truth and human review as not done.
 - The latest no-network acceptance dry-run bound all C/D/Q receipts to checkout SHA `f392c847...` and manifest file SHA `f741776e...`, then stopped at owner authorization before Provider transport. The production code was fully tested at its preceding code commit `12bf400d...`; the intervening commit is evidence-only. Therefore C, D, and Q are `NOT_VERIFIED`, not PASS.
+- A fresh Q `run_all` preflight resolved the configured model roles with zero network calls and computed required custom hosts `ai.saigou.work,chat.178266.xyz` plus route fingerprint `ab98b7233f2ac6bb205d6a6992260880fd66a684f0cb47570a328c1869ab7a1d`; configuration does not substitute for their explicit v2 ACK.
 
 ## Delivery state
 
