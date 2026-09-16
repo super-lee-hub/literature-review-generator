@@ -187,6 +187,8 @@ acceptance_artifacts/f1_*/f1-ocr-aux-*/
 acceptance_artifacts/f1_*/gui_production_*/
 acceptance_artifacts/f1_*/F1_GUI_ACCEPTANCE_PLAN_STATE*.json*
 acceptance_artifacts/f1_*/f1-gui-acceptance-*/
+acceptance_artifacts/f1_*/F1_K_OFFLINE_ACCEPTANCE_PLAN_STATE*.json*
+acceptance_artifacts/f1_*/f1-k-offline-*/
 
 # iFlow CLI generated files
 IFLOW.md

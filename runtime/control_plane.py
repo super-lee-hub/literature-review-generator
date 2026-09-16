@@ -3095,6 +3095,23 @@ class ReviewControlPlane:
                         "evidence_manifest": "",
                     }
                 else:
+                    if gate == "K":
+                        receipt_refs = [
+                            item
+                            for item in refs
+                            if str(item.get("role") or "") == "scenario_execution_receipt"
+                        ]
+                        if len(receipt_refs) != 1:
+                            raise ControlPlaneError(
+                                "Gate K contention evidence must contain exactly one scenario receipt"
+                            )
+                        receipt_path = Path(
+                            str(receipt_refs[0].get("path") or "")
+                        ).expanduser().resolve()
+                        if not receipt_path.is_file() or receipt_path.is_symlink():
+                            raise ControlPlaneError(
+                                "Gate K contention scenario receipt is missing or unsafe"
+                            )
                     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
                     evidence_path = self._write_acceptance_child_manifest(
                         evidence_path,
