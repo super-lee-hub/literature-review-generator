@@ -1,9 +1,9 @@
 {
   "project_name": "f1_acceptance_C",
-  "job_id": "f1-acceptance-C-20260916-r2",
+  "job_id": "f1-acceptance-C-20260916-r3",
   "config": "F1_ACCEPTANCE_CONFIG_20260915.ini",
   "action": "analyze",
-  "workspace_path": "runs/f1_acceptance_C__f1-acceptance-C-20260916-r2",
+  "workspace_path": "runs/f1_acceptance_C__f1-acceptance-C-20260916-r3",
   "source": {
     "mode": "direct",
     "pdf_folder": "source_corpus"
