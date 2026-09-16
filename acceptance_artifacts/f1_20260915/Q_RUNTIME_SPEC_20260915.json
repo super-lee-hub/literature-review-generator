@@ -20,16 +20,16 @@
       "gate": "Q",
       "corpus_id": "field-f1-20260915",
       "provider_calls_allowed": false,
-      "blocked_until": "current route acknowledgement for custom Outline/Writer gateways",
-      "external_host_acknowledgement": {
-        "schema_version": "external-host-acknowledgement-v2",
-        "version": 2,
-        "acknowledged": true,
-        "hosts": ["ai.saigou.work", "chat.178266.xyz"],
-        "route_fingerprint": "344765ad52227adc74d73030a8c0942f527bc84bf136babf0c873144c30392a9",
-        "issued_at": "2026-09-16T11:51:39.155227Z",
-        "expires_at": "2026-09-17T11:51:39.155227Z"
-      }
+      "blocked_until": "current route acknowledgement for custom Outline/Writer gateways"
+    },
+    "external_host_acknowledgement": {
+      "schema_version": "external-host-acknowledgement-v2",
+      "version": 2,
+      "acknowledged": true,
+      "hosts": ["ai.saigou.work", "chat.178266.xyz"],
+      "route_fingerprint": "344765ad52227adc74d73030a8c0942f527bc84bf136babf0c873144c30392a9",
+      "issued_at": "2026-09-16T11:51:39.155227Z",
+      "expires_at": "2026-09-17T11:51:39.155227Z"
     },
     "f1_corpus_binding": {
       "schema_version": "f1-corpus-binding-v1",
