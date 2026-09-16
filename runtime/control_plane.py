@@ -1475,10 +1475,12 @@ class ReviewControlPlane:
         semantic_status = str(
             metadata.get("semantic_validation_status") or ""
         ).strip().casefold()
-        # A transport-success response that failed canonical validation (or was
-        # truncated) is not a completed logical call.  Resume may legitimately
-        # retry it; it must not be reported as an unnecessary reexecution.
-        return semantic_status not in {"failed", "not_evaluated"}
+        # A transport-success response is not a completed logical call until
+        # the Stage 1 semantic boundary explicitly records ``passed``.  An
+        # absent status is intentionally not promoted: the provider receipt
+        # may have been durable while the summary/manifest publication was
+        # still in flight, so resume may legitimately retry it.
+        return semantic_status == "passed"
 
     def _acceptance_unique_provider_ledger_paths(
         self,

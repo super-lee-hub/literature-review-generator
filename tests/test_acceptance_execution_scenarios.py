@@ -777,6 +777,9 @@ def test_resume_snapshot_does_not_mark_semantically_invalid_success_completed() 
             metadata={"semantic_validation_status": "not_evaluated"},
         )
     )
+    assert not ReviewControlPlane._acceptance_receipt_is_completed(
+        SimpleNamespace(status="success", metadata={})
+    )
     assert ReviewControlPlane._acceptance_receipt_is_completed(
         SimpleNamespace(
             status="success",
