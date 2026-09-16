@@ -1,11 +1,11 @@
 {
   "schema_version": "release-acceptance-plan-v2",
-  "parent_run_id": "f1-ocr-aux-20260916-r3",
+  "parent_run_id": "f1-ocr-aux-20260916-r4",
   "final_executable_sha": "",
-  "state_path": "F1_OCR_AUXILIARY_PLAN_STATE_20260916_R3.json",
+  "state_path": "F1_OCR_AUXILIARY_PLAN_STATE_20260916_R4.json",
   "budget": {
     "max_provider_calls_total": 1,
-    "max_output_tokens_total": 64000,
+    "max_output_tokens_total": 128000,
     "max_retry_attempts_total": 1,
     "max_wall_seconds": 7200
   },
@@ -17,13 +17,13 @@
       "scenario_id": "J",
       "gate": "J",
       "runtime_spec": "J_RUNTIME_SPEC_20260916.json",
-      "workspace": "runs/f1_acceptance_J__f1-acceptance-J-20260916-r3",
+      "workspace": "runs/f1_acceptance_J__f1-acceptance-J-20260916-r4",
       "input_manifest": "",
       "f1_source_ids": [],
       "execution_mode": "ocr",
       "budget_domain": "live",
       "prerequisites": [],
-      "job_id": "f1-acceptance-J-20260916-r3"
+      "job_id": "f1-acceptance-J-20260916-r4"
     }
   }
 }
