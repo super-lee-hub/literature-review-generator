@@ -74,6 +74,7 @@ def interprocess_file_lock(
                 if os.name == "nt":
                     import msvcrt
 
+                    handle.seek(0)
                     msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
                 else:
                     import fcntl

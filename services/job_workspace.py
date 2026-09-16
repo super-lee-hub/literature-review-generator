@@ -172,6 +172,11 @@ def _latest_pointer_lock(
 
                 while not acquired:
                     try:
+                        # ``msvcrt.locking`` advances the file position by
+                        # the locked byte count.  Reset it on every retry so
+                        # a failed contention attempt never changes the byte
+                        # range being locked.
+                        handle.seek(0)
                         msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
                         acquired = True
                     except OSError as exc:

@@ -479,6 +479,11 @@ class PersistentQueueService:
 
                         while not acquired_os_lock:
                             try:
+                                # ``msvcrt.locking`` advances the file
+                                # position; reset it before each retry so a
+                                # contention failure cannot move the lock
+                                # range.
+                                handle.seek(0)
                                 msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
                                 acquired_os_lock = True
                             except OSError as exc:
