@@ -1,6 +1,6 @@
 # F1 C→D→Q acceptance report
 
-Status: `C=PASS / D=FAIL_MODALITY / Q=BLOCKED_D_PREREQUISITE / J_AUX=PASS`.
+Status: `C=PASS / D=FAIL_MODALITY / I=PASS_SCOPED / Q=BLOCKED_D_PREREQUISITE / J_AUX=PASS`.
 
 This report records the current executable and the exact evidence boundary. It
 does not upgrade historical F1 outputs, local fixtures, or no-call preflight
@@ -8,14 +8,21 @@ into live acceptance.
 
 ## Frozen identities
 
-- Live evidence checkout: `09477d666a0f31c2b1d95a2a6cb25c00b4e7bfca`.
-- Live acceptance parent run: `f1-acceptance-20260916-r3-09477d666a0f`.
-- The stored plan intentionally leaves `final_executable_sha` blank so each authorized run binds the exact clean checkout at execution time. The live receipts below remain bound to the SHA above; later documentation-only commits do not change this runtime evidence.
+- C/D/Q live evidence checkout: `09477d666a0f31c2b1d95a2a6cb25c00b4e7bfca`.
+- C/D/Q live acceptance parent run: `f1-acceptance-20260916-r3-09477d666a0f`.
+- Gate I live evidence checkout: `24884c2adaeac2d98af85349dbbccc6980d2c814`.
+- Gate I live acceptance parent run: `f1-gui-acceptance-20260917-r2`.
+- The stored plans intentionally leave `final_executable_sha` blank so each authorized run binds the exact clean checkout at execution time. Each live receipt remains bound to the SHA recorded for its own parent; later documentation-only commits do not change either runtime evidence set.
 - Branch: `codex/f1-validation-authority-closure`
 - Acceptance plan: [F1_ACCEPTANCE_PLAN_20260915.json](F1_ACCEPTANCE_PLAN_20260915.json)
 - Plan identity SHA-256: `6cf51ea5b01a4986a4489b84f16addc8cf9e7672624afad5ea754db18d218f8d`
 - Plan file SHA-256: `7f9be873cc9f9c563d2f6fd176531d983bb976c09f4927ab9fccabd0867d626a`
 - Acceptance budget: at most 4 Provider calls, 128,000 output tokens, 4 retry attempts, and 7,200 wall-clock seconds.
+- Gate I plan: [F1_GUI_ACCEPTANCE_PLAN_20260917_R2.json](F1_GUI_ACCEPTANCE_PLAN_20260917_R2.json)
+- Gate I plan identity SHA-256: `a2439e3c941914b5426efb963c25a5d73539ef281b44c18b06a9abcb3fc146ac`
+- Gate I plan file SHA-256: `f8f28850ae89652c504942a2488fc924e6b1e1619c497eba865d64ee9f776287`
+- Gate I input manifest file SHA-256: `7bdfa3460e52ee41f971317cb52d56073273eb36a9451453940a73f0efd6694b`
+- Gate I acceptance budget: at most 2 Provider calls, 128,000 output tokens, 2 retry attempts, and 1,800 wall-clock seconds.
 - Corpus manifest: [F1_CORPUS_MANIFEST_20260915.json](F1_CORPUS_MANIFEST_20260915.json)
 - Corpus manifest file SHA-256: `f741776ea2eda6b5937f4fc13e40569216eb3173ff597fb80eeea2e46dab3e90`
 - Corpus content SHA-256: `ebaf5c2a9220ed23b527e279c0fd82a6770fa70e5d4ab5d1e1e64f2150ce4319`
@@ -92,6 +99,7 @@ this F1 route.
 |---|---|---|---|---:|
 | C | F1-01 | `e0d0f5815c371bf691c6ca71f585b00720ab33227691f0a3bbe255a5d6e37827` | PASS: one source, canonical Stage 1, closure complete | 1 |
 | D | F1-01, F1-03, F1-14 | `8a0c4633f4305abd62aab826c12d53e4b72e96227287e864144240d7644fe6d6` | FAIL: no `ocr_scanned` production-derived profile | 3 |
+| I | F1-01 GUI PDF flow | `c0301f40006ae22d817b137167a3addc94360fe723cfd2c3e2db3bd76cf11423` | PASS: real localhost GUI submission, completed canonical job, browser/trace evidence | 1 |
 | Q | F1-01…F1-15 exact set | `cb7541d40e627bf9017649773e82b3ffb476731429f4b8e6c3e95a173f9013d7` | BLOCKED: D prerequisite not passed; custom-host v2 ACK is valid | 0 |
 
 The live command used the same control-plane entrypoint with owner authorization
@@ -103,12 +111,30 @@ The child receipts are:
 - D: [scenario_execution_receipt.json](f1-acceptance-20260916-r3-09477d666a0f/D/scenario_execution_receipt.json)
 - Q: [scenario_execution_receipt.json](f1-acceptance-20260916-r3-09477d666a0f/Q/scenario_execution_receipt.json)
 
-The result binds every child receipt to checkout SHA
+Gate I was run separately with a primary-reader-only GUI config and its own
+budget namespace. The parent projection is `SCOPED_PASS` because the plan
+contains only Gate I; this is a live Gate I PASS, not full F1 merge readiness.
+The submitted job was `job_f725f32d4ef0`, and the durable evidence is:
+
+- Parent result: [parent_acceptance_result_v2.json](f1-gui-acceptance-20260917-r2/parent_acceptance_result_v2.json)
+- Gate I receipt: [scenario_execution_receipt.json](f1-gui-acceptance-20260917-r2/I/scenario_execution_receipt.json)
+- Gate I evidence index: [evidence_index_v1.json](f1-gui-acceptance-20260917-r2/I/evidence_index_v1.json)
+- Browser evidence, trace archive, screenshot manifest, RuntimeJobSpec, completed JobOutcome, attempt, and one non-test `Primary_Reader_API` receipt are all bound to the same job and current executable SHA.
+
+The C/D/Q result binds every child receipt to checkout SHA
 `09477d666a0f31c2b1d95a2a6cb25c00b4e7bfca`, corpus manifest SHA
 `f741776ea2eda6b5937f4fc13e40569216eb3173ff597fb80eeea2e46dab3e90`, and
 the plan identity above. C recorded one successful HTTP 200 DeepSeek
 `Primary_Reader_API` call. D recorded three successful HTTP 200 calls on the
 same route; the four calls consumed 49,787 output tokens in total.
+
+Gate I recorded one successful non-test HTTP 200 call to `https://api.deepseek.com`
+through `Primary_Reader_API`, with 15 planned/15 sent rendered visual inputs and
+`successful_input_mode=multimodal`. The Gate I budget ledger recorded 20,633
+output tokens, and the job outcome recorded `source_intake` and `analyze` as
+completed with `canonical_ready=true`. The R2 config raised the primary model
+and Stage 1 synthesis ceiling to 64,000 tokens after the earlier 32,000-token
+attempt correctly failed closed on truncation.
 
 The D production-derived profiles were:
 
@@ -151,8 +177,10 @@ pass.
 
 The earlier live attempt was correctly rejected before transport because owner
 authorization had not yet been given. After the explicit authorization, C and D
-did run using only extracted text and rendered images; no original PDF file was
-sent. The current blocker is corpus modality, not authorization or PDF format.
+ran using only extracted text and rendered images; Gate I also completed a real
+GUI submission using the same text-plus-rendered-image route. No original PDF
+file was sent. The current blocker is corpus modality, not authorization or PDF
+format.
 
 To make D pass, the owner must provide an approved source selection whose
 production-derived profiles include an actual `ocr_scanned` member, or approve a
@@ -169,10 +197,10 @@ the unmet D prerequisite; no custom-host content was sent.
   canonical JobOutcome.
 - Human original-PDF ground truth, claim-level citation review, negative
   validator challenge, repair/revalidation, and DOCX visual QA.
-- Full production GUI/Playwright submission flow and F1 primary OCR/scanned-primary
-  flow. A read-only GUI smoke did reach the real localhost pages and exposed the
-  automatic OCR settings/queue/result views, but it did not submit a task.
+- F1 primary OCR/scanned-primary flow. Gate I proves the real production
+  GUI/Playwright path for one F1-01 PDF analyze job, but it does not prove a
+  scanned-primary F1 route.
 - Real MinerU create→upload→poll→download→parse and kill/resume.
-- Hosted CI run `35115650237` for executable SHA `09477d666a0f31c2b1d95a2a6cb25c00b4e7bfca`
-  completed successfully across all six jobs. The PR remains open and
-  unmerged.
+- Hosted CI for the current executable SHA `24884c2adaeac2d98af85349dbbccc6980d2c814`.
+  The PR remains open and unmerged; the current post-push CI identity is checked
+  separately below.
