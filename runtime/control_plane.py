@@ -1460,6 +1460,57 @@ class ReviewControlPlane:
             result["status"] = "PASS"
         return result
 
+    def _acceptance_unique_provider_ledger_paths(
+        self,
+        workspace: str | Path,
+        *,
+        job_id: str,
+    ) -> tuple[str, ...]:
+        """Return ledger files without counting mirrored receipt copies twice."""
+
+        candidates = self._acceptance_provider_ledger_paths(workspace, job_id=job_id)
+        # Prefer Registry-published ledgers over their publication-staging
+        # mirrors when both contain the same receipt identities.  A differing
+        # payload for one receipt ID is a conflict, not a reason to silently
+        # choose one copy.
+        ordered = sorted(
+            candidates,
+            key=lambda value: (
+                ".publication-staging" in str(value).casefold(),
+                str(value).casefold(),
+            ),
+        )
+        seen: dict[str, str] = {}
+        selected: list[str] = []
+        for path in ordered:
+            try:
+                receipts = ProviderRuntimeLedger(path).list_acceptance_receipts(
+                    expected_job_id=job_id
+                )
+            except (OSError, ValueError, RuntimeError):
+                continue
+            new_receipt = False
+            for receipt in receipts:
+                receipt_id = str(receipt.receipt_id).strip()
+                encoded = json.dumps(
+                    receipt.to_dict(),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                previous = seen.get(receipt_id)
+                if previous is not None and previous != encoded:
+                    raise ControlPlaneError(
+                        "acceptance provider ledgers contain conflicting copies "
+                        f"of receipt {receipt_id}"
+                    )
+                if previous is None:
+                    seen[receipt_id] = encoded
+                    new_receipt = True
+            if new_receipt:
+                selected.append(str(path))
+        return tuple(selected)
+
     def _acceptance_ledger_snapshot(
         self,
         workspace: str | Path,
@@ -1467,7 +1518,11 @@ class ReviewControlPlane:
         job_id: str,
     ) -> dict[str, Any]:
         receipt_rows: list[Any] = []
-        for path in self._acceptance_provider_ledger_paths(workspace, job_id=job_id):
+        ledger_paths = self._acceptance_unique_provider_ledger_paths(
+            workspace,
+            job_id=job_id,
+        )
+        for path in ledger_paths:
             try:
                 receipt_rows.extend(
                     ProviderRuntimeLedger(path).list_acceptance_receipts(
@@ -1498,9 +1553,7 @@ class ReviewControlPlane:
             "provider_calls": sum(int(item.attempts) for item in receipt_rows),
             "output_tokens": sum(int(item.output_tokens or 0) for item in receipt_rows),
             "retry_attempts": sum(max(0, int(item.attempts) - 1) for item in receipt_rows),
-            "ledger_paths": list(
-                self._acceptance_provider_ledger_paths(workspace, job_id=job_id)
-            ),
+            "ledger_paths": list(ledger_paths),
         }
 
     @staticmethod
@@ -1672,7 +1725,11 @@ class ReviewControlPlane:
         event_rows: list[dict[str, Any]] = []
 
         def event(name: str, **values: Any) -> None:
-            event_rows.append(
+            row = dict(values)
+            # Values such as the budget snapshot carry their own schema
+            # version.  The outer JSONL row must remain a typed process event;
+            # otherwise the verifier rejects the entire resume trace.
+            row.update(
                 {
                     "artifact_type": "acceptance_process_event",
                     "artifact_version": "v1",
@@ -1685,9 +1742,9 @@ class ReviewControlPlane:
                     "process_creation_identity": str(parent_identity.creation_time or "unknown"),
                     "event": name,
                     "occurred_at": self._utc_now(),
-                    **values,
                 }
             )
+            event_rows.append(row)
 
         event(
             "ledger_snapshot",
