@@ -1618,6 +1618,21 @@ class ReviewControlPlane:
         return None
 
     @staticmethod
+    def _acceptance_safe_resume_output(output: str) -> str:
+        """Keep only a short, credential-redacted child failure tail."""
+
+        text = str(output or "")
+        if not text:
+            return ""
+        text = re.sub(
+            r"(?i)(api[_-]?key|token|authorization|password|secret)\s*[:=]\s*[^\s,;]+",
+            r"\1=[REDACTED]",
+            text,
+        )
+        text = re.sub(r"(?i)bearer\s+[^\s,;]+", "Bearer [REDACTED]", text)
+        return text[-2000:]
+
+    @staticmethod
     def _acceptance_write_jsonl(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         descriptor, temporary = tempfile.mkstemp(
@@ -1854,6 +1869,9 @@ class ReviewControlPlane:
             }
             if isinstance(diagnostic.get("error"), str):
                 diagnostic["error"] = diagnostic["error"][-1000:]
+            output_tail = self._acceptance_safe_resume_output(resume_output)
+            if output_tail:
+                diagnostic["resume_output_tail"] = output_tail
             raise ControlPlaneError(
                 "fresh resume process exited unsuccessfully: "
                 f"{resume_exit}; diagnostic={json.dumps(diagnostic, sort_keys=True)}"
