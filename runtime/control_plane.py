@@ -1460,6 +1460,26 @@ class ReviewControlPlane:
             result["status"] = "PASS"
         return result
 
+    @staticmethod
+    def _acceptance_receipt_is_completed(receipt: Any) -> bool:
+        """Count only semantically completed calls in resume snapshots."""
+
+        if str(getattr(receipt, "status", "") or "").casefold() not in {
+            "success",
+            "completed",
+        }:
+            return False
+        metadata = getattr(receipt, "metadata", {})
+        if not isinstance(metadata, Mapping):
+            return True
+        semantic_status = str(
+            metadata.get("semantic_validation_status") or ""
+        ).strip().casefold()
+        # A transport-success response that failed canonical validation (or was
+        # truncated) is not a completed logical call.  Resume may legitimately
+        # retry it; it must not be reported as an unnecessary reexecution.
+        return semantic_status not in {"failed", "not_evaluated"}
+
     def _acceptance_unique_provider_ledger_paths(
         self,
         workspace: str | Path,
@@ -1536,7 +1556,7 @@ class ReviewControlPlane:
             {
                 str(item.call_id)
                 for item in receipt_rows
-                if str(item.status).casefold() in {"success", "completed"}
+                if self._acceptance_receipt_is_completed(item)
                 and str(item.call_id).strip()
             }
         )

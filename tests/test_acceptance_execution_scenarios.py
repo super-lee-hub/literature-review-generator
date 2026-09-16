@@ -762,6 +762,29 @@ def test_gate_k_acceptance_binds_contention_receipt_from_evidence_root(
     assert facts["live_budget_unchanged"] is True
 
 
+def test_resume_snapshot_does_not_mark_semantically_invalid_success_completed() -> None:
+    from runtime.control_plane import ReviewControlPlane
+
+    assert not ReviewControlPlane._acceptance_receipt_is_completed(
+        SimpleNamespace(
+            status="success",
+            metadata={"semantic_validation_status": "failed"},
+        )
+    )
+    assert not ReviewControlPlane._acceptance_receipt_is_completed(
+        SimpleNamespace(
+            status="success",
+            metadata={"semantic_validation_status": "not_evaluated"},
+        )
+    )
+    assert ReviewControlPlane._acceptance_receipt_is_completed(
+        SimpleNamespace(
+            status="success",
+            metadata={"semantic_validation_status": "passed"},
+        )
+    )
+
+
 def test_parent_acceptance_resumes_child_with_durable_workspace_marker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
