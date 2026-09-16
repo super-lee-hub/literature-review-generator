@@ -184,6 +184,7 @@ acceptance_artifacts/f1_*/f1-acceptance-*/
 acceptance_artifacts/f1_*/auxiliary_ocr_scan_*/
 acceptance_artifacts/f1_*/F1_OCR_AUXILIARY_PLAN_STATE*.json*
 acceptance_artifacts/f1_*/f1-ocr-aux-*/
+acceptance_artifacts/f1_*/gui_production_*/
 
 # iFlow CLI generated files
 IFLOW.md

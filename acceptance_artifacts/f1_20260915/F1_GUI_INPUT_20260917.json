@@ -1,0 +1,20 @@
+{
+  "artifact_type": "acceptance_gui_input",
+  "artifact_version": "v2",
+  "schema_version": "acceptance-gui-input-v2",
+  "execution_kind": "production",
+  "base_url": "http://127.0.0.1:8101",
+  "config_path": "gui_production_20260917/GUI_ACCEPTANCE_CONFIG_20260917.ini",
+  "repo_root": "../..",
+  "output_root": "gui_production_20260917/runs",
+  "input_mode": "pdf",
+  "pdf_folder": "gui_production_20260917/source_corpus",
+  "zotero_report": "",
+  "library_path": "",
+  "project_name": "f1_gui_production_acceptance",
+  "work_mode": "normal",
+  "action": "analyze",
+  "port": 8101,
+  "startup_timeout_seconds": 60,
+  "completion_timeout_seconds": 900
+}
