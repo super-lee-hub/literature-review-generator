@@ -333,6 +333,9 @@ Current disposition remains:
 `D=FAIL_MODALITY`, `Q=BLOCKED`, and
 `FINAL_RELEASE_STATUS=NOT_READY_TO_MERGE`.
 
+The compact, secret-free R14 projection is
+[F1_STAGE1_R14_EVIDENCE_SUMMARY_20260918.json](F1_STAGE1_R14_EVIDENCE_SUMMARY_20260918.json).
+
 ## R11–R14 official DeepSeek Stage 1 recovery (2026-09-17)
 
 R11 isolated the credential discrepancy: the official Primary route produced

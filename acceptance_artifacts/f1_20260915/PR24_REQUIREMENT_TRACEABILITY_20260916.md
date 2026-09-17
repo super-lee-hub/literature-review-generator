@@ -136,3 +136,6 @@ profiles are F1-01 `text_heavy`, F1-03 `text_heavy`, and F1-14
 not enter the F1-15 corpus. Q therefore remains blocked before any Outline or
 custom-gateway payload. The existing custom-route ACK is stale and the Outline
 route still has the recorded `SEC_E_CERT_EXPIRED` TLS blocker.
+
+The secret-free, hash-bound R14 count/identity projection is
+[F1_STAGE1_R14_EVIDENCE_SUMMARY_20260918.json](F1_STAGE1_R14_EVIDENCE_SUMMARY_20260918.json).
