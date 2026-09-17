@@ -325,18 +325,21 @@ class ProviderReceiptClosure:
                 )
                 if getattr(contract, field)
                 and str(getattr(current, field) or "") != str(getattr(contract, field) or "")
-                and not (variant_matches and field in {"input_hash", "config_hash"})
+                and not (
+                    variant_matches
+                    and field in {"input_hash", "config_hash", "prompt_hash"}
+                )
             }
-            for field, actual_field in (
+            for expected_field, actual_field in (
                 ("provider", "provider"),
                 ("model", "model"),
                 ("endpoint", "endpoint"),
                 ("endpoint_type", "endpoint_type"),
             ):
-                expected_value = str(getattr(contract, field) or "")
+                expected_value = str(getattr(contract, expected_field) or "")
                 actual_value = str(getattr(current, actual_field) or "")
                 if expected_value and expected_value != actual_value:
-                    identity_mismatches[field] = (actual_value, expected_value)
+                    identity_mismatches[expected_field] = (actual_value, expected_value)
             # A variant must explicitly bind both input and config identity;
             # partial variants are never allowed to excuse a mismatch.
             if variant_matches and not any(

@@ -19,6 +19,7 @@ from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry
 from services.job_workspace import JobWorkspace
 from services.settings import ApplicationSettings
 from services.stage1_analysis_service import Stage1AnalysisService
+from runtime.reconcile import validate_canonical_ai_summary
 from validation.closure import resolve_current_stage_closure_map
 from summary_schema import normalize_ai_summary
 
@@ -1621,3 +1622,34 @@ def test_current_stage1_rejects_placeholder_provider_output(tmp_path: Path) -> N
         assert "placeholder" in str(exc)
     else:
         raise AssertionError("placeholder Stage 1 output was accepted")
+
+
+def test_current_stage1_publishes_normalized_routing_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pdf_path = tmp_path / "missing-derived-routing-field.pdf"
+    _write_pdf(pdf_path)
+    raw_summary = _canonical_summary()
+    raw_summary["routing"]["paper_subtype_raw"] = "quantitative"
+    raw_summary["routing"]["paper_subtype_normalized"] = None
+
+    def reader(**_kwargs: Any) -> Mapping[str, Any]:
+        return {"status": "success", "content": raw_summary}
+
+    # Exercise the publication boundary with the raw-but-substantive provider
+    # shape observed in the F1-07 live Stage 1 artifact.
+    monkeypatch.setattr(
+        Stage1AnalysisService,
+        "_canonical_substantive_summary",
+        staticmethod(lambda _provider_result: raw_summary),
+    )
+    service, bundle = _service(tmp_path, pdf_path, reader)
+    result = service.run(bundle)
+    assert result.generated_count == 1
+    summary_record = next(
+        record for record in service.registry.list_records() if record.artifact_type == "summary_file"
+    )
+    persisted = json.loads(Path(summary_record.path).read_text(encoding="utf-8"))[0]
+    assert persisted["ai_summary"]["routing"]["paper_subtype_normalized"] == "quantitative"
+    validate_canonical_ai_summary(persisted["ai_summary"], label="published ai_summary")

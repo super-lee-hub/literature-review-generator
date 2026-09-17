@@ -569,3 +569,66 @@ def test_stage1_backup_success_is_recorded_as_text_only_after_visual_scan(
     assert summary["provider"]["visual_coverage_status"] == "complete"
     assert "final_raw_visual_recheck_missing" in summary["ai_summary"]["quality_audit"]["conflict_flags"]
     assert summary["ai_summary"]["quality_audit"]["needs_manual_review"] is True
+
+
+def test_stage1_backup_reader_gets_one_semantic_corrective_retry(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    pdf_path = tmp_path / "backup-semantic-retry-paper.pdf"
+    _write_pdf(pdf_path)
+    calls: list[tuple[str, int, bool]] = []
+    backup_calls = 0
+
+    def invalid_summary() -> dict[str, Any]:
+        value = _canonical_summary()
+        value["core_analysis"]["findings"] = "Not available."
+        return value
+
+    def fake_detailed(
+        prompt_text: str,
+        primary_api_config: Mapping[str, Any],
+        backup_api_config: Mapping[str, Any],
+        *,
+        engine_type: str = "primary",
+        **kwargs: Any,
+    ) -> Mapping[str, Any]:
+        nonlocal backup_calls
+        del kwargs
+        config = primary_api_config if engine_type == "primary" else backup_api_config
+        calls.append(
+            (
+                engine_type,
+                int(config.get("stage1_semantic_retry_index") or 0),
+                "CORRECTIVE RETRY:" in prompt_text,
+            )
+        )
+        if engine_type == "primary":
+            return {"status": "success", "content": invalid_summary()}
+        backup_calls += 1
+        if backup_calls == 1:
+            return {"status": "success", "content": invalid_summary()}
+        return {"status": "success", "content": _canonical_summary()}
+
+    monkeypatch.setattr(ai_interface, "get_summary_from_ai_detailed", fake_detailed)
+    service, bundle = _service(
+        tmp_path,
+        pdf_path,
+        reader=None,
+        config_overrides={
+            "Stage1_Input": {"stage1_semantic_retry_max_attempts": "1"},
+        },
+    )
+
+    result = service.run(bundle)
+
+    assert result.generated_count == 1
+    assert calls == [
+        ("primary", 0, False),
+        ("primary", 1, True),
+        ("backup", 0, False),
+        ("backup", 1, True),
+    ]
+    provider = result.summaries[0]["provider"]
+    assert provider["successful_engine"] == "backup"
+    assert provider["semantic_retries"] == 2

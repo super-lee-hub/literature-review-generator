@@ -1245,6 +1245,40 @@ class Stage1AnalysisService:
         paper_info: Mapping[str, Any],
         ai_summary: Mapping[str, Any],
     ) -> tuple[ArtifactRecord, Stage1ReusableSummaryBindingV1]:
+        # Provider responses may be semantically substantive while omitting a
+        # derived canonical routing field (for example, a valid raw subtype
+        # with ``paper_subtype_normalized=null``).  The Registry/reconcile
+        # boundary validates the exact canonical summary shape, so normalize
+        # once more at publication time instead of persisting a raw provider
+        # projection that later cannot be consumed.  Preserve execution-time
+        # quality flags added by the visual reducer.
+        canonical_ai_summary = normalize_ai_summary(ai_summary)
+        existing_quality = ai_summary.get("quality_audit")
+        if isinstance(existing_quality, Mapping):
+            quality = dict(canonical_ai_summary.get("quality_audit") or {})
+            for field_name in ("missing_critical_fields", "conflict_flags", "inferred_fields"):
+                quality[field_name] = list(
+                    dict.fromkeys(
+                        [
+                            *[
+                                str(value)
+                                for value in (quality.get(field_name) or [])
+                                if str(value)
+                            ],
+                            *[
+                                str(value)
+                                for value in (existing_quality.get(field_name) or [])
+                                if str(value)
+                            ],
+                        ]
+                    )
+                )
+            quality["needs_manual_review"] = bool(
+                quality.get("needs_manual_review")
+                or existing_quality.get("needs_manual_review") is True
+            )
+            canonical_ai_summary["quality_audit"] = quality
+        ai_summary = canonical_ai_summary
         summary_payload_hash = hash_json(ai_summary)
         provisional = replace(
             prepared.current_binding,
@@ -1808,6 +1842,16 @@ class Stage1AnalysisService:
                 )
             synthesis_content = item.built_input.user_message_content
             synthesis_system_prompt = self.prompt_registry.read("stage1.analysis.system.v3")
+            semantic_retry_limit = stage1_semantic_retry_max_attempts(
+                item.stage1_input_settings
+            )
+            synthesis_budget_count = len(
+                stage1_output_budget_sequence(
+                    "synthesis",
+                    item.stage1_input_settings,
+                    provider_config=item.primary_config,
+                )
+            )
             primary_variants = self._stage1_request_variants(
                 prompt=item.built_input.prompt_text,
                 system_prompt=synthesis_system_prompt,
@@ -1815,6 +1859,7 @@ class Stage1AnalysisService:
                 provider_config=item.primary_config,
                 stage1_input_settings=item.stage1_input_settings,
                 stage="synthesis",
+                semantic_retry_limit=semantic_retry_limit,
             )
             backup_variants = self._stage1_request_variants(
                 prompt=item.built_input.prompt_text,
@@ -1823,6 +1868,7 @@ class Stage1AnalysisService:
                 provider_config=item.backup_config,
                 stage1_input_settings=item.stage1_input_settings,
                 stage="synthesis",
+                semantic_retry_limit=semantic_retry_limit,
             )
             primary_hash = (
                 ""
@@ -1833,10 +1879,7 @@ class Stage1AnalysisService:
             variants = []
             if primary_hash:
                 variants.extend(primary_variants)
-            variants.extend(backup_variants[:1])
-            semantic_retry_limit = stage1_semantic_retry_max_attempts(
-                item.stage1_input_settings
-            )
+            variants.extend(backup_variants)
             primary_config_hash = primary_variants[0]["config_hash"]
             graph_seed.append(
                 {
@@ -1855,7 +1898,7 @@ class Stage1AnalysisService:
                     "schema_hash": self._schema_hash(),
                     "artifact_path": self._paper_artifact_path(item.item),
                     "max_attempts": (
-                        len(primary_variants) + semantic_retry_limit + 1
+                        synthesis_budget_count + semantic_retry_limit + 1 + semantic_retry_limit
                         if primary_hash
                         else 1
                     ),
@@ -2126,8 +2169,9 @@ class Stage1AnalysisService:
         provider_config: Mapping[str, Any],
         stage1_input_settings: Mapping[str, Any],
         stage: str,
+        semantic_retry_limit: int = 0,
     ) -> tuple[dict[str, Any], ...]:
-        """Build exact request/config identities for bounded length retries."""
+        """Build exact request/config identities for bounded retries."""
 
         timeout_seconds = stage1_request_timeout_seconds(stage1_input_settings)
         variants: list[dict[str, Any]] = []
@@ -2138,25 +2182,31 @@ class Stage1AnalysisService:
                 provider_config=provider_config,
             )
         ):
-            staged_config = Stage1AnalysisService._stage1_provider_config(
-                provider_config,
-                stage=stage,
-                output_tokens=output_tokens,
-                timeout_seconds=timeout_seconds,
-                retry_index=retry_index,
-            )
-            variants.append(
-                {
-                    "input_hash": Stage1AnalysisService._request_hash(
-                        prompt,
-                        system_prompt,
-                        user_content,
-                        staged_config,
-                        response_format="json",
-                    ),
-                    "config_hash": hash_json(_redact_mapping(staged_config)),
-                }
-            )
+            for semantic_retry_index in range(max(0, int(semantic_retry_limit)) + 1):
+                request_prompt = prompt
+                if semantic_retry_index:
+                    request_prompt = Stage1AnalysisService._canonical_retry_prompt(prompt, "")
+                staged_config = Stage1AnalysisService._stage1_provider_config(
+                    provider_config,
+                    stage=stage,
+                    output_tokens=output_tokens,
+                    timeout_seconds=timeout_seconds,
+                    retry_index=retry_index,
+                    semantic_retry_index=semantic_retry_index,
+                )
+                variants.append(
+                    {
+                        "prompt_hash": hash_text(request_prompt),
+                        "input_hash": Stage1AnalysisService._request_hash(
+                            request_prompt,
+                            system_prompt,
+                            user_content,
+                            staged_config,
+                            response_format="json",
+                        ),
+                        "config_hash": hash_json(_redact_mapping(staged_config)),
+                    }
+                )
         return tuple(variants)
 
     @staticmethod
@@ -2395,6 +2445,16 @@ class Stage1AnalysisService:
         paper_key = self._paper_key(prepared.item)
         prompt = prepared.built_input.prompt_text
         system_prompt = self.prompt_registry.read("stage1.analysis.system.v3")
+        semantic_retry_limit = stage1_semantic_retry_max_attempts(
+            prepared.stage1_input_settings
+        )
+        synthesis_budget_count = len(
+            stage1_output_budget_sequence(
+                "synthesis",
+                prepared.stage1_input_settings,
+                provider_config=prepared.primary_config,
+            )
+        )
         primary_variants = self._stage1_request_variants(
             prompt=prompt,
             system_prompt=system_prompt,
@@ -2402,6 +2462,7 @@ class Stage1AnalysisService:
             provider_config=prepared.primary_config,
             stage1_input_settings=prepared.stage1_input_settings,
             stage="synthesis",
+            semantic_retry_limit=semantic_retry_limit,
         )
         backup_variants = self._stage1_request_variants(
             prompt=prompt,
@@ -2410,22 +2471,22 @@ class Stage1AnalysisService:
             provider_config=prepared.backup_config,
             stage1_input_settings=prepared.stage1_input_settings,
             stage="synthesis",
+            semantic_retry_limit=semantic_retry_limit,
         )
         primary_hash = primary_variants[0]["input_hash"]
         primary_config_hash = primary_variants[0]["config_hash"]
-        request_variants = (*primary_variants, *backup_variants[:1])
-        semantic_retry_limit = stage1_semantic_retry_max_attempts(
-            prepared.stage1_input_settings
-        )
+        request_variants = (*primary_variants, *backup_variants)
         self.expected_calls = tuple(
             replace(
                 expected,
                 input_hash=primary_hash if expected.call_id == self._synthesis_call_id(paper_key) else expected.input_hash,
                 config_hash=primary_config_hash if expected.call_id == self._synthesis_call_id(paper_key) else expected.config_hash,
                 prompt_hash=hash_text(prompt) if expected.call_id == self._synthesis_call_id(paper_key) else expected.prompt_hash,
-                max_attempts=(len(request_variants) + semantic_retry_limit
-                              if expected.call_id == self._synthesis_call_id(paper_key)
-                              else expected.max_attempts),
+                max_attempts=(
+                    synthesis_budget_count + semantic_retry_limit + 1 + semantic_retry_limit
+                    if expected.call_id == self._synthesis_call_id(paper_key)
+                    else expected.max_attempts
+                ),
                 request_variants=request_variants
                 if expected.call_id == self._synthesis_call_id(paper_key)
                 else expected.request_variants,
@@ -2663,9 +2724,25 @@ class Stage1AnalysisService:
         # The synthesis runtime must be created after the expected graph is
         # rebound to its final post-scan identity so its receipt is written
         # under the final closure epoch.
+        semantic_retry_limit = stage1_semantic_retry_max_attempts(
+            prepared.stage1_input_settings
+        )
+        primary_reader_only = parse_strict_bool(
+            prepared.stage1_input_settings.get("primary_reader_only"),
+            field="Stage1_Input.primary_reader_only",
+            default=False,
+        )
+        # A synthesis budget retry is only reached after the previous request
+        # returned a length result; semantic retries stop the current budget
+        # branch.  Reserve the exact worst-case logical call count for the
+        # primary branch plus the optional backup branch and its corrective
+        # retry, so a valid fallback is never denied by a stale fixed budget.
+        logical_call_budget = len(synthesis_budgets) + semantic_retry_limit
+        if not primary_reader_only:
+            logical_call_budget += 1 + semantic_retry_limit
         runtime = ProviderRuntime(
             budget=ProviderBudgetV1(
-                max_calls=max(2, self.settings.runtime.node_retry_limit + 2),
+                max_calls=max(1, logical_call_budget),
                 max_retries_per_call=self.settings.runtime.node_retry_limit,
             ),
             ledger=self.receipt_ledger,
@@ -2707,9 +2784,19 @@ class Stage1AnalysisService:
             provider_result.get("stage1_terminal_output_tokens")
             or synthesis_budgets[0]
         )
-        terminal_retry_index = max(
+        if "stage1_terminal_retry_index" in provider_result:
+            terminal_retry_index = max(
+                0,
+                int(provider_result.get("stage1_terminal_retry_index") or 0),
+            )
+        else:
+            terminal_retry_index = max(
+                0,
+                len(provider_result.get("stage1_requested_output_budgets") or ()) - 1,
+            )
+        terminal_semantic_retry_index = max(
             0,
-            len(provider_result.get("stage1_requested_output_budgets") or ()) - 1,
+            int(provider_result.get("stage1_terminal_semantic_retry_index") or 0),
         )
         effective_provider_config = self._stage1_provider_config(
             provider_config,
@@ -2719,6 +2806,7 @@ class Stage1AnalysisService:
                 prepared.stage1_input_settings,
             ),
             retry_index=terminal_retry_index,
+            semantic_retry_index=terminal_semantic_retry_index,
         )
         request_content = (
             self._text_only_content(prepared.built_input.user_message_content)
@@ -3160,16 +3248,20 @@ class Stage1AnalysisService:
                 "requested_output_budgets": list(
                     provider_result.get("stage1_requested_output_budgets") or []
                 ),
+                "backup_requested_output_budgets": list(
+                    provider_result.get("stage1_backup_requested_output_budgets") or []
+                ),
                 "length_retries": int(
                     provider_result.get("stage1_length_retries") or 0
                 ),
                 "schema_retries": int(
                     provider_result.get("stage1_schema_retries") or 0
                 ),
-                "semantic_retries": int(
-                    coverage.get("semantic_retries")
-                    or provider_result.get("stage1_semantic_retries")
-                    or 0
+                "semantic_retries": int(coverage.get("semantic_retries") or 0) + int(
+                    provider_result.get("stage1_semantic_retries") or 0
+                ),
+                "backup_semantic_retries": int(
+                    provider_result.get("stage1_backup_semantic_retries") or 0
                 ),
                 "terminal_output_tokens": int(
                     provider_result.get("stage1_terminal_output_tokens")
@@ -6247,11 +6339,13 @@ class Stage1AnalysisService:
             "message": "primary Stage 1 reader did not run",
         }
         attempted_budgets: list[int] = []
+        terminal_retry_index = 0
         length_retry_count = 0
         schema_retry_count = 0
         semantic_retry_count = 0
         semantic_retry_limit = stage1_semantic_retry_max_attempts(stage1_input_settings)
         for retry_index, output_budget in enumerate(synthesis_budgets):
+            terminal_retry_index = retry_index
             semantic_retry_index = 0
             budget_retry_required = False
             while True:
@@ -6320,6 +6414,8 @@ class Stage1AnalysisService:
                             "stage1_schema_retries": schema_retry_count,
                             "stage1_semantic_retries": semantic_retry_count,
                             "stage1_terminal_output_tokens": output_budget,
+                            "stage1_terminal_retry_index": retry_index,
+                            "stage1_terminal_semantic_retry_index": semantic_retry_index,
                             "stage1_request_timeout_seconds": request_timeout_seconds,
                         }
                 if self._is_length_result(primary_result):
@@ -6351,6 +6447,7 @@ class Stage1AnalysisService:
                 "stage1_terminal_output_tokens": (
                     attempted_budgets[-1] if attempted_budgets else 0
                 ),
+                "stage1_terminal_retry_index": terminal_retry_index,
                 "stage1_request_timeout_seconds": request_timeout_seconds,
             }
 
@@ -6372,32 +6469,100 @@ class Stage1AnalysisService:
                 "stage1_terminal_output_tokens": (
                     attempted_budgets[-1] if attempted_budgets else 0
                 ),
+                "stage1_terminal_retry_index": terminal_retry_index,
                 "stage1_request_timeout_seconds": request_timeout_seconds,
             }
 
-        backup_config_for_stage = self._stage1_provider_config(
-            backup_config,
-            stage="synthesis",
-            output_tokens=synthesis_budgets[0],
-            timeout_seconds=request_timeout_seconds,
-            retry_index=0,
-        )
-        backup_result = get_summary_from_ai_detailed(
-            built_input.prompt_text,
-            cast(APIConfig, dict(primary_config)),
-            cast(APIConfig, backup_config_for_stage),
-            engine_type="backup",
-            logger=self.logger,
-            config=self.config,
-            user_content=built_input.user_message_content,
-            retry_attempts=1,
-            timeout_seconds=request_timeout_seconds,
-            provider_runtime=runtime,
-            system_prompt=system_prompt,
-            normalize_summary=False,
-            max_single_image_bytes=visual_coverage.get("max_single_image_bytes"),
-            max_request_image_bytes=visual_coverage.get("max_request_image_bytes"),
-        )
+        backup_attempted_budgets: list[int] = []
+        backup_semantic_retry_count = 0
+        backup_semantic_retry_index_terminal = 0
+        backup_result: Mapping[str, Any] = {
+            "status": "failed",
+            "error_kind": "invalid_response",
+            "message": "backup Stage 1 reader did not run",
+            "engine_type": "backup",
+        }
+        for backup_semantic_retry_index in range(semantic_retry_limit + 1):
+            backup_semantic_retry_index_terminal = backup_semantic_retry_index
+            backup_config_for_stage = self._stage1_provider_config(
+                backup_config,
+                stage="synthesis",
+                output_tokens=synthesis_budgets[0],
+                timeout_seconds=request_timeout_seconds,
+                retry_index=0,
+                semantic_retry_index=backup_semantic_retry_index,
+            )
+            backup_prompt = built_input.prompt_text
+            if backup_semantic_retry_index:
+                backup_prompt = self._canonical_retry_prompt(
+                    built_input.prompt_text,
+                    str(backup_result.get("message") or "canonical validation failed"),
+                )
+            backup_result = get_summary_from_ai_detailed(
+                backup_prompt,
+                cast(APIConfig, dict(primary_config)),
+                cast(APIConfig, backup_config_for_stage),
+                engine_type="backup",
+                logger=self.logger,
+                config=self.config,
+                user_content=built_input.user_message_content,
+                retry_attempts=1,
+                timeout_seconds=request_timeout_seconds,
+                provider_runtime=runtime,
+                system_prompt=system_prompt,
+                normalize_summary=False,
+                max_single_image_bytes=visual_coverage.get("max_single_image_bytes"),
+                max_request_image_bytes=visual_coverage.get("max_request_image_bytes"),
+            )
+            backup_attempted_budgets.append(synthesis_budgets[0])
+            if str(backup_result.get("status") or "").strip().casefold() != "success":
+                break
+            try:
+                self._canonical_substantive_summary(backup_result)
+            except RuntimeError as exc:
+                error_text = str(exc)
+                backup_result = {
+                    **dict(backup_result),
+                    "status": "failed",
+                    "error_kind": "invalid_response",
+                    "message": error_text,
+                    "engine_type": "backup",
+                }
+                if backup_semantic_retry_index < semantic_retry_limit:
+                    if self._is_schema_validation_error(error_text):
+                        schema_retry_count += 1
+                    else:
+                        backup_semantic_retry_count += 1
+                    if self.logger:
+                        self.logger.warning(
+                            "Stage 1 backup synthesis response failed canonical validation; "
+                            "retrying with a corrective prompt at the same output budget "
+                            f"({backup_semantic_retry_index + 1}/{semantic_retry_limit})."
+                        )
+                    continue
+            else:
+                return {
+                    **dict(backup_result),
+                    "engine_type": "backup",
+                    "fallback_reason": str(
+                        primary_result.get("message")
+                        or primary_result.get("error_kind")
+                        or "primary_reader_failed_before_backup"
+                    )[:240],
+                    "stage1_output_stage": "synthesis",
+                    "stage1_requested_output_budgets": attempted_budgets,
+                    "stage1_backup_requested_output_budgets": backup_attempted_budgets,
+                    "stage1_length_retries": length_retry_count,
+                    "stage1_schema_retries": schema_retry_count,
+                    "stage1_semantic_retries": semantic_retry_count + backup_semantic_retry_count,
+                    "stage1_backup_semantic_retries": backup_semantic_retry_count,
+                    "stage1_backup_semantic_retry_index": backup_semantic_retry_index,
+                    "stage1_terminal_output_tokens": synthesis_budgets[0],
+                    "stage1_terminal_retry_index": 0,
+                    "stage1_terminal_semantic_retry_index": backup_semantic_retry_index,
+                    "stage1_request_timeout_seconds": request_timeout_seconds,
+                }
+            break
         return {
             **dict(backup_result),
             "fallback_reason": str(
@@ -6407,10 +6572,15 @@ class Stage1AnalysisService:
             )[:240],
             "stage1_output_stage": "synthesis",
             "stage1_requested_output_budgets": attempted_budgets,
+            "stage1_backup_requested_output_budgets": backup_attempted_budgets,
             "stage1_length_retries": length_retry_count,
             "stage1_schema_retries": schema_retry_count,
-            "stage1_semantic_retries": semantic_retry_count,
+            "stage1_semantic_retries": semantic_retry_count + backup_semantic_retry_count,
+            "stage1_backup_semantic_retries": backup_semantic_retry_count,
+            "stage1_backup_semantic_retry_index": backup_semantic_retry_index_terminal,
             "stage1_terminal_output_tokens": synthesis_budgets[0],
+            "stage1_terminal_retry_index": 0,
+            "stage1_terminal_semantic_retry_index": backup_semantic_retry_index_terminal,
             "stage1_request_timeout_seconds": request_timeout_seconds,
         }
 

@@ -29,7 +29,7 @@ except ImportError:  # pragma: no cover - compatibility with older PyMuPDF relea
 import requests  # type: ignore
 
 from preprocess.provider_circuit import ProviderCircuitBreaker, ProviderCircuitOpen
-from services.durable_io import interprocess_file_lock
+from services.durable_io import atomic_replace_with_retry, interprocess_file_lock
 from services.job_workspace import atomic_write_json, is_reparse_path
 from services.stage1_input_completeness import (
     build_completeness_metrics,
@@ -1605,7 +1605,12 @@ class PreprocessManager:
             generation_dir,
         )
         self._write_json_durable(artifact_paths["manifest_path"], manifest_payload)
-        os.replace(staging_dir, generation_dir)
+        # Windows scanners/indexers can briefly hold a generated leaf while
+        # the complete generation is being published.  Use the same bounded
+        # replace primitive as Registry/Queue so a transient sharing denial
+        # cannot turn an otherwise complete preprocess result into a job-wide
+        # failure, while a persistent denial still fails closed.
+        atomic_replace_with_retry(staging_dir, generation_dir, timeout_seconds=5.0)
         self._publish_active_generation(
             cache_dir,
             generation_dir,
