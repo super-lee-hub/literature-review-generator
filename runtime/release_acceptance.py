@@ -3623,7 +3623,7 @@ class DocumentModalityProfileV1:
     def derived_modality(self) -> str:
         scan_ratio = self.scanned_candidate_page_count / self.total_page_count
         ocr_ratio = self.ocr_used_page_count / self.total_page_count
-        if ocr_ratio > 0 or scan_ratio >= 0.25:
+        if ocr_ratio >= 0.25 or scan_ratio >= 0.25:
             return "ocr_scanned"
         visual_signal = self.image_page_ratio >= 0.5 or (
             self.table_count + self.figure_count
@@ -3720,7 +3720,10 @@ class DocumentModalityProfileV2:
 
     @property
     def derived_modality(self) -> str:
-        if self.actual_ocr_pages > 0 or self.scanned_candidate_pages / self.page_count >= 0.25:
+        if (
+            self.actual_ocr_pages / self.page_count >= 0.25
+            or self.scanned_candidate_pages / self.page_count >= 0.25
+        ):
             return "ocr_scanned"
         if self.image_page_count / self.page_count >= 0.5 or self.table_count + self.figure_count >= max(1, self.page_count // 3):
             return "visual_table_heavy"

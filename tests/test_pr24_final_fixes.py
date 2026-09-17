@@ -27,6 +27,7 @@ from runtime.trust_admission import (
     build_external_host_policy,
     validate_external_host_acknowledgement,
 )
+from runtime.release_acceptance import DocumentModalityProfileV1, DocumentModalityProfileV2
 from services.configuration_service import ensure_config_sections
 from services.queue_service import PersistentQueueService, QueueJobSpec, QueueInputDriftError
 from services.stage1_analysis_service import Stage1AnalysisService
@@ -564,3 +565,36 @@ def test_g01_ready_to_apply_accepts_only_json_boolean(value: object) -> None:
     result = _normalize_planner_response({"ready_to_apply": value})
     expected = value if isinstance(value, bool) else False
     assert result["ready_to_apply"] is expected
+
+
+def test_modality_requires_ocr_or_scan_primary_page_coverage() -> None:
+    v1 = DocumentModalityProfileV1(
+        source_pdf_sha256="a" * 64,
+        total_page_count=21,
+        text_page_ratio=20 / 21,
+        image_page_ratio=1 / 21,
+        table_count=0,
+        figure_count=0,
+        scanned_candidate_page_count=1,
+        ocr_used_page_count=1,
+        selected_visual_count=0,
+        extractor_used="pymupdf-deterministic-profile",
+    )
+    v2 = DocumentModalityProfileV2(
+        source_pdf_sha256="b" * 64,
+        preprocess_manifest_hash="c" * 64,
+        stage1_input_manifest_hash="d" * 64,
+        actual_extractor="pymupdf",
+        page_count=21,
+        text_page_count=20,
+        image_page_count=1,
+        table_count=0,
+        figure_count=0,
+        scanned_candidate_pages=1,
+        actual_ocr_pages=1,
+        actual_selected_visual_count=0,
+        stage1_input_mode="normalized_markdown",
+    )
+
+    assert v1.derived_modality == "text_heavy"
+    assert v2.derived_modality == "text_heavy"
