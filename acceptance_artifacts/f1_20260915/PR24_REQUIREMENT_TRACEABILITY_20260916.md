@@ -86,3 +86,29 @@ validation has passed.
 - The stored F1 plan is executable-SHA-neutral; the control plane records the exact clean checkout SHA at each run. C/D/Q evidence is frozen to `09477d666a0f31c2b1d95a2a6cb25c00b4e7bfca`; Gate I evidence is frozen to `24884c2adaeac2d98af85349dbbccc6980d2c814`; later report-only commits do not change either runtime evidence set.
 - PR #24 remains `OPEN`, `isDraft=false`, and no merge or force-push was performed. Hosted CI run `35159017730` is `SUCCESS` 6/6 for head `e8b6837ec1165b65c3dce124a3bcd20bfbae6c78`.
 - The acceptance-only budget copy is bounded at 4 Provider calls and 128,000 output tokens; the live C/D ledgers record 4 successful DeepSeek calls and 49,787 output tokens.
+
+## Current-SHA repair and live recheck addendum (2026-09-17)
+
+The current executable repair freeze is
+`5835a7be7c654785da751c6f29aa6223d59f1819`, pushed to
+`codex/f1-validation-authority-closure`. It remains separate from the
+historical C/D/Gate-I/Gate-K evidence freezes above.
+
+Current-SHA local verification: the combined provider-closure, graph-refresh,
+Stage 1 fallback/publication, and PR24 regression command completed with
+`59 passed` in `210.63s`; Pyright and fatal Ruff checks also passed on the
+changed modules. Hosted Windows CI `35226855031` completed `6/6 SUCCESS` for
+this exact commit.
+
+| Current item | Current evidence | Judgment / boundary |
+|---|---|---|
+| Stage 1 semantic fallback | `services/stage1_analysis_service.py`; `tests/test_current_stage1_provider_fallback.py::test_stage1_backup_reader_gets_one_semantic_corrective_retry` | PASS_OFFLINE_TARGETED. Primary and Backup canonical validation now share a bounded corrective retry, with explicit engine and retry accounting. |
+| Stage 1 call-graph closure | `services/stage1_analysis_service.py`; `runtime/provider_receipt_closure.py`; `tests/test_stage1_graph_identity_refresh.py`; `tests/test_provider_receipt_closure.py` | PASS_OFFLINE_TARGETED. Deterministic semantic prompt/config variants are registered and prompt variance is accepted only when an exact declared variant matches. |
+| Stage 1 publication durability | `services/stage1_analysis_service.py`; `preprocess/service.py`; `tests/test_current_stage1_generation.py::test_current_stage1_publishes_normalized_routing_fields`; `tests/test_pr24_final_fixes.py` | PASS_OFFLINE_TARGETED. Routing normalization occurs before hashing/publication, and preprocess generation directory replacement uses bounded Windows retry. |
+| Official DeepSeek F1 R10 | `F1_STAGE1_FULL_RUNTIME_SPEC_20260917_R10.json`; R10 workspace `runs_stage1_r7/f1_stage1_official_fallback_r10__f1-stage1-full-20260917-r10` | BLOCKED_INVALID_CREDENTIAL. Source intake was 15/15; the first real Primary request returned `fatal_config_or_auth` because the configured key is invalid. The runner reports no accepted provider-receipt snapshot and no Stage 1 authority. |
+| Full F1 Q | F1 corpus manifest and the existing Q/Outline evidence | NOT_RUN. D remains blocked by the strict three-way `ocr_scanned` requirement; Q also still requires a healthy Outline route and a fresh ACK before custom-host content. |
+
+The R10 attempt used official DeepSeek only and did not send any original PDF.
+The custom `ai.saigou.work` and `chat.178266.xyz` routes were not used by the
+R10 run. The root `.env` values were loaded only into the child process and
+were not printed, persisted, or committed.

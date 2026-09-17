@@ -296,3 +296,39 @@ image was sent by these probes. The F1 acceptance status remains
 certificate/route recovery, while D remains blocked by the strict
 `ocr_scanned` modality requirement. The F1 Q configuration uses local parsing,
 so no real MinerU task was silently enabled or sent.
+
+## Current-SHA repair and F1 Stage 1 recheck (2026-09-17)
+
+The current repair commit is `5835a7be7c654785da751c6f29aa6223d59f1819`.
+It adds bounded semantic correction for the Backup Reader, reserves the exact
+Primary/Backup logical-call budget, records deterministic correction variants
+in the provider call graph, normalizes routing fields at the publication
+boundary, and uses bounded retry for Windows preprocess-generation
+publication. The changed production modules and tests passed the current-SHA
+focused regression (`59 passed`), and Hosted Windows CI `35226855031` passed
+all 6 jobs at this same commit.
+
+The official-DeepSeek-only Stage 1 R10 attempt used the same 15-paper binding,
+reused only the previously completed preprocess cache, kept
+`send_original_pdf=never`, and loaded the two configured official DeepSeek
+credentials from the root `.env` into the child process without writing or
+printing them. The runner completed `source_intake` for all 15 sources and
+then stopped at F1-01 when DeepSeek returned `fatal_config_or_auth` because
+the configured key is invalid. The canonical runner projection is
+`job_status=failed`, `stage1_authority_ready=false`,
+`provider_receipt_snapshot_count=0`, and `provider_receipts_incomplete`; this
+is a real credential failure, not a successful F1 Stage 1 result. The R10
+specification is [F1_STAGE1_FULL_RUNTIME_SPEC_20260917_R10.json](F1_STAGE1_FULL_RUNTIME_SPEC_20260917_R10.json),
+and its local outcome is under the R10 workspace recorded by the runner.
+
+The preceding R9 attempt was rejected before transport because the sanitized
+acceptance config had only template key sentinels. No custom gateway was used
+by either attempt. The root `.env` key must be rotated or replaced before a
+new official DeepSeek F1 run can be meaningful; no code path will bypass the
+credential check.
+
+Current disposition remains:
+`CODE_REPAIR_STATUS=PASS_OFFLINE_TARGETED`,
+`F1_LIVE_STATUS=BLOCKED_INVALID_DEEPSEEK_CREDENTIAL`,
+`D=FAIL_MODALITY`, `Q=BLOCKED`, and
+`FINAL_RELEASE_STATUS=NOT_READY_TO_MERGE`.
