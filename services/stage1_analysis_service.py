@@ -6601,10 +6601,18 @@ class Stage1AnalysisService:
         del error
         return (
             f"{prompt}\n\n"
-            "CORRECTIVE RETRY: The previous answer did not satisfy the required "
-            "canonical Stage 1 summary contract. Return only a complete JSON "
-            "object with substantive non-placeholder values for summary, "
-            "methodology, findings, and conclusions. Do not explain the retry."
+            "CORRECTIVE RETRY: Re-read the supplied source evidence and return "
+            "only one complete JSON object that satisfies the canonical Stage 1 "
+            "summary contract. The object must contain routing, paper_metadata, "
+            "core_analysis, and specialized_details; core_analysis must contain "
+            "substantive source-grounded strings for summary, methodology, "
+            "findings, and conclusions. Use the evidence in the input rather "
+            "than inventing facts. If a field is genuinely not reported, state "
+            "that the source does not report that field, but do not use an empty "
+            "value or a placeholder such as unknown, not available, not provided, "
+            "N/A, TBD, TODO, placeholder, or ellipsis. Preserve concrete numbers, "
+            "directions, sample details, and limitations from the source. Do not "
+            "explain the retry or emit Markdown outside the JSON object."
         )
 
     @staticmethod

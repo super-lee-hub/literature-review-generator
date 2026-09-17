@@ -578,6 +578,7 @@ def test_stage1_backup_reader_gets_one_semantic_corrective_retry(
     pdf_path = tmp_path / "backup-semantic-retry-paper.pdf"
     _write_pdf(pdf_path)
     calls: list[tuple[str, int, bool]] = []
+    prompts: list[str] = []
     backup_calls = 0
 
     def invalid_summary() -> dict[str, Any]:
@@ -595,6 +596,7 @@ def test_stage1_backup_reader_gets_one_semantic_corrective_retry(
     ) -> Mapping[str, Any]:
         nonlocal backup_calls
         del kwargs
+        prompts.append(prompt_text)
         config = primary_api_config if engine_type == "primary" else backup_api_config
         calls.append(
             (
@@ -629,6 +631,10 @@ def test_stage1_backup_reader_gets_one_semantic_corrective_retry(
         ("backup", 0, False),
         ("backup", 1, True),
     ]
+    assert "core_analysis" in prompts[1]
+    assert "paper_metadata" in prompts[1]
+    assert "not available" in prompts[1]
+    assert "not provided" in prompts[1]
     provider = result.summaries[0]["provider"]
     assert provider["successful_engine"] == "backup"
     assert provider["semantic_retries"] == 2
