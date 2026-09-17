@@ -332,3 +332,43 @@ Current disposition remains:
 `F1_LIVE_STATUS=BLOCKED_INVALID_DEEPSEEK_CREDENTIAL`,
 `D=FAIL_MODALITY`, `Q=BLOCKED`, and
 `FINAL_RELEASE_STATUS=NOT_READY_TO_MERGE`.
+
+## R11–R14 official DeepSeek Stage 1 recovery (2026-09-17)
+
+R11 isolated the credential discrepancy: the official Primary route produced
+three successful DeepSeek receipts, while the configured `deepseek-v4-pro`
+Backup credential was rejected as invalid. R12 therefore used the same
+already-verified Primary credential for the configured official Backup model,
+with that deviation recorded in the R12 spec. R12's first run and resume
+correctly stopped on placeholder content and then a length-budget exhaustion;
+neither result was promoted to authority. R13 added one finite 32k-to-64k
+length retry but still stopped on F1-02 placeholder content after bounded
+Primary/Backup retries.
+
+R14 used the source-grounded corrective prompt on executable SHA
+`420663e4eea4e9e2a1ffdee1d5d16193d7e5d08e` and completed the full Stage 1
+corpus: 15/15 preprocess generations, 15/15 paper artifacts, 18 expected
+provider call IDs, and 22 published successful DeepSeek receipts across
+Primary/Backup and the selected visual extraction calls. Its provider receipt
+closure was complete. The first runner projection exposed a prompt-hash
+binding defect in the higher-level closure map; commit
+`9e42105e529a964396c52320d67aaa719a047817` fixed that exact declared-variant
+check. A no-provider reconcile and status readback using `9e42105e…` returned
+`issues=[]`, `completion_status=complete`, `canonical_ready=true`,
+`STAGE1_AUTHORITY_READY=true`, and `VISUAL_QUALIFICATION_READY=true`.
+
+This is a real F1 Stage 1 acceptance result, but not full Q or release
+acceptance. The controlled R14 credential source differs from the configured
+Backup credential, all 15 semantic summaries remain subject to independent
+human/original-PDF ground-truth review, and the authoritative F1 profiles
+still do not satisfy the strict D three-way requirement: the selected D
+members remain F1-01 `text_heavy`, F1-03 `text_heavy`, and F1-14
+`visual_table_heavy`, with no production-derived `ocr_scanned` member.
+Therefore Q has not started; Outline v3, Writer, Validator repair, DOCX QA,
+live MinerU recovery, and governance closure remain unverified.
+
+Current disposition is:
+`CODE_REPAIR_STATUS=PASS_OFFLINE_TARGETED`,
+`F1_STAGE1_STATUS=PASS_LIVE_CONTROLLED_CREDENTIAL_CONFIG`,
+`D=FAIL_MODALITY`, `Q=BLOCKED`, and
+`FINAL_RELEASE_STATUS=NOT_READY_TO_MERGE`.

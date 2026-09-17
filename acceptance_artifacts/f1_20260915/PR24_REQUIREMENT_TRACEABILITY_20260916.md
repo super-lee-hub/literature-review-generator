@@ -112,3 +112,27 @@ The R10 attempt used official DeepSeek only and did not send any original PDF.
 The custom `ai.saigou.work` and `chat.178266.xyz` routes were not used by the
 R10 run. The root `.env` values were loaded only into the child process and
 were not printed, persisted, or committed.
+
+## R11–R14 current F1 Stage 1 evidence addendum (2026-09-17)
+
+| Run | Evidence | Current judgment |
+|---|---|---|
+| R11 | `F1_STAGE1_FULL_RUNTIME_SPEC_20260917_R11.json`; 3 successful Primary receipts followed by invalid configured Backup credential | BLOCKED_INVALID_BACKUP_CREDENTIAL; no authority promoted. |
+| R12 + resume | `F1_STAGE1_FULL_RUNTIME_SPEC_20260917_R12.json`; explicit Primary-credential reuse for the official Backup model; placeholder rejection followed by bounded resume and output-budget exhaustion | BLOCKED_PROVIDER_CONTENT; fail-closed, no authority promoted. |
+| R13 | `F1_STAGE1_FULL_RUNTIME_SPEC_20260917_R13.json`; one finite 32k→64k length retry; bounded Primary/Backup semantic retries | BLOCKED_PROVIDER_CONTENT; F1-02 remained placeholder, no authority promoted. |
+| R14 | `F1_STAGE1_FULL_RUNTIME_SPEC_20260917_R14.json`; execution SHA `420663e4eea4e9e2a1ffdee1d5d16193d7e5d08e`; 15/15 paper artifacts, 18 expected call IDs, 22 successful published receipts, complete provider closure | PASS_LIVE_STAGE1_ONLY. Current closure/status rechecked with `9e42105e529a964396c52320d67aaa719a047817`: `issues=[]`, `completion_status=complete`, `canonical_ready=true`, `STAGE1_AUTHORITY_READY=true`, `VISUAL_QUALIFICATION_READY=true`. |
+
+R14 is bound to the exact 15-paper manifest and used only
+`https://api.deepseek.com`; original PDFs remained `send_original_pdf=never`.
+The controlled run explicitly reused the verified Primary credential for the
+configured official Backup model because the configured Backup credential had
+failed in R11. This is recorded as a run-specific credential-source deviation,
+not a silent production-config change. R14 proves Stage 1 source/visual/
+canonical/receipt closure, not human semantic ground truth or full Q.
+
+The strict D gate is still not met: the three selected production-derived
+profiles are F1-01 `text_heavy`, F1-03 `text_heavy`, and F1-14
+`visual_table_heavy`; the auxiliary scanned sample remains separate and does
+not enter the F1-15 corpus. Q therefore remains blocked before any Outline or
+custom-gateway payload. The existing custom-route ACK is stale and the Outline
+route still has the recorded `SEC_E_CERT_EXPIRED` TLS blocker.
