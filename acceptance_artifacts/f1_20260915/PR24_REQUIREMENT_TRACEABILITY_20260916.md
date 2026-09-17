@@ -145,3 +145,6 @@ The current executable D modality recheck is
 It confirms the 1/21 OCR/scanned-candidate pages in F1-10 do not qualify as
 an `ocr_scanned` primary modality and preserves the strict D `FAIL_MODALITY`
 result.
+The formal v2 profile derivation used
+[F1_D_MODALITY_RUNTIME_SPEC_20260918.json](F1_D_MODALITY_RUNTIME_SPEC_20260918.json)
+with the existing R14 Registry and zero provider calls.

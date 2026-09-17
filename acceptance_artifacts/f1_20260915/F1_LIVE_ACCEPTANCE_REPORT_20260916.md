@@ -338,6 +338,9 @@ The current-SHA D modality recheck is recorded in
 It binds the R14 production page diagnostics and confirms F1-10 has only 1/21
 OCR/scanned-candidate pages, so its derived modality is `visual_table_heavy`,
 not `ocr_scanned`, under the 25% primary-coverage rule.
+The formal three-source v2 derivation used
+[F1_D_MODALITY_RUNTIME_SPEC_20260918.json](F1_D_MODALITY_RUNTIME_SPEC_20260918.json)
+and made zero provider calls.
 
 The compact, secret-free R14 projection is
 [F1_STAGE1_R14_EVIDENCE_SUMMARY_20260918.json](F1_STAGE1_R14_EVIDENCE_SUMMARY_20260918.json).

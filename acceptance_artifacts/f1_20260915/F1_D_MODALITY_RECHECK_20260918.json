@@ -63,6 +63,26 @@
     "status": "FAIL_MODALITY",
     "reason": "the authoritative F1 corpus has no production-derived OCR/scanned-primary member"
   },
+  "formal_profile_derivation": {
+    "runtime_spec": "F1_D_MODALITY_RUNTIME_SPEC_20260918.json",
+    "recheck_workspace": "runs_stage1_r13/f1_stage1_official_primary_credential_recovery_r14__f1-stage1-full-20260917-r14",
+    "registry_profile_refs": [
+      {
+        "artifact_id": "document-modality-profile:v2:6593fe7c65c62e9fca1a9cbbd0e10dc6cbfbcc4b1ea01bb59f2bc11f8226c2a7",
+        "registry_content_hash": "62e9ed0b5220e1cf4e8991a12ac7714c019ee839a8eaddca6c002e4df5e93cdd"
+      },
+      {
+        "artifact_id": "document-modality-profile:v2:b90ba7df54f1e20e93bf4e587b68745381b9f32e179badedfe29224dba42d027",
+        "registry_content_hash": "c1eed62c25fade79ece02ff689ea4dec7c18aa37b288759e6d417e5ea360e84c"
+      },
+      {
+        "artifact_id": "document-modality-profile:v2:7f25ebf74ae87f92bba3a626c1a787a4aebd32e1e4cc17347a2b78fa01cd8e0f",
+        "registry_content_hash": "33714d65ee4d8cab788c7147cee8ec741368ca261da1d4a33be073bfc7b96cf8"
+      }
+    ],
+    "derived_modalities": ["text_heavy", "visual_table_heavy"],
+    "provider_calls": 0
+  },
   "evidence_boundary": {
     "original_pdf_transport": "never",
     "auxiliary_scan_is_not_in_f1_corpus": true,
