@@ -139,3 +139,9 @@ route still has the recorded `SEC_E_CERT_EXPIRED` TLS blocker.
 
 The secret-free, hash-bound R14 count/identity projection is
 [F1_STAGE1_R14_EVIDENCE_SUMMARY_20260918.json](F1_STAGE1_R14_EVIDENCE_SUMMARY_20260918.json).
+
+The current executable D modality recheck is
+[F1_D_MODALITY_RECHECK_20260918.json](F1_D_MODALITY_RECHECK_20260918.json).
+It confirms the 1/21 OCR/scanned-candidate pages in F1-10 do not qualify as
+an `ocr_scanned` primary modality and preserves the strict D `FAIL_MODALITY`
+result.

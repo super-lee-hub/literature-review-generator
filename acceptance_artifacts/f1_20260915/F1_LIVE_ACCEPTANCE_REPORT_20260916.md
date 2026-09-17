@@ -333,6 +333,12 @@ Current disposition remains:
 `D=FAIL_MODALITY`, `Q=BLOCKED`, and
 `FINAL_RELEASE_STATUS=NOT_READY_TO_MERGE`.
 
+The current-SHA D modality recheck is recorded in
+[F1_D_MODALITY_RECHECK_20260918.json](F1_D_MODALITY_RECHECK_20260918.json).
+It binds the R14 production page diagnostics and confirms F1-10 has only 1/21
+OCR/scanned-candidate pages, so its derived modality is `visual_table_heavy`,
+not `ocr_scanned`, under the 25% primary-coverage rule.
+
 The compact, secret-free R14 projection is
 [F1_STAGE1_R14_EVIDENCE_SUMMARY_20260918.json](F1_STAGE1_R14_EVIDENCE_SUMMARY_20260918.json).
 

@@ -1,0 +1,71 @@
+{
+  "artifact_type": "f1_d_modality_recheck_projection",
+  "artifact_version": "v1",
+  "recheck_executable_sha": "c49bf58675746ad647a9ecd104e514d8b4cc21db",
+  "source_execution_run": "f1-stage1-full-20260917-r14",
+  "source_execution_sha": "420663e4eea4e9e2a1ffdee1d5d16193d7e5d08e",
+  "corpus_manifest": "F1_CORPUS_MANIFEST_20260915.json",
+  "corpus_manifest_sha256": "f741776ea2eda6b5937f4fc13e40569216eb3173ff597fb80eeea2e46dab3e90",
+  "classification_contract": {
+    "production_profile_schema": "document-modality-profile-v2",
+    "ocr_or_scanned_primary_min_page_ratio": 0.25,
+    "source_of_counts": "R14 production preprocess page_diagnostics",
+    "self_declared_profiles_allowed": false
+  },
+  "profiles": [
+    {
+      "source_id": "F1-01",
+      "source_pdf_sha256": "6593fe7c65c62e9fca1a9cbbd0e10dc6cbfbcc4b1ea01bb59f2bc11f8226c2a7",
+      "page_count": 27,
+      "text_pages": 27,
+      "image_pages": 6,
+      "scanned_candidate_pages": 0,
+      "actual_ocr_pages": 0,
+      "derived_modality": "text_heavy"
+    },
+    {
+      "source_id": "F1-03",
+      "source_pdf_sha256": "b90ba7df54f1e20e93bf4e587b68745381b9f32e179badedfe29224dba42d027",
+      "page_count": 20,
+      "text_pages": 20,
+      "image_pages": 9,
+      "scanned_candidate_pages": 0,
+      "actual_ocr_pages": 0,
+      "derived_modality": "text_heavy"
+    },
+    {
+      "source_id": "F1-10",
+      "source_pdf_sha256": "36f89d156352245fa5aee5eab5ba6b1740da55dbd1859db4597694cac999670c",
+      "page_count": 21,
+      "text_pages": 21,
+      "image_pages": 21,
+      "scanned_candidate_pages": 1,
+      "actual_ocr_pages": 1,
+      "derived_modality": "visual_table_heavy",
+      "ocr_primary_qualification": false,
+      "reason": "1/21 pages is below the 25 percent primary-modality threshold; all 21 pages have substantive text"
+    },
+    {
+      "source_id": "F1-14",
+      "source_pdf_sha256": "7f25ebf74ae87f92bba3a626c1a787a4aebd32e1e4cc17347a2b78fa01cd8e0f",
+      "page_count": 11,
+      "text_pages": 11,
+      "image_pages": 11,
+      "scanned_candidate_pages": 0,
+      "actual_ocr_pages": 0,
+      "derived_modality": "visual_table_heavy"
+    }
+  ],
+  "gate_d_selection": {
+    "selected_source_ids": ["F1-01", "F1-03", "F1-14"],
+    "derived_modalities": ["text_heavy", "visual_table_heavy"],
+    "ocr_scanned_members": [],
+    "status": "FAIL_MODALITY",
+    "reason": "the authoritative F1 corpus has no production-derived OCR/scanned-primary member"
+  },
+  "evidence_boundary": {
+    "original_pdf_transport": "never",
+    "auxiliary_scan_is_not_in_f1_corpus": true,
+    "human_original_pdf_adjudication": "not_completed"
+  }
+}
