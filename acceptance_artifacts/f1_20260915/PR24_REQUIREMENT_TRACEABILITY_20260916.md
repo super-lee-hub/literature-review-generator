@@ -30,6 +30,28 @@ The code result below is `PASS_OFFLINE` only where the current repository checks
 | E03 | NOT_VERIFIED_FAIL_CLOSED (historical r13) | Gate E's earlier local controlled probe reached a durable receipt, terminated the initial process, and refused resume when a transport-started aggregate reservation had no matching receipt. | `F1_E_LOCAL_ACCEPTANCE_PLAN_20260917.json`; parent `f1-e-local-acceptance-20260917-r13`; interruption receipt and safe resume diagnostic show the ambiguous reservation; no external calls. | Superseded for the positive local boundary by E04; live-provider resume remains unverified. |
 | E04 | PASS_OFFLINE_SCOPED | Gate E now terminates immediately after observing the durable receipt/Registry boundary, and counts a provider call as completed for resume purposes only after explicit semantic `passed`. | `F1_E_LOCAL_ACCEPTANCE_PLAN_20260917_R14.json`; parent `f1-e-local-acceptance-20260917-positive`; current executable `a2c934081e93834338249f44e17d4e9af89b2ddc`; interruption/resume evidence records 1 receipt before and 2 after, `duplicate_receipts=0`, `reexecuted_completed_call_ids=[]`, and zero nonlocal calls. | Local stub only; live-provider crash/resume and MinerU recovery remain unverified. |
 
+## Current-route authorization and protocol recheck (2026-09-17)
+
+The current task contains explicit owner authorization for F1 extracted text and
+rendered images to the configured custom LLM gateways. The durable
+[F1_EXTERNAL_HOST_ACKNOWLEDGEMENT_20260917.json](F1_EXTERNAL_HOST_ACKNOWLEDGEMENT_20260917.json)
+records the v2 acknowledgement for `ai.saigou.work` and `chat.178266.xyz`,
+bound to route fingerprint
+`8c5443705306d6a1df9b726579faef434297215ac3b1dbf95a4ce5ba0f608309` and
+validated by `runtime.trust_admission`. The authorized, non-secret Q spec is
+[Q_RUNTIME_SPEC_20260917_AUTHORIZED.json](Q_RUNTIME_SPEC_20260917_AUTHORIZED.json).
+Its transport policy remains `send_original_pdf=never` and base64-rendered image
+transport.
+
+The Writer route passed one real minimal `/v1/responses` probe with HTTP 200 and
+reported usage. The Outline route was probed twice with two attempts each; all
+four physical attempts failed before HTTP response. A separate header-only
+probe showed DNS/TCP/443 reachability but TLS failed with
+`SEC_E_CERT_EXPIRED`. The authorized Q therefore was not started; certificate
+verification was not disabled. No F1 payload was sent by these probes. This is
+current route evidence, not a claim that Q, D, MinerU, DOCX, or semantic
+validation has passed.
+
 ## Current repository verification
 
 - Full clean pytest command: `python -m pytest -q --maxfail=1` → `1694 passed, 28 skipped` (Windows multiprocessing run in the elevated local environment).

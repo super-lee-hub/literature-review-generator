@@ -264,3 +264,35 @@ custom-host content was sent.
   at head `e8b6837ec1165b65c3dce124a3bcd20bfbae6c78`; the current K evidence
   freeze is `96e6f829e4fc0b99d636190b742129e74226c8b0`; the PR remains open and
   unmerged.
+
+## Current-route authorization and protocol recheck (2026-09-17)
+
+The owner supplied an explicit authorization in the current task for F1
+extracted text and rendered images to be sent to the configured custom LLM
+gateways. A durable v2 acknowledgement was recorded at
+[F1_EXTERNAL_HOST_ACKNOWLEDGEMENT_20260917.json](F1_EXTERNAL_HOST_ACKNOWLEDGEMENT_20260917.json)
+and bound to the current F1 route fingerprint
+`8c5443705306d6a1df9b726579faef434297215ac3b1dbf95a4ce5ba0f608309`, with an
+expiry of `2026-09-18T06:20:07.290471Z`. The new authorized Q spec is
+[Q_RUNTIME_SPEC_20260917_AUTHORIZED.json](Q_RUNTIME_SPEC_20260917_AUTHORIZED.json).
+The admission check passed for exactly `ai.saigou.work` and
+`chat.178266.xyz`; `send_original_pdf=never` and `image_transport=base64` remain
+in force. The historical Q spec and its blocked run are retained unchanged.
+
+Before any F1 payload was sent, the current routes were probed independently:
+
+- `Writer_API` at `ai.saigou.work/v1/responses`: one real minimal probe,
+  HTTP 200, structured response success, five reported output tokens.
+- `Outline_API` at `chat.178266.xyz/v1/messages`: two bounded probe runs,
+  four physical attempts total, all `transient_network` with no HTTP status.
+  A header-only HTTPS check confirmed DNS and TCP/443 reachability but failed
+  TLS certificate validation with `SEC_E_CERT_EXPIRED`.
+
+Therefore the authorized Q was not started: Outline is a current route
+prerequisite and disabling certificate verification would be unsafe and would
+not be a valid acceptance result. No F1 PDF, extracted F1 text, or rendered F1
+image was sent by these probes. The F1 acceptance status remains
+`NOT_READY_TO_MERGE`; Q is additionally blocked on the expired Outline TLS
+certificate/route recovery, while D remains blocked by the strict
+`ocr_scanned` modality requirement. The F1 Q configuration uses local parsing,
+so no real MinerU task was silently enabled or sent.
