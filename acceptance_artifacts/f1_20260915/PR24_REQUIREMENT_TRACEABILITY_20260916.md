@@ -153,3 +153,10 @@ R14 machine-level content/source integrity is recorded in
 [F1_STAGE1_R14_CONTENT_INTEGRITY_20260918.json](F1_STAGE1_R14_CONTENT_INTEGRITY_20260918.json):
 15/15 canonical summaries, zero placeholder/empty-core/source-hash/receipt
 binding defects. Human semantic ground truth remains explicitly pending.
+
+Independent source-content cross-check is recorded in
+[F1_R14_SOURCE_CONTENT_AUDIT_20260918.json](F1_R14_SOURCE_CONTENT_AUDIT_20260918.json):
+15/15 manifest SHA bindings and summary-source paths match; rendered/OCR
+evidence resolves the four text-layer numeric gaps. This is agent-level
+source verification only and does not satisfy the required human semantic
+ground-truth or full C→D→Q acceptance.

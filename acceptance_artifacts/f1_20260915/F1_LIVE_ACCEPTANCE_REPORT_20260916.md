@@ -390,3 +390,21 @@ Current disposition is:
 `F1_STAGE1_STATUS=PASS_LIVE_CONTROLLED_CREDENTIAL_CONFIG`,
 `D=FAIL_MODALITY`, `Q=BLOCKED`, and
 `FINAL_RELEASE_STATUS=NOT_READY_TO_MERGE`.
+
+## Independent source-content cross-check (2026-09-18)
+
+The current R14 summaries were independently checked against the 15
+manifest-bound source PDFs in
+[F1_R14_SOURCE_CONTENT_AUDIT_20260918.json](F1_R14_SOURCE_CONTENT_AUDIT_20260918.json).
+All 15 actual PDF SHA-256 values match both the corpus manifest and the R14
+summary-source binding. The agent-level source cross-check is complete for
+15/15 papers. Four numeric groups that were not recoverable from the ordinary
+text layer were verified from rendered PDF pages with OCR/visual inspection:
+F1-03 p.7, F1-06 p.13, F1-09 p.10, and F1-14 p.7. For F1-03, the reported
+17.44 quadrillion is a rounded form of the source's printed
+17,438,876,024,293,366 value.
+
+This is an independent source-binding and numeric-content cross-check, not
+human semantic ground truth. `human_semantic_ground_truth` remains
+`PENDING_HUMAN_REVIEW`; this evidence does not change `D=FAIL_MODALITY` or
+the pre-provider `Q=BLOCKED_D_PREREQUISITE` boundary.
