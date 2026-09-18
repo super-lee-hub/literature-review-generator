@@ -166,3 +166,9 @@ Independent source-content cross-check is recorded in
 evidence resolves the four text-layer numeric gaps. This is agent-level
 source verification only and does not satisfy the required human semantic
 ground-truth or full C→D→Q acceptance.
+
+The current Q route/ACK admission read-back is recorded in
+[F1_Q_ROUTE_ADMISSION_RECHECK_20260918.json](F1_Q_ROUTE_ADMISSION_RECHECK_20260918.json):
+preflight made zero network calls; the current five-host policy does not
+match the stored two-host ACK or its fingerprint, and the stored ACK is
+expired. Q remains blocked before transport.

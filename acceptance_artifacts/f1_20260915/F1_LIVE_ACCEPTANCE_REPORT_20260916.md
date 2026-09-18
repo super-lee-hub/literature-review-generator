@@ -417,3 +417,13 @@ This is an independent source-binding and numeric-content cross-check, not
 human semantic ground truth. `human_semantic_ground_truth` remains
 `PENDING_HUMAN_REVIEW`; this evidence does not change `D=FAIL_MODALITY` or
 the pre-provider `Q=BLOCKED_D_PREREQUISITE` boundary.
+
+## Q route admission recheck (2026-09-18)
+
+The current configuration/ACK comparison is recorded in
+[F1_Q_ROUTE_ADMISSION_RECHECK_20260918.json](F1_Q_ROUTE_ADMISSION_RECHECK_20260918.json).
+The read-only preflight resolved the current configuration with zero network
+calls and required five external hosts, while the stored Q ACK covers only
+`ai.saigou.work` and `chat.178266.xyz`, has a different route fingerprint, and
+is expired at the recheck time. Admission therefore remains fail-closed before
+HTTP; no custom gateway or MinerU call was made.

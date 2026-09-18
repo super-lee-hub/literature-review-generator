@@ -1,0 +1,56 @@
+{
+  "artifact_type": "f1_q_route_admission_recheck",
+  "artifact_version": "v1",
+  "checked_at_utc": "2026-09-18T03:56:46.5572085Z",
+  "current_executable_sha": "9c700fa151355521557456ffa777c7a19959ced1",
+  "config": {
+    "path": "D:/auto-generate/config.ini",
+    "sha256": "3BEA83FA46B16E8E6C7FDD9191E923D9411CFE2288117D12D32674F752137D1C",
+    "preflight_ok": true,
+    "preflight_network_calls": 0,
+    "route_fingerprint": "fa4d7bec1b7f13f4f04d8dc008c55865b55d3c3b7a91524cf50fb4d0af3a31d",
+    "required_external_hosts": [
+      "ai.saigou.work",
+      "api.yhlxj.ai",
+      "cdn-mineru.openxlab.org.cn",
+      "mineru.net",
+      "mineru.oss-cn-shanghai.aliyuncs.com"
+    ],
+    "provider_routes": {
+      "official": ["api.deepseek.com"],
+      "third_party_llm": ["ai.saigou.work", "api.yhlxj.ai"],
+      "mineru": ["mineru.net", "cdn-mineru.openxlab.org.cn", "mineru.oss-cn-shanghai.aliyuncs.com"]
+    }
+  },
+  "stored_q_acknowledgement": {
+    "path": "F1_EXTERNAL_HOST_ACKNOWLEDGEMENT_20260917.json",
+    "sha256": "5CB1486868FFDB005F37EBE1DEB0214DC94810A769FB518308D11E0479CBF994",
+    "schema_version": "external-host-acknowledgement-v2",
+    "version": 2,
+    "acknowledged": true,
+    "hosts": ["ai.saigou.work", "chat.178266.xyz"],
+    "route_fingerprint": "8c5443705306d6a1df9b726579faef434297215ac3b1dbf95a4ce5ba0f608309",
+    "issued_at": "2026-09-17T06:20:07.290471Z",
+    "expires_at": "2026-09-18T06:20:07.290471Z",
+    "expired_at_check": true
+  },
+  "admission_comparison": {
+    "required_hosts_match": false,
+    "route_fingerprint_match": false,
+    "ack_is_current": false,
+    "provider_calls_made": 0,
+    "rejection_boundary": "before HTTP/provider transport"
+  },
+  "f1_scope": {
+    "corpus_id": "field-f1-20260915",
+    "manifest_sha256": "f741776ea2eda6b5937f4fc13e40569216eb3173ff597fb80eeea2e46dab3e90",
+    "original_pdf_transport": "never",
+    "official_deepseek_extracted_text_and_rendered_visual_authorization": true,
+    "custom_gateway_authorization_in_current_scope": false
+  },
+  "gate_state": {
+    "d_status": "FAIL_MODALITY",
+    "q_status": "BLOCKED_D_PREREQUISITE_AND_ROUTE_ACK",
+    "status": "BLOCKED_FAIL_CLOSED"
+  }
+}
