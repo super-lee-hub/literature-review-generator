@@ -148,3 +148,8 @@ result.
 The formal v2 profile derivation used
 [F1_D_MODALITY_RUNTIME_SPEC_20260918.json](F1_D_MODALITY_RUNTIME_SPEC_20260918.json)
 with the existing R14 Registry and zero provider calls.
+
+R14 machine-level content/source integrity is recorded in
+[F1_STAGE1_R14_CONTENT_INTEGRITY_20260918.json](F1_STAGE1_R14_CONTENT_INTEGRITY_20260918.json):
+15/15 canonical summaries, zero placeholder/empty-core/source-hash/receipt
+binding defects. Human semantic ground truth remains explicitly pending.

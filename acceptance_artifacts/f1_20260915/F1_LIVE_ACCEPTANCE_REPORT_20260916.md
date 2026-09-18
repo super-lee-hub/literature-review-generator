@@ -342,6 +342,12 @@ The formal three-source v2 derivation used
 [F1_D_MODALITY_RUNTIME_SPEC_20260918.json](F1_D_MODALITY_RUNTIME_SPEC_20260918.json)
 and made zero provider calls.
 
+The R14 per-paper machine-integrity projection is
+[F1_STAGE1_R14_CONTENT_INTEGRITY_20260918.json](F1_STAGE1_R14_CONTENT_INTEGRITY_20260918.json):
+15/15 canonical summaries, non-empty core fields, no placeholder hits, exact
+source-PDF hashes, and receipt bindings. It is explicitly not human semantic
+ground truth.
+
 The compact, secret-free R14 projection is
 [F1_STAGE1_R14_EVIDENCE_SUMMARY_20260918.json](F1_STAGE1_R14_EVIDENCE_SUMMARY_20260918.json).
 
