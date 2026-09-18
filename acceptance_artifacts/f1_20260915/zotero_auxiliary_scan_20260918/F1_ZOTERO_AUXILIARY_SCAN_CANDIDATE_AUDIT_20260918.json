@@ -50,9 +50,9 @@
     "mineru_remote_requested": false,
     "mineru_remote_enabled": false,
     "diagnostics_sha256": "00928c21feda20e89ba030300f587a8c47f09c1f018027b97dcc57d017cae489",
-    "diagnostics_path": "acceptance_artifacts/f1_20260915/zotero_auxiliary_scan_20260918/preprocess-cache/dfc3d952d86b8021cc327629ec3432aa4fec8d23a6a95af7718e6f116b5ed1c5/generation-45ce85e5bb7d4bf6a194b6cc21e98935/diagnostics.json",
+    "diagnostics_path": "acceptance_artifacts/f1_20260915/zotero_auxiliary_scan_20260918/production/diagnostics.json",
     "page_index_sha256": "d09cf3e26eaf6a4c1c4ce53570d49379fee35b8a9684759579ef5c9b7dcac190",
-    "page_index_path": "acceptance_artifacts/f1_20260915/zotero_auxiliary_scan_20260918/preprocess-cache/dfc3d952d86b8021cc327629ec3432aa4fec8d23a6a95af7718e6f116b5ed1c5/generation-45ce85e5bb7d4bf6a194b6cc21e98935/page_index.json"
+    "page_index_path": "acceptance_artifacts/f1_20260915/zotero_auxiliary_scan_20260918/production/page_index.json"
   },
   "visual_verification": {
     "method": "PyMuPDF render followed by visual inspection",
