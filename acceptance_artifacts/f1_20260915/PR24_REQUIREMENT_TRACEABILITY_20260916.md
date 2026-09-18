@@ -178,3 +178,9 @@ The current authorization refresh is recorded in
 the fresh five-host v2 ACK passes current `runtime.trust_admission` schema,
 host, fingerprint, and expiry validation; Q remains unstarted solely because
 the D prerequisite is still `FAIL_MODALITY`.
+
+Synthetic provider reachability is recorded in
+[F1_PROVIDER_MICRO_PROBE_20260918.json](F1_PROVIDER_MICRO_PROBE_20260918.json):
+6/6 configured route probes succeeded with no F1 payload. This is transport
+evidence only and must not be promoted to Q, semantic, DOCX, or validation
+PASS.

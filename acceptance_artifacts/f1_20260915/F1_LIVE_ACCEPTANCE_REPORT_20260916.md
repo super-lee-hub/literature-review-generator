@@ -434,3 +434,10 @@ scope and validated against the current route fingerprint in
 The fresh v2 ACK validation is `PASS`, but Q was deliberately not started:
 `D=FAIL_MODALITY` remains the first unmet prerequisite. No provider call was
 made during this authorization refresh.
+
+The current route reachability probe is recorded in
+[F1_PROVIDER_MICRO_PROBE_20260918.json](F1_PROVIDER_MICRO_PROBE_20260918.json):
+all six configured Reader/Backup/Outline/Free Mode/Writer/Validator routes
+returned synthetic-probe success through the production transport path. The
+probe sent no F1 content and does not prove Q, semantic quality, DOCX, or
+validation closure; D remains the gate that prevents Q start.
