@@ -1,0 +1,42 @@
+{
+  "artifact_type": "f1_zotero_duplicate_attachment_modality_audit",
+  "artifact_version": "v1",
+  "checked_at_utc": "2026-09-19T00:00:00Z",
+  "read_mode": "Zotero SQLite immutable=1; filesystem read-only",
+  "f1_manifest": "F1_CORPUS_MANIFEST_20260915.json",
+  "f1_manifest_sha256": "f741776ea2eda6b5937f4fc13e40569216eb3173ff597fb80eeea2e46dab3e90",
+  "matching_strategy": "14 manifest DOIs plus F1-11 Zotero title/author identity; inspect every matched PDF attachment",
+  "counts": {
+    "f1_source_identities_checked": 15,
+    "zotero_parent_matches": 15,
+    "pdf_attachments_checked": 19,
+    "attachments_with_any_scanned_candidate_page": 1,
+    "f1_sources_with_ocr_primary_qualified": 0
+  },
+  "modality_rule": "page.scanned_candidate = trimmed extracted text length < 50 and page has at least one embedded image; primary qualification requires >= 25% of pages",
+  "matched_source_summary": [
+    {"source_id":"F1-01","match":"10.1016/j.ijresmar.2026.02.001","attachments":2,"scanned_candidate_pages":0,"page_count_max":27},
+    {"source_id":"F1-02","match":"10.1287/isre.2023.0581","attachments":1,"scanned_candidate_pages":0,"page_count_max":42},
+    {"source_id":"F1-03","match":"10.1177/2056305118786720","attachments":1,"scanned_candidate_pages":0,"page_count_max":20},
+    {"source_id":"F1-04","match":"10.1080/00913367.2021.1977737","attachments":1,"scanned_candidate_pages":0,"page_count_max":21},
+    {"source_id":"F1-05","match":"10.1177/00222429231217471","attachments":1,"scanned_candidate_pages":0,"page_count_max":24},
+    {"source_id":"F1-06","match":"10.1177/08944393241311586","attachments":1,"scanned_candidate_pages":0,"page_count_max":24},
+    {"source_id":"F1-07","match":"10.1002/mar.22084","attachments":1,"scanned_candidate_pages":0,"page_count_max":17},
+    {"source_id":"F1-08","match":"10.1287/mksc.2021.0107","attachments":1,"scanned_candidate_pages":0,"page_count_max":79},
+    {"source_id":"F1-09","match":"10.1007/s10796-026-10722-6","attachments":1,"scanned_candidate_pages":0,"page_count_max":16},
+    {"source_id":"F1-10","match":"10.5465/amr.2000.3363315","attachments":1,"scanned_candidate_pages":1,"page_count":21,"scanned_ratio":0.047619,"scanned_pages":[21],"attachment_key":"YSNHYQUQ","attachment_sha256":"36f89d156352245fa5aee5eab5ba6b1740da55dbd1859db4597694cac999670c","same_as_manifest_sha256":true},
+    {"source_id":"F1-11","match":"Zotero title/author: 社交媒体原创内容如何影响商业内容——基于微观数据的实证研究 / 孙梦阳、孙琦、陈隽旎","attachments":1,"scanned_candidate_pages":0,"page_count":11,"attachment_key":"MANCMIAD"},
+    {"source_id":"F1-12","match":"10.1287/mnsc.2023.00193","attachments":4,"scanned_candidate_pages":0,"page_count_range":[47,49]},
+    {"source_id":"F1-13","match":"10.1093/jcr/ucad003","attachments":1,"scanned_candidate_pages":0,"page_count":28},
+    {"source_id":"F1-14","match":"10.3969/j.issn.1672-0334.2024.04.003","attachments":1,"scanned_candidate_pages":0,"page_count":11},
+    {"source_id":"F1-15","match":"10.1016/j.jbusres.2021.05.011","attachments":1,"scanned_candidate_pages":0,"page_count":22}
+  ],
+  "conclusion": {
+    "new_f1_scan_primary_found": false,
+    "f1_d_status": "FAIL_MODALITY",
+    "q_status": "BLOCKED_D_PREREQUISITE",
+    "auxiliary_zotero_scan_remains_separate": true,
+    "manifest_changed": false,
+    "source_pdfs_modified": false
+  }
+}

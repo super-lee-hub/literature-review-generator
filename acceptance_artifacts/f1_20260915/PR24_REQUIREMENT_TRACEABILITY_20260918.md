@@ -91,6 +91,12 @@ SHA-256 `c355350f16ba9d55089eddd7dcbcd5df0fac2fe51f4788a18dac58cef17d51c9`.
 This PDF is explicitly auxiliary: it is not in the F1 manifest, was not sent to
 an external provider, does not change F1 D, and does not start Q.
 
+A directed Zotero audit then matched all 15 F1 identities (14 DOIs plus the
+F1-11 Chinese title/author identity) and inspected 19 PDF attachments. It found
+no new F1 scan-primary source; the only scanned-candidate attachment was an
+F1-10 duplicate with 1/21 pages and the same SHA as the manifest source. See
+`F1_ZOTERO_F1_DUPLICATE_ATTACHMENT_MODALITY_AUDIT_20260919.json`.
+
 ## Final status matrix
 
 ```text
