@@ -172,3 +172,9 @@ The current Q route/ACK admission read-back is recorded in
 preflight made zero network calls; the current five-host policy does not
 match the stored two-host ACK or its fingerprint, and the stored ACK is
 expired. Q remains blocked before transport.
+
+The current authorization refresh is recorded in
+[F1_Q_ROUTE_ADMISSION_RECHECK_20260918_R2.json](F1_Q_ROUTE_ADMISSION_RECHECK_20260918_R2.json):
+the fresh five-host v2 ACK passes current `runtime.trust_admission` schema,
+host, fingerprint, and expiry validation; Q remains unstarted solely because
+the D prerequisite is still `FAIL_MODALITY`.

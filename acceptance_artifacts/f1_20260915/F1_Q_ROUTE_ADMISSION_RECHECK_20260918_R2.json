@@ -1,0 +1,39 @@
+{
+  "artifact_type": "f1_q_route_admission_recheck",
+  "artifact_version": "v2",
+  "checked_at_utc": "2026-09-18T09:24:24.3212536Z",
+  "schema_validation_executable_sha": "494cc13bd9df63c41e3557f9fdf1bcd448aae480",
+  "config_route_fingerprint": "fa4d7bec1b7f13f4f04d8dc008c55865b55d3c3b7a91524cf50fb4d0af3a31d4",
+  "required_external_hosts": [
+    "ai.saigou.work",
+    "api.yhlxj.ai",
+    "cdn-mineru.openxlab.org.cn",
+    "mineru.net",
+    "mineru.oss-cn-shanghai.aliyuncs.com"
+  ],
+  "authorization_record": {
+    "path": "F1_EXTERNAL_HOST_ACKNOWLEDGEMENT_20260918.json",
+    "sha256": "4E97CD2C84B7789BB03A93384B21DC6B07DD070339B2927711E8F70F60426DD9",
+    "validated_by": "runtime.trust_admission.validate_external_host_acknowledgement",
+    "acknowledged": true,
+    "schema_version": "external-host-acknowledgement-v2",
+    "issued_at": "2026-09-18T09:24:24.3212536Z",
+    "expires_at": "2026-09-24T09:24:24.3212536Z",
+    "validation_result": "PASS"
+  },
+  "q_runtime_spec": {
+    "path": "Q_RUNTIME_SPEC_20260918_AUTHORIZED.json",
+    "sha256": "E7FB5BE4677260613AE2B6AD9CB7C8021E97BD4CDCB1D6BC6C91AE90708B0EA7",
+    "original_pdf_transport": "never",
+    "image_transport": "base64",
+    "provider_calls_allowed_by_authorization": true
+  },
+  "execution_boundary": {
+    "preflight_network_calls": 0,
+    "q_provider_calls_made": 0,
+    "ack_admission": "PASS",
+    "d_prerequisite": "FAIL_MODALITY",
+    "q_status": "BLOCKED_D_PREREQUISITE",
+    "status": "AUTHORIZED_BUT_NOT_STARTED_FAIL_CLOSED"
+  }
+}

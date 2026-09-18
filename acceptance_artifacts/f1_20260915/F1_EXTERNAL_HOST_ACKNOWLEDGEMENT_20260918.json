@@ -1,0 +1,15 @@
+{
+  "schema_version": "external-host-acknowledgement-v2",
+  "version": 2,
+  "acknowledged": true,
+  "hosts": [
+    "ai.saigou.work",
+    "api.yhlxj.ai",
+    "cdn-mineru.openxlab.org.cn",
+    "mineru.net",
+    "mineru.oss-cn-shanghai.aliyuncs.com"
+  ],
+  "route_fingerprint": "fa4d7bec1b7f13f4f04d8dc008c55865b55d3c3b7a91524cf50fb4d0af3a31d4",
+  "issued_at": "2026-09-18T09:24:24.3212536Z",
+  "expires_at": "2026-09-24T09:24:24.3212536Z"
+}

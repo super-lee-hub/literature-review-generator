@@ -427,3 +427,10 @@ calls and required five external hosts, while the stored Q ACK covers only
 `ai.saigou.work` and `chat.178266.xyz`, has a different route fingerprint, and
 is expired at the recheck time. Admission therefore remains fail-closed before
 HTTP; no custom gateway or MinerU call was made.
+
+The authorization was subsequently refreshed under the explicit current
+scope and validated against the current route fingerprint in
+[F1_Q_ROUTE_ADMISSION_RECHECK_20260918_R2.json](F1_Q_ROUTE_ADMISSION_RECHECK_20260918_R2.json).
+The fresh v2 ACK validation is `PASS`, but Q was deliberately not started:
+`D=FAIL_MODALITY` remains the first unmet prerequisite. No provider call was
+made during this authorization refresh.
