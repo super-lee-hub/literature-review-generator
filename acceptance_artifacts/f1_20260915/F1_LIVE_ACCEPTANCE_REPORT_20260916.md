@@ -441,3 +441,8 @@ all six configured Reader/Backup/Outline/Free Mode/Writer/Validator routes
 returned synthetic-probe success through the production transport path. The
 probe sent no F1 content and does not prove Q, semantic quality, DOCX, or
 validation closure; D remains the gate that prevents Q start.
+
+The authorized Q spec was accepted by the production control-plane planner in
+read-only mode; [F1_Q_PLAN_RECHECK_20260918.json](F1_Q_PLAN_RECHECK_20260918.json)
+records the plan hash, zero provider calls, and the preserved D prerequisite
+block. Execution remains deliberately unstarted.

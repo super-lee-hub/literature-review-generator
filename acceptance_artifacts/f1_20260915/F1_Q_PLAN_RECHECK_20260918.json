@@ -1,0 +1,25 @@
+{
+  "artifact_type": "f1_q_runtime_plan_recheck",
+  "artifact_version": "v1",
+  "checked_at_utc": "2026-09-18T10:28:53.4064398Z",
+  "schema_validation_executable_sha": "494cc13bd9df63c41e3557f9fdf1bcd448aae480",
+  "runtime_spec": {
+    "path": "Q_RUNTIME_SPEC_20260918_AUTHORIZED.json",
+    "sha256": "E7FB5BE4677260613AE2B6AD9CB7C8021E97BD4CDCB1D6BC6C91AE90708B0EA7",
+    "plan_hash": "93268abd0a7e7a518d7529c6f766b878bafb24f639f08ac5ebe871b2259ad399"
+  },
+  "plan_readback": {
+    "status": "planned",
+    "read_only": true,
+    "provider_calls": "not executed",
+    "action": "run_all",
+    "stages": ["source_intake", "analyze", "outline", "review", "validate"],
+    "current_acknowledgement_accepted": true
+  },
+  "gate_boundary": {
+    "d_status": "FAIL_MODALITY",
+    "q_status": "BLOCKED_D_PREREQUISITE",
+    "execution_started": false,
+    "status": "AUTHORIZED_AND_PLANNED_NOT_EXECUTED"
+  }
+}

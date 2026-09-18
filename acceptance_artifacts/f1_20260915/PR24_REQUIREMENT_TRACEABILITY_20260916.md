@@ -184,3 +184,8 @@ Synthetic provider reachability is recorded in
 6/6 configured route probes succeeded with no F1 payload. This is transport
 evidence only and must not be promoted to Q, semantic, DOCX, or validation
 PASS.
+
+The authorized Q RuntimeJobSpec was accepted by `reviewctl plan` in read-only
+mode; [F1_Q_PLAN_RECHECK_20260918.json](F1_Q_PLAN_RECHECK_20260918.json)
+records the plan hash, zero provider calls, and the preserved D prerequisite
+block.
