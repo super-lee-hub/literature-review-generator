@@ -149,6 +149,12 @@ The formal v2 profile derivation used
 [F1_D_MODALITY_RUNTIME_SPEC_20260918.json](F1_D_MODALITY_RUNTIME_SPEC_20260918.json)
 with the existing R14 Registry and zero provider calls.
 
+The complete 15-paper R14 production diagnostic projection is recorded in
+[F1_D_MODALITY_ALL_CORPUS_DIAGNOSTICS_20260918.json](F1_D_MODALITY_ALL_CORPUS_DIAGNOSTICS_20260918.json):
+15/15 diagnostic files checked, only F1-10 has a scanned/OCR candidate, and
+its 1/21 coverage is below the 25% primary-modality threshold. D therefore
+remains `FAIL_MODALITY` on complete-corpus evidence.
+
 R14 machine-level content/source integrity is recorded in
 [F1_STAGE1_R14_CONTENT_INTEGRITY_20260918.json](F1_STAGE1_R14_CONTENT_INTEGRITY_20260918.json):
 15/15 canonical summaries, zero placeholder/empty-core/source-hash/receipt

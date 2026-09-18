@@ -1,0 +1,51 @@
+{
+  "artifact_type": "f1_d_all_corpus_production_diagnostics_projection",
+  "artifact_version": "v1",
+  "source_execution_run": "f1-stage1-full-20260917-r14",
+  "source_execution_sha": "420663e4eea4e9e2a1ffdee1d5d16193d7e5d08e",
+  "recheck_executable_sha": "c49bf58675746ad647a9ecd104e514d8b4cc21db",
+  "corpus_manifest": "F1_CORPUS_MANIFEST_20260915.json",
+  "corpus_manifest_sha256": "f741776ea2eda6b5937f4fc13e40569216eb3173ff597fb80eeea2e46dab3e90",
+  "source_of_counts": "R14 production paper_artifact stage1_inputs diagnostics.json",
+  "classification_contract": {
+    "production_profile_schema": "document-modality-profile-v2",
+    "ocr_or_scanned_primary_min_page_ratio": 0.25,
+    "scanned_candidate_field": "page_diagnostics[].scanned_candidate",
+    "actual_ocr_field": "page_diagnostics[].used_ocr",
+    "self_declared_profiles_allowed": false
+  },
+  "counts": {
+    "manifest_sources": 15,
+    "paper_artifacts_checked": 15,
+    "diagnostic_files_checked": 15,
+    "scanned_candidate_pages": 1,
+    "actual_ocr_pages": 1,
+    "sources_with_any_scanned_candidate": ["F1-10"],
+    "sources_with_any_actual_ocr": ["F1-10"],
+    "ocr_primary_qualified_sources": []
+  },
+  "status": "FAIL_MODALITY",
+  "reason": "The complete R14 production diagnostics set has no source with at least 25 percent scanned-candidate or actual-OCR page coverage.",
+  "per_paper": [
+    {"source_id":"F1-01","source_pdf_sha256":"6593fe7c65c62e9fca1a9cbbd0e10dc6cbfbcc4b1ea01bb59f2bc11f8226c2a7","page_count":27,"scanned_candidate_pages":0,"actual_ocr_pages":0,"low_quality_pages":0,"diagnostics_scanned_like":false,"diagnostics_used_ocr":false},
+    {"source_id":"F1-02","source_pdf_sha256":"c6ade5dba67e7557225e5410d1d1296ab8ce7b0d563ed7cc2e3c131853d35278","page_count":42,"scanned_candidate_pages":0,"actual_ocr_pages":0,"low_quality_pages":0,"diagnostics_scanned_like":false,"diagnostics_used_ocr":false},
+    {"source_id":"F1-03","source_pdf_sha256":"b90ba7df54f1e20e93bf4e587b68745381b9f32e179badedfe29224dba42d027","page_count":20,"scanned_candidate_pages":0,"actual_ocr_pages":0,"low_quality_pages":0,"diagnostics_scanned_like":false,"diagnostics_used_ocr":false},
+    {"source_id":"F1-04","source_pdf_sha256":"cb4ea385dd292eb46fd75a987b673930b1413b9767f5deb61ec70998057afaaa","page_count":21,"scanned_candidate_pages":0,"actual_ocr_pages":0,"low_quality_pages":0,"diagnostics_scanned_like":false,"diagnostics_used_ocr":false},
+    {"source_id":"F1-05","source_pdf_sha256":"30a4bebef5b6835c0be5befd9caa83574e443df4f9139a9eca7cb70d701d6d11","page_count":24,"scanned_candidate_pages":0,"actual_ocr_pages":0,"low_quality_pages":0,"diagnostics_scanned_like":false,"diagnostics_used_ocr":false},
+    {"source_id":"F1-06","source_pdf_sha256":"019799825517b941b22dc423386ccc5e65f30b2f03ffa98d48df5f6b63e8690e","page_count":24,"scanned_candidate_pages":0,"actual_ocr_pages":0,"low_quality_pages":0,"diagnostics_scanned_like":false,"diagnostics_used_ocr":false},
+    {"source_id":"F1-07","source_pdf_sha256":"fae0787bc0a978945154cd261f7c4ed18c38a4b08cf7151c7784a2d99c9b0e61","page_count":17,"scanned_candidate_pages":0,"actual_ocr_pages":0,"low_quality_pages":0,"diagnostics_scanned_like":false,"diagnostics_used_ocr":false},
+    {"source_id":"F1-08","source_pdf_sha256":"b40d466a7bc2ab7597145ac4701940cb0733c8896077b616df54dfa620995e97","page_count":79,"scanned_candidate_pages":0,"actual_ocr_pages":0,"low_quality_pages":0,"diagnostics_scanned_like":false,"diagnostics_used_ocr":false},
+    {"source_id":"F1-09","source_pdf_sha256":"b275770b8aada6f3df1dbaf14dff29d06c4de2589b627464955e7dba5a52176e","page_count":16,"scanned_candidate_pages":0,"actual_ocr_pages":0,"low_quality_pages":0,"diagnostics_scanned_like":false,"diagnostics_used_ocr":false},
+    {"source_id":"F1-10","source_pdf_sha256":"36f89d156352245fa5aee5eab5ba6b1740da55dbd1859db4597694cac999670c","page_count":21,"scanned_candidate_pages":1,"actual_ocr_pages":1,"low_quality_pages":0,"diagnostics_scanned_like":true,"diagnostics_used_ocr":true},
+    {"source_id":"F1-11","source_pdf_sha256":"62c4d0244dcf52dae249df65407db9bfba6d8e3fc644ab9ceb6c0583686f63a9","page_count":11,"scanned_candidate_pages":0,"actual_ocr_pages":0,"low_quality_pages":0,"diagnostics_scanned_like":false,"diagnostics_used_ocr":false},
+    {"source_id":"F1-12","source_pdf_sha256":"8d9430c8827f54ba3cc18479cb7c9b827b654e724f239b3a56ab57267a5acc66","page_count":47,"scanned_candidate_pages":0,"actual_ocr_pages":0,"low_quality_pages":0,"diagnostics_scanned_like":false,"diagnostics_used_ocr":false},
+    {"source_id":"F1-13","source_pdf_sha256":"9029a9f98b923a499c68112c632d1695c7fa3cc161947e65dfbf1c642a9a56c3","page_count":28,"scanned_candidate_pages":0,"actual_ocr_pages":0,"low_quality_pages":0,"diagnostics_scanned_like":false,"diagnostics_used_ocr":false},
+    {"source_id":"F1-14","source_pdf_sha256":"7f25ebf74ae87f92bba3a626c1a787a4aebd32e1e4cc17347a2b78fa01cd8e0f","page_count":11,"scanned_candidate_pages":0,"actual_ocr_pages":0,"low_quality_pages":0,"diagnostics_scanned_like":false,"diagnostics_used_ocr":false},
+    {"source_id":"F1-15","source_pdf_sha256":"925c8e45b0370ac23ef36783338cb9f8c1eb5cd3f57ecce12610c1916fe4d9ed","page_count":22,"scanned_candidate_pages":0,"actual_ocr_pages":0,"low_quality_pages":1,"diagnostics_scanned_like":false,"diagnostics_used_ocr":false}
+  ],
+  "evidence_boundary": {
+    "auxiliary_scan_is_not_in_f1_corpus": true,
+    "human_original_pdf_adjudication": "not_completed",
+    "q_status": "BLOCKED_D_PREREQUISITE"
+  }
+}

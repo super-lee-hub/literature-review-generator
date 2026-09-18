@@ -342,6 +342,15 @@ The formal three-source v2 derivation used
 [F1_D_MODALITY_RUNTIME_SPEC_20260918.json](F1_D_MODALITY_RUNTIME_SPEC_20260918.json)
 and made zero provider calls.
 
+The Registry's formal profile set covered the three D candidates, so the
+complete-corpus production diagnostic check is separately recorded in
+[F1_D_MODALITY_ALL_CORPUS_DIAGNOSTICS_20260918.json](F1_D_MODALITY_ALL_CORPUS_DIAGNOSTICS_20260918.json).
+It reads all 15 R14 `paper_artifact`-bound `diagnostics.json` files: 15/15
+were checked, only F1-10 has any scanned/OCR candidate (1/21 pages), and no
+source reaches the 25% primary-modality threshold. This strengthens the
+evidence for `D=FAIL_MODALITY` without adding a self-declared profile or
+changing the corpus.
+
 The R14 per-paper machine-integrity projection is
 [F1_STAGE1_R14_CONTENT_INTEGRITY_20260918.json](F1_STAGE1_R14_CONTENT_INTEGRITY_20260918.json):
 15/15 canonical summaries, non-empty core fields, no placeholder hits, exact
