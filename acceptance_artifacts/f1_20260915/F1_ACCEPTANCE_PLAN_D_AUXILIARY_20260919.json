@@ -38,7 +38,7 @@
       "gate": "D",
       "runtime_spec": "D_RUNTIME_SPEC_20260919_AUXILIARY_POLICY.json",
       "workspace": "runs/f1_acceptance_D__f1-acceptance-D-20260919-auxiliary-policy-r2",
-      "input_manifest": "F1_CORPUS_MANIFEST_20260915.json",
+      "input_manifest": "runtime_inputs/f1_manifest.json",
       "f1_source_ids": ["F1-01", "F1-03", "F1-14"],
       "execution_mode": "runtime",
       "budget_domain": "live",

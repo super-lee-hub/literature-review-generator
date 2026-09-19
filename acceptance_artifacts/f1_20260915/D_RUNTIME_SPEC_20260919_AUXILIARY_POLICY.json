@@ -6,7 +6,7 @@
   "workspace_path": "D:/auto-generate/.worktrees/f1-hardening-20260906/acceptance_artifacts/f1_20260915/runs/f1_acceptance_D__f1-acceptance-D-20260919-auxiliary-policy-r2",
   "source": {
     "mode": "direct",
-    "pdf_folder": "source_corpus"
+    "pdf_folder": "runtime_inputs/source_corpus"
   },
   "metadata": {
     "requested_stages": ["source_intake", "analyze"],
@@ -34,7 +34,7 @@
     },
     "f1_corpus_binding": {
       "schema_version": "f1-corpus-binding-v1",
-      "manifest_path": "F1_CORPUS_MANIFEST_20260915.json",
+      "manifest_path": "runtime_inputs/f1_manifest.json",
       "manifest_sha256": "f741776ea2eda6b5937f4fc13e40569216eb3173ff597fb80eeea2e46dab3e90",
       "source_ids": ["F1-01", "F1-03", "F1-14"]
     }
