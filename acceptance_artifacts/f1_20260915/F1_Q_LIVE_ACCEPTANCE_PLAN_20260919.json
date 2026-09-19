@@ -1,8 +1,8 @@
 {
   "schema_version": "release-acceptance-plan-v2",
-  "parent_run_id": "f1-acceptance-Q-20260919-local-r3",
+  "parent_run_id": "f1-acceptance-Q-20260919-local-r4",
   "final_executable_sha": "",
-  "state_path": "F1_Q_LOCAL_ACCEPTANCE_STATE_20260919_R3.json",
+  "state_path": "F1_Q_LOCAL_ACCEPTANCE_STATE_20260919_R4.json",
   "budget": {
     "max_provider_calls_total": 64,
     "max_output_tokens_total": 2000000,
