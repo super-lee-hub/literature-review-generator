@@ -1,8 +1,8 @@
 {
   "schema_version": "release-acceptance-plan-v2",
-  "parent_run_id": "f1-acceptance-Q-20260919-local-r1",
+  "parent_run_id": "f1-acceptance-Q-20260919-local-r2",
   "final_executable_sha": "",
-  "state_path": "F1_Q_LOCAL_ACCEPTANCE_STATE_20260919_R1.json",
+  "state_path": "F1_Q_LOCAL_ACCEPTANCE_STATE_20260919_R2.json",
   "budget": {
     "max_provider_calls_total": 64,
     "max_output_tokens_total": 2000000,
@@ -25,7 +25,7 @@
       "scenario_id": "Q",
       "gate": "Q",
       "runtime_spec": "Q_RUNTIME_SPEC_20260919_LOCAL_AUTHORIZED.json",
-      "workspace": "D:/auto-generate/.acceptance_runs/f1_q_local_r1/f1_acceptance_Q_local_parser__f1-acceptance-Q-20260919-local-r1",
+      "workspace": "D:/auto-generate/.acceptance_runs/f1_q_local_r2/f1_acceptance_Q_local_parser__f1-acceptance-Q-20260919-local-r2",
       "input_manifest": "D:/auto-generate/.acceptance_inputs/f1_d_20260919/f1_manifest.json",
       "f1_source_ids": [
         "F1-01", "F1-02", "F1-03", "F1-04", "F1-05",
@@ -35,7 +35,7 @@
       "execution_mode": "runtime",
       "budget_domain": "live",
       "prerequisites": [],
-      "job_id": "f1-acceptance-Q-20260919-local-r1"
+      "job_id": "f1-acceptance-Q-20260919-local-r2"
     }
   }
 }

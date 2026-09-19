@@ -1,9 +1,9 @@
 {
   "project_name": "f1_acceptance_Q_local_parser",
-  "job_id": "f1-acceptance-Q-20260919-local-r1",
+  "job_id": "f1-acceptance-Q-20260919-local-r2",
   "config": "D:/auto-generate/F1_Q_RUNTIME_CONFIG_20260919_LOCAL.ini",
   "action": "run_all",
-  "workspace_path": "D:/auto-generate/.acceptance_runs/f1_q_local_r1/f1_acceptance_Q_local_parser__f1-acceptance-Q-20260919-local-r1",
+  "workspace_path": "D:/auto-generate/.acceptance_runs/f1_q_local_r2/f1_acceptance_Q_local_parser__f1-acceptance-Q-20260919-local-r2",
   "source": {"mode": "direct", "pdf_folder": "D:/auto-generate/.acceptance_inputs/f1_d_20260919/source_corpus"},
   "metadata": {
     "requested_stages": ["source_intake", "analyze", "outline", "review", "validate"],
