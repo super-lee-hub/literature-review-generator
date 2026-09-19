@@ -143,6 +143,23 @@ provider calls.
   closure is incomplete. Evidence projection:
   `F1_AIHUBMIX_OUTLINE_RETRY_SUMMARY_20260919_R13.json`.
 
+## Current-SHA valid-key retry readback (R14/R15)
+
+The user-provided key was written with the project's atomic dotenv writer to
+the four AihubMix route variables only. Three no-document route probes then
+passed for Outline, Free Mode, and Writer.
+
+- R14 received HTTP 200 and 6,536 relation-adjudication output tokens, but the
+  model returned a rejected relation ID with a `_placeholder_ignore` suffix
+  that was not present in the candidate set. The existing fail-closed validator
+  correctly stopped before candidate generation.
+- R15 received HTTP 200 and 7,972 relation-adjudication output tokens, then
+  attempted the 32,000-output candidate request; AihubMix closed the
+  connection with `ProxyError: RemoteDisconnected`. The lower output cap did
+  not eliminate the large-request disconnect.
+- No original PDFs were transported and Stage1 was not rerun. Evidence:
+  `F1_AIHUBMIX_OUTLINE_RETRY_SUMMARY_20260919_R14_R15.json`.
+
 ## F1 corpus and runtime boundary
 
 - Formal corpus: `F1_CORPUS_MANIFEST_20260915.json`, SHA-256
@@ -203,8 +220,8 @@ PR_STATE: OPEN
 PR_MERGED: false
 CODE_REPAIR_STATUS: PASS_OFFLINE
 OFFLINE_REGRESSION_STATUS: CI PASS (6/6); local sandbox 1689 passed, 28 skipped, 13 named-pipe ACL-blocked; blocked nodes 13/13 pass outside sandbox
-PRODUCTION_INTEGRATION_STATUS: CURRENT-SHA OUTLINE ATTEMPTED; PROVIDER AUTH BLOCKED; NOT_VERIFIED
-AIHUBMIX_OUTLINE_RETRY_STATUS: R13 RELATION_ADJUDICATION HTTP 401 INVALID_KEY; CANDIDATE NOT ATTEMPTED; GATE_F NOT_VERIFIED
+PRODUCTION_INTEGRATION_STATUS: CURRENT-SHA OUTLINE ATTEMPTED; SEMANTIC/NETWORK BLOCKED; NOT_VERIFIED
+AIHUBMIX_OUTLINE_RETRY_STATUS: R14 SEMANTIC CONTRACT BLOCK; R15 CANDIDATE REMOTE-DISCONNECTED AT 32000 CAP; NOT_VERIFIED
 F1_CORPUS_BINDING_STATUS: PASS_MACHINE_SOURCE_BINDING (15/15); HUMAN_SEMANTIC_GROUND_TRUTH_PENDING
 F1_C_D_Q_STATUS: C STAGE1 15/15; D SCOPED_PASS UNDER APPROVED POLICY; Q NOT_VERIFIED
 F1_CONTENT_AND_DOCX_QA_STATUS: NOT_VERIFIED_FOR_FINAL_Q
@@ -213,5 +230,5 @@ REAL_OCR_STATUS: PASS_AUXILIARY_ZOTERO_ONLY; NO F1 OCR-PRIMARY SOURCE
 RESUME_AND_BUDGET_STATUS: BUDGETED_Q_ATTEMPTS_RECORDED; CHECKPOINT_READBACK_INCONSISTENT; LIVE MINERU RECOVERY UNVERIFIED
 GOVERNANCE_STATUS: NOT_COMPLETE; main branch protection remains disabled
 FINAL_RELEASE_STATUS: NOT_READY_TO_MERGE
-REMAINING_BLOCKERS: valid AihubMix credential; Q Outline/Writer/Validator/DOCX closure; Q resume checkpoint integrity; human semantic ground truth; live MinerU recovery; full GUI Q; governance/branch protection
+REMAINING_BLOCKERS: relation-output contract repair or valid retry; AihubMix large-candidate transport stability; Q Outline/Writer/Validator/DOCX closure; Q resume checkpoint integrity; human semantic ground truth; live MinerU recovery; full GUI Q; governance/branch protection
 ```

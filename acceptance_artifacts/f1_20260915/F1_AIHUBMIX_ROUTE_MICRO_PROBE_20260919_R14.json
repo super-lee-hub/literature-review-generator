@@ -1,0 +1,19 @@
+{
+  "artifact_type": "f1_aihubmix_route_micro_probe",
+  "artifact_version": "v1",
+  "checked_at_utc": "2026-09-19T13:51:34Z",
+  "executable_sha": "d7c4a4d117ff2706aa673f7f0b4cd029cd66cf51",
+  "gateway": "aihubmix.com",
+  "route_fingerprint": "8fc1533c7a390a8b889760d64ef1f4b008a7bc592ec1772186e5ff336a51b9cf",
+  "f1_content_transmitted": false,
+  "original_pdf_transmitted": false,
+  "probes": [
+    {"section": "Outline_API", "model": "claude-opus-5", "endpoint_type": "chat_completions", "status": "failed", "error_kind": "fatal_config_or_auth", "http_status": 401, "retries": 0},
+    {"section": "Free_Mode_API", "model": "claude-fable-5-1", "endpoint_type": "chat_completions", "status": "failed", "error_kind": "fatal_config_or_auth", "http_status": 401, "retries": 0},
+    {"section": "Writer_API", "model": "gpt-5.6-sol", "endpoint_type": "responses", "status": "failed", "error_kind": "fatal_config_or_auth", "http_status": 401, "retries": 0}
+  ],
+  "physical_calls": 3,
+  "timeout_count": 0,
+  "receipt_ledger_path": "D:/auto-generate/.aihubmix_trial_20260919/output/_acceptance/provider_micro_probe.jsonl",
+  "receipt_ledger_sha256": "c6854b2294c148807483590567416626213a6ddb5363272a904b41b1c5bfcd83"
+}
