@@ -37,7 +37,7 @@
       "scenario_id": "D",
       "gate": "D",
       "runtime_spec": "D_RUNTIME_SPEC_20260919_AUXILIARY_POLICY.json",
-      "workspace": "runs/f1_acceptance_D__f1-acceptance-D-20260919-auxiliary-policy-r2",
+      "workspace": "D:/auto-generate/.acceptance_runs/f1_d_auxiliary_policy_r2",
       "input_manifest": "D:/auto-generate/.acceptance_inputs/f1_d_20260919/f1_manifest.json",
       "f1_source_ids": ["F1-01", "F1-03", "F1-14"],
       "execution_mode": "runtime",
