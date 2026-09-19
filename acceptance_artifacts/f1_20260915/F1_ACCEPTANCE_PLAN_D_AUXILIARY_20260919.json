@@ -1,8 +1,8 @@
 {
   "schema_version": "release-acceptance-plan-v2",
-  "parent_run_id": "f1-acceptance-D-20260919-auxiliary-policy-r5",
+  "parent_run_id": "f1-acceptance-D-20260919-auxiliary-policy-r6",
   "final_executable_sha": "",
-  "state_path": "F1_ACCEPTANCE_PLAN_D_AUXILIARY_STATE_20260919_R5.json",
+  "state_path": "F1_ACCEPTANCE_PLAN_D_AUXILIARY_STATE_20260919_R6.json",
   "budget": {
     "max_provider_calls_total": 3,
     "max_output_tokens_total": 96000,
@@ -37,13 +37,13 @@
       "scenario_id": "D",
       "gate": "D",
       "runtime_spec": "D_RUNTIME_SPEC_20260919_AUXILIARY_POLICY.json",
-      "workspace": "D:/auto-generate/.acceptance_runs/f1_d_auxiliary_policy_r5/f1_acceptance_D_auxiliary_ocr_policy__f1-acceptance-D-20260919-auxiliary-policy-r5",
+      "workspace": "D:/auto-generate/.acceptance_runs/f1_d_auxiliary_policy_r6/f1_acceptance_D_auxiliary_ocr_policy__f1-acceptance-D-20260919-auxiliary-policy-r6",
       "input_manifest": "D:/auto-generate/.acceptance_inputs/f1_d_20260919/f1_manifest.json",
       "f1_source_ids": ["F1-01", "F1-03", "F1-14"],
       "execution_mode": "runtime",
       "budget_domain": "live",
       "prerequisites": [],
-      "job_id": "f1-acceptance-D-20260919-auxiliary-policy-r5"
+      "job_id": "f1-acceptance-D-20260919-auxiliary-policy-r6"
     }
   }
 }

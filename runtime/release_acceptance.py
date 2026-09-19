@@ -5112,7 +5112,7 @@ class GateEvidenceVerifier:
                     return {}, "auxiliary OCR fixture is not derived as ocr_scanned"
                 try:
                     scanned_ratio = float(
-                        auxiliary_payload.get("scanned_candidate_ratio")
+                        auxiliary_payload.get("scanned_candidate_ratio") or 0
                     )
                     actual_ocr_pages = int(
                         auxiliary_payload.get("actual_ocr_pages") or 0

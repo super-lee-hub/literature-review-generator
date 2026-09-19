@@ -1,9 +1,9 @@
 {
   "project_name": "f1_acceptance_D_auxiliary_ocr_policy",
-  "job_id": "f1-acceptance-D-20260919-auxiliary-policy-r5",
+  "job_id": "f1-acceptance-D-20260919-auxiliary-policy-r6",
   "config": "D:/auto-generate/F1_D_RUNTIME_CONFIG_20260919.ini",
   "action": "analyze",
-  "workspace_path": "D:/auto-generate/.acceptance_runs/f1_d_auxiliary_policy_r5/f1_acceptance_D_auxiliary_ocr_policy__f1-acceptance-D-20260919-auxiliary-policy-r5",
+  "workspace_path": "D:/auto-generate/.acceptance_runs/f1_d_auxiliary_policy_r6/f1_acceptance_D_auxiliary_ocr_policy__f1-acceptance-D-20260919-auxiliary-policy-r6",
   "source": {
     "mode": "direct",
     "pdf_folder": "D:/auto-generate/.acceptance_inputs/f1_d_20260919/source_corpus"
