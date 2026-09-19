@@ -1391,6 +1391,9 @@ class AgentRuntimeBridge:
         if (
             request.action not in {"analyze", "run_all", "retry_failed"}
             and request.summary_sources
+            and not isinstance(
+                self.job_spec.metadata.get("f1_corpus_binding"), Mapping
+            )
         ):
             # Downstream stages consume a verified summary source.  Do not
             # make their inventory readiness depend on re-running PDF intake.
@@ -1495,7 +1498,14 @@ class AgentRuntimeBridge:
             )
             if str(item).strip()
         )
-        if request.action not in {"analyze", "run_all", "retry_failed"} and summary_sources:
+        has_f1_corpus_binding = isinstance(
+            self.job_spec.metadata.get("f1_corpus_binding"), Mapping
+        )
+        if (
+            request.action not in {"analyze", "run_all", "retry_failed"}
+            and summary_sources
+            and not has_f1_corpus_binding
+        ):
             # Downstream and derived-review actions consume an already verified
             # canonical summary source.  Their source-intake artifact must not
             # reinterpret a deliberately cleared PDF path as the current
