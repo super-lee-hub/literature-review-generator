@@ -160,6 +160,22 @@ passed for Outline, Free Mode, and Writer.
 - No original PDFs were transported and Stage1 was not rerun. Evidence:
   `F1_AIHUBMIX_OUTLINE_RETRY_SUMMARY_20260919_R14_R15.json`.
 
+### Provider-side dashboard correlation (owner-provided, not local closure)
+
+The user's AihubMix usage export exactly matches the R14/R15 relation receipts:
+`68080 -> 6536` and `68080 -> 7972`, both marked successful upstream. It also
+shows two `AWS/claude-opus-5` requests with `56835` input tokens and `18474` /
+`18964` output tokens over 291/309 seconds. Those rows are consistent with the
+candidate-generation sequence and show that AihubMix may have completed and
+billed the upstream work even when the local proxy returned
+`RemoteDisconnected`.
+
+This is corroborating provider-side evidence only. The candidate response was
+not delivered to the local runtime, so there is no local provider receipt,
+content hash, schema validation, Registry artifact, or receipt-closure proof;
+Gate F and Q therefore remain `NOT_VERIFIED`. See
+`F1_AIHUBMIX_PROVIDER_DASHBOARD_CORRELATION_20260919.json`.
+
 ## F1 corpus and runtime boundary
 
 - Formal corpus: `F1_CORPUS_MANIFEST_20260915.json`, SHA-256
@@ -221,7 +237,7 @@ PR_MERGED: false
 CODE_REPAIR_STATUS: PASS_OFFLINE
 OFFLINE_REGRESSION_STATUS: CI PASS (6/6); local sandbox 1689 passed, 28 skipped, 13 named-pipe ACL-blocked; blocked nodes 13/13 pass outside sandbox
 PRODUCTION_INTEGRATION_STATUS: CURRENT-SHA OUTLINE ATTEMPTED; SEMANTIC/NETWORK BLOCKED; NOT_VERIFIED
-AIHUBMIX_OUTLINE_RETRY_STATUS: R14 SEMANTIC CONTRACT BLOCK; R15 CANDIDATE REMOTE-DISCONNECTED AT 32000 CAP; NOT_VERIFIED
+AIHUBMIX_OUTLINE_RETRY_STATUS: R14 SEMANTIC CONTRACT BLOCK; R15 LOCAL CANDIDATE RECEIPT MISSING AFTER REMOTE-DISCONNECT; PROVIDER DASHBOARD SHOWS CORROBORATING UPSTREAM OUTPUT; NOT_VERIFIED
 F1_CORPUS_BINDING_STATUS: PASS_MACHINE_SOURCE_BINDING (15/15); HUMAN_SEMANTIC_GROUND_TRUTH_PENDING
 F1_C_D_Q_STATUS: C STAGE1 15/15; D SCOPED_PASS UNDER APPROVED POLICY; Q NOT_VERIFIED
 F1_CONTENT_AND_DOCX_QA_STATUS: NOT_VERIFIED_FOR_FINAL_Q
