@@ -268,6 +268,88 @@ def test_gate_j_finds_ocr_lineage_across_all_canonical_refs() -> None:
     assert facts["lineage"] is True
 
 
+def test_gate_d_accepts_explicit_auxiliary_ocr_policy_without_changing_f1_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from runtime.release_acceptance import GateEvidenceVerifier
+
+    source_hashes = ["a" * 64, "b" * 64, "c" * 64]
+    refs = [
+        SimpleNamespace(role="source_pdf", ref_id=f"source-{index}", sha256=value)
+        for index, value in enumerate(source_hashes)
+    ]
+
+    def profile(source_hash: str, *, visual: bool) -> dict[str, object]:
+        return {
+            "artifact_type": "document_modality_profile",
+            "artifact_version": "v2",
+            "schema_version": "document-modality-profile-v2",
+            "source_pdf_sha256": source_hash,
+            "preprocess_manifest_hash": "d" * 64,
+            "stage1_input_manifest_hash": "e" * 64,
+            "actual_extractor": "fitz",
+            "page_count": 10,
+            "text_page_count": 10,
+            "image_page_count": 6 if visual else 1,
+            "table_count": 4 if visual else 0,
+            "figure_count": 0,
+            "scanned_candidate_pages": 0,
+            "actual_ocr_pages": 0,
+            "actual_selected_visual_count": 0,
+            "stage1_input_mode": "normalized_markdown",
+        }
+
+    refs.extend(
+        SimpleNamespace(role="modality_profile", ref_id=f"profile-{index}", sha256=f"{index + 4}" * 64)
+        for index in range(3)
+    )
+    refs.append(
+        SimpleNamespace(role="auxiliary_ocr_fixture", ref_id="auxiliary", sha256="9" * 64)
+    )
+    auxiliary = {
+        "artifact_type": "auxiliary_ocr_fixture",
+        "schema_version": "auxiliary-ocr-fixture-v1",
+        "auxiliary_only": True,
+        "f1_corpus_member": False,
+        "source_pdf_sha256": "f" * 64,
+        "derived_modality": "ocr_scanned",
+        "page_count": 62,
+        "scanned_candidate_ratio": 1.0,
+        "actual_ocr_pages": 3,
+        "source_pdf_transmitted": False,
+    }
+    payloads = {
+        "profile-0": profile(source_hashes[0], visual=False),
+        "profile-1": profile(source_hashes[1], visual=True),
+        "profile-2": profile(source_hashes[2], visual=False),
+        "auxiliary": auxiliary,
+    }
+    monkeypatch.setattr(
+        GateEvidenceVerifier,
+        "_f1_bound_sources",
+        lambda self, gate, by_role, values: (
+            SimpleNamespace(corpus_id="f1", content_sha256="0" * 64),
+            [SimpleNamespace(source_id="F1-01"), SimpleNamespace(source_id="F1-03"), SimpleNamespace(source_id="F1-14")],
+            None,
+        ),
+    )
+
+    facts, error = GateEvidenceVerifier()._derive_semantic_facts(
+        "D",
+        refs,
+        payloads,
+        {},
+        origin_dir=None,
+        expected_job_id="job-d",
+    )
+
+    assert error is None
+    assert facts["d_modality_policy"] == "f1-two-in-corpus-plus-auxiliary-ocr-v1"
+    assert facts["in_corpus_heterogeneity"] == 2
+    assert facts["auxiliary_ocr_fixture"] is True
+    assert facts["f1_source_ids"] == ["F1-01", "F1-03", "F1-14"]
+
+
 def test_single_acceptance_spec_preserves_and_validates_executable_sha() -> None:
     spec = ReleaseAcceptanceSpec.from_mapping(
         {

@@ -3946,6 +3946,36 @@ class ReviewControlPlane:
                     artifact_id=f"document-modality-profile:v2:{source_hash}",
                 )
             )
+        d_policy = spec.metadata.get("f1_d_modality_policy")
+        if (
+            gate == "D"
+            and isinstance(d_policy, Mapping)
+            and str(d_policy.get("policy_id") or "").strip()
+            == "f1-two-in-corpus-plus-auxiliary-ocr-v1"
+        ):
+            fixture_path = Path(
+                str(d_policy.get("auxiliary_fixture_path") or "")
+            ).expanduser().resolve()
+            if not fixture_path.is_file() or is_reparse_path(fixture_path):
+                raise ControlPlaneError(
+                    "modified D policy auxiliary OCR fixture is missing or unsafe"
+                )
+            expected_hash = str(d_policy.get("auxiliary_fixture_sha256") or "").strip().lower()
+            actual_hash = file_sha256(str(fixture_path))
+            if expected_hash != actual_hash:
+                raise ControlPlaneError(
+                    "modified D policy auxiliary OCR fixture hash does not match"
+                )
+            refs.append(
+                producer.reference(
+                    fixture_path,
+                    role="auxiliary_ocr_fixture",
+                    artifact_type="auxiliary_ocr_fixture",
+                    artifact_version="v1",
+                    schema_version="auxiliary-ocr-fixture-v1",
+                    job_id=job_id,
+                )
+            )
         return refs
 
     @staticmethod

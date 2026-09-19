@@ -1,0 +1,42 @@
+{
+  "project_name": "f1_acceptance_D_auxiliary_ocr_policy",
+  "job_id": "f1-acceptance-D-20260919-auxiliary-policy-r2",
+  "config": "D:/auto-generate/F1_D_RUNTIME_CONFIG_20260919.ini",
+  "action": "analyze",
+  "workspace_path": "D:/auto-generate/.worktrees/f1-hardening-20260906/acceptance_artifacts/f1_20260915/runs/f1_acceptance_D__f1-acceptance-D-20260919-auxiliary-policy-r2",
+  "source": {
+    "mode": "direct",
+    "pdf_folder": "D:/auto-generate/.worktrees/f1-hardening-20260906/acceptance_artifacts/f1_20260915/source_corpus"
+  },
+  "metadata": {
+    "requested_stages": ["source_intake", "analyze"],
+    "validation_required": false,
+    "require_clean_validation": false,
+    "allow_unvalidated_when_validation_optional": true,
+    "audit_actor": "Codex",
+    "audit_reason": "User-approved D policy v1: two in-corpus production modalities plus separate Zotero OCR fixture",
+    "audit_scope": {
+      "field": "F1",
+      "gate": "D",
+      "corpus_id": "field-f1-20260915",
+      "provider_calls_allowed": true,
+      "original_pdf_transport": "never",
+      "image_transport": "base64"
+    },
+    "f1_d_modality_policy": {
+      "schema_version": "f1-d-modality-policy-v1",
+      "policy_id": "f1-two-in-corpus-plus-auxiliary-ocr-v1",
+      "approval": "current user choice 2",
+      "auxiliary_fixture_path": "D:/auto-generate/.worktrees/f1-hardening-20260906/acceptance_artifacts/f1_20260915/F1_D_AUXILIARY_OCR_FIXTURE_20260919.json",
+      "auxiliary_fixture_sha256": "c7572279a7d66df5340e03beb46b2b835dc59591f622f44c2b0f951998592ff3",
+      "f1_manifest_unchanged": true,
+      "q_corpus_unchanged": true
+    },
+    "f1_corpus_binding": {
+      "schema_version": "f1-corpus-binding-v1",
+      "manifest_path": "D:/auto-generate/.worktrees/f1-hardening-20260906/acceptance_artifacts/f1_20260915/F1_CORPUS_MANIFEST_20260915.json",
+      "manifest_sha256": "f741776ea2eda6b5937f4fc13e40569216eb3173ff597fb80eeea2e46dab3e90",
+      "source_ids": ["F1-01", "F1-03", "F1-14"]
+    }
+  }
+}

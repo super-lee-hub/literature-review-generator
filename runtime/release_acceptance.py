@@ -3083,7 +3083,7 @@ _SHA256_RE = r"^[0-9a-f]{64}$"
 
 _GATE_REF_ROLES: dict[str, frozenset[str]] = {
     "C": frozenset({"runtime_spec", "source_pdf", "canonical_stage1", "stage_terminal", "job_outcome", "attempt", "registry", "provider_receipt_ledger", "closure", "scenario_execution_receipt"}),
-    "D": frozenset({"runtime_spec", "source_pdf", "modality_profile", "canonical_stage1", "stage_terminal", "registry", "provider_receipt_ledger", "closure", "scenario_execution_receipt"}),
+    "D": frozenset({"runtime_spec", "source_pdf", "modality_profile", "auxiliary_ocr_fixture", "canonical_stage1", "stage_terminal", "registry", "provider_receipt_ledger", "closure", "scenario_execution_receipt"}),
     "E": frozenset({"interruption_event", "resume_event", "provider_receipt_ledger", "process_events", "scenario_execution_receipt"}),
     "F": frozenset({"canonical_stage1", "outline_provider_call_plan", "provider_receipt_ledger", "stage_terminal", "closure", "scenario_execution_receipt"}),
     "G": frozenset({"free_mode_profile", "provider_receipt_ledger", "stage_terminal", "scenario_execution_receipt"}),
@@ -3145,6 +3145,7 @@ _ROLE_ARTIFACT_TYPES: dict[str, frozenset[str]] = {
         "controlled_defect_challenge",
     }),
     "modality_profile": frozenset({"document_modality_profile"}),
+    "auxiliary_ocr_fixture": frozenset({"auxiliary_ocr_fixture"}),
     "repair_artifact": frozenset({
         "repair_transaction",
         "validation_run_result_repaired",
@@ -5065,6 +5066,7 @@ class GateEvidenceVerifier:
                 return {}, f1_error
             source_refs = by_role.get("source_pdf", [])
             profile_refs = by_role.get("modality_profile", [])
+            auxiliary_refs = by_role.get("auxiliary_ocr_fixture", [])
             source_hashes = {ref.sha256 for ref in source_refs}
             if len(source_hashes) < 3 or len(profile_refs) < 3:
                 return {}, "heterogeneous gate requires three source PDFs and three derived modality profiles"
@@ -5081,11 +5083,65 @@ class GateEvidenceVerifier:
                     return {}, "document modality profile is not bound to a source PDF"
                 profiles.append(profile)
             modalities = {profile.derived_modality for profile in profiles}
-            if len(modalities) < 3:
+            policy_id = "f1-three-in-corpus-modalities-v1"
+            auxiliary_fixture = False
+            if auxiliary_refs:
+                if len(auxiliary_refs) != 1:
+                    return {}, "modified D policy requires exactly one auxiliary OCR fixture"
+                auxiliary_payload = payloads.get(auxiliary_refs[0].ref_id)
+                if not isinstance(auxiliary_payload, Mapping):
+                    return {}, "auxiliary OCR fixture is not a JSON object"
+                if (
+                    auxiliary_payload.get("artifact_type") != "auxiliary_ocr_fixture"
+                    or auxiliary_payload.get("schema_version")
+                    != "auxiliary-ocr-fixture-v1"
+                ):
+                    return {}, "auxiliary OCR fixture schema is invalid"
+                if auxiliary_payload.get("auxiliary_only") is not True:
+                    return {}, "auxiliary OCR fixture must be explicitly auxiliary_only"
+                if auxiliary_payload.get("f1_corpus_member") is not False:
+                    return {}, "auxiliary OCR fixture must not be an F1 corpus member"
+                auxiliary_source_hash = str(
+                    auxiliary_payload.get("source_pdf_sha256") or ""
+                ).strip().lower()
+                if not _valid_sha256(auxiliary_source_hash):
+                    return {}, "auxiliary OCR fixture source hash is invalid"
+                if auxiliary_source_hash in source_hashes:
+                    return {}, "auxiliary OCR fixture must be outside the F1 source set"
+                if auxiliary_payload.get("derived_modality") != "ocr_scanned":
+                    return {}, "auxiliary OCR fixture is not derived as ocr_scanned"
+                try:
+                    scanned_ratio = float(
+                        auxiliary_payload.get("scanned_candidate_ratio")
+                    )
+                    actual_ocr_pages = int(
+                        auxiliary_payload.get("actual_ocr_pages") or 0
+                    )
+                    page_count = int(auxiliary_payload.get("page_count") or 0)
+                except (TypeError, ValueError):
+                    return {}, "auxiliary OCR fixture page metrics are invalid"
+                if page_count <= 0 or scanned_ratio < 0.25 or actual_ocr_pages <= 0:
+                    return {}, "auxiliary OCR fixture does not prove primary OCR coverage"
+                if auxiliary_payload.get("source_pdf_transmitted") is not False:
+                    return {}, "auxiliary OCR fixture source transport boundary is invalid"
+                policy_id = "f1-two-in-corpus-plus-auxiliary-ocr-v1"
+                auxiliary_fixture = True
+                modalities = set(modalities)
+                modalities.add("ocr_scanned")
+                if not {"text_heavy", "visual_table_heavy"}.issubset(
+                    {profile.derived_modality for profile in profiles}
+                ):
+                    return {}, "modified D policy requires text-heavy and visual/table-heavy F1 profiles"
+            elif len(modalities) < 3:
                 return {}, "heterogeneous gate requires text-heavy, visual/table-heavy, and OCR/scanned derived profiles"
             return {
                 "source_count": len(source_hashes),
                 "heterogeneity": len(modalities),
+                "in_corpus_heterogeneity": len(
+                    {profile.derived_modality for profile in profiles}
+                ),
+                "d_modality_policy": policy_id,
+                "auxiliary_ocr_fixture": auxiliary_fixture,
                 "derived_modalities": sorted(modalities),
                 "modality_profiles": [profile.source_pdf_sha256 for profile in profiles],
                 "f1_corpus_id": manifest.corpus_id if manifest is not None else "",
@@ -5934,8 +5990,29 @@ class GateEvidenceVerifier:
             }
         if gate == "D" and int(facts.get("source_count") or 0) < 3:
             return {"status": "FAIL", "reason": "heterogeneous gate requires at least three source artifacts", "derived_facts": facts, "contract": contract}
-        if gate == "D" and int(facts.get("heterogeneity") or 0) < 3:
-            return {"status": "FAIL", "reason": "heterogeneous gate requires three distinct durable modality identities", "derived_facts": facts, "contract": contract}
+        if gate == "D":
+            if facts.get("d_modality_policy") == "f1-two-in-corpus-plus-auxiliary-ocr-v1":
+                if int(facts.get("in_corpus_heterogeneity") or 0) < 2:
+                    return {
+                        "status": "FAIL",
+                        "reason": "modified D policy requires two distinct in-corpus modality identities",
+                        "derived_facts": facts,
+                        "contract": contract,
+                    }
+                if facts.get("auxiliary_ocr_fixture") is not True:
+                    return {
+                        "status": "FAIL",
+                        "reason": "modified D policy requires a separately bound auxiliary OCR fixture",
+                        "derived_facts": facts,
+                        "contract": contract,
+                    }
+            elif int(facts.get("heterogeneity") or 0) < 3:
+                return {
+                    "status": "FAIL",
+                    "reason": "heterogeneous gate requires three distinct durable modality identities",
+                    "derived_facts": facts,
+                    "contract": contract,
+                }
         if gate == "F" and (
             not facts.get("semantic_roles")
             or int(facts.get("candidate_count") or 0) <= 0

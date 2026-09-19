@@ -49,6 +49,7 @@ _RUNTIME_METADATA_FIELDS = frozenset({
     "stage_plan",
     "external_host_acknowledgement",
     "f1_corpus_binding",
+    "f1_d_modality_policy",
 })
 _RUNTIME_COMPATIBILITY_FIELDS = frozenset(
     {
@@ -210,6 +211,52 @@ class RuntimeJobSpec:
         for field_name in ("audit_scope", "stage_plan"):
             if field_name in self.metadata and not isinstance(self.metadata[field_name], Mapping):
                 raise ValueError(f"metadata.{field_name} must be a JSON object")
+        d_modality_policy = self.metadata.get("f1_d_modality_policy")
+        if d_modality_policy is not None:
+            if not isinstance(d_modality_policy, Mapping):
+                raise ValueError("metadata.f1_d_modality_policy must be a JSON object")
+            allowed_d_policy_fields = {
+                "schema_version",
+                "policy_id",
+                "approval",
+                "auxiliary_fixture_path",
+                "auxiliary_fixture_sha256",
+                "f1_manifest_unchanged",
+                "q_corpus_unchanged",
+            }
+            unknown_d_policy_fields = sorted(
+                str(key)
+                for key in d_modality_policy
+                if str(key) not in allowed_d_policy_fields
+            )
+            if unknown_d_policy_fields:
+                raise ValueError(
+                    "metadata.f1_d_modality_policy contains unknown fields: "
+                    + ", ".join(unknown_d_policy_fields)
+                )
+            if d_modality_policy.get("schema_version") != "f1-d-modality-policy-v1":
+                raise ValueError("metadata.f1_d_modality_policy schema_version is invalid")
+            if d_modality_policy.get("policy_id") != "f1-two-in-corpus-plus-auxiliary-ocr-v1":
+                raise ValueError("metadata.f1_d_modality_policy policy_id is invalid")
+            for field_name in ("approval", "auxiliary_fixture_path"):
+                if not isinstance(d_modality_policy.get(field_name), str) or not str(
+                    d_modality_policy.get(field_name)
+                ).strip():
+                    raise ValueError(
+                        f"metadata.f1_d_modality_policy.{field_name} must be a non-empty JSON string"
+                    )
+            fixture_hash = d_modality_policy.get("auxiliary_fixture_sha256")
+            if not isinstance(fixture_hash, str) or not re.fullmatch(
+                r"[0-9a-f]{64}", fixture_hash.strip().lower()
+            ):
+                raise ValueError(
+                    "metadata.f1_d_modality_policy.auxiliary_fixture_sha256 must be a SHA-256"
+                )
+            for field_name in ("f1_manifest_unchanged", "q_corpus_unchanged"):
+                if d_modality_policy.get(field_name) is not True:
+                    raise ValueError(
+                        f"metadata.f1_d_modality_policy.{field_name} must be true"
+                    )
         acknowledgement = self.metadata.get("external_host_acknowledgement")
         if acknowledgement is not None:
             if not isinstance(acknowledgement, Mapping):
