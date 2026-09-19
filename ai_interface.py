@@ -219,6 +219,138 @@ def _classify_exception(exc: BaseException) -> Tuple[str, str]:
     return "invalid_response", message
 
 
+def _aihubmix_recovery_enabled(api_config: Mapping[str, Any]) -> bool:
+    """Return whether opt-in recovery of a disconnected AihubMix LLM call is enabled."""
+
+    api_base = str(api_config.get("api_base") or "").casefold()
+    if "aihubmix.com" not in api_base:
+        return False
+    configured = api_config.get("aihubmix_recovery_enabled")
+    if configured is None:
+        configured = os.getenv("AUTO_GENERATE_AIHUBMIX_RECOVERY", "0")
+    return str(configured or "").strip().casefold() in {"1", "true", "yes", "on"}
+
+
+def _epoch_seconds(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _aihubmix_recover_disconnected_call(
+    *,
+    api_config: APIConfig,
+    model: str,
+    request_started_epoch: float,
+    response_parser: Callable[[Dict[str, Any]], Tuple[str, str]],
+    response_format: str,
+    logger: Any = None,
+) -> Dict[str, Any] | None:
+    """Recover one uniquely matched AihubMix task after a client disconnect.
+
+    AihubMix creates an LLM recovery task only when the account feature is
+    enabled and the client disconnects after the platform accepted the call.
+    The public task list has no request-hash filter, so ambiguity is a hard
+    failure: this helper never selects the newest task merely because it is
+    convenient.
+    """
+
+    if not _aihubmix_recovery_enabled(api_config):
+        return None
+    api_base = str(api_config.get("api_base") or "").strip()
+    parsed_base = urlparse(api_base)
+    if not parsed_base.scheme or not parsed_base.netloc:
+        return None
+    recovery_base = f"{parsed_base.scheme}://{parsed_base.netloc}"
+    api_key = str(api_config.get("api_key") or "").strip()
+    if not api_key or is_template_credential(api_key):
+        return None
+    headers = {"Authorization": f"Bearer {api_key}"}
+    timeout_seconds = min(
+        30,
+        _coerce_positive_int(api_config.get("recovery_request_timeout_seconds"), 30),
+    )
+
+    def get_json(url: str, **kwargs: Any) -> Any:
+        if should_bypass_environment_proxy(api_config):
+            with requests.Session() as session:
+                session.trust_env = False
+                return session.get(url, **kwargs)
+        return requests.get(url, **kwargs)
+
+    try:
+        listing = get_json(
+            f"{recovery_base}/ai/v1/tasks",
+            params={"object": "llm", "model": model, "limit": 20, "order": "desc"},
+            headers=headers,
+            timeout=timeout_seconds,
+        )
+        if listing.status_code != 200:
+            return None
+        payload = listing.json()
+        rows = payload.get("data") if isinstance(payload, Mapping) else None
+        if not isinstance(rows, list):
+            return None
+        candidates = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            if str(row.get("model") or "").strip() != model:
+                continue
+            created_at = _epoch_seconds(row.get("created_at"))
+            if created_at is None or created_at < request_started_epoch - 15:
+                continue
+            candidates.append(row)
+        if len(candidates) != 1:
+            return None
+        task = candidates[0]
+        task_id = str(task.get("id") or "").strip()
+        if not task_id:
+            return None
+        output_items = task.get("output")
+        if not isinstance(output_items, list) or not output_items:
+            return None
+        if any(bool(item.get("truncated")) for item in output_items if isinstance(item, Mapping)):
+            return None
+        content_response = get_json(
+            f"{recovery_base}/ai/v1/tasks/{task_id}/content",
+            headers=headers,
+            timeout=max(timeout_seconds, 60),
+        )
+        if content_response.status_code != 200:
+            return None
+        recovered_payload = content_response.json()
+        if not isinstance(recovered_payload, dict):
+            return None
+        content, finish_reason = response_parser(recovered_payload)
+        formatted = _format_success_result(
+            content,
+            response_format,
+            content_response,
+            finish_reason,
+            logger=logger,
+        )
+        if formatted.get("status") != "success":
+            return None
+        formatted.update(
+            {
+                "http_status": 200,
+                "recovered_from_aihubmix_task": True,
+                "aihubmix_recovery_task_id": task_id,
+                "aihubmix_recovery_content_sha256": hashlib.sha256(
+                    content_response.content
+                ).hexdigest(),
+            }
+        )
+        return formatted
+    except (OSError, ValueError, TypeError, KeyError, requests.RequestException, json.JSONDecodeError) as exc:
+        if logger:
+            logger.warning("AihubMix recovery lookup failed closed: %s", _redact_provider_text(exc, api_key))
+        return None
+
+
 def _is_payload_parameter_error(parameter_name: str, *parts: Any) -> bool:
     text = " ".join(str(part or "") for part in parts).casefold()
     return parameter_name.casefold() in text and any(marker in text for marker in _PAYLOAD_PARAMETER_ERROR_MARKERS)
@@ -1757,6 +1889,7 @@ def _call_ai_api_detailed_uninstrumented(
         api_key = api_config.get('api_key') or ''
         model_name = api_config.get('model') or ''
         api_base = api_config.get('api_base', 'https://api.openai.com/v1') or 'https://api.openai.com/v1'
+        request_started_epoch = time.time()
         capability = resolve_model_capability(api_config)
 
         if not api_key or is_template_credential(api_key) or not model_name:
@@ -1846,6 +1979,18 @@ def _call_ai_api_detailed_uninstrumented(
             if strict_retry_budget:
                 return attempts_used < max_retries
             return attempt < max_retries
+
+        def recover_final_transient_failure(failure: Dict[str, Any]) -> Dict[str, Any] | None:
+            if str(failure.get("error_kind") or "") != "transient_network":
+                return None
+            return _aihubmix_recover_disconnected_call(
+                api_config=api_config,
+                model=str(model_name),
+                request_started_epoch=request_started_epoch,
+                response_parser=response_parser,
+                response_format=response_format,
+                logger=logger,
+            )
 
         while can_start_attempt():
             attempt += 1
@@ -2023,7 +2168,8 @@ def _call_ai_api_detailed_uninstrumented(
 
                 if logger:
                     logger.error(f"API调用最终失败: {last_failure['message']}")
-                return finish(last_failure)
+                recovered = recover_final_transient_failure(last_failure)
+                return finish(recovered or last_failure)
 
             except Exception as exc:
                 response_status = getattr(response, "status_code", None)
@@ -2058,9 +2204,11 @@ def _call_ai_api_detailed_uninstrumented(
 
                 if logger:
                     logger.error(f"API调用最终失败 ({error_kind}): {message}")
-                return finish(last_failure)
+                recovered = recover_final_transient_failure(last_failure)
+                return finish(recovered or last_failure)
 
-        return finish(last_failure)
+        recovered = recover_final_transient_failure(last_failure)
+        return finish(recovered or last_failure)
 
     except Exception as exc:
         if logger:
@@ -2273,6 +2421,15 @@ def _call_ai_api_detailed(
         "transport_metadata": {
             **transport_report,
             "successful_input_mode": "multimodal" if transport_report.get("images_actually_sent_count", 0) else "text_only",
+            **{
+                key: result[key]
+                for key in (
+                    "recovered_from_aihubmix_task",
+                    "aihubmix_recovery_task_id",
+                    "aihubmix_recovery_content_sha256",
+                )
+                if key in result
+            },
         },
     }
     if capability.endpoint_type == "anthropic":
