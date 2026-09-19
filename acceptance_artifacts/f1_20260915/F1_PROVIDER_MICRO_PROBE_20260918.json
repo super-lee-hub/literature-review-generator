@@ -1,0 +1,32 @@
+{
+  "artifact_type": "f1_provider_micro_probe_projection",
+  "artifact_version": "v1",
+  "observed_on": "2026-09-18",
+  "execution_sha": "494cc13bd9df63c41e3557f9fdf1bcd448aae480",
+  "command_surface": "python -m reviewctl micro-probe",
+  "probe_payload": "ping / Return one short token.",
+  "f1_content_transmitted": false,
+  "original_pdf_transmitted": false,
+  "current_route_acknowledgement": "F1_EXTERNAL_HOST_ACKNOWLEDGEMENT_20260918.json",
+  "provider_micro_probe_ledger": "D:/auto-generate/output/_acceptance/provider_micro_probe.jsonl",
+  "counts": {
+    "routes_probed": 6,
+    "successful_routes": 6,
+    "failed_routes": 0,
+    "synthetic_network_calls": 6
+  },
+  "routes": [
+    {"section":"Primary_Reader_API","semantic_roles":["primary_reader"],"provider_family":"deepseek","model":"deepseek-flash","endpoint_type":"chat_completions","host":"api.deepseek.com","status":"success","receipt_id":"provider-receipt-96a7fe04c5d44fec953291489c5ffa24","ack_required":false},
+    {"section":"Backup_Reader_API","semantic_roles":["backup_reader"],"provider_family":"openai_responses","model":"gpt-5.6-sol","endpoint_type":"responses","host":"ai.saigou.work","status":"success","receipt_id":"provider-receipt-7bcb8fe81fb5445089e6a3bb99e50eae","ack_required":true},
+    {"section":"Outline_API","semantic_roles":["candidate_provider_generation"],"provider_family":"claude_chat_reasoning","model":"claude-opus-5","endpoint_type":"chat_completions","host":"api.yhlxj.ai","status":"success","receipt_id":"provider-receipt-d24cecb2d581429db7ad0f711a9bd714","ack_required":true},
+    {"section":"Free_Mode_API","semantic_roles":["relation_adjudication","coverage_critique","arbitration"],"provider_family":"claude_chat_reasoning","model":"claude-fable-5-1","endpoint_type":"chat_completions","host":"api.yhlxj.ai","status":"success","receipt_id":"provider-receipt-c6dbcc6881584defaf50ac277d72cc10","ack_required":true},
+    {"section":"Writer_API","semantic_roles":["structure_critique","evidence_critique","writer"],"provider_family":"openai_responses","model":"gpt-5.6-sol","endpoint_type":"responses","host":"ai.saigou.work","status":"success","receipt_id":"provider-receipt-76236d84cf464dc1bdd6218239e28db5","ack_required":true},
+    {"section":"Validator_API","semantic_roles":["validator"],"provider_family":"deepseek","model":"deepseek-flash","endpoint_type":"chat_completions","host":"api.deepseek.com","status":"success","receipt_id":"provider-receipt-1fa4302295b74de09e122703eac50625","ack_required":false}
+  ],
+  "acceptance_boundary": {
+    "provider_reachability_status": "PASS_SYNTHETIC_ONLY",
+    "d_status": "FAIL_MODALITY",
+    "q_status": "BLOCKED_D_PREREQUISITE",
+    "does_not_prove": ["F1 Q", "Outline quality", "Writer output", "Validator semantics", "DOCX QA", "human ground truth"]
+  }
+}

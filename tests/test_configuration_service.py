@@ -35,6 +35,7 @@ def test_ensure_config_sections_includes_outline_free_mode_and_preprocess() -> N
     assert config['Preprocess']['parser_mode'] == 'hybrid'
     assert config['Preprocess']['primary_parser'] == 'mineru_remote'
     assert config['Preprocess']['use_markdown_as_stage1_input'] == 'true'
+    assert config['Preprocess']['local_rag_retain_recent_identities'] == '2'
     assert config['Validation']['stage1_enabled'] == 'false'
     assert config['Runtime']['retain_checkpoints_after_completion'] == 'false'
     assert config['Validation']['repair_policy'] == 'report_only'

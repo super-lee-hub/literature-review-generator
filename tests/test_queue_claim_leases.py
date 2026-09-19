@@ -11,6 +11,7 @@ import zipfile
 
 import pytest
 
+from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
 from services.artifact_registry import ArtifactRegistry, CurrentArtifactSetV1
 from services.job_workspace import atomic_write_json
 from services.queue_service import PersistentQueueService, QueueJobSpec, QueueLease, QueueState
@@ -790,17 +791,24 @@ def test_queue_runner_heartbeats_while_job_runner_is_blocked(tmp_path) -> None:
     queue_file = tmp_path / "queue.json"
     service = PersistentQueueService(queue_file)
     job_id = "job-heartbeat"
+    config_path = tmp_path / "config.ini"
+    config_path.write_text("[Paths]\noutput_path = ./output\n", encoding="utf-8")
+    pdf_dir = tmp_path / "papers"
+    pdf_dir.mkdir()
+    (pdf_dir / "paper.pdf").write_bytes(b"%PDF-1.4\nlease test\n")
+    parameters = RuntimeJobSpec(
+        project_name="lease-test",
+        source=RuntimeSourceSpec(mode="direct", pdf_folder=str(pdf_dir)),
+        config=str(config_path),
+        action="generate_review",
+        metadata={},
+    ).to_dict()
     service.add_job(
         QueueJobSpec(
             job_id=job_id,
-            job_type="review",
+            job_type="generate_review",
             project_name="lease-test",
-            parameters={
-                "config": "config.ini",
-                "project_name": "lease-test",
-                "pdf_folder": "D:/papers",
-                "action": "review",
-            },
+            parameters=parameters,
         )
     )
     started = threading.Event()
@@ -815,6 +823,7 @@ def test_queue_runner_heartbeats_while_job_runner_is_blocked(tmp_path) -> None:
                 (),
                 {
                     "job_status": "completed",
+                    "success": True,
                     "exit_code": 0,
                     "message": "ok",
                     "workspace_path": str(tmp_path / "workspace"),
@@ -847,3 +856,60 @@ def test_queue_runner_heartbeats_while_job_runner_is_blocked(tmp_path) -> None:
     thread.join(timeout=5)
     assert not thread.is_alive()
     assert PersistentQueueService(queue_file).get_job_runtime(job_id).state == QueueState.COMPLETED
+
+
+def test_expired_cancel_request_becomes_terminal_across_queue_runner_heartbeat(tmp_path) -> None:
+    queue_file = tmp_path / "queue.json"
+    service = PersistentQueueService(queue_file)
+    _add_job(service, "cancel-expired")
+    lease = service.claim_job("cancel-expired", worker_id="dead-worker", lease_seconds=1)
+    assert lease is not None
+    assert service.request_cancel("cancel-expired", reason="cross-process-cancel")
+    time.sleep(1.1)
+    assert service.recover_expired_leases() == ["cancel-expired"]
+    runtime = PersistentQueueService(queue_file).get_job_runtime("cancel-expired")
+    assert runtime is not None
+    assert runtime.state == QueueState.CANCELLED
+    assert runtime.lease_id == ""
+
+
+def test_owner_heartbeat_keeps_cancel_request_acknowledgeable(tmp_path) -> None:
+    queue_file = tmp_path / "queue.json"
+    service = PersistentQueueService(queue_file)
+    _add_job(service, "cancel-heartbeat")
+    lease = service.claim_job("cancel-heartbeat", worker_id="live-worker", lease_seconds=10)
+    assert lease is not None
+    assert service.request_cancel("cancel-heartbeat", reason="slow-checkpoint")
+
+    assert service.heartbeat(
+        "cancel-heartbeat",
+        lease_id=lease.lease_id,
+        worker_id=lease.worker_id,
+        lease_generation=lease.lease_generation,
+        fence_token=lease.fence_token,
+        lease_seconds=10,
+    )
+    assert service.release_lease(
+        "cancel-heartbeat",
+        lease_id=lease.lease_id,
+        worker_id=lease.worker_id,
+        lease_generation=lease.lease_generation,
+        fence_token=lease.fence_token,
+        state=QueueState.CANCELLED,
+    )
+    runtime = PersistentQueueService(queue_file).get_job_runtime("cancel-heartbeat")
+    assert runtime is not None
+    assert runtime.state == QueueState.CANCELLED
+    assert runtime.lease_id == ""
+
+
+def test_dependency_failure_transition_persists_state_and_error_atomically(tmp_path) -> None:
+    queue_file = tmp_path / "queue.json"
+    service = PersistentQueueService(queue_file)
+    _add_job(service, "dependent")
+    assert service.fail_job("dependent", "Dependency job missing not found")
+    runtime = PersistentQueueService(queue_file).get_job_runtime("dependent")
+    assert runtime is not None
+    assert runtime.state == QueueState.FAILED
+    assert runtime.error_message == "Dependency job missing not found"
+    assert service.retry_failed_jobs() == ["dependent"]

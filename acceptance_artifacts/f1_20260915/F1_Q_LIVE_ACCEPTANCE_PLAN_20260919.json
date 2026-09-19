@@ -1,0 +1,41 @@
+{
+  "schema_version": "release-acceptance-plan-v2",
+  "parent_run_id": "f1-acceptance-Q-20260919-local-r8",
+  "final_executable_sha": "",
+  "state_path": "F1_Q_LOCAL_ACCEPTANCE_STATE_20260919_R8.json",
+  "budget": {
+    "max_provider_calls_total": 64,
+    "max_output_tokens_total": 2000000,
+    "max_retry_attempts_total": 16,
+    "max_wall_seconds": 7200
+  },
+  "third_party_acknowledged": true,
+  "third_party_hosts": ["ai.saigou.work", "api.yhlxj.ai"],
+  "external_host_acknowledgement": {
+    "schema_version": "external-host-acknowledgement-v2",
+    "version": 2,
+    "acknowledged": true,
+    "hosts": ["ai.saigou.work", "api.yhlxj.ai"],
+    "route_fingerprint": "83f20d460cf21fb67e856c4f5daddaaabeeafbc75bb79742dca7a27b90d4326f",
+    "issued_at": "2026-09-19T04:18:15.622865Z",
+    "expires_at": "2026-09-25T04:18:15.622865Z"
+  },
+  "scenarios": {
+    "Q": {
+      "scenario_id": "Q",
+      "gate": "Q",
+      "runtime_spec": "Q_RUNTIME_SPEC_20260919_LOCAL_AUTHORIZED.json",
+      "workspace": "D:/auto-generate/.acceptance_runs/f1_q_local_r3/f1_acceptance_Q_local_parser__f1-acceptance-Q-20260919-local-r3",
+      "input_manifest": "D:/auto-generate/.acceptance_inputs/f1_d_20260919/f1_manifest.json",
+      "f1_source_ids": [
+        "F1-01", "F1-02", "F1-03", "F1-04", "F1-05",
+        "F1-06", "F1-07", "F1-08", "F1-09", "F1-10",
+        "F1-11", "F1-12", "F1-13", "F1-14", "F1-15"
+      ],
+      "execution_mode": "runtime",
+      "budget_domain": "live",
+      "prerequisites": [],
+      "job_id": "f1-acceptance-Q-20260919-local-r3"
+    }
+  }
+}

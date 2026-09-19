@@ -6,6 +6,7 @@ import re
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from services.citation_metadata import normalize_summary_paper_metadata
+from services.citation_style import normalize_creators
 from services.paper_identity import build_canonical_paper_key, normalize_doi
 
 
@@ -71,8 +72,24 @@ def _paper_identity(summary: Mapping[str, Any]) -> Dict[str, Any]:
         "paper_id": canonical_key or doi or source_paper_id or f"source:{_summary_hash(summary)[:12]}",
         "canonical_paper_key": canonical_key or doi or source_paper_id or f"source:{_summary_hash(summary)[:12]}",
         "title": str(merged.get("title") or "").strip(),
-        "authors": _normalize_authors(merged.get("authors")),
+        "authors": list(normalized.authors or _normalize_authors(merged.get("authors"))),
+        "creators": normalize_creators(merged.get("creators") or merged.get("authors")),
         "year": str(merged.get("year") or "").strip(),
+        "container_title": str(
+            normalized.container_title
+            or merged.get("container_title")
+            or merged.get("publication_title")
+            or merged.get("journal")
+            or ""
+        ).strip(),
+        "volume": str(normalized.volume or merged.get("volume") or "").strip(),
+        "issue": str(normalized.issue or merged.get("issue") or "").strip(),
+        "pages": str(normalized.pages or merged.get("pages") or "").strip(),
+        "article_number": str(
+            normalized.article_number or merged.get("article_number") or ""
+        ).strip(),
+        "publisher": str(normalized.publisher or merged.get("publisher") or "").strip(),
+        "url": str(normalized.url or merged.get("url") or "").strip(),
         "doi": doi,
         "source_paper_id": source_paper_id,
         "source_summary_hash": _summary_hash(summary),
@@ -114,7 +131,11 @@ def _next_ref_id(number: int) -> str:
     return f"R{number:03d}"
 
 
-LEGAL_CITE_REF_TOKEN_PATTERN = re.compile(r"\[\[cite_ref:R\d{3,}(?:,\s*R\d{3,})*\]\]")
+LEGAL_CITE_REF_TOKEN_PATTERN = re.compile(
+    r"\[\[cite_ref:R\d{3,}(?:,\s*R\d{3,})*"
+    r"(?:\|mode=(?:parenthetical|narrative))?"
+    r"(?:\|locator=[^\]]+)?\]\]"
+)
 
 
 def extract_ref_ids_from_token(citation_token: Any) -> List[str]:
@@ -135,8 +156,16 @@ def _entry_hash_payload(entries: Sequence[Mapping[str, Any]]) -> List[Dict[str, 
             "canonical_paper_key": entry.get("canonical_paper_key"),
             "title": entry.get("title"),
             "authors": list(entry.get("authors") or []),
+            "creators": [dict(item) for item in entry.get("creators", []) if isinstance(item, Mapping)],
             "year": entry.get("year"),
             "doi": entry.get("doi"),
+            "container_title": entry.get("container_title"),
+            "volume": entry.get("volume"),
+            "issue": entry.get("issue"),
+            "pages": entry.get("pages"),
+            "article_number": entry.get("article_number"),
+            "publisher": entry.get("publisher"),
+            "url": entry.get("url"),
             "source_summary_hash": entry.get("source_summary_hash"),
             "status": entry.get("status"),
         }

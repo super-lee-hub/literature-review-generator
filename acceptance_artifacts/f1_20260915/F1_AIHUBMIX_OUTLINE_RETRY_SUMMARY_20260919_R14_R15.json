@@ -1,0 +1,51 @@
+{
+  "artifact_type": "f1_aihubmix_outline_retry_comparison",
+  "artifact_version": "v1",
+  "checked_at_utc": "2026-09-19T14:14:00Z",
+  "executable_sha": "d7c4a4d117ff2706aa673f7f0b4cd029cd66cf51",
+  "gateway": "aihubmix.com",
+  "request_shape": {
+    "outline_model": "claude-opus-5",
+    "outline_max_output_tokens": 32000,
+    "input_estimate_tokens": 64138,
+    "original_pdf_transport": "never",
+    "canonical_stage1_reused": true,
+    "stage1_provider_calls": 0
+  },
+  "credential_probe": {
+    "route_count": 3,
+    "successful_routes": ["Outline_API", "Free_Mode_API", "Writer_API"],
+    "f1_content_transmitted": false,
+    "credential_source": "short-lived process environment and updated local env"
+  },
+  "r14": {
+    "acceptance_run_id": "f1-acceptance-F-outline-aihubmix-r14",
+    "status": "NOT_VERIFIED",
+    "relation_http_status": 200,
+    "relation_output_tokens": 6536,
+    "relation_confirmed_count": 8,
+    "relation_rejected_count": 45,
+    "semantic_failure": "provider returned a rejected relation id not present in the candidate set: relation-e521a79dd732f932fc9de1da_placeholder_ignore",
+    "candidate_request_attempted": false,
+    "scenario_receipt_sha256": "01e712ecfdd173b14aad48740e71968fc5dde69c8f7e829724a8928cadb1d55a",
+    "parent_result_sha256": "91e06c7cf15988721d12fd7dbb2d8b444478dc641dd27bd471100724a3ba9b1e"
+  },
+  "r15": {
+    "acceptance_run_id": "f1-acceptance-F-outline-aihubmix-r15",
+    "status": "NOT_VERIFIED",
+    "relation_http_status": 200,
+    "relation_output_tokens": 7972,
+    "candidate_node": "candidate_1_provider_generation",
+    "candidate_estimated_input_tokens": 64138,
+    "candidate_max_output_tokens": 32000,
+    "candidate_transport_failure": "ProxyError: RemoteDisconnected; AihubMix closed the connection during the large candidate request",
+    "candidate_provider_receipt_persisted": false,
+    "scenario_receipt_sha256": "6f6becdf896efba86d55c750ba0936e7ebbdc1ea3ae6e923ac30f7d7ea4b3ce7",
+    "parent_result_sha256": "23ba292c78400326d19904e378ed2b92f5f0bfae59ebf7bf5fe5e02bfd205cb7"
+  },
+  "provider_receipt_ledgers": {
+    "r14_sha256": "17619f1220f5ba54552dac110784cd39cbd7fd906e546905f75ab7bf7d1ed9f6",
+    "r15_sha256": "f8f8e4897118c2094d297fd067dddab3158ebef732b40063730d332e092c5e0a"
+  },
+  "final_status": "NOT_VERIFIED; valid credential confirmed, but relation semantic contract and large candidate transport remain unresolved"
+}

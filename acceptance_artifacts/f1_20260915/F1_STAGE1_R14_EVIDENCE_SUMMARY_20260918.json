@@ -1,0 +1,83 @@
+{
+  "artifact_type": "f1_stage1_live_evidence_projection",
+  "artifact_version": "v1",
+  "run_id": "f1-stage1-full-20260917-r14",
+  "execution_sha": "420663e4eea4e9e2a1ffdee1d5d16193d7e5d08e",
+  "closure_recheck_sha": "9e42105e529a964396c52320d67aaa719a047817",
+  "config": "F1_STAGE1_OFFICIAL_PRIMARY_CREDENTIAL_RECOVERY_CONFIG_20260917_R13.ini",
+  "runtime_spec": "F1_STAGE1_FULL_RUNTIME_SPEC_20260917_R14.json",
+  "corpus": {
+    "corpus_id": "field-f1-20260915",
+    "manifest": "F1_CORPUS_MANIFEST_20260915.json",
+    "manifest_sha256": "f741776ea2eda6b5937f4fc13e40569216eb3173ff597fb80eeea2e46dab3e90",
+    "source_ids": [
+      "F1-01",
+      "F1-02",
+      "F1-03",
+      "F1-04",
+      "F1-05",
+      "F1-06",
+      "F1-07",
+      "F1-08",
+      "F1-09",
+      "F1-10",
+      "F1-11",
+      "F1-12",
+      "F1-13",
+      "F1-14",
+      "F1-15"
+    ]
+  },
+  "transport": {
+    "allowed_provider": "https://api.deepseek.com",
+    "routes": ["Primary_Reader_API", "Backup_Reader_API"],
+    "models": ["deepseek-v4-flash-vision-exp", "deepseek-v4-pro"],
+    "original_pdf_transport": "never",
+    "primary_credential_reused_for_backup_model": true,
+    "credential_values_emitted": false
+  },
+  "stage1_counts": {
+    "preprocess_generations": 15,
+    "visual_bundles": 15,
+    "paper_artifacts": 15,
+    "expected_provider_call_ids": 18,
+    "published_provider_receipts": 22,
+    "successful_provider_receipts": 22,
+    "failed_provider_receipts": 0
+  },
+  "stage1_status_after_recheck": {
+    "reconcile_issues": [],
+    "completion_status": "complete",
+    "canonical_ready": true,
+    "stage1_authority_ready": true,
+    "visual_qualification_ready": true,
+    "job_disposition": "unvalidated",
+    "validation_required": false
+  },
+  "acceptance_boundary": {
+    "semantic_ground_truth": "NOT_REVIEWED_BY_HUMAN",
+    "d_status": "FAIL_MODALITY",
+    "d_profiles": {
+      "text_heavy": ["F1-01", "F1-03"],
+      "visual_table_heavy": ["F1-14"],
+      "ocr_scanned": []
+    },
+    "q_status": "BLOCKED_D_PREREQUISITE",
+    "full_q_started": false
+  },
+  "evidence_records": {
+    "workspace": "runs_stage1_r13/f1_stage1_official_primary_credential_recovery_r14__f1-stage1-full-20260917-r14",
+    "provider_receipt_ledger": {
+      "relative_path": "runs_stage1_r13/f1_stage1_official_primary_credential_recovery_r14__f1-stage1-full-20260917-r14/artifacts/stage1_provider_receipts__d311dd4d892f8854323d9a0e.jsonl",
+      "registry_content_hash": "d311dd4d892f8854323d9a0e211b52e68812ad524e742ccd4933e03997c7e36d"
+    },
+    "provider_receipt_closure": {
+      "relative_path": "runs_stage1_r13/f1_stage1_official_primary_credential_recovery_r14__f1-stage1-full-20260917-r14/artifacts/stage1/provider_receipt_closure__1f229aef4734313d75c91ed1.json",
+      "registry_content_hash": "1f229aef4734313d75c91ed1c4c7be3a0646e22b8448b5cce437697a07ce9db5"
+    },
+    "summary_file": {
+      "relative_path": "runs_stage1_r13/f1_stage1_official_primary_credential_recovery_r14__f1-stage1-full-20260917-r14/artifacts/stage1/inputs/stage1_summaries_286a29cc54c6bebb127591e4__70c44250cfd061ccd02157f5.json",
+      "registry_content_hash": "70c44250cfd061ccd02157f536358eeceb9f5aaccb1bf4f6977d58b507dc22a2"
+    }
+  }
+}

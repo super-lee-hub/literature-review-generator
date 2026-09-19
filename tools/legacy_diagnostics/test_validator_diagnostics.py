@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import configparser
+import argparse
 import json
 import os
 from typing import Any, Dict
@@ -118,9 +119,12 @@ def provide_optimization_advice() -> None:
     print("4. 现在摘要结构已是 canonical-first，诊断时优先看 routing/core_analysis/quality_audit。")
 
 
-def check_validator_api() -> bool:
+def check_validator_api(*, allow_network: bool = False) -> bool:
     """Smoke-test validator API connectivity."""
     print("\n测试验证 API 连接...")
+    if not allow_network:
+        print("网络诊断默认关闭；使用 --allow-network 才会发送请求")
+        return False
     try:
         from ai_interface import _call_ai_api
         from config_loader import load_config
@@ -154,12 +158,15 @@ def check_validator_api() -> bool:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Legacy validator diagnostic; network is disabled by default.")
+    parser.add_argument("--allow-network", action="store_true")
+    args = parser.parse_args()
     print("验证系统诊断工具")
     print("=" * 50)
     config_ok = check_validator_config()
     analyze_validation_results()
     if config_ok:
-        check_validator_api()
+        check_validator_api(allow_network=args.allow_network)
     provide_optimization_advice()
     print("\n" + "=" * 50)
     print("诊断完成")

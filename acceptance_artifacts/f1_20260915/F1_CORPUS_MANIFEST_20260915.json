@@ -1,0 +1,25 @@
+{
+  "artifact_type": "f1_corpus_manifest",
+  "artifact_version": "v1",
+  "schema_version": "f1-corpus-manifest-v1",
+  "corpus_id": "field-f1-20260915",
+  "source_root": "source_corpus",
+  "sources": [
+    {"source_id": "F1-01", "relative_path": "F1-01.pdf", "sha256": "6593fe7c65c62e9fca1a9cbbd0e10dc6cbfbcc4b1ea01bb59f2bc11f8226c2a7", "size_bytes": 8551629},
+    {"source_id": "F1-02", "relative_path": "F1-02.pdf", "sha256": "c6ade5dba67e7557225e5410d1d1296ab8ce7b0d563ed7cc2e3c131853d35278", "size_bytes": 976884},
+    {"source_id": "F1-03", "relative_path": "F1-03.pdf", "sha256": "b90ba7df54f1e20e93bf4e587b68745381b9f32e179badedfe29224dba42d027", "size_bytes": 682565},
+    {"source_id": "F1-04", "relative_path": "F1-04.pdf", "sha256": "cb4ea385dd292eb46fd75a987b673930b1413b9767f5deb61ec70998057afaaa", "size_bytes": 2554918},
+    {"source_id": "F1-05", "relative_path": "F1-05.pdf", "sha256": "30a4bebef5b6835c0be5befd9caa83574e443df4f9139a9eca7cb70d701d6d11", "size_bytes": 2100047},
+    {"source_id": "F1-06", "relative_path": "F1-06.pdf", "sha256": "019799825517b941b22dc423386ccc5e65f30b2f03ffa98d48df5f6b63e8690e", "size_bytes": 885594},
+    {"source_id": "F1-07", "relative_path": "F1-07.pdf", "sha256": "fae0787bc0a978945154cd261f7c4ed18c38a4b08cf7151c7784a2d99c9b0e61", "size_bytes": 963650},
+    {"source_id": "F1-08", "relative_path": "F1-08.pdf", "sha256": "b40d466a7bc2ab7597145ac4701940cb0733c8896077b616df54dfa620995e97", "size_bytes": 2602744},
+    {"source_id": "F1-09", "relative_path": "F1-09.pdf", "sha256": "b275770b8aada6f3df1dbaf14dff29d06c4de2589b627464955e7dba5a52176e", "size_bytes": 1034820},
+    {"source_id": "F1-10", "relative_path": "F1-10.pdf", "sha256": "36f89d156352245fa5aee5eab5ba6b1740da55dbd1859db4597694cac999670c", "size_bytes": 25802292},
+    {"source_id": "F1-11", "relative_path": "F1-11.pdf", "sha256": "62c4d0244dcf52dae249df65407db9bfba6d8e3fc644ab9ceb6c0583686f63a9", "size_bytes": 2190643},
+    {"source_id": "F1-12", "relative_path": "F1-12.pdf", "sha256": "8d9430c8827f54ba3cc18479cb7c9b827b654e724f239b3a56ab57267a5acc66", "size_bytes": 1911078},
+    {"source_id": "F1-13", "relative_path": "F1-13.pdf", "sha256": "9029a9f98b923a499c68112c632d1695c7fa3cc161947e65dfbf1c642a9a56c3", "size_bytes": 890864},
+    {"source_id": "F1-14", "relative_path": "F1-14.pdf", "sha256": "7f25ebf74ae87f92bba3a626c1a787a4aebd32e1e4cc17347a2b78fa01cd8e0f", "size_bytes": 23588616},
+    {"source_id": "F1-15", "relative_path": "F1-15.pdf", "sha256": "925c8e45b0370ac23ef36783338cb9f8c1eb5cd3f57ecce12610c1916fe4d9ed", "size_bytes": 5576072}
+  ],
+  "content_sha256": "ebaf5c2a9220ed23b527e279c0fd82a6770fa70e5d4ab5d1e1e64f2150ce4319"
+}

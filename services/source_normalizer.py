@@ -2,10 +2,17 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, Iterable, List, Mapping
 
 from services.paper_identity import build_paper_key, normalize_doi
+
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+
+
+class SourceIdentityError(ValueError):
+    """Raised when source identities cannot safely form independent work items."""
 
 
 def _safe_text(value: Any) -> str:
@@ -45,6 +52,76 @@ class SourcePaperDescriptor:
         return asdict(self)
 
 
+def _identity_fields(
+    item: SourcePaperDescriptor | Mapping[str, Any],
+) -> tuple[str, str, str]:
+    if isinstance(item, SourcePaperDescriptor):
+        return (
+            _safe_text(item.canonical_paper_key),
+            _safe_text(item.source_pdf),
+            _safe_text(item.source_pdf_fingerprint).casefold(),
+        )
+    return (
+        _safe_text(item.get("canonical_paper_key")),
+        _safe_text(item.get("source_pdf")),
+        _safe_text(item.get("source_pdf_fingerprint")).casefold(),
+    )
+
+
+def validate_source_paper_uniqueness(
+    papers: Iterable[SourcePaperDescriptor | Mapping[str, Any]],
+) -> None:
+    """Reject identities that would collapse Stage 1 work or provider call IDs.
+
+    Canonical paper keys are used directly in Stage 1 artifact and provider-call
+    identifiers.  PDF content SHA-256 is the physical-source identity, so two
+    copies with different filenames must not become independent work items.
+    """
+
+    key_positions: dict[str, list[int]] = {}
+    key_values: dict[str, str] = {}
+    pdf_positions: dict[str, list[int]] = {}
+    for index, item in enumerate(papers):
+        canonical_key, source_pdf, source_pdf_fingerprint = _identity_fields(item)
+        if canonical_key:
+            normalized_key = canonical_key.casefold()
+            key_positions.setdefault(normalized_key, []).append(index)
+            key_values.setdefault(normalized_key, canonical_key)
+        if source_pdf_fingerprint and not _SHA256_HEX.fullmatch(source_pdf_fingerprint):
+            raise SourceIdentityError(
+                f"source_identity_pdf_sha256_invalid:index={index}"
+            )
+        if source_pdf and source_pdf_fingerprint:
+            pdf_positions.setdefault(source_pdf_fingerprint, []).append(index)
+
+    duplicate_keys = [
+        (key_values[key], positions)
+        for key, positions in key_positions.items()
+        if len(positions) > 1
+    ]
+    if duplicate_keys:
+        canonical_key, positions = min(
+            duplicate_keys,
+            key=lambda item: (item[0].casefold(), item[1]),
+        )
+        raise SourceIdentityError(
+            "source_identity_duplicate_canonical_paper_key:"
+            f"{canonical_key}:indexes={','.join(str(index) for index in positions)}"
+        )
+
+    duplicate_pdfs = [
+        (fingerprint, positions)
+        for fingerprint, positions in pdf_positions.items()
+        if len(positions) > 1
+    ]
+    if duplicate_pdfs:
+        fingerprint, positions = min(duplicate_pdfs, key=lambda item: (item[0], item[1]))
+        raise SourceIdentityError(
+            "source_identity_duplicate_pdf_sha256:"
+            f"{fingerprint}:indexes={','.join(str(index) for index in positions)}"
+        )
+
+
 def normalize_source_papers(source_mode: str, papers: Iterable[Mapping[str, Any]]) -> List[SourcePaperDescriptor]:
     normalized: List[SourcePaperDescriptor] = []
     for index, paper in enumerate(papers):
@@ -79,4 +156,14 @@ def normalize_source_papers(source_mode: str, papers: Iterable[Mapping[str, Any]
                 metadata_source_priority_snapshot=priority,
             )
         )
+    validate_source_paper_uniqueness(normalized)
     return normalized
+
+
+__all__ = [
+    "SourceIdentityError",
+    "SourcePaperDescriptor",
+    "fingerprint_pdf_file",
+    "normalize_source_papers",
+    "validate_source_paper_uniqueness",
+]

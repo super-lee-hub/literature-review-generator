@@ -329,6 +329,23 @@ def _stage1_status_projection(registry: ArtifactRegistry) -> dict[str, bool]:
     }
 
 
+def _acceptance_budget_state_path(workspace: Any) -> Path:
+    """Resolve the parent budget path in-process or from a child environment."""
+
+    from runtime.provider_runtime import (
+        acceptance_execution_context_from_environment,
+        current_acceptance_execution_context,
+    )
+
+    context = (
+        current_acceptance_execution_context()
+        or acceptance_execution_context_from_environment()
+    )
+    if context is not None:
+        return Path(context.provider_budget_state_path)
+    return Path(workspace.log_path("acceptance_budget_state_v1.json"))
+
+
 class AgentRuntimeRunner:
     """Single AI-native state machine layered on the internal stage registry."""
 
@@ -389,7 +406,32 @@ class AgentRuntimeRunner:
         cancel_token: CancelToken | None = None,
         publication_context: Any | None = None,
     ) -> None:
-        resolved = job_spec.resolved_from(origin_dir) if origin_dir is not None else job_spec
+        from runtime.provider_runtime import provider_budget_controller_from_environment
+
+        provider_budget_controller_from_environment()
+        if origin_dir is not None:
+            resolved = job_spec.resolved_from(origin_dir)
+        else:
+            resolved = job_spec
+            # ``queue_file`` has a historical relative default, while direct
+            # RuntimeJobSpec callers commonly provide an absolute config and
+            # source path without a spec-file origin.  Canonicalize only that
+            # implicit default against the explicit config origin; user-supplied
+            # relative paths remain rejected below instead of silently binding
+            # to the process CWD.
+            default_queue_file = str(
+                RuntimeJobSpec.__dataclass_fields__["queue_file"].default
+            )
+            if (
+                resolved.queue_file == default_queue_file
+                and Path(resolved.config).expanduser().is_absolute()
+            ):
+                resolved = replace(
+                    resolved,
+                    queue_file=str(
+                        Path(resolved.config).expanduser().parent / default_queue_file
+                    ),
+                )
         self._require_explicit_path_origins(resolved)
         resolved.validate()
         self.job_spec = resolved
@@ -431,10 +473,34 @@ class AgentRuntimeRunner:
         requested_stages = metadata.get("requested_stages")
         from config_loader import load_config
         from services.settings import ApplicationSettings
+        from runtime.provider_routes import build_reachable_provider_route_plan
         from runtime.stage_planning import StagePlanError, build_stage_plan
+        from runtime.test_dependencies import current_runtime_test_dependencies
+        from runtime.trust_admission import (
+            ExternalHostAdmissionError,
+            build_external_host_policy,
+            validate_external_host_acknowledgement,
+        )
 
         try:
-            settings = ApplicationSettings.from_config(load_config(self.job_spec.config))
+            free_mode_enabled = bool(
+                self.job_spec.free_mode_profile
+                or self.job_spec.free_mode_idea
+                or metadata.get("free_mode_input")
+            )
+            test_dependencies = current_runtime_test_dependencies()
+            if test_dependencies is not None:
+                test_dependencies.validate()
+            resolved_config = load_config(
+                self.job_spec.config,
+                action=self.job_spec.action,
+                requested_stages=requested_stages,
+                free_mode_enabled=free_mode_enabled,
+                allow_template_credentials=bool(
+                    test_dependencies and test_dependencies.allow_template_credentials
+                ),
+            )
+            settings = ApplicationSettings.from_config(resolved_config)
             plan = build_stage_plan(
                 action=self.job_spec.action,
                 requested_stages=requested_stages,
@@ -445,7 +511,25 @@ class AgentRuntimeRunner:
                     "allow_unvalidated_when_validation_optional"
                 ),
             )
-        except (StagePlanError, OSError, ValueError) as exc:
+            # Only an explicitly injected, in-process test adapter may omit
+            # external-host acknowledgement.  Ordinary environment variables
+            # are never an authority boundary for production run/resume.
+            if test_dependencies is None:
+                policy = build_external_host_policy(
+                    resolved_config,
+                    build_reachable_provider_route_plan(
+                        resolved_config,
+                        action=self.job_spec.action,
+                        requested_stages=requested_stages,
+                        free_mode_enabled=free_mode_enabled,
+                        stage_plan=plan,
+                    ),
+                )
+                validate_external_host_acknowledgement(
+                    policy,
+                    metadata.get("external_host_acknowledgement"),
+                )
+        except (StagePlanError, ExternalHostAdmissionError, OSError, ValueError) as exc:
             raise RuntimeRunnerError(str(exc)) from exc
         metadata["requested_stages"] = list(plan.requested_stages)
         metadata["validation_required"] = plan.validation_required
@@ -995,6 +1079,16 @@ class AgentRuntimeRunner:
             except AttemptAlreadyRunningError as exc:
                 raise RuntimeRunnerError(f"run rejected: {exc}") from exc
         try:
+            from runtime.provider_runtime import provider_budget_controller_from_environment
+
+            acceptance_budget = provider_budget_controller_from_environment()
+            if acceptance_budget is not None:
+                acceptance_state_path = _acceptance_budget_state_path(
+                    session.context.workspace
+                )
+                acceptance_budget.bind_state_path(
+                    acceptance_state_path
+                )
             return self._execute_with_lease(
                 session=session,
                 spec=spec,
@@ -1073,6 +1167,19 @@ class AgentRuntimeRunner:
 
         try:
             bundle = bridge.build_source_bundle()
+            f1_binding = spec.metadata.get("f1_corpus_binding")
+            if f1_binding is not None:
+                from runtime.source_intake import validate_f1_corpus_source_bundle
+
+                if not isinstance(f1_binding, Mapping):
+                    raise RuntimeRunnerError("f1_corpus_binding must be a mapping")
+                # This happens before source publication, preprocessing, OCR,
+                # MinerU, or provider construction. The helper infers C/D/Q
+                # from the bound selection cardinality and reopens every PDF.
+                bundle = validate_f1_corpus_source_bundle(
+                    bundle,
+                    binding=f1_binding,
+                )
             reconciler = RuntimeReconciler(
                 session.context.workspace,
                 session.context.registry,

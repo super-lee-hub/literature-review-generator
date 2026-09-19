@@ -1,0 +1,48 @@
+{
+  "artifact_type": "f1_aihubmix_llm_recovery_probe",
+  "artifact_version": "v1",
+  "observed_at_utc": "2026-09-19T15:40:00Z",
+  "gateway": "aihubmix.com",
+  "user_reported_account_action": "AihubMix asynchronous tasks enabled",
+  "candidate_probe": {
+    "model": "claude-opus-5",
+    "request_bytes": 183935,
+    "transport_status": "failed",
+    "error_kind": "transient_network",
+    "message_class": "ProxyError_RemoteDisconnected",
+    "local_provider_receipt": false
+  },
+  "recovery_queries": {
+    "model_filtered": {
+      "endpoint": "/ai/v1/tasks?object=llm&model=claude-opus-5&limit=20&order=desc",
+      "http_status": 200,
+      "task_count": 0
+    },
+    "all_llm": {
+      "endpoint": "/ai/v1/tasks?object=llm&limit=100&order=desc",
+      "http_status": 200,
+      "task_count": 0
+    },
+    "post_probe_poll": {
+      "poll_count": 12,
+      "interval_seconds": 15,
+      "http_statuses": [200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200],
+      "task_counts": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    },
+    "dashboard_tid_detail_checks": [
+      {"tid": "2026091914083058209367051712364", "http_status": 404},
+      {"tid": "2026091914103613156241741542034", "http_status": 404}
+    ]
+  },
+  "interpretation": {
+    "status": "RECOVERY_NOT_OBSERVED",
+    "meaning": "No recoverable LLM task or task-content endpoint was visible to the API key after the new disconnected candidate probe.",
+    "not_claimed": [
+      "does not prove the provider discarded the upstream output",
+      "does not convert dashboard billing/output rows into a local acceptance receipt",
+      "does not mark Gate F or Q as passed"
+    ],
+    "next_required_evidence": "A task visible through this API key, or a provider-returned response delivered to the local runtime and closed through Registry receipt validation."
+  },
+  "official_reference": "https://docs.aihubmix.com/cn/api/async-tasks"
+}

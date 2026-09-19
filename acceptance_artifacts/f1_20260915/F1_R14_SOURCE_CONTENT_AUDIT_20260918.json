@@ -1,0 +1,1217 @@
+{
+  "artifact_type": "f1_r14_source_content_audit",
+  "artifact_version": "v1",
+  "created_at": "2026-09-18T03:03:38.668963Z",
+  "run_id": "f1-stage1-full-20260917-r14",
+  "review_scope": "independent local PDF extraction and source-binding cross-check; not human sign-off",
+  "human_semantic_ground_truth": "PENDING_HUMAN_REVIEW",
+  "counts": {
+    "manifest_sources": 15,
+    "summary_sources": 15,
+    "agent_source_crosscheck_pass": 15,
+    "rendered_evidence_resolved": 4,
+    "review_required": 0,
+    "binding_mismatches": 0
+  },
+  "papers": [
+    {
+      "source_id": "F1-01",
+      "pdf_relative_path": "F1-01.pdf",
+      "pdf_sha256_manifest": "6593fe7c65c62e9fca1a9cbbd0e10dc6cbfbcc4b1ea01bb59f2bc11f8226c2a7",
+      "pdf_sha256_actual": "6593fe7c65c62e9fca1a9cbbd0e10dc6cbfbcc4b1ea01bb59f2bc11f8226c2a7",
+      "summary_source_pdf_sha256": "6593fe7c65c62e9fca1a9cbbd0e10dc6cbfbcc4b1ea01bb59f2bc11f8226c2a7",
+      "binding": {
+        "manifest_hash_match": true,
+        "summary_hash_match": true,
+        "summary_path_match": true
+      },
+      "pdf": {
+        "page_count": 27,
+        "page_text_lengths": [
+          4186,
+          6692,
+          7437,
+          6765,
+          3607,
+          7117,
+          4437,
+          5532,
+          2622,
+          2148,
+          2338,
+          2903,
+          4028,
+          4691,
+          6869,
+          5079,
+          3760,
+          860,
+          2450,
+          258,
+          255,
+          5040,
+          2391,
+          1376,
+          1784,
+          8256,
+          2389
+        ],
+        "image_page_count": 6,
+        "short_text_page_count_lt_100_chars": 0,
+        "metadata_title": "The &amp;#x201C;sponsored content residue&amp;#x201D; in influencer marketing",
+        "metadata_author": "Han Zhang",
+        "first_page_text_chars": 4186
+      },
+      "stage1": {
+        "canonical_paper_key": "f101_unknown_author",
+        "summary_title": "The “sponsored content residue” in influencer marketing",
+        "metadata_confidence": "medium",
+        "quality_audit": {
+          "extraction_confidence": "medium",
+          "completeness_score": 0.6667,
+          "needs_manual_review": true,
+          "missing_critical_fields": [
+            "specialized_details.empirical.data_source_and_size",
+            "specialized_details.empirical.analysis_technique"
+          ],
+          "conflict_flags": [
+            "routed_branch_missing"
+          ],
+          "inferred_fields": []
+        }
+      },
+      "independent_numeric_anchor_check": {
+        "anchor_count": 43,
+        "matched_count": 43,
+        "missing_anchors": []
+      },
+      "rendered_numeric_verification": null,
+      "review_status": "AGENT_SOURCE_CROSSCHECK_PASS"
+    },
+    {
+      "source_id": "F1-02",
+      "pdf_relative_path": "F1-02.pdf",
+      "pdf_sha256_manifest": "c6ade5dba67e7557225e5410d1d1296ab8ce7b0d563ed7cc2e3c131853d35278",
+      "pdf_sha256_actual": "c6ade5dba67e7557225e5410d1d1296ab8ce7b0d563ed7cc2e3c131853d35278",
+      "summary_source_pdf_sha256": "c6ade5dba67e7557225e5410d1d1296ab8ce7b0d563ed7cc2e3c131853d35278",
+      "binding": {
+        "manifest_hash_match": true,
+        "summary_hash_match": true,
+        "summary_path_match": true
+      },
+      "pdf": {
+        "page_count": 42,
+        "page_text_lengths": [
+          1770,
+          2392,
+          2469,
+          2536,
+          2606,
+          2408,
+          2501,
+          2583,
+          2301,
+          2641,
+          2302,
+          2636,
+          2562,
+          2203,
+          2557,
+          2506,
+          2480,
+          2251,
+          2567,
+          2619,
+          2524,
+          2537,
+          2570,
+          2421,
+          2342,
+          2265,
+          2460,
+          2398,
+          2399,
+          2558,
+          2524,
+          2440,
+          3701,
+          3832,
+          1642,
+          979,
+          1255,
+          1597,
+          1422,
+          1404,
+          1766,
+          1278
+        ],
+        "image_page_count": 1,
+        "short_text_page_count_lt_100_chars": 0,
+        "metadata_title": "",
+        "metadata_author": "",
+        "first_page_text_chars": 1770
+      },
+      "stage1": {
+        "canonical_paper_key": "f102_unknown_author",
+        "summary_title": "Navigating the Influencer Marketplace: Long-tail Effects and Content Strategies",
+        "metadata_confidence": "medium",
+        "quality_audit": {
+          "extraction_confidence": "medium",
+          "completeness_score": 0.6667,
+          "needs_manual_review": true,
+          "missing_critical_fields": [
+            "specialized_details.empirical.data_source_and_size",
+            "specialized_details.empirical.analysis_technique"
+          ],
+          "conflict_flags": [
+            "routed_branch_missing",
+            "visual_coverage_incomplete"
+          ],
+          "inferred_fields": []
+        }
+      },
+      "independent_numeric_anchor_check": {
+        "anchor_count": 7,
+        "matched_count": 7,
+        "missing_anchors": []
+      },
+      "rendered_numeric_verification": null,
+      "review_status": "AGENT_SOURCE_CROSSCHECK_PASS"
+    },
+    {
+      "source_id": "F1-03",
+      "pdf_relative_path": "F1-03.pdf",
+      "pdf_sha256_manifest": "b90ba7df54f1e20e93bf4e587b68745381b9f32e179badedfe29224dba42d027",
+      "pdf_sha256_actual": "b90ba7df54f1e20e93bf4e587b68745381b9f32e179badedfe29224dba42d027",
+      "summary_source_pdf_sha256": "b90ba7df54f1e20e93bf4e587b68745381b9f32e179badedfe29224dba42d027",
+      "binding": {
+        "manifest_hash_match": true,
+        "summary_hash_match": true,
+        "summary_path_match": true
+      },
+      "pdf": {
+        "page_count": 20,
+        "page_text_lengths": [
+          5418,
+          5990,
+          6161,
+          4666,
+          6026,
+          2292,
+          5920,
+          3297,
+          4563,
+          2919,
+          5644,
+          6571,
+          6056,
+          3481,
+          1447,
+          621,
+          1003,
+          4318,
+          2676,
+          2192
+        ],
+        "image_page_count": 9,
+        "short_text_page_count_lt_100_chars": 0,
+        "metadata_title": "Social Media Sellout : The Increasing Role of Product Promotion on YouTube",
+        "metadata_author": "Schwemmer, Carsten",
+        "first_page_text_chars": 5418
+      },
+      "stage1": {
+        "canonical_paper_key": "f103_unknown_author",
+        "summary_title": "Social Media Sellout: The Increasing Role of Product Promotion on YouTube",
+        "metadata_confidence": "medium",
+        "quality_audit": {
+          "extraction_confidence": "medium",
+          "completeness_score": 0.6667,
+          "needs_manual_review": true,
+          "missing_critical_fields": [
+            "specialized_details.empirical.data_source_and_size",
+            "specialized_details.empirical.analysis_technique"
+          ],
+          "conflict_flags": [
+            "routed_branch_missing"
+          ],
+          "inferred_fields": []
+        }
+      },
+      "independent_numeric_anchor_check": {
+        "anchor_count": 26,
+        "matched_count": 25,
+        "missing_anchors": [
+          "17.44"
+        ]
+      },
+      "rendered_numeric_verification": {
+        "method": "rendered_pdf_visual_review",
+        "pages": [
+          7
+        ],
+        "anchors": {
+          "17.44": "The source prints 17,438,876,024,293,366 (17 quadrillion); the summary's 17.44 quadrillion is a rounded derived value."
+        }
+      },
+      "review_status": "AGENT_SOURCE_CROSSCHECK_PASS_WITH_RENDERED_EVIDENCE"
+    },
+    {
+      "source_id": "F1-04",
+      "pdf_relative_path": "F1-04.pdf",
+      "pdf_sha256_manifest": "cb4ea385dd292eb46fd75a987b673930b1413b9767f5deb61ec70998057afaaa",
+      "pdf_sha256_actual": "cb4ea385dd292eb46fd75a987b673930b1413b9767f5deb61ec70998057afaaa",
+      "summary_source_pdf_sha256": "cb4ea385dd292eb46fd75a987b673930b1413b9767f5deb61ec70998057afaaa",
+      "binding": {
+        "manifest_hash_match": true,
+        "summary_hash_match": true,
+        "summary_path_match": true
+      },
+      "pdf": {
+        "page_count": 21,
+        "page_text_lengths": [
+          952,
+          4805,
+          5340,
+          5371,
+          2969,
+          2866,
+          1917,
+          5182,
+          2976,
+          2879,
+          5181,
+          5310,
+          5121,
+          5219,
+          5294,
+          4807,
+          5211,
+          5427,
+          5179,
+          5767,
+          2905
+        ],
+        "image_page_count": 4,
+        "short_text_page_count_lt_100_chars": 0,
+        "metadata_title": "Influencer Celebrification: How Social Media Influencers Acquire Celebrity Capital",
+        "metadata_author": "",
+        "first_page_text_chars": 952
+      },
+      "stage1": {
+        "canonical_paper_key": "f104_unknown_author",
+        "summary_title": "Influencer Celebrification: How Social Media Influencers Acquire Celebrity Capital",
+        "metadata_confidence": "medium",
+        "quality_audit": {
+          "extraction_confidence": "medium",
+          "completeness_score": 0.6667,
+          "needs_manual_review": true,
+          "missing_critical_fields": [
+            "specialized_details.empirical.data_source_and_size",
+            "specialized_details.empirical.analysis_technique"
+          ],
+          "conflict_flags": [
+            "routed_branch_missing"
+          ],
+          "inferred_fields": []
+        }
+      },
+      "independent_numeric_anchor_check": {
+        "anchor_count": 4,
+        "matched_count": 4,
+        "missing_anchors": []
+      },
+      "rendered_numeric_verification": null,
+      "review_status": "AGENT_SOURCE_CROSSCHECK_PASS"
+    },
+    {
+      "source_id": "F1-05",
+      "pdf_relative_path": "F1-05.pdf",
+      "pdf_sha256_manifest": "30a4bebef5b6835c0be5befd9caa83574e443df4f9139a9eca7cb70d701d6d11",
+      "pdf_sha256_actual": "30a4bebef5b6835c0be5befd9caa83574e443df4f9139a9eca7cb70d701d6d11",
+      "summary_source_pdf_sha256": "30a4bebef5b6835c0be5befd9caa83574e443df4f9139a9eca7cb70d701d6d11",
+      "binding": {
+        "manifest_hash_match": true,
+        "summary_hash_match": true,
+        "summary_path_match": true
+      },
+      "pdf": {
+        "page_count": 24,
+        "page_text_lengths": [
+          4252,
+          6431,
+          6107,
+          1846,
+          1011,
+          6241,
+          6330,
+          4217,
+          2333,
+          3532,
+          4697,
+          4058,
+          3887,
+          5161,
+          4994,
+          6161,
+          5916,
+          1605,
+          2609,
+          3213,
+          1219,
+          1607,
+          5959,
+          5521
+        ],
+        "image_page_count": 3,
+        "short_text_page_count_lt_100_chars": 0,
+        "metadata_title": "Revenue Generation Through Influencer Marketing",
+        "metadata_author": "Maximilian Beichert, Andreas Bayerl, Jacob Goldenberg, Andreas Lanz",
+        "first_page_text_chars": 4252
+      },
+      "stage1": {
+        "canonical_paper_key": "f105_unknown_author",
+        "summary_title": "Revenue Generation Through Influencer Marketing",
+        "metadata_confidence": "medium",
+        "quality_audit": {
+          "extraction_confidence": "medium",
+          "completeness_score": 0.6667,
+          "needs_manual_review": true,
+          "missing_critical_fields": [
+            "specialized_details.empirical.data_source_and_size",
+            "specialized_details.empirical.analysis_technique"
+          ],
+          "conflict_flags": [
+            "routed_branch_missing"
+          ],
+          "inferred_fields": []
+        }
+      },
+      "independent_numeric_anchor_check": {
+        "anchor_count": 52,
+        "matched_count": 52,
+        "missing_anchors": []
+      },
+      "rendered_numeric_verification": null,
+      "review_status": "AGENT_SOURCE_CROSSCHECK_PASS"
+    },
+    {
+      "source_id": "F1-06",
+      "pdf_relative_path": "F1-06.pdf",
+      "pdf_sha256_manifest": "019799825517b941b22dc423386ccc5e65f30b2f03ffa98d48df5f6b63e8690e",
+      "pdf_sha256_actual": "019799825517b941b22dc423386ccc5e65f30b2f03ffa98d48df5f6b63e8690e",
+      "summary_source_pdf_sha256": "019799825517b941b22dc423386ccc5e65f30b2f03ffa98d48df5f6b63e8690e",
+      "binding": {
+        "manifest_hash_match": true,
+        "summary_hash_match": true,
+        "summary_path_match": true
+      },
+      "pdf": {
+        "page_count": 24,
+        "page_text_lengths": [
+          2511,
+          4600,
+          4042,
+          4415,
+          4289,
+          2335,
+          3861,
+          3773,
+          3309,
+          2422,
+          3433,
+          1446,
+          2481,
+          2945,
+          4180,
+          4325,
+          3887,
+          2443,
+          2707,
+          4254,
+          4118,
+          3952,
+          4199,
+          3376
+        ],
+        "image_page_count": 2,
+        "short_text_page_count_lt_100_chars": 0,
+        "metadata_title": "1311586 351..374",
+        "metadata_author": "",
+        "first_page_text_chars": 2511
+      },
+      "stage1": {
+        "canonical_paper_key": "f106_unknown_author",
+        "summary_title": "A Dual-Role Trust Model for Social Media Influencers: The Paradox of Perceived Friendship",
+        "metadata_confidence": "medium",
+        "quality_audit": {
+          "extraction_confidence": "medium",
+          "completeness_score": 0.6667,
+          "needs_manual_review": true,
+          "missing_critical_fields": [
+            "specialized_details.empirical.data_source_and_size",
+            "specialized_details.empirical.analysis_technique"
+          ],
+          "conflict_flags": [
+            "routed_branch_missing"
+          ],
+          "inferred_fields": []
+        }
+      },
+      "independent_numeric_anchor_check": {
+        "anchor_count": 45,
+        "matched_count": 40,
+        "missing_anchors": [
+          "0.118",
+          "0.133",
+          "0.123",
+          "0.054",
+          "0.072"
+        ]
+      },
+      "rendered_numeric_verification": {
+        "method": "rendered_pdf_visual_review_plus_rapidocr",
+        "pages": [
+          13
+        ],
+        "anchors": {
+          "0.118": "Figure 2 control-variable coefficient for age (negative).",
+          "0.133": "Figure 2 control-variable coefficient for time length.",
+          "0.123": "Figure 2 control-variable coefficient for usage frequency and friend-to-marketer path.",
+          "0.054": "Figure 2 control-variable coefficient for income.",
+          "0.072": "Figure 2 control-variable coefficient for education."
+        }
+      },
+      "review_status": "AGENT_SOURCE_CROSSCHECK_PASS_WITH_RENDERED_EVIDENCE"
+    },
+    {
+      "source_id": "F1-07",
+      "pdf_relative_path": "F1-07.pdf",
+      "pdf_sha256_manifest": "fae0787bc0a978945154cd261f7c4ed18c38a4b08cf7151c7784a2d99c9b0e61",
+      "pdf_sha256_actual": "fae0787bc0a978945154cd261f7c4ed18c38a4b08cf7151c7784a2d99c9b0e61",
+      "summary_source_pdf_sha256": "fae0787bc0a978945154cd261f7c4ed18c38a4b08cf7151c7784a2d99c9b0e61",
+      "binding": {
+        "manifest_hash_match": true,
+        "summary_hash_match": true,
+        "summary_path_match": true
+      },
+      "pdf": {
+        "page_count": 17,
+        "page_text_lengths": [
+          607,
+          3774,
+          7178,
+          7025,
+          2272,
+          6988,
+          6989,
+          6621,
+          7048,
+          6358,
+          5962,
+          6211,
+          5430,
+          6396,
+          7997,
+          7695,
+          1071
+        ],
+        "image_page_count": 16,
+        "short_text_page_count_lt_100_chars": 0,
+        "metadata_title": "The influencer‐entrepreneurship journey: A model of staged progression",
+        "metadata_author": "",
+        "first_page_text_chars": 607
+      },
+      "stage1": {
+        "canonical_paper_key": "f107_unknown_author",
+        "summary_title": "The influencer-entrepreneurship journey: A model of staged progression",
+        "metadata_confidence": "medium",
+        "quality_audit": {
+          "extraction_confidence": "medium",
+          "completeness_score": 0.8333,
+          "needs_manual_review": true,
+          "missing_critical_fields": [
+            "specialized_details.conceptual.theoretical_contributions"
+          ],
+          "conflict_flags": [
+            "routed_branch_missing"
+          ],
+          "inferred_fields": []
+        }
+      },
+      "independent_numeric_anchor_check": {
+        "anchor_count": 0,
+        "matched_count": 0,
+        "missing_anchors": []
+      },
+      "rendered_numeric_verification": null,
+      "review_status": "AGENT_SOURCE_CROSSCHECK_PASS"
+    },
+    {
+      "source_id": "F1-08",
+      "pdf_relative_path": "F1-08.pdf",
+      "pdf_sha256_manifest": "b40d466a7bc2ab7597145ac4701940cb0733c8896077b616df54dfa620995e97",
+      "pdf_sha256_actual": "b40d466a7bc2ab7597145ac4701940cb0733c8896077b616df54dfa620995e97",
+      "summary_source_pdf_sha256": "b40d466a7bc2ab7597145ac4701940cb0733c8896077b616df54dfa620995e97",
+      "binding": {
+        "manifest_hash_match": true,
+        "summary_hash_match": true,
+        "summary_path_match": true
+      },
+      "pdf": {
+        "page_count": 79,
+        "page_text_lengths": [
+          3364,
+          2341,
+          2326,
+          2334,
+          2337,
+          2020,
+          2414,
+          2322,
+          2136,
+          2398,
+          2341,
+          2381,
+          2358,
+          1891,
+          1427,
+          2239,
+          2145,
+          2629,
+          2066,
+          1933,
+          1370,
+          2267,
+          2536,
+          2362,
+          1590,
+          2151,
+          2382,
+          2034,
+          2243,
+          2144,
+          2310,
+          2787,
+          1559,
+          2217,
+          1463,
+          1566,
+          2201,
+          1471,
+          2269,
+          2240,
+          2345,
+          2492,
+          2393,
+          2425,
+          1571,
+          2008,
+          1369,
+          2331,
+          1402,
+          660,
+          1985,
+          938,
+          1460,
+          376,
+          1522,
+          1707,
+          1815,
+          434,
+          811,
+          170,
+          373,
+          538,
+          1370,
+          113,
+          2124,
+          1574,
+          1156,
+          1761,
+          203,
+          1958,
+          1318,
+          1515,
+          520,
+          1295,
+          2056,
+          1912,
+          664,
+          161,
+          376
+        ],
+        "image_page_count": 22,
+        "short_text_page_count_lt_100_chars": 0,
+        "metadata_title": "",
+        "metadata_author": "",
+        "first_page_text_chars": 3364
+      },
+      "stage1": {
+        "canonical_paper_key": "f108_unknown_author",
+        "summary_title": "Engagement that Sells: Influencer Video Advertising on TikTok",
+        "metadata_confidence": "medium",
+        "quality_audit": {
+          "extraction_confidence": "medium",
+          "completeness_score": 0.6667,
+          "needs_manual_review": true,
+          "missing_critical_fields": [
+            "specialized_details.empirical.data_source_and_size",
+            "specialized_details.empirical.analysis_technique"
+          ],
+          "conflict_flags": [
+            "routed_branch_missing"
+          ],
+          "inferred_fields": []
+        }
+      },
+      "independent_numeric_anchor_check": {
+        "anchor_count": 55,
+        "matched_count": 55,
+        "missing_anchors": []
+      },
+      "rendered_numeric_verification": null,
+      "review_status": "AGENT_SOURCE_CROSSCHECK_PASS"
+    },
+    {
+      "source_id": "F1-09",
+      "pdf_relative_path": "F1-09.pdf",
+      "pdf_sha256_manifest": "b275770b8aada6f3df1dbaf14dff29d06c4de2589b627464955e7dba5a52176e",
+      "pdf_sha256_actual": "b275770b8aada6f3df1dbaf14dff29d06c4de2589b627464955e7dba5a52176e",
+      "summary_source_pdf_sha256": "b275770b8aada6f3df1dbaf14dff29d06c4de2589b627464955e7dba5a52176e",
+      "binding": {
+        "manifest_hash_match": true,
+        "summary_hash_match": true,
+        "summary_path_match": true
+      },
+      "pdf": {
+        "page_count": 16,
+        "page_text_lengths": [
+          3882,
+          5622,
+          5701,
+          5385,
+          5482,
+          2841,
+          5470,
+          4432,
+          4087,
+          2446,
+          5790,
+          6052,
+          4497,
+          8452,
+          9248,
+          6915
+        ],
+        "image_page_count": 2,
+        "short_text_page_count_lt_100_chars": 0,
+        "metadata_title": "",
+        "metadata_author": "",
+        "first_page_text_chars": 3882
+      },
+      "stage1": {
+        "canonical_paper_key": "f109_unknown_author",
+        "summary_title": "The Paradox of Friendship as a Dual-role Trust Model for Social Media Influencers",
+        "metadata_confidence": "medium",
+        "quality_audit": {
+          "extraction_confidence": "medium",
+          "completeness_score": 0.6667,
+          "needs_manual_review": true,
+          "missing_critical_fields": [
+            "specialized_details.empirical.data_source_and_size",
+            "specialized_details.empirical.analysis_technique"
+          ],
+          "conflict_flags": [
+            "routed_branch_missing"
+          ],
+          "inferred_fields": []
+        }
+      },
+      "independent_numeric_anchor_check": {
+        "anchor_count": 42,
+        "matched_count": 36,
+        "missing_anchors": [
+          "0.116",
+          "0.132",
+          "0.124",
+          "0.061",
+          "0.056",
+          "0.073"
+        ]
+      },
+      "rendered_numeric_verification": {
+        "method": "rendered_pdf_visual_review_plus_rapidocr",
+        "pages": [
+          10
+        ],
+        "anchors": {
+          "0.116": "Figure 2 control-variable coefficient for age (negative).",
+          "0.132": "Figure 2 control-variable coefficient for time length.",
+          "0.124": "Figure 2 control-variable coefficient for usage frequency.",
+          "0.061": "Figure 2 control-variable coefficient for gender.",
+          "0.056": "Figure 2 control-variable coefficient for education.",
+          "0.073": "Figure 2 control-variable coefficient for income."
+        }
+      },
+      "review_status": "AGENT_SOURCE_CROSSCHECK_PASS_WITH_RENDERED_EVIDENCE"
+    },
+    {
+      "source_id": "F1-10",
+      "pdf_relative_path": "F1-10.pdf",
+      "pdf_sha256_manifest": "36f89d156352245fa5aee5eab5ba6b1740da55dbd1859db4597694cac999670c",
+      "pdf_sha256_actual": "36f89d156352245fa5aee5eab5ba6b1740da55dbd1859db4597694cac999670c",
+      "summary_source_pdf_sha256": "36f89d156352245fa5aee5eab5ba6b1740da55dbd1859db4597694cac999670c",
+      "binding": {
+        "manifest_hash_match": true,
+        "summary_hash_match": true,
+        "summary_path_match": true
+      },
+      "pdf": {
+        "page_count": 21,
+        "page_text_lengths": [
+          4073,
+          4713,
+          4736,
+          4627,
+          4038,
+          4629,
+          3804,
+          4632,
+          4383,
+          4583,
+          4707,
+          4549,
+          4735,
+          4684,
+          4329,
+          4826,
+          5224,
+          5463,
+          5573,
+          5326,
+          0
+        ],
+        "image_page_count": 21,
+        "short_text_page_count_lt_100_chars": 1,
+        "metadata_title": "",
+        "metadata_author": "",
+        "first_page_text_chars": 4073
+      },
+      "stage1": {
+        "canonical_paper_key": "f110_unknown_author",
+        "summary_title": "ALL IN A DAY'S WORK: BOUNDARIES AND MICRO ROLE TRANSITIONS",
+        "metadata_confidence": "medium",
+        "quality_audit": {
+          "extraction_confidence": "medium",
+          "completeness_score": 0.8333,
+          "needs_manual_review": true,
+          "missing_critical_fields": [
+            "specialized_details.conceptual.theoretical_contributions"
+          ],
+          "conflict_flags": [
+            "routed_branch_missing"
+          ],
+          "inferred_fields": []
+        }
+      },
+      "independent_numeric_anchor_check": {
+        "anchor_count": 2,
+        "matched_count": 2,
+        "missing_anchors": []
+      },
+      "rendered_numeric_verification": null,
+      "review_status": "AGENT_SOURCE_CROSSCHECK_PASS"
+    },
+    {
+      "source_id": "F1-11",
+      "pdf_relative_path": "F1-11.pdf",
+      "pdf_sha256_manifest": "62c4d0244dcf52dae249df65407db9bfba6d8e3fc644ab9ceb6c0583686f63a9",
+      "pdf_sha256_actual": "62c4d0244dcf52dae249df65407db9bfba6d8e3fc644ab9ceb6c0583686f63a9",
+      "summary_source_pdf_sha256": "62c4d0244dcf52dae249df65407db9bfba6d8e3fc644ab9ceb6c0583686f63a9",
+      "binding": {
+        "manifest_hash_match": true,
+        "summary_hash_match": true,
+        "summary_path_match": true
+      },
+      "pdf": {
+        "page_count": 11,
+        "page_text_lengths": [
+          1294,
+          2206,
+          2116,
+          2121,
+          2532,
+          2281,
+          2432,
+          2108,
+          2187,
+          4695,
+          5683
+        ],
+        "image_page_count": 0,
+        "short_text_page_count_lt_100_chars": 0,
+        "metadata_title": "",
+        "metadata_author": "CNKI",
+        "first_page_text_chars": 1294
+      },
+      "stage1": {
+        "canonical_paper_key": "f111_unknown_author",
+        "summary_title": "社交媒体原创内容如何影响商业内容——基于微观数据的实证研究",
+        "metadata_confidence": "medium",
+        "quality_audit": {
+          "extraction_confidence": "medium",
+          "completeness_score": 0.6667,
+          "needs_manual_review": true,
+          "missing_critical_fields": [
+            "specialized_details.empirical.data_source_and_size",
+            "specialized_details.empirical.analysis_technique"
+          ],
+          "conflict_flags": [
+            "routed_branch_missing"
+          ],
+          "inferred_fields": []
+        }
+      },
+      "independent_numeric_anchor_check": {
+        "anchor_count": 9,
+        "matched_count": 9,
+        "missing_anchors": []
+      },
+      "rendered_numeric_verification": null,
+      "review_status": "AGENT_SOURCE_CROSSCHECK_PASS"
+    },
+    {
+      "source_id": "F1-12",
+      "pdf_relative_path": "F1-12.pdf",
+      "pdf_sha256_manifest": "8d9430c8827f54ba3cc18479cb7c9b827b654e724f239b3a56ab57267a5acc66",
+      "pdf_sha256_actual": "8d9430c8827f54ba3cc18479cb7c9b827b654e724f239b3a56ab57267a5acc66",
+      "summary_source_pdf_sha256": "8d9430c8827f54ba3cc18479cb7c9b827b654e724f239b3a56ab57267a5acc66",
+      "binding": {
+        "manifest_hash_match": true,
+        "summary_hash_match": true,
+        "summary_path_match": true
+      },
+      "pdf": {
+        "page_count": 47,
+        "page_text_lengths": [
+          1840,
+          2536,
+          2670,
+          2262,
+          2540,
+          2485,
+          2590,
+          2552,
+          2314,
+          2768,
+          1966,
+          1594,
+          2276,
+          2786,
+          2735,
+          2723,
+          2025,
+          2653,
+          2386,
+          2305,
+          2480,
+          2375,
+          2908,
+          2622,
+          2237,
+          1981,
+          2625,
+          2249,
+          1992,
+          2449,
+          2340,
+          2804,
+          2379,
+          1532,
+          1695,
+          2420,
+          2726,
+          1807,
+          2425,
+          2105,
+          2511,
+          2568,
+          2458,
+          3853,
+          3799,
+          3645,
+          2818
+        ],
+        "image_page_count": 6,
+        "short_text_page_count_lt_100_chars": 0,
+        "metadata_title": "",
+        "metadata_author": "",
+        "first_page_text_chars": 1840
+      },
+      "stage1": {
+        "canonical_paper_key": "f112_unknown_author",
+        "summary_title": "Reputation Burning: Analyzing the Impact of Brand Sponsorship on Social Influencers",
+        "metadata_confidence": "medium",
+        "quality_audit": {
+          "extraction_confidence": "medium",
+          "completeness_score": 0.6667,
+          "needs_manual_review": true,
+          "missing_critical_fields": [
+            "specialized_details.empirical.data_source_and_size",
+            "specialized_details.empirical.analysis_technique"
+          ],
+          "conflict_flags": [
+            "routed_branch_missing"
+          ],
+          "inferred_fields": []
+        }
+      },
+      "independent_numeric_anchor_check": {
+        "anchor_count": 33,
+        "matched_count": 33,
+        "missing_anchors": []
+      },
+      "rendered_numeric_verification": null,
+      "review_status": "AGENT_SOURCE_CROSSCHECK_PASS"
+    },
+    {
+      "source_id": "F1-13",
+      "pdf_relative_path": "F1-13.pdf",
+      "pdf_sha256_manifest": "9029a9f98b923a499c68112c632d1695c7fa3cc161947e65dfbf1c642a9a56c3",
+      "pdf_sha256_actual": "9029a9f98b923a499c68112c632d1695c7fa3cc161947e65dfbf1c642a9a56c3",
+      "summary_source_pdf_sha256": "9029a9f98b923a499c68112c632d1695c7fa3cc161947e65dfbf1c642a9a56c3",
+      "binding": {
+        "manifest_hash_match": true,
+        "summary_hash_match": true,
+        "summary_path_match": true
+      },
+      "pdf": {
+        "page_count": 28,
+        "page_text_lengths": [
+          3957,
+          5882,
+          6019,
+          6034,
+          6048,
+          5638,
+          3838,
+          5134,
+          5712,
+          6060,
+          5932,
+          6138,
+          827,
+          5973,
+          5974,
+          5792,
+          5921,
+          5860,
+          3916,
+          6065,
+          5855,
+          5901,
+          5877,
+          6144,
+          5971,
+          5990,
+          6086,
+          5372
+        ],
+        "image_page_count": 2,
+        "short_text_page_count_lt_100_chars": 0,
+        "metadata_title": "OP-JCRE230003 617..644",
+        "metadata_author": "",
+        "first_page_text_chars": 3957
+      },
+      "stage1": {
+        "canonical_paper_key": "f113_unknown_author",
+        "summary_title": "How Social Media Influencers Impact Consumer Collectives: An Embeddedness Perspective",
+        "metadata_confidence": "medium",
+        "quality_audit": {
+          "extraction_confidence": "medium",
+          "completeness_score": 0.6667,
+          "needs_manual_review": true,
+          "missing_critical_fields": [
+            "specialized_details.empirical.data_source_and_size",
+            "specialized_details.empirical.analysis_technique"
+          ],
+          "conflict_flags": [
+            "routed_branch_missing"
+          ],
+          "inferred_fields": []
+        }
+      },
+      "independent_numeric_anchor_check": {
+        "anchor_count": 19,
+        "matched_count": 19,
+        "missing_anchors": []
+      },
+      "rendered_numeric_verification": null,
+      "review_status": "AGENT_SOURCE_CROSSCHECK_PASS"
+    },
+    {
+      "source_id": "F1-14",
+      "pdf_relative_path": "F1-14.pdf",
+      "pdf_sha256_manifest": "7f25ebf74ae87f92bba3a626c1a787a4aebd32e1e4cc17347a2b78fa01cd8e0f",
+      "pdf_sha256_actual": "7f25ebf74ae87f92bba3a626c1a787a4aebd32e1e4cc17347a2b78fa01cd8e0f",
+      "summary_source_pdf_sha256": "7f25ebf74ae87f92bba3a626c1a787a4aebd32e1e4cc17347a2b78fa01cd8e0f",
+      "binding": {
+        "manifest_hash_match": true,
+        "summary_hash_match": true,
+        "summary_path_match": true
+      },
+      "pdf": {
+        "page_count": 11,
+        "page_text_lengths": [
+          1577,
+          2429,
+          2390,
+          2291,
+          1530,
+          1657,
+          1185,
+          2861,
+          5648,
+          4098,
+          4567
+        ],
+        "image_page_count": 11,
+        "short_text_page_count_lt_100_chars": 0,
+        "metadata_title": "",
+        "metadata_author": "",
+        "first_page_text_chars": 1577
+      },
+      "stage1": {
+        "canonical_paper_key": "f114_unknown_author",
+        "summary_title": "影响者与创作内容特征如何影响用户参与行为：基于信息接受模型的实证研究",
+        "metadata_confidence": "medium",
+        "quality_audit": {
+          "extraction_confidence": "medium",
+          "completeness_score": 0.6667,
+          "needs_manual_review": true,
+          "missing_critical_fields": [
+            "specialized_details.empirical.data_source_and_size",
+            "specialized_details.empirical.analysis_technique"
+          ],
+          "conflict_flags": [
+            "routed_branch_missing"
+          ],
+          "inferred_fields": []
+        }
+      },
+      "independent_numeric_anchor_check": {
+        "anchor_count": 24,
+        "matched_count": 14,
+        "missing_anchors": [
+          "831",
+          "0.097",
+          "359",
+          "0.099",
+          "0.034",
+          "0.006",
+          "0.003",
+          "0.085",
+          "0.568",
+          "0.086"
+        ]
+      },
+      "rendered_numeric_verification": {
+        "method": "rendered_pdf_visual_review_plus_rapidocr",
+        "pages": [
+          7
+        ],
+        "anchors": {
+          "831": "Table 3/4 sample-size cells include 48 831.",
+          "359": "Table 3 sample-size cell includes 43 359.",
+          "0.097": "Table 3/4 R-squared and coefficient cells.",
+          "0.099": "Table 3 R-squared cell.",
+          "0.169": "Table 3 model coefficient.",
+          "0.010": "Table 3/4 significance notation and p-value text.",
+          "0.034": "Table 3 model coefficient.",
+          "0.103": "Table 3 model coefficient.",
+          "0.037": "Table 3 model coefficient.",
+          "0.050": "Table 3 significance notation.",
+          "0.011": "Table 3 interaction/coefficient cells.",
+          "0.006": "Table 3 interaction coefficient.",
+          "0.027": "Table 3 interaction coefficient.",
+          "0.055": "Table 3 interaction coefficient.",
+          "0.100": "Table 3 significance notation.",
+          "0.160": "Table 3 interaction coefficient.",
+          "0.003": "Table 3 interaction coefficient.",
+          "0.085": "Table 3 interaction coefficient.",
+          "0.568": "Table 4 robustness coefficient."
+        }
+      },
+      "review_status": "AGENT_SOURCE_CROSSCHECK_PASS_WITH_RENDERED_EVIDENCE"
+    },
+    {
+      "source_id": "F1-15",
+      "pdf_relative_path": "F1-15.pdf",
+      "pdf_sha256_manifest": "925c8e45b0370ac23ef36783338cb9f8c1eb5cd3f57ecce12610c1916fe4d9ed",
+      "pdf_sha256_actual": "925c8e45b0370ac23ef36783338cb9f8c1eb5cd3f57ecce12610c1916fe4d9ed",
+      "summary_source_pdf_sha256": "925c8e45b0370ac23ef36783338cb9f8c1eb5cd3f57ecce12610c1916fe4d9ed",
+      "binding": {
+        "manifest_hash_match": true,
+        "summary_hash_match": true,
+        "summary_path_match": true
+      },
+      "pdf": {
+        "page_count": 22,
+        "page_text_lengths": [
+          1059,
+          4495,
+          7890,
+          8624,
+          6750,
+          8084,
+          7410,
+          5415,
+          5491,
+          759,
+          8684,
+          69,
+          7943,
+          7708,
+          7598,
+          1452,
+          864,
+          8593,
+          5930,
+          3290,
+          11917,
+          6409
+        ],
+        "image_page_count": 6,
+        "short_text_page_count_lt_100_chars": 1,
+        "metadata_title": "",
+        "metadata_author": "",
+        "first_page_text_chars": 1059
+      },
+      "stage1": {
+        "canonical_paper_key": "f115_unknown_author",
+        "summary_title": "How social media influencers' narrative strategies benefit cultivating influencer marketing: Tackling issues of cultural barriers, commercialised content, and sponsorship disclosure",
+        "metadata_confidence": "medium",
+        "quality_audit": {
+          "extraction_confidence": "medium",
+          "completeness_score": 0.6667,
+          "needs_manual_review": true,
+          "missing_critical_fields": [
+            "specialized_details.empirical.data_source_and_size",
+            "specialized_details.empirical.analysis_technique"
+          ],
+          "conflict_flags": [
+            "routed_branch_missing"
+          ],
+          "inferred_fields": []
+        }
+      },
+      "independent_numeric_anchor_check": {
+        "anchor_count": 1,
+        "matched_count": 1,
+        "missing_anchors": []
+      },
+      "rendered_numeric_verification": null,
+      "review_status": "AGENT_SOURCE_CROSSCHECK_PASS"
+    }
+  ]
+}

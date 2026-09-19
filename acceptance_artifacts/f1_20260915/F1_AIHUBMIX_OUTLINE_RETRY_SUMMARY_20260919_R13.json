@@ -1,0 +1,44 @@
+{
+  "artifact_type": "f1_aihubmix_outline_retry_summary",
+  "artifact_version": "v2",
+  "checked_at_utc": "2026-09-19T13:27:00Z",
+  "final_executable_sha": "d7c4a4d117ff2706aa673f7f0b4cd029cd66cf51",
+  "scope": "Current-SHA Outline-only child; exact 15-paper canonical Stage1 summaries reused; no Stage1 provider calls",
+  "f1_manifest_sha256": "f741776ea2eda6b5937f4fc13e40569216eb3173ff597fb80eeea2e46dab3e90",
+  "canonical_stage1_summary": {
+    "path": "D:/auto-generate/.acceptance_runs/f1_q_local_r3/f1_acceptance_Q_local_parser__f1-acceptance-Q-20260919-local-r3/artifacts/outline_v3/inputs/stage1_summaries_bcb217a040cc20989dbe5071__23cd9861ed9e63a84c70f283.json",
+    "sha256": "23cd9861ed9e63a84c70f283b35411089958902aed275e10f1c1d50b47bd0e87",
+    "paper_count": 15,
+    "stage1_provider_calls_in_this_retry": 0
+  },
+  "request_shape": {
+    "outline_model": "claude-opus-5",
+    "outline_max_output_tokens": 32000,
+    "prior_outline_max_output_tokens": 65536,
+    "route_fingerprint": "8fc1533c7a390a8b889760d64ef1f4b008a7bc592ec1772186e5ff336a51b9cf",
+    "gateway": "aihubmix.com",
+    "original_pdf_transport": "never"
+  },
+  "outline_retry": {
+    "acceptance_run_id": "f1-acceptance-F-outline-aihubmix-r13",
+    "job_id": "f1-acceptance-F-outline-aihubmix-r13",
+    "status": "NOT_VERIFIED",
+    "provider_receipts_persisted": 1,
+    "provider_calls_used": 1,
+    "retry_attempts_used": 0,
+    "failed_node": "relation_adjudication",
+    "failed_http_status": 401,
+    "failed_error_kind": "fatal_config_or_auth",
+    "failed_observation": "Aihubmix rejected the configured key; the provider returned invalid-key authentication failure before any candidate-generation request",
+    "candidate_large_request_attempted": false,
+    "complete_outline_closure": false,
+    "parent_acceptance_status": "NOT_VERIFIED"
+  },
+  "evidence": {
+    "provider_receipt_ledger_path": "D:/auto-generate/.acceptance_runs/f1_q_outline_aihubmix_20260919/f1_q_outline_retry_aihubmix_r13__f1-acceptance-F-outline-aihubmix-r13/artifacts/outline_v3_provider_receipts__7a5788c88d44dda651850c61.jsonl",
+    "provider_receipt_ledger_sha256": "7a5788c88d44dda651850c6117e51a11cd1090e55e3d7f4bf2b4dc03457888d0",
+    "scenario_execution_receipt_sha256": "810e0be8c74c0de43f6073d0cb7ae336a73bf11fd69921556fb286de27923aa6",
+    "parent_acceptance_result_sha256": "839775f2f6319a61f0a244912f21e91287905f36ee0720c83857ddfd2b766e3e",
+    "budget_state_sha256": "6ce0e2e89d047baf7fb3779d12e6e379dd6a2cb4111e66609048e1a34504ccaf"
+  }
+}

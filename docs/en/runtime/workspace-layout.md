@@ -32,13 +32,20 @@ output/<project_name>__<job_id>/
 
 Preprocess cache at `output/_preprocess_cache/`. Common cache files:
 
-- `normalized.md`
-- `plain_text.txt`
-- `page_index.json`
-- `chunks.json`
-- `diagnostics.json`
-- `structured.json`
-- `prepare_manifest.json`
+- `<content-addressed-source-key>/active_generation.json`
+- `<content-addressed-source-key>/<generation>/normalized.md`
+- `<content-addressed-source-key>/<generation>/plain_text.txt`
+- `<content-addressed-source-key>/<generation>/page_index.json`
+- `<content-addressed-source-key>/<generation>/chunks.json`
+- `<content-addressed-source-key>/<generation>/diagnostics.json`
+- `<content-addressed-source-key>/<generation>/structured.json`
+- `<content-addressed-source-key>/<generation>/prepare_manifest.json`
+
+The active pointer is published only after the generation's required files are
+complete, fsynced, schema/fingerprint checked, and hashed. Missing, tampered,
+or fingerprint-incompatible generations are rebuilt through a new staging
+generation; an old active generation is never mixed with partially written
+files.
 
 ## Job Workspace Layout
 

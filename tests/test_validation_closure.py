@@ -180,3 +180,35 @@ def test_provider_closure_accepts_a_declared_output_budget_variant() -> None:
     assert _receipt_matches_expected_binding(expected, row) is True
     row["config_hash"] = "x" * 64
     assert _receipt_matches_expected_binding(expected, row) is False
+
+
+def test_provider_closure_accepts_a_declared_semantic_prompt_variant() -> None:
+    expected = {
+        "attempt_id": "attempt-1",
+        "node_id": "paper:synthesis",
+        "logical_attempt_identity": "attempt-1",
+        "prompt_hash": "p" * 64,
+        "input_hash": "i" * 64,
+        "config_hash": "c" * 64,
+        "schema_hash": "s" * 64,
+        "request_variants": [
+            {
+                "prompt_hash": "q" * 64,
+                "input_hash": "j" * 64,
+                "config_hash": "d" * 64,
+            }
+        ],
+    }
+    row = {
+        "attempt_id": expected["attempt_id"],
+        "node_id": expected["node_id"],
+        "logical_attempt_identity": expected["logical_attempt_identity"],
+        "prompt_hash": "q" * 64,
+        "input_hash": "j" * 64,
+        "config_hash": "d" * 64,
+        "schema_hash": expected["schema_hash"],
+    }
+
+    assert _receipt_matches_expected_binding(expected, row) is True
+    row["prompt_hash"] = "x" * 64
+    assert _receipt_matches_expected_binding(expected, row) is False

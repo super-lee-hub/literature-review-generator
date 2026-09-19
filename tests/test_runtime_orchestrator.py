@@ -41,3 +41,37 @@ def test_agent_runtime_bridge_bootstrap_and_trace(tmp_path: Path) -> None:
     registry = session.context.registry
     assert registry.get("source_bundle") is not None
     assert registry.get("runtime_stage_trace") is not None
+
+
+def test_f1_bound_outline_with_reused_summary_still_intakes_local_pdfs(
+    tmp_path: Path,
+) -> None:
+    pdf_dir = tmp_path / "papers"
+    pdf_dir.mkdir()
+    pdf_path = pdf_dir / "alpha.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n%alpha\n")
+    summary_path = tmp_path / "summary.json"
+    summary_path.write_text("{}", encoding="utf-8")
+
+    bridge = AgentRuntimeBridge(
+        RuntimeJobSpec(
+            project_name="f1-outline-source-intake",
+            source=RuntimeSourceSpec(mode="direct", pdf_folder=str(pdf_dir)),
+            action="generate_outline",
+            config=str(current_config(tmp_path)),
+            summary_file=str(summary_path),
+            metadata={
+                "f1_corpus_binding": {
+                    "schema_version": "f1-corpus-binding-v1",
+                    "manifest_path": str(tmp_path / "manifest.json"),
+                    "manifest_sha256": "a" * 64,
+                    "source_ids": ["F1-01"],
+                }
+            },
+        )
+    )
+    bridge.bootstrap()
+
+    bundle = bridge.build_source_bundle()
+
+    assert [item.source_pdf for item in bundle.paper_work_items] == [str(pdf_path)]

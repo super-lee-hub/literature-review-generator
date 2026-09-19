@@ -294,15 +294,27 @@ class EvidenceResolver:
         # summary hints must not push the real paper windows out of the
         # bounded packet.  Source-grounded candidates fill the window budget
         # first; summary hints only take the remaining slots.
-        grounded = [c for c in candidates if c.resolver_tier != "ai_summary"]
-        hints = [c for c in candidates if c.resolver_tier == "ai_summary"]
+        grounded = [
+            c for c in candidates if c.resolver_tier in SOURCE_GROUNDED_RESOLVER_TIERS
+        ]
+        hints = [c for c in candidates if c.resolver_tier in SUMMARY_HINT_RESOLVER_TIERS]
+        other = [
+            c
+            for c in candidates
+            if c.resolver_tier not in SOURCE_GROUNDED_RESOLVER_TIERS
+            and c.resolver_tier not in SUMMARY_HINT_RESOLVER_TIERS
+        ]
         grounded.sort(key=lambda x: (-x.confidence, x.window_rank))
         hints.sort(key=lambda x: (-x.confidence, x.window_rank))
+        other.sort(key=lambda x: (-x.confidence, x.window_rank))
         max_hints = max(1, min(2, max_windows))
         if grounded:
-            chosen = grounded[: max_windows - max_hints] + hints[:max_hints]
+            chosen = grounded[:max_windows]
+            remaining = max_windows - len(chosen)
+            if remaining > 0:
+                chosen.extend(hints[: min(max_hints, remaining)])
         else:
-            chosen = hints[:max_windows]
+            chosen = hints[:max_windows] if hints else other[:max_windows]
         if not chosen:
             chosen = [
                 c for c in candidates

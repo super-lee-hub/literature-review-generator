@@ -191,6 +191,14 @@ Relative paths resolve from their owning spec, config, or summary file. Runtime
 reconciliation never calls a provider. `SystemExit` and other terminal paths
 persist a durable result before re-raising the original exception.
 
+The runtime.provider_routes.ReachableProviderRoutePlan is the authoritative
+projection from the durable StagePlan and OutlineModels flags to semantic
+provider roles and unique physical routes. Configuration admission, doctor,
+dry preflight, the explicit micro-probe, Outline v3, acceptance state, and
+their reports must use this plan. A missing or incomplete reachable role is a
+configuration failure; an unreachable or disabled role is never silently
+replaced by Outline_API.
+
 ## Outline v3 and control-plane projections
 
 Outline Intelligence v3 is a deterministic, registered DAG. Each node persists

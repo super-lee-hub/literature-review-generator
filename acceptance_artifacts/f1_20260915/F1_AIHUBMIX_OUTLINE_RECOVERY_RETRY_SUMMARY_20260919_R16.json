@@ -1,0 +1,34 @@
+{
+  "artifact_type": "f1_aihubmix_outline_recovery_retry",
+  "artifact_version": "v1",
+  "checked_at_utc": "2026-09-19T15:56:59Z",
+  "executable_sha": "5be593af2d0666a8f07d5ac62032eb09d3e470a6",
+  "gateway": "aihubmix.com",
+  "acceptance_run_id": "f1-acceptance-F-outline-aihubmix-r16",
+  "recovery_enabled": true,
+  "request_shape": {
+    "outline_model": "claude-opus-5",
+    "outline_max_output_tokens": 32000,
+    "canonical_stage1_reused": true,
+    "stage1_provider_calls": 0,
+    "original_pdf_transport": "never"
+  },
+  "result": {
+    "status": "NOT_VERIFIED",
+    "first_provider_node": "relation_adjudication",
+    "http_status": 403,
+    "error_kind": "quota_exhausted",
+    "provider_message_class": "account_balance_insufficient",
+    "provider_tid": "2026091915565775613189009841924",
+    "candidate_request_attempted": false,
+    "recovery_task_created": false,
+    "local_provider_receipt_status": "failed"
+  },
+  "budget_snapshot": {
+    "calls_used": 1,
+    "output_tokens_used": 16000,
+    "retry_attempts_used": 0,
+    "note": "output_tokens_used is the pre-admitted budget reservation; no successful provider usage was reported"
+  },
+  "final_status": "NOT_VERIFIED; AihubMix account balance gate stopped the run before Outline candidate generation"
+}

@@ -1,0 +1,49 @@
+{
+  "schema_version": "release-acceptance-plan-v2",
+  "parent_run_id": "f1-acceptance-D-20260919-auxiliary-policy-r6",
+  "final_executable_sha": "",
+  "state_path": "F1_ACCEPTANCE_PLAN_D_AUXILIARY_STATE_20260919_R6.json",
+  "budget": {
+    "max_provider_calls_total": 3,
+    "max_output_tokens_total": 96000,
+    "max_retry_attempts_total": 3,
+    "max_wall_seconds": 3600
+  },
+  "third_party_acknowledged": true,
+  "third_party_hosts": [
+    "ai.saigou.work",
+    "api.yhlxj.ai",
+    "cdn-mineru.openxlab.org.cn",
+    "mineru.net",
+    "mineru.oss-cn-shanghai.aliyuncs.com"
+  ],
+  "external_host_acknowledgement": {
+    "schema_version": "external-host-acknowledgement-v2",
+    "version": 2,
+    "acknowledged": true,
+    "hosts": [
+      "ai.saigou.work",
+      "api.yhlxj.ai",
+      "cdn-mineru.openxlab.org.cn",
+      "mineru.net",
+      "mineru.oss-cn-shanghai.aliyuncs.com"
+    ],
+    "route_fingerprint": "fa4d7bec1b7f13f4f04d8dc008c55865b55d3c3b7a91524cf50fb4d0af3a31d4",
+    "issued_at": "2026-09-18T09:24:24.3212536Z",
+    "expires_at": "2026-09-24T09:24:24.3212536Z"
+  },
+  "scenarios": {
+    "D": {
+      "scenario_id": "D",
+      "gate": "D",
+      "runtime_spec": "D_RUNTIME_SPEC_20260919_AUXILIARY_POLICY.json",
+      "workspace": "D:/auto-generate/.acceptance_runs/f1_d_auxiliary_policy_r6/f1_acceptance_D_auxiliary_ocr_policy__f1-acceptance-D-20260919-auxiliary-policy-r6",
+      "input_manifest": "D:/auto-generate/.acceptance_inputs/f1_d_20260919/f1_manifest.json",
+      "f1_source_ids": ["F1-01", "F1-03", "F1-14"],
+      "execution_mode": "runtime",
+      "budget_domain": "live",
+      "prerequisites": [],
+      "job_id": "f1-acceptance-D-20260919-auxiliary-policy-r6"
+    }
+  }
+}

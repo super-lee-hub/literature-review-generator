@@ -198,17 +198,16 @@ def test_runtime_and_connection_probe_resolve_the_same_url(monkeypatch) -> None:
 
     captured: list[str] = []
 
-    class _Response:
-        status_code = 200
+    def _fake_probe(api_config: dict[str, Any]) -> dict[str, object]:
+        runtime_url, _headers = anthropic_request_target(
+            str(api_config.get("api_base") or ""),
+            api_config,
+            str(api_config.get("api_key") or ""),
+        )
+        captured.append(runtime_url)
+        return {"status": "success"}
 
-        def json(self) -> dict[str, object]:
-            return {"content": [{"type": "text", "text": "ok"}]}
-
-    def _fake_post(url: str, **_kwargs: object) -> _Response:
-        captured.append(url)
-        return _Response()
-
-    monkeypatch.setattr("config_validator.requests.post", _fake_post)
+    monkeypatch.setattr("config_validator._probe_provider_connection", _fake_probe)
 
     for api_base in ("https://gate.test", "https://gate.test/", "https://gate.test/v1", "https://gate.test/v1/", "https://gate.test/v1/messages"):
         for configured_path in ("", "v1/messages", "/v1/messages"):

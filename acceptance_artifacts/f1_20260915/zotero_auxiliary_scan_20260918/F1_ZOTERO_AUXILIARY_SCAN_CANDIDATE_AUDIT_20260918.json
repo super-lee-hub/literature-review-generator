@@ -1,0 +1,121 @@
+{
+  "artifact_type": "zotero_auxiliary_scan_candidate_audit",
+  "artifact_version": "v1",
+  "created_at": "2026-09-18T14:24:25.5088483Z",
+  "purpose": "Read-only discovery of a real scanned PDF in the user's Zotero library for auxiliary OCR verification.",
+  "scope": {
+    "zotero_database": "D:\\zotero library\\Zotero\\zotero.sqlite",
+    "zotero_storage_root": "D:\\zotero library\\Zotero\\storage",
+    "read_mode": "SQLite URI immutable=1; no Zotero database or attachment writes",
+    "pdf_attachment_rows": 4046,
+    "stored_pdf_attachment_rows": 3139,
+    "stored_pdf_files_found": 3139,
+    "selection_rule": "preprocess.service.py page diagnostic: trimmed extracted text length < 50 and page has at least one embedded image",
+    "f1_d_qualification_rule": "scanned_candidate_pages / page_count >= 0.25"
+  },
+  "candidate": {
+    "attachment_key": "WFX3F52Q",
+    "parent_item_key": "S5DBEWIA",
+    "zotero_title": "The Persuasion Knowledge Model: How People Cope with Persuasion Attempts",
+    "publication_title": "Journal of Consumer Research",
+    "authors": [
+      "Marian Friestad",
+      "Peter Wright"
+    ],
+    "date": "1994-06-01",
+    "volume": "21",
+    "issue": "1",
+    "pages": "1-31",
+    "doi": "10.1086/209380",
+    "source_pdf_path": "D:\\zotero library\\Zotero\\storage\\WFX3F52Q\\1994 - Journal of Consumer Research - Friestad et.al - The Persuasion Knowledge Model How People Cope wi.pdf",
+    "source_pdf_size_bytes": 108395214,
+    "source_pdf_sha256": "14eb5a88d318cbddeb0971b397b5e6b71d2aed9feb9724ae07887bcbad9bb349",
+    "page_count": 62,
+    "text_chars": 0,
+    "text_nonzero_pages": 0,
+    "image_pages": 62,
+    "scanned_candidate_pages": 62,
+    "scanned_candidate_ratio": 1.0,
+    "page_image_count_min": 2,
+    "page_image_count_max": 475,
+    "f1_manifest_membership": "not_present"
+  },
+  "production_diagnostics": {
+    "extractor_used": "fitz",
+    "scanned_like": true,
+    "used_ocr": false,
+    "ocr_available": true,
+    "low_quality_pages": 62,
+    "mineru_attempted": false,
+    "mineru_remote_requested": false,
+    "mineru_remote_enabled": false,
+    "diagnostics_sha256": "00928c21feda20e89ba030300f587a8c47f09c1f018027b97dcc57d017cae489",
+    "diagnostics_path": "acceptance_artifacts/f1_20260915/zotero_auxiliary_scan_20260918/production/diagnostics.json",
+    "page_index_sha256": "d09cf3e26eaf6a4c1c4ce53570d49379fee35b8a9684759579ef5c9b7dcac190",
+    "page_index_path": "acceptance_artifacts/f1_20260915/zotero_auxiliary_scan_20260918/production/page_index.json"
+  },
+  "visual_verification": {
+    "method": "PyMuPDF render followed by visual inspection",
+    "rendered_pages": [
+      {
+        "page": 2,
+        "path": "acceptance_artifacts/f1_20260915/zotero_auxiliary_scan_20260918/renders/page-002.png",
+        "sha256": "d779113f3e0633a6133f2f66f16c59fd18851ae10974d5b81c2f596446d7b904"
+      },
+      {
+        "page": 3,
+        "path": "acceptance_artifacts/f1_20260915/zotero_auxiliary_scan_20260918/renders/page-003.png",
+        "sha256": "e3b895dbc660940e1ab02211f5d78f2f77f4ac7f24b0efbf76f06012d63e48f4"
+      },
+      {
+        "page": 6,
+        "path": "acceptance_artifacts/f1_20260915/zotero_auxiliary_scan_20260918/renders/page-006.png",
+        "sha256": "b248373de3a6fe78e17a4cf9d7aa126add3afb980f97b34afc3c27b3602d4218"
+      },
+      {
+        "page": 32,
+        "path": "acceptance_artifacts/f1_20260915/zotero_auxiliary_scan_20260918/renders/page-032.png",
+        "sha256": "e05cd916db4728ac842bc6fa7f076aac7191ecddd514cbe9f83514baccdf8262"
+      }
+    ],
+    "finding": "Rendered pages contain page-numbered article text, figures, and scan artifacts; this is not a title-only or text-native PDF."
+  },
+  "ocr_verification": {
+    "worker": "python -m preprocess.ocr_worker",
+    "engine": "rapidocr",
+    "sample_pages": [2, 32, 62],
+    "successful_pages": 3,
+    "all_samples_ok": true,
+    "samples": [
+      {
+        "page": 2,
+        "text_chars": 1335,
+        "path": "acceptance_artifacts/f1_20260915/zotero_auxiliary_scan_20260918/ocr-worker-page-002.json",
+        "sha256": "b03e13047220d1d6c16181c65b7f7a013eea311d168a970eab45ae15b0507fbf"
+      },
+      {
+        "page": 32,
+        "text_chars": 1988,
+        "path": "acceptance_artifacts/f1_20260915/zotero_auxiliary_scan_20260918/ocr-samples/page-032.json",
+        "sha256": "c53353ced7b1643b6a356c3fc461e7a204f578225ffb66d796368a1bbd31cf3b"
+      },
+      {
+        "page": 62,
+        "text_chars": 1848,
+        "path": "acceptance_artifacts/f1_20260915/zotero_auxiliary_scan_20260918/ocr-samples/page-062.json",
+        "sha256": "4de7c21e948b872967454e8202ce88512c9c62fa0c7511583b3c25dc7e74e971"
+      }
+    ],
+    "source_pdf_sent_to_external_provider": false
+  },
+  "disposition": {
+    "real_scan_candidate": true,
+    "qualifies_against_f1_d_ratio": true,
+    "is_auxiliary_only": true,
+    "f1_15_corpus_changed": false,
+    "f1_d_status_unchanged": "FAIL_MODALITY for the authorized F1-15 corpus; this Zotero item is not silently substituted into F1 or Q",
+    "human_semantic_ground_truth": "not_provided",
+    "q_status": "not_started_by_this_auxiliary_audit",
+    "next_authorized_use": "Use as an auxiliary OCR/visual regression fixture, or separately authorize adding it to the F1 acceptance corpus before any Q claim."
+  }
+}

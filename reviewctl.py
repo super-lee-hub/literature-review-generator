@@ -13,9 +13,11 @@ from pathlib import Path
 from typing import Any
 
 from runtime.control_plane import ControlPlaneError, ReviewControlPlane
+from runtime.runner import RuntimeRunnerError
 from services.console_io import configure_utf8_stdio, write_ascii_json_line
 from services.queue_service import (
     PersistentQueueService,
+    QueueError,
     QueueJobSpec,
     QueueRunner,
     QueueState,
@@ -52,6 +54,47 @@ def _queue_snapshot(service: PersistentQueueService) -> dict[str, Any]:
             for runtime in service.list_job_runtimes()
         ],
     }
+
+
+def _queue_terminal_results(
+    service: PersistentQueueService,
+    job_ids: list[str],
+) -> list[dict[str, Any]]:
+    """Report each selected job from its durable terminal/runtime record."""
+
+    results: list[dict[str, Any]] = []
+    for job_id in job_ids:
+        runtime = service.get_job_runtime(job_id)
+        if runtime is None:
+            results.append({"job_id": job_id, "state": "missing"})
+            continue
+        results.append(
+            {
+                "job_id": job_id,
+                "state": runtime.state.value,
+                "exit_code": (
+                    (runtime.result_summary or {}).get("exit_code")
+                    if isinstance(runtime.result_summary, dict)
+                    else None
+                ),
+                "error_message": runtime.error_message,
+                "result_summary": runtime.result_summary,
+            }
+        )
+    return results
+
+
+def _queue_run_status(results: list[dict[str, Any]]) -> str:
+    if not results:
+        return "idle"
+    states = {str(item.get("state") or "missing") for item in results}
+    if states == {QueueState.COMPLETED.value}:
+        return "completed"
+    if QueueState.FAILED.value in states or "missing" in states:
+        return "failed"
+    if QueueState.CANCELLED.value in states or QueueState.CANCEL_ACKNOWLEDGED.value in states:
+        return "cancelled"
+    return "pending"
 
 
 def _queue_command(args: argparse.Namespace) -> dict[str, Any]:
@@ -118,11 +161,26 @@ def _queue_command(args: argparse.Namespace) -> dict[str, Any]:
             ran = runner.run_single_job(args.job)
             if not ran:
                 raise ValueError(f"queue job cannot be run: {args.job}")
-            ran_job_ids = [args.job]
+            selected_job_ids = [args.job]
         else:
+            selected_job_ids = [
+                job.job_id
+                for job in (
+                    service.list_jobs()
+                    if args.all
+                    else service.list_jobs_by_state(QueueState.PENDING)
+                )
+            ]
             runner.run()
-            ran_job_ids = [job.job_id for job in service.list_jobs()]
-        return {"status": "completed", "command": command, "ran_job_ids": ran_job_ids, **_queue_snapshot(service)}
+        job_results = _queue_terminal_results(service, selected_job_ids)
+        return {
+            "status": _queue_run_status(job_results),
+            "command": command,
+            "selected_job_ids": selected_job_ids,
+            "ran_job_ids": selected_job_ids,
+            "job_results": job_results,
+            **_queue_snapshot(service),
+        }
     raise ControlPlaneError(f"unsupported queue command: {command}")
 
 
@@ -183,6 +241,22 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--repo-root", dest="doctor_repo_root", default="")
     doctor.add_argument("--config", dest="doctor_config", default="")
 
+    preflight = subparsers.add_parser("preflight")
+    preflight.add_argument("--config", dest="preflight_config", default="")
+    preflight.add_argument("--action", default="analyze")
+    preflight.add_argument("--stages", nargs="*", default=None)
+    preflight.add_argument("--section", default="")
+    preflight.add_argument("--free-mode-enabled", action="store_true")
+
+    micro_probe = subparsers.add_parser("micro-probe")
+    micro_probe.add_argument("--config", dest="micro_probe_config", default="")
+    micro_probe.add_argument("--action", default="analyze")
+    micro_probe.add_argument("--stages", nargs="*", default=None)
+    micro_probe.add_argument("--section", default="")
+    micro_probe.add_argument("--third-party-acknowledged", action="store_true")
+    micro_probe.add_argument("--third-party-host", action="append", default=[])
+    micro_probe.add_argument("--free-mode-enabled", action="store_true")
+
     config_migrate = subparsers.add_parser("config-migrate")
     config_migrate.add_argument("--config", dest="migrate_config", required=True)
     config_migrate.add_argument("--dry-run", action="store_true")
@@ -196,6 +270,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     plan = subparsers.add_parser("plan")
     plan.add_argument("--spec", required=True)
+
+    acceptance_run = subparsers.add_parser("acceptance-run")
+    acceptance_run.add_argument("--acceptance-spec", required=True)
 
     for command in ("run",):
         subparser = subparsers.add_parser(command)
@@ -276,14 +353,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _exit_code(command: str, payload: dict[str, Any]) -> int:
-    if command == "doctor":
+    if command in {"doctor", "preflight", "micro-probe"}:
+        return 0 if bool(payload.get("ok")) else 1
+    if command == "acceptance-run":
         return 0 if bool(payload.get("ok")) else 1
     if command in {"status", "inspect", "next-action", "reconcile", "repair-plan", "validate", "validation-status", "attest", "export", "queue-list"}:
         return 0
     if command == "config-migrate":
         return 0 if payload.get("status") == "ok" else 1
     if command in {"retry-node", "repair-apply", "repair-promote", "cancel", "adopt", "queue-add", "queue-run", "queue-retry", "queue-cancel", "queue-remove", "queue-export", "queue-import"}:
-        return 0 if payload.get("status") in {"available", "complete", "succeeded", "already_adopted", "planned", "requested", "added", "completed", "removed", "exported", "imported", "promoted", "already_promoted"} else 1
+        success_statuses = {"available", "complete", "succeeded", "already_adopted", "planned", "requested", "added", "removed", "exported", "imported", "promoted", "already_promoted"}
+        if command == "queue-run":
+            success_statuses.update({"completed", "idle"})
+        return 0 if payload.get("status") in success_statuses else 1
     if command in {"run", "resume"}:
         return 0 if payload.get("job_status") == "completed" and payload.get("completion_status") == "complete" else 1
     return 0
@@ -292,9 +374,15 @@ def _exit_code(command: str, payload: dict[str, Any]) -> int:
 def main(argv: list[str] | None = None) -> int:
     configure_utf8_stdio()
     args = build_parser().parse_args(argv)
-    repo_root = args.repo_root or getattr(args, "doctor_repo_root", "")
-    control = ReviewControlPlane(repo_root=repo_root or None)
+    # Initialize an owner-supplied acceptance controller at process start so
+    # max_wall_seconds covers preprocessing, stage setup, and all later routes,
+    # not merely the first ProviderRuntime construction.
+    from runtime.provider_runtime import provider_budget_controller_from_environment
+
     try:
+        provider_budget_controller_from_environment()
+        repo_root = args.repo_root or getattr(args, "doctor_repo_root", "")
+        control = ReviewControlPlane(repo_root=repo_root or None)
         if args.command.startswith("queue-"):
             payload = _queue_command(args)
         elif args.command == "doctor":
@@ -302,10 +390,30 @@ def main(argv: list[str] | None = None) -> int:
                 config_path=(getattr(args, "doctor_config", "") or args.config or None),
                 workspace=args.workspace or None,
             )
+        elif args.command == "preflight":
+            payload = control.provider_preflight(
+                config_path=(getattr(args, "preflight_config", "") or args.config or None),
+                action=args.action,
+                requested_stages=args.stages,
+                section=args.section or None,
+                free_mode_enabled=bool(args.free_mode_enabled),
+            )
+        elif args.command == "micro-probe":
+            payload = control.provider_micro_probe(
+                config_path=(getattr(args, "micro_probe_config", "") or args.config or None),
+                action=args.action,
+                requested_stages=args.stages,
+                section=args.section or None,
+                third_party_acknowledged=bool(args.third_party_acknowledged),
+                third_party_hosts=args.third_party_host,
+                free_mode_enabled=bool(args.free_mode_enabled),
+            )
         elif args.command == "config-migrate":
             payload = _config_migrate_command(args)
         elif args.command == "plan":
             payload = control.plan(args.spec)
+        elif args.command == "acceptance-run":
+            payload = control.acceptance_run(args.acceptance_spec)
         elif args.command == "run":
             payload = control.run(
                 args.spec,
@@ -379,7 +487,7 @@ def main(argv: list[str] | None = None) -> int:
             payload = control.attest(job_id=args.job or None, workspace=args.workspace or None)
         else:  # pragma: no cover
             raise ControlPlaneError(f"unsupported command: {args.command}")
-    except (ControlPlaneError, OSError, ValueError, TypeError) as exc:
+    except (ControlPlaneError, RuntimeRunnerError, QueueError, OSError, ValueError, TypeError) as exc:
         payload = {
             "control_plane_version": "reviewctl-v1",
             "status": "error",

@@ -9,7 +9,7 @@ import pytest
 import preprocess.visual_artifacts as visual_artifacts
 from preprocess.visual_artifacts import Stage1VisualArtifactBuilder
 from services.artifact_registry import file_sha256
-from tests.test_current_stage1_generation import _canonical_summary, _service, _write_visual_pdf
+from tests.test_current_stage1_generation import _canonical_summary, _service
 
 
 def test_page_snapshots_are_clear_bounded_and_hashed(tmp_path: Path) -> None:
@@ -17,7 +17,10 @@ def test_page_snapshots_are_clear_bounded_and_hashed(tmp_path: Path) -> None:
     document = fitz.open()
     for page_no in range(2):
         page = document.new_page()
-        page.insert_text((72, 72), f"Page {page_no + 1} Figure and table evidence")
+        page.insert_text(
+            (72, 72),
+            f"Page {page_no + 1} contains figure and table evidence for bounded layout.",
+        )
     document.save(pdf_path)
     document.close()
 

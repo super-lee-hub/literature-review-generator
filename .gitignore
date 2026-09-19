@@ -172,6 +172,27 @@ nul
 *_review_draft.json
 *_citation_manifest.json
 
+# Local F1 acceptance inputs and run outputs (source PDFs are never committed)
+acceptance_artifacts/f1_*/source_corpus/
+acceptance_artifacts/f1_*/C_source_corpus/
+acceptance_artifacts/f1_*/D_source_corpus/
+acceptance_artifacts/f1_*/runs/
+acceptance_artifacts/f1_*/preprocess_cache/
+acceptance_artifacts/f1_*/F1_ACCEPTANCE_PLAN_STATE*.json
+acceptance_artifacts/f1_*/F1_ACCEPTANCE_PLAN_STATE*.json.lock
+acceptance_artifacts/f1_*/f1-acceptance-*/
+acceptance_artifacts/f1_*/auxiliary_ocr_scan_*/
+acceptance_artifacts/f1_*/F1_OCR_AUXILIARY_PLAN_STATE*.json*
+acceptance_artifacts/f1_*/f1-ocr-aux-*/
+acceptance_artifacts/f1_*/gui_production_*/
+acceptance_artifacts/f1_*/F1_GUI_ACCEPTANCE_PLAN_STATE*.json*
+acceptance_artifacts/f1_*/f1-gui-acceptance-*/
+acceptance_artifacts/f1_*/F1_K_OFFLINE_ACCEPTANCE_PLAN_STATE*.json*
+acceptance_artifacts/f1_*/f1-k-offline-*/
+acceptance_artifacts/f1_*/F1_E_LOCAL_ACCEPTANCE_PLAN_STATE*.json*
+acceptance_artifacts/f1_*/f1-e-local-*/
+tmp/gate-e-local/
+
 # iFlow CLI generated files
 IFLOW.md
 

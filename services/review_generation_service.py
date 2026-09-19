@@ -1091,7 +1091,9 @@ class ReviewGenerationService:
             profile = self._provider_context_profile()
             estimate = profile.estimate_request(request)
             admission = runtime.admit(
-                estimated_tokens=max(1, int(estimate["estimated_input_tokens"]))
+                estimated_tokens=max(1, int(estimate["estimated_input_tokens"])),
+                requested_output_tokens=max(0, int(profile.max_output_tokens)),
+                requested_retry_attempts=max(0, int(result.get("attempts") or 1) - 1),
             )
             runtime.complete(
                 admission=admission,

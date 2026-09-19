@@ -4,10 +4,13 @@ import hashlib
 import json
 import mimetypes
 import os
+from pathlib import Path
+import tempfile
 import time
 import re
 import requests  # type: ignore
-from typing import Union, Dict, Optional, Any, List, Tuple, Callable, Set, Mapping
+from typing import Union, Dict, Optional, Any, List, Tuple, Callable, Set, Mapping, cast
+from urllib.parse import urlparse
 
 from models import APIConfig
 from config_loader import load_config
@@ -23,11 +26,13 @@ from services.model_capabilities import (
     resolve_model_capability,
 )
 from services.proxy_policy import should_bypass_environment_proxy
+from services.credential_provenance import is_template_credential
 from services.prompt_registry import default_prompt_registry
 from runtime.provider_context import ProviderContextProfile
 from runtime.provider_runtime import (
     ProviderBudgetExceeded,
     ProviderRuntime,
+    ProviderRuntimeLedger,
     canonical_provider_request_payload,
 )
 from summary_schema import (
@@ -115,7 +120,24 @@ def _api_result(
     }
 
 
-def _extract_provider_error(response: Any) -> Dict[str, Any]:
+def _redact_provider_text(value: Any, secret: str = "") -> str:
+    text = str(value or "")
+    if secret:
+        text = text.replace(secret, "[REDACTED]")
+    text = re.sub(
+        r"(?i)(authorization['\"]?\s*[:=]\s*['\"]?(?:bearer\s+)?)[^,\s}\"']+",
+        r"\1[REDACTED]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)(x-api-key|api[_-]?key|token|secret)['\"]?\s*[:=]\s*['\"]?[^,\s}\"']+",
+        r"\1=[REDACTED]",
+        text,
+    )
+    return text[:2000]
+
+
+def _extract_provider_error(response: Any, *, secret: str = "") -> Dict[str, Any]:
     status_code = getattr(response, "status_code", None)
     provider_code = None
     message = ""
@@ -142,12 +164,12 @@ def _extract_provider_error(response: Any) -> Dict[str, Any]:
                 or error_payload.get("type")
                 or error_payload.get("error_code")
             )
-            message = str(error_payload.get("message") or error_payload.get("error") or "")
+            message = _redact_provider_text(error_payload.get("message") or error_payload.get("error") or "", secret)
         elif error_payload is not None:
-            message = str(error_payload)
-        raw_text = str(payload)
+            message = _redact_provider_text(error_payload, secret)
+        raw_text = _redact_provider_text(payload, secret)
     else:
-        raw_text = str(getattr(response, "text", "") or "")
+        raw_text = _redact_provider_text(getattr(response, "text", "") or "", secret)
         message = raw_text
 
     return {
@@ -163,8 +185,8 @@ def _looks_like_quota_error(*parts: Any) -> bool:
     return any(marker.casefold() in text for marker in _QUOTA_ERROR_MARKERS)
 
 
-def _classify_http_error(response: Any) -> Tuple[str, Optional[int], Optional[str], str]:
-    details = _extract_provider_error(response)
+def _classify_http_error(response: Any, *, secret: str = "") -> Tuple[str, Optional[int], Optional[str], str]:
+    details = _extract_provider_error(response, secret=secret)
     status_code = details.get("http_status")
     provider_code = str(details.get("provider_code") or "")
     message = str(details.get("message") or details.get("raw_text") or "")
@@ -195,6 +217,138 @@ def _classify_exception(exc: BaseException) -> Tuple[str, str]:
     if any(marker in message_folded for marker in _TRANSIENT_NETWORK_MARKERS):
         return "transient_network", message
     return "invalid_response", message
+
+
+def _aihubmix_recovery_enabled(api_config: Mapping[str, Any]) -> bool:
+    """Return whether opt-in recovery of a disconnected AihubMix LLM call is enabled."""
+
+    api_base = str(api_config.get("api_base") or "").casefold()
+    if "aihubmix.com" not in api_base:
+        return False
+    configured = api_config.get("aihubmix_recovery_enabled")
+    if configured is None:
+        configured = os.getenv("AUTO_GENERATE_AIHUBMIX_RECOVERY", "0")
+    return str(configured or "").strip().casefold() in {"1", "true", "yes", "on"}
+
+
+def _epoch_seconds(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _aihubmix_recover_disconnected_call(
+    *,
+    api_config: APIConfig,
+    model: str,
+    request_started_epoch: float,
+    response_parser: Callable[[Dict[str, Any]], Tuple[str, str]],
+    response_format: str,
+    logger: Any = None,
+) -> Dict[str, Any] | None:
+    """Recover one uniquely matched AihubMix task after a client disconnect.
+
+    AihubMix creates an LLM recovery task only when the account feature is
+    enabled and the client disconnects after the platform accepted the call.
+    The public task list has no request-hash filter, so ambiguity is a hard
+    failure: this helper never selects the newest task merely because it is
+    convenient.
+    """
+
+    if not _aihubmix_recovery_enabled(api_config):
+        return None
+    api_base = str(api_config.get("api_base") or "").strip()
+    parsed_base = urlparse(api_base)
+    if not parsed_base.scheme or not parsed_base.netloc:
+        return None
+    recovery_base = f"{parsed_base.scheme}://{parsed_base.netloc}"
+    api_key = str(api_config.get("api_key") or "").strip()
+    if not api_key or is_template_credential(api_key):
+        return None
+    headers = {"Authorization": f"Bearer {api_key}"}
+    timeout_seconds = min(
+        30,
+        _coerce_positive_int(api_config.get("recovery_request_timeout_seconds"), 30),
+    )
+
+    def get_json(url: str, **kwargs: Any) -> Any:
+        if should_bypass_environment_proxy(api_config):
+            with requests.Session() as session:
+                session.trust_env = False
+                return session.get(url, **kwargs)
+        return requests.get(url, **kwargs)
+
+    try:
+        listing = get_json(
+            f"{recovery_base}/ai/v1/tasks",
+            params={"object": "llm", "model": model, "limit": 20, "order": "desc"},
+            headers=headers,
+            timeout=timeout_seconds,
+        )
+        if listing.status_code != 200:
+            return None
+        payload = listing.json()
+        rows = payload.get("data") if isinstance(payload, Mapping) else None
+        if not isinstance(rows, list):
+            return None
+        candidates = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            if str(row.get("model") or "").strip() != model:
+                continue
+            created_at = _epoch_seconds(row.get("created_at"))
+            if created_at is None or created_at < request_started_epoch - 15:
+                continue
+            candidates.append(row)
+        if len(candidates) != 1:
+            return None
+        task = candidates[0]
+        task_id = str(task.get("id") or "").strip()
+        if not task_id:
+            return None
+        output_items = task.get("output")
+        if not isinstance(output_items, list) or not output_items:
+            return None
+        if any(bool(item.get("truncated")) for item in output_items if isinstance(item, Mapping)):
+            return None
+        content_response = get_json(
+            f"{recovery_base}/ai/v1/tasks/{task_id}/content",
+            headers=headers,
+            timeout=max(timeout_seconds, 60),
+        )
+        if content_response.status_code != 200:
+            return None
+        recovered_payload = content_response.json()
+        if not isinstance(recovered_payload, dict):
+            return None
+        content, finish_reason = response_parser(recovered_payload)
+        formatted = _format_success_result(
+            content,
+            response_format,
+            content_response,
+            finish_reason,
+            logger=logger,
+        )
+        if formatted.get("status") != "success":
+            return None
+        formatted.update(
+            {
+                "http_status": 200,
+                "recovered_from_aihubmix_task": True,
+                "aihubmix_recovery_task_id": task_id,
+                "aihubmix_recovery_content_sha256": hashlib.sha256(
+                    content_response.content
+                ).hexdigest(),
+            }
+        )
+        return formatted
+    except (OSError, ValueError, TypeError, KeyError, requests.RequestException, json.JSONDecodeError) as exc:
+        if logger:
+            logger.warning("AihubMix recovery lookup failed closed: %s", _redact_provider_text(exc, api_key))
+        return None
 
 
 def _is_payload_parameter_error(parameter_name: str, *parts: Any) -> bool:
@@ -762,6 +916,142 @@ def _post_with_proxy_mode(api_url: str, *, api_config: APIConfig, **kwargs: Any)
     return requests.post(api_url, **kwargs)
 
 
+def build_provider_transport_preflight(
+    api_config: Mapping[str, Any],
+    *,
+    credential_source: str = "unknown",
+    prompt: str = "preflight",
+    system_prompt: str = "preflight",
+) -> Dict[str, Any]:
+    """Build the exact route/payload shape used by the formal AI transport.
+
+    This is intentionally no-network: it exercises capability resolution,
+    endpoint construction, proxy policy, payload builders, and the canonical
+    request identity without exposing or hashing the credential.
+    """
+
+    api_key = str(api_config.get("api_key") or "").strip()
+    if not api_key or is_template_credential(api_key):
+        raise ValueError("provider preflight requires a non-template runtime credential")
+    model = str(api_config.get("model") or "").strip()
+    if not model:
+        raise ValueError("provider preflight requires a model")
+    api_base = str(api_config.get("api_base") or "").strip()
+    if not api_base:
+        raise ValueError("provider preflight requires an api_base")
+
+    typed_config = cast(APIConfig, api_config)
+    capability = resolve_model_capability(typed_config)
+    if capability.endpoint_type == "anthropic":
+        route, _headers = anthropic_request_target(api_base, typed_config, api_key)
+        payload = build_anthropic_messages_payload(
+            prompt,
+            api_config,  # type: ignore[arg-type]
+            system_prompt,
+            max_tokens=1,
+            temperature=0.0,
+            response_format="json",
+            user_content=None,
+            capability=capability,
+        )
+    elif capability.endpoint_type == "responses":
+        route = f"{api_base.rstrip('/')}/responses"
+        payload = build_responses_payload(
+            prompt,
+            api_config,  # type: ignore[arg-type]
+            system_prompt,
+            max_tokens=1,
+            temperature=0.0,
+            response_format="json",
+            user_content=None,
+            capability=capability,
+        )
+    else:
+        route = f"{api_base.rstrip('/')}/chat/completions"
+        payload = build_chat_completions_payload(
+            prompt,
+            api_config,  # type: ignore[arg-type]
+            system_prompt,
+            max_tokens=1,
+            temperature=0.0,
+            response_format="json",
+            user_content=None,
+            capability=capability,
+        )
+    input_identity = canonical_provider_request_payload(
+        prompt=prompt,
+        system_prompt=system_prompt,
+        user_content=None,
+        response_format="json",
+        max_output_tokens=1,
+        temperature=0.0,
+    )
+    payload_bytes = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    input_bytes = json.dumps(
+        input_identity,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    timeout_seconds, retry_attempts = _load_api_runtime_settings(api_config)
+    bypass_proxy = should_bypass_environment_proxy(api_config)
+    endpoint_classification = classify_provider_endpoint(
+        api_base,
+        capability.provider_family,
+    )
+    return {
+        "provider_family": capability.provider_family,
+        "endpoint_type": capability.endpoint_type,
+        "api_base": api_base,
+        "model": model,
+        "proxy_mode": str(api_config.get("proxy_mode") or "environment"),
+        "trust_env": not bypass_proxy,
+        "credential_source": str(credential_source or "unknown"),
+        "endpoint_classification": endpoint_classification,
+        "request_method": "POST",
+        "request_route": route,
+        "payload_sha256": hashlib.sha256(payload_bytes).hexdigest(),
+        "input_sha256": hashlib.sha256(input_bytes).hexdigest(),
+        "request_byte_estimate": len(payload_bytes),
+        "timeout_seconds": timeout_seconds,
+        "transport_retries": retry_attempts,
+    }
+
+
+def classify_provider_endpoint(api_base: str, provider_family: str = "") -> dict[str, Any]:
+    """Classify a provider host without contacting it or reading credentials."""
+
+    raw_base = str(api_base or "").strip()
+    host = str(urlparse(raw_base).hostname or "").casefold()
+    family = str(provider_family or "").strip().casefold().replace("-", "_")
+    official_hosts = {
+        "deepseek": {"api.deepseek.com"},
+        "anthropic": {"api.anthropic.com"},
+        "openai_responses": {"api.openai.com"},
+        "openai": {"api.openai.com"},
+    }
+    local_hosts = {"localhost", "127.0.0.1", "::1"}
+    if host in local_hosts:
+        classification = "custom_local_endpoint"
+        warning = "requests stay on a local/custom endpoint"
+    elif host in official_hosts.get(family, set()):
+        classification = "official_provider_host"
+        warning = "host matches the configured official provider family"
+    else:
+        classification = "third_party_gateway"
+        warning = "prompts, document content, and endpoint credentials are sent to a non-official/custom gateway"
+    return {
+        "host": host,
+        "classification": classification,
+        "warning": warning,
+    }
+
+
 def _default_core_variables() -> Dict[str, List[str]]:
     specialized = default_ai_summary()["specialized_details"]
     empirical = specialized.get("empirical") or {}
@@ -776,17 +1066,17 @@ def _coerce_positive_int(value: Any, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
-def _response_error_details(response: Any, limit: int = 500) -> str:
+def _response_error_details(response: Any, limit: int = 500, *, secret: str = "") -> str:
     if response is None:
         return "HTTP错误 ?"
 
     details = f"HTTP错误 {getattr(response, 'status_code', '?')}"
     try:
         error_response = response.json()
-        details += f"，响应: {str(error_response)[:limit]}"
+        details += f"，响应: {_redact_provider_text(error_response, secret)[:limit]}"
     except Exception:
         response_text = getattr(response, "text", "") or "无响应内容"
-        details += f"，响应文本: {response_text[:limit]}"
+        details += f"，响应文本: {_redact_provider_text(response_text, secret)[:limit]}"
     return details
 
 
@@ -1565,11 +1855,14 @@ def _call_ai_api_detailed_uninstrumented(
     retry_attempts: Optional[int] = None,
     timeout_seconds: Optional[int] = None,
     max_retries_per_call: int = 0,
+    attempt_limit: Optional[int] = None,
     max_single_image_bytes: Optional[int] = None,
     max_request_image_bytes: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Call a configured AI API transport and retain failure details."""
     attempts_used = 0
+    usage_totals: Dict[str, int] = {}
+    usage_reported = False
     removed_compat_params: Set[Any] = set()
 
     def mutation_label(value: Any) -> str:
@@ -1596,10 +1889,11 @@ def _call_ai_api_detailed_uninstrumented(
         api_key = api_config.get('api_key') or ''
         model_name = api_config.get('model') or ''
         api_base = api_config.get('api_base', 'https://api.openai.com/v1') or 'https://api.openai.com/v1'
+        request_started_epoch = time.time()
         capability = resolve_model_capability(api_config)
 
-        if not api_key or not model_name:
-            message = "API config is missing api_key or model"
+        if not api_key or is_template_credential(api_key) or not model_name:
+            message = "API config is missing a real api_key or model"
             if logger:
                 logger.error(message)
             return finish(_api_result(status="failed", error_kind="fatal_config_or_auth", message=message))
@@ -1617,6 +1911,8 @@ def _call_ai_api_detailed_uninstrumented(
         )
         if max_retries_per_call:
             max_retries = min(max_retries, max(1, int(max_retries_per_call)) + 1)
+        if attempt_limit is not None:
+            max_retries = max(1, int(attempt_limit))
         if capability.endpoint_type == "anthropic":
             api_url, headers = anthropic_request_target(api_base, api_config, api_key)
         else:
@@ -1677,12 +1973,24 @@ def _call_ai_api_detailed_uninstrumented(
         response = None
         last_failure = _api_result(status="failed", error_kind="invalid_response", message="API call did not run")
         attempt = 0
-        strict_retry_budget = bool(max_retries_per_call)
+        strict_retry_budget = attempt_limit is not None or bool(max_retries_per_call)
 
         def can_start_attempt() -> bool:
             if strict_retry_budget:
                 return attempts_used < max_retries
             return attempt < max_retries
+
+        def recover_final_transient_failure(failure: Dict[str, Any]) -> Dict[str, Any] | None:
+            if str(failure.get("error_kind") or "") != "transient_network":
+                return None
+            return _aihubmix_recover_disconnected_call(
+                api_config=api_config,
+                model=str(model_name),
+                request_started_epoch=request_started_epoch,
+                response_parser=response_parser,
+                response_format=response_format,
+                logger=logger,
+            )
 
         while can_start_attempt():
             attempt += 1
@@ -1701,6 +2009,7 @@ def _call_ai_api_detailed_uninstrumented(
                 )
                 response.raise_for_status()
 
+                response_data: Any = None
                 try:
                     response_data = response.json()
                     content, finish_reason = response_parser(response_data)
@@ -1708,14 +2017,15 @@ def _call_ai_api_detailed_uninstrumented(
                     message = f"Malformed API response: {exc}"
                     if logger:
                         logger.error(message)
-                    return finish(_api_result(
+                    formatted = _api_result(
                         status="failed",
                         error_kind="invalid_response",
                         http_status=getattr(response, "status_code", None),
                         message=message,
-                    ))
+                    )
+                else:
+                    formatted = _format_success_result(content, response_format, response, finish_reason, logger=logger)
 
-                formatted = _format_success_result(content, response_format, response, finish_reason, logger=logger)
                 if isinstance(response_data, dict):
                     provider_model = str(response_data.get("model") or "").strip()
                     usage = response_data.get("usage")
@@ -1727,6 +2037,7 @@ def _call_ai_api_detailed_uninstrumented(
                             "output_tokens": ("completion_tokens", "output_tokens"),
                             "total_tokens": ("total_tokens",),
                         }
+                        attempt_usage = {}
                         for result_key, candidates in usage_keys.items():
                             for usage_key in candidates:
                                 raw_value = usage.get(usage_key)
@@ -1739,9 +2050,16 @@ def _call_ai_api_detailed_uninstrumented(
                                 except (TypeError, ValueError, OverflowError):
                                     continue
                                 if parsed_value >= 0:
-                                    formatted[result_key] = parsed_value
+                                    attempt_usage[result_key] = parsed_value
                                     break
-                        formatted["usage_status"] = "reported"
+                        if attempt_usage:
+                            usage_reported = True
+                            for result_key, parsed_value in attempt_usage.items():
+                                usage_totals[result_key] = usage_totals.get(result_key, 0) + parsed_value
+                            formatted.update(usage_totals)
+                            formatted["usage_status"] = "reported"
+                if usage_reported:
+                    formatted.update(usage_totals)
                 if (
                     formatted.get("status") == "failed"
                     and formatted.get("error_kind") == "invalid_response"
@@ -1760,13 +2078,16 @@ def _call_ai_api_detailed_uninstrumented(
                 return finish(formatted)
 
             except requests.exceptions.HTTPError:
-                error_kind, http_status, provider_code, message = _classify_http_error(response)
+                error_kind, http_status, provider_code, message = _classify_http_error(
+                    response,
+                    secret=api_key,
+                )
                 last_failure = _api_result(
                     status="failed",
                     error_kind=error_kind,
                     http_status=http_status,
                     provider_code=provider_code,
-                    message=message or _response_error_details(response, limit=500),
+                    message=message or _response_error_details(response, limit=500, secret=api_key),
                 )
                 if (
                     capability.reasoning_param_style == "chat_reasoning"
@@ -1838,18 +2159,25 @@ def _call_ai_api_detailed_uninstrumented(
                 if can_start_attempt():
                     wait_time = 2 * (2 ** (attempt - 1))
                     if logger:
-                        logger.warning(f"{_response_error_details(response, limit=200)}，{wait_time:.1f}秒后重试...")
+                        logger.warning(
+                            f"{_response_error_details(response, limit=200, secret=api_key)}，"
+                            f"{wait_time:.1f}秒后重试..."
+                        )
                     time.sleep(wait_time)
                     continue
 
                 if logger:
                     logger.error(f"API调用最终失败: {last_failure['message']}")
-                return finish(last_failure)
+                recovered = recover_final_transient_failure(last_failure)
+                return finish(recovered or last_failure)
 
             except Exception as exc:
                 response_status = getattr(response, "status_code", None)
                 if isinstance(response_status, int) and response_status >= 400:
-                    error_kind, http_status, provider_code, message = _classify_http_error(response)
+                    error_kind, http_status, provider_code, message = _classify_http_error(
+                        response,
+                        secret=api_key,
+                    )
                 else:
                     error_kind, message = _classify_exception(exc)
                     http_status = response_status
@@ -1876,9 +2204,11 @@ def _call_ai_api_detailed_uninstrumented(
 
                 if logger:
                     logger.error(f"API调用最终失败 ({error_kind}): {message}")
-                return finish(last_failure)
+                recovered = recover_final_transient_failure(last_failure)
+                return finish(recovered or last_failure)
 
-        return finish(last_failure)
+        recovered = recover_final_transient_failure(last_failure)
+        return finish(recovered or last_failure)
 
     except Exception as exc:
         if logger:
@@ -1932,6 +2262,23 @@ def _call_ai_api_detailed(
         max_output_tokens=int(max_tokens),
         temperature=temperature,
     )
+    runtime_api_key = str(api_config.get("api_key") or "").strip()
+    runtime_model = str(api_config.get("model") or "").strip()
+    if not runtime_api_key or is_template_credential(runtime_api_key) or not runtime_model:
+        receipt = provider_runtime.blocked_receipt(
+            prompt=prompt,
+            input_payload=request_payload,
+            api_config=api_config,
+            message="provider runtime rejected an empty/template credential or model before transport",
+            route=provider_route,
+        )
+        blocked = _api_result(
+            status="failed",
+            error_kind="fatal_config_or_auth",
+            message="provider runtime rejected an empty/template credential or model before transport",
+        )
+        blocked["provider_receipt"] = receipt.to_dict()
+        return blocked
     capability = resolve_model_capability(api_config)
     profile = ProviderContextProfile.conservative(
         provider=str(api_config.get("provider_family") or capability.provider_family),
@@ -1967,8 +2314,15 @@ def _call_ai_api_detailed(
         return blocked
 
     estimated_tokens = int(budget["estimated_input_tokens"])
+    configured_attempts = _load_api_runtime_settings(api_config)[1]
+    requested_attempts = retry_attempts if retry_attempts is not None else configured_attempts
+    effective_attempts = provider_runtime.max_attempts_for_call(requested_attempts)
     try:
-        admission = provider_runtime.admit(estimated_tokens=estimated_tokens)
+        admission = provider_runtime.admit(
+            estimated_tokens=estimated_tokens,
+            requested_output_tokens=max(0, int(max_tokens)) * max(1, effective_attempts),
+            requested_retry_attempts=max(0, effective_attempts - 1),
+        )
     except ProviderBudgetExceeded as exc:
         receipt = provider_runtime.blocked_receipt(
             prompt=prompt,
@@ -1989,6 +2343,11 @@ def _call_ai_api_detailed(
         }
         return blocked
 
+    # The durable budget distinguishes a process that died before transport
+    # from one that may have sent a request but failed before writing a receipt.
+    # Mark this boundary immediately before entering the uninstrumented
+    # transport so resume can release only the former case.
+    provider_runtime.mark_transport_started(admission)
     result = _call_ai_api_detailed_uninstrumented(
         prompt,
         api_config,
@@ -1998,9 +2357,10 @@ def _call_ai_api_detailed(
         response_format=response_format,
         logger=logger,
         user_content=admitted_user_content,
-        retry_attempts=retry_attempts,
+        retry_attempts=effective_attempts,
         timeout_seconds=timeout_seconds,
-        max_retries_per_call=provider_runtime.budget.max_retries_per_call,
+        max_retries_per_call=max(0, effective_attempts - 1),
+        attempt_limit=effective_attempts,
         max_single_image_bytes=max_single_image_bytes,
         max_request_image_bytes=max_request_image_bytes,
     )
@@ -2061,7 +2421,46 @@ def _call_ai_api_detailed(
         "transport_metadata": {
             **transport_report,
             "successful_input_mode": "multimodal" if transport_report.get("images_actually_sent_count", 0) else "text_only",
+            **{
+                key: result[key]
+                for key in (
+                    "recovered_from_aihubmix_task",
+                    "aihubmix_recovery_task_id",
+                    "aihubmix_recovery_content_sha256",
+                )
+                if key in result
+            },
         },
+    }
+    if capability.endpoint_type == "anthropic":
+        request_route = anthropic_request_target(
+            str(api_config.get("api_base") or ""),
+            cast(APIConfig, api_config),
+            str(api_config.get("api_key") or ""),
+        )[0]
+    else:
+        request_route = (
+            f"{str(api_config.get('api_base') or '').rstrip('/')}/"
+            f"{'responses' if capability.endpoint_type == 'responses' else 'chat/completions'}"
+        )
+    transport_config = {
+        "provider_family": capability.provider_family,
+        "endpoint_type": capability.endpoint_type,
+        "api_base": str(api_config.get("api_base") or ""),
+        "model": str(api_config.get("model") or ""),
+        "proxy_mode": str(api_config.get("proxy_mode") or "environment"),
+        "trust_env": not should_bypass_environment_proxy(api_config),
+        "request_route": request_route,
+        "request_byte_estimate": len(
+            json.dumps(
+                request_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ),
+        "timeout_seconds": _load_api_runtime_settings(api_config)[0],
+        "transport_retries": _load_api_runtime_settings(api_config)[1],
     }
     receipt = provider_runtime.complete(
         admission=admission,
@@ -2072,6 +2471,10 @@ def _call_ai_api_detailed(
         metadata={
             "request_budget": budget,
             "requested_output_tokens": int(max_tokens),
+            "transport_config": transport_config,
+            "config_section": str(provider_runtime.route or "")
+            if str(provider_runtime.route or "").endswith("_API")
+            else "",
             **dict(result.get("transport_metadata") or {}),
         },
         route=provider_route,
@@ -2079,6 +2482,49 @@ def _call_ai_api_detailed(
     enriched = dict(result)
     enriched["provider_receipt"] = receipt.to_dict()
     return enriched
+
+
+def probe_provider_connection(
+    api_config: Mapping[str, Any],
+    *,
+    logger: Any = None,
+) -> Dict[str, Any]:
+    """Run the canonical one-token provider probe through the real transport."""
+
+    descriptor, ledger_path = tempfile.mkstemp(
+        prefix="auto-generate-provider-probe-",
+        suffix=".jsonl",
+    )
+    os.close(descriptor)
+    target = Path(ledger_path)
+    try:
+        capability = resolve_model_capability(cast(APIConfig, dict(api_config)))
+        runtime = ProviderRuntime(
+            ledger=ProviderRuntimeLedger(target),
+            job_id="configuration-provider-probe",
+            attempt_id=f"probe-{os.getpid()}",
+            stage_name="configuration_probe",
+            route="configuration_probe",
+            node_id="configuration_probe",
+            call_id=f"configuration_probe:{os.getpid()}",
+            endpoint_type=capability.endpoint_type,
+        )
+        return _call_ai_api_detailed(
+            "ping",
+            cast(APIConfig, dict(api_config)),
+            "Return one short token.",
+            max_tokens=1,
+            temperature=0.0,
+            response_format="text",
+            logger=logger,
+            provider_runtime=runtime,
+        )
+    finally:
+        try:
+            target.unlink(missing_ok=True)
+            target.with_name(target.name + ".lock").unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _call_ai_api(prompt: str, api_config: APIConfig, system_prompt: str, max_tokens: int = 4000,

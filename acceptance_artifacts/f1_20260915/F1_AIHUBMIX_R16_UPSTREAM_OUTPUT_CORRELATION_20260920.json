@@ -1,0 +1,61 @@
+{
+  "artifact_type": "f1_aihubmix_r16_upstream_output_correlation",
+  "artifact_version": "v1",
+  "observed_at_local": "2026-09-20",
+  "source": "user-provided AihubMix usage/dashboard export",
+  "gateway": "aihubmix.com",
+  "acceptance_run": "f1-acceptance-F-outline-aihubmix-r16",
+  "executable_sha": "5be593af2d0666a8f07d5ac62032eb09d3e470a6",
+  "account_event": {
+    "type": "credit_top_up",
+    "amount_usd": 10.0,
+    "dashboard_status": "success"
+  },
+  "relation": {
+    "local_provider_receipt": {
+      "status": "success",
+      "http_status": 200,
+      "input_tokens": 68080,
+      "output_tokens": 8367,
+      "started_at_utc": "2026-09-19T16:07:04Z",
+      "finished_at_utc": "2026-09-19T16:09:02Z",
+      "response_hash": "29a6b6c02992c663025527893f5b6663bbcd24ffa71d2f27d3ed2fcea403fb3c"
+    },
+    "dashboard": {
+      "model": "AWS/claude-fable-5-1",
+      "input_tokens": 68080,
+      "output_tokens": 8367,
+      "status": "success",
+      "created_at_local": "2026-09-20 00:09:03",
+      "duration_seconds": 117.013,
+      "trace_id": "2026091916070644792102688772764"
+    },
+    "correlation_strength": "exact_token_count_and_time_match"
+  },
+  "candidate": {
+    "local_runtime": {
+      "node_id": "candidate_1_provider_generation",
+      "status": "failed_closed",
+      "failure": "ProviderRuntimeContractError: provider transport attempts exceeded the pre-admitted aggregate reservation",
+      "local_provider_receipt": false,
+      "candidate_estimated_input_tokens": 64138,
+      "candidate_output_cap": 32000
+    },
+    "dashboard": {
+      "model": "AWS/claude-opus-5",
+      "input_tokens": 56835,
+      "output_tokens": 19096,
+      "status": "success",
+      "created_at_local": "2026-09-20 00:14:18",
+      "duration_seconds": 311.91,
+      "trace_id": "2026091916090630058258864184408"
+    },
+    "correlation_strength": "model_sequence_actual_provider_token_count_and_time_consistent_but_no_local_response_hash"
+  },
+  "acceptance_effect": {
+    "provider_side": "AihubMix dashboard reports successful upstream generation and billing for relation and candidate calls after the top-up.",
+    "local_side": "The relation response is closed locally; the candidate response is not. No candidate content hash, schema validation, Registry artifact, or receipt closure exists.",
+    "status": "NOT_VERIFIED",
+    "billing_is_not_local_pass": true
+  }
+}

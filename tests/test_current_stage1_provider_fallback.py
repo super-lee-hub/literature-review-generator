@@ -47,6 +47,41 @@ def test_current_stage1_default_reader_falls_back_from_primary_to_backup(
     assert engines[:2] == ["primary", "backup"]
 
 
+def test_current_stage1_primary_reader_only_blocks_backup_fallback(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    pdf_path = tmp_path / "primary-only-paper.pdf"
+    _write_pdf(pdf_path)
+    engines: list[str] = []
+
+    def fake_detailed(
+        prompt_text: str,
+        primary_api_config: Mapping[str, Any],
+        backup_api_config: Mapping[str, Any],
+        *,
+        engine_type: str = "primary",
+        **kwargs: Any,
+    ) -> Mapping[str, Any]:
+        del prompt_text, primary_api_config, backup_api_config, kwargs
+        engines.append(engine_type)
+        if engine_type == "primary":
+            return {"status": "failed", "error_kind": "quota_exhausted", "message": "test quota"}
+        return {"status": "success", "content": _canonical_summary()}
+
+    monkeypatch.setattr(ai_interface, "get_summary_from_ai_detailed", fake_detailed)
+    service, bundle = _service(
+        tmp_path,
+        pdf_path,
+        reader=None,
+        config_overrides={"Stage1_Input": {"primary_reader_only": "true"}},
+    )
+
+    with pytest.raises(RuntimeError):
+        service.run(bundle)
+
+    assert engines == ["primary"]
+
+
 def test_stage1_length_retry_escalates_same_primary_budget_before_backup(
     tmp_path: Path,
     monkeypatch: Any,
@@ -108,6 +143,45 @@ def test_stage1_length_retry_escalates_same_primary_budget_before_backup(
     assert all(receipt.route == "Primary_Reader_API" for receipt in receipts)
 
 
+def test_stage1_schema_retry_uses_corrective_prompt_at_existing_budget(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    pdf_path = tmp_path / "schema-retry-paper.pdf"
+    _write_pdf(pdf_path)
+    calls: list[tuple[str, int]] = []
+
+    def fake_detailed(
+        prompt_text: str,
+        primary_api_config: Mapping[str, Any],
+        backup_api_config: Mapping[str, Any],
+        *,
+        engine_type: str = "primary",
+        **kwargs: Any,
+    ) -> Mapping[str, Any]:
+        del prompt_text, backup_api_config, kwargs
+        calls.append((engine_type, int(primary_api_config.get("max_output_tokens") or 0)))
+        if len(calls) == 1:
+            return {
+                "status": "success",
+                "content": {"core_analysis": {"summary": "partial"}},
+            }
+        return {"status": "success", "content": _canonical_summary()}
+
+    monkeypatch.setattr(ai_interface, "get_summary_from_ai_detailed", fake_detailed)
+    service, bundle = _service(tmp_path, pdf_path, reader=None)
+
+    result = service.run(bundle)
+
+    assert result.generated_count == 1
+    assert calls == [("primary", 64000), ("primary", 64000)]
+    provider = result.summaries[0]["provider"]
+    assert provider["requested_output_budgets"] == [64000, 64000]
+    assert provider["length_retries"] == 0
+    assert provider["schema_retries"] == 1
+    assert provider["semantic_retries"] == 0
+
+
 def test_stage1_length_budget_exhaustion_does_not_fallback_to_backup(
     tmp_path: Path,
     monkeypatch: Any,
@@ -159,7 +233,13 @@ def test_stage1_visual_length_retry_is_recorded_before_scan_can_close(
     document = fitz.open()
     for page_number in range(1, 14):
         page = document.new_page()
-        page.insert_text((72, 72), f"Page {page_number}. Figure and results.")
+        page.insert_text(
+            (72, 72),
+            f"Page {page_number}. The figure and results describe experimental cohort "
+            f"{page_number}, treatment effect {page_number * 2} percent, confidence "
+            f"interval {page_number + 10} to {page_number + 20}, and the interpretation "
+            f"for this distinct condition is recorded for the visual scan.",
+        )
     document.save(pdf_path)
     document.close()
     scan_calls: list[tuple[int, int]] = []
@@ -317,7 +397,7 @@ def test_stage1_semantic_retry_accepts_only_schema_valid_visual_observation(
         nonlocal invalidated
         if kwargs.get("purpose") == "visual_scan":
             batch = kwargs["visual_scan_batch"]
-            candidates = list(batch.get("child_candidates") or [])
+            list(batch.get("child_candidates") or [])
             is_invalid_attempt = not invalidated
             if is_invalid_attempt:
                 invalidated = True
@@ -489,3 +569,72 @@ def test_stage1_backup_success_is_recorded_as_text_only_after_visual_scan(
     assert summary["provider"]["visual_coverage_status"] == "complete"
     assert "final_raw_visual_recheck_missing" in summary["ai_summary"]["quality_audit"]["conflict_flags"]
     assert summary["ai_summary"]["quality_audit"]["needs_manual_review"] is True
+
+
+def test_stage1_backup_reader_gets_one_semantic_corrective_retry(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    pdf_path = tmp_path / "backup-semantic-retry-paper.pdf"
+    _write_pdf(pdf_path)
+    calls: list[tuple[str, int, bool]] = []
+    prompts: list[str] = []
+    backup_calls = 0
+
+    def invalid_summary() -> dict[str, Any]:
+        value = _canonical_summary()
+        value["core_analysis"]["findings"] = "Not available."
+        return value
+
+    def fake_detailed(
+        prompt_text: str,
+        primary_api_config: Mapping[str, Any],
+        backup_api_config: Mapping[str, Any],
+        *,
+        engine_type: str = "primary",
+        **kwargs: Any,
+    ) -> Mapping[str, Any]:
+        nonlocal backup_calls
+        del kwargs
+        prompts.append(prompt_text)
+        config = primary_api_config if engine_type == "primary" else backup_api_config
+        calls.append(
+            (
+                engine_type,
+                int(config.get("stage1_semantic_retry_index") or 0),
+                "CORRECTIVE RETRY:" in prompt_text,
+            )
+        )
+        if engine_type == "primary":
+            return {"status": "success", "content": invalid_summary()}
+        backup_calls += 1
+        if backup_calls == 1:
+            return {"status": "success", "content": invalid_summary()}
+        return {"status": "success", "content": _canonical_summary()}
+
+    monkeypatch.setattr(ai_interface, "get_summary_from_ai_detailed", fake_detailed)
+    service, bundle = _service(
+        tmp_path,
+        pdf_path,
+        reader=None,
+        config_overrides={
+            "Stage1_Input": {"stage1_semantic_retry_max_attempts": "1"},
+        },
+    )
+
+    result = service.run(bundle)
+
+    assert result.generated_count == 1
+    assert calls == [
+        ("primary", 0, False),
+        ("primary", 1, True),
+        ("backup", 0, False),
+        ("backup", 1, True),
+    ]
+    assert "core_analysis" in prompts[1]
+    assert "paper_metadata" in prompts[1]
+    assert "not available" in prompts[1]
+    assert "not provided" in prompts[1]
+    provider = result.summaries[0]["provider"]
+    assert provider["successful_engine"] == "backup"
+    assert provider["semantic_retries"] == 2
