@@ -198,6 +198,15 @@ no recovery task could be created. This is an account-balance gate, not a
 semantic or local-code PASS. Evidence:
 `F1_AIHUBMIX_OUTLINE_RECOVERY_RETRY_SUMMARY_20260919_R16.json`.
 
+After the account top-up, the resumed R16 provider/dashboard readback shows an
+exact relation match (`68080 -> 8367`, HTTP 200, local response hash present)
+and a model/time/token-consistent candidate row (`56835 -> 19096`, successful
+upstream). The local candidate node still failed closed before persisting a
+provider receipt, content hash, schema validation, or Registry artifact. The
+dashboard result therefore proves upstream generation/billing, not local Q
+closure. Evidence:
+`F1_AIHUBMIX_R16_UPSTREAM_OUTPUT_CORRELATION_20260920.json`.
+
 ## F1 corpus and runtime boundary
 
 - Formal corpus: `F1_CORPUS_MANIFEST_20260915.json`, SHA-256
@@ -259,7 +268,7 @@ PR_MERGED: false
 CODE_REPAIR_STATUS: PASS_OFFLINE
 OFFLINE_REGRESSION_STATUS: CI PASS (6/6); local sandbox 1689 passed, 28 skipped, 13 named-pipe ACL-blocked; blocked nodes 13/13 pass outside sandbox
 PRODUCTION_INTEGRATION_STATUS: CURRENT-SHA OUTLINE ATTEMPTED; SEMANTIC/NETWORK BLOCKED; NOT_VERIFIED
-AIHUBMIX_OUTLINE_RETRY_STATUS: R14 SEMANTIC CONTRACT BLOCK; R15 LOCAL CANDIDATE RECEIPT MISSING AFTER REMOTE-DISCONNECT; RECOVERY PROBE FOUND NO TASK; R16 ACCOUNT BALANCE 403 BEFORE CANDIDATE; NOT_VERIFIED
+AIHUBMIX_OUTLINE_RETRY_STATUS: R14 SEMANTIC CONTRACT BLOCK; R15 LOCAL CANDIDATE RECEIPT MISSING AFTER REMOTE-DISCONNECT; R16 BALANCE CLEARED AND UPSTREAM CANDIDATE OUTPUT OBSERVED BUT LOCAL RECEIPT CLOSURE MISSING; NOT_VERIFIED
 F1_CORPUS_BINDING_STATUS: PASS_MACHINE_SOURCE_BINDING (15/15); HUMAN_SEMANTIC_GROUND_TRUTH_PENDING
 F1_C_D_Q_STATUS: C STAGE1 15/15; D SCOPED_PASS UNDER APPROVED POLICY; Q NOT_VERIFIED
 F1_CONTENT_AND_DOCX_QA_STATUS: NOT_VERIFIED_FOR_FINAL_Q
