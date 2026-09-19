@@ -1615,6 +1615,14 @@ class AgentRuntimeBridge:
         if self.job_spec.workspace_path:
             planned_workspace = Path(self.job_spec.workspace_path).expanduser().resolve()
             output_base_dir = str(planned_workspace.parent)
+            # RuntimeJobSpec.workspace_path is the durable workspace identity,
+            # not merely an admission-time hint.  Keep the generator's
+            # effective output root aligned with that identity so lifecycle
+            # bootstrap creates the workspace where the control plane bound
+            # the child run.
+            configured_paths = dict(stage_host.config.get("Paths", {}))
+            configured_paths["output_path"] = output_base_dir
+            stage_host.config["Paths"] = configured_paths
         resolved_project_name = runner._resolve_project_name_from_existing_workspaces(
             base_output_dir=output_base_dir,
             requested_project_name=project_name,
