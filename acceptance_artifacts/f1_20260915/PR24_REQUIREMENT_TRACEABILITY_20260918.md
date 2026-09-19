@@ -92,6 +92,32 @@ This section records an incomplete live execution. It does not promote Stage 1
 outputs, the successful relation receipt, a ping probe, or any historical green
 run into full Q acceptance.
 
+## AihubMix Outline-only retry readback
+
+The user explicitly authorized sending the complete F1 extracted text/rendered
+images to AihubMix; the original PDFs remained prohibited. To honor the user's
+correction, this retry reused the existing canonical 15-paper Stage 1 summary
+artifact and did not rerun Stage 1 or issue Stage 1 provider calls.
+
+- The previous failed node was `candidate_1_provider_generation` on
+  `api.yhlxj.ai`, with node route fingerprint
+  `43a238be2ee491a28d8ee59cb145d89ec8cc0eb8ea2bd91b26f16e135933763c`.
+- The AihubMix Outline route fingerprint is
+  `2550d1a10fac4fcd4bb2890859435800d3c8e0908d5b2eb75a0adc0c82954d34`;
+  the Outline-only external-host policy fingerprint is
+  `6b0e8045e1dc36009667cf6574f64e905c9416fa1727d3c3eceb0dfbfe72b5c4`.
+- Four minimal physical-route probes passed with zero retries and zero
+  timeouts. The real Outline-only Gate F child then completed the
+  `relation_adjudication` call with HTTP 200 and 6,986 output tokens, but the
+  first large `candidate_1_provider_generation` request failed with
+  `transient_network` / `ProxyError: RemoteDisconnected`. No 524 was observed;
+  this gateway closed the connection before a provider receipt could be
+  persisted. The child terminal reason was
+  `provider transport attempts exceeded the pre-admitted aggregate reservation`.
+- Gate F is `NOT_VERIFIED`; Outline closure is incomplete and no full Q PASS is
+  claimed. Evidence projection:
+  `F1_AIHUBMIX_OUTLINE_RETRY_SUMMARY_20260919.json`.
+
 ## F1 corpus and runtime boundary
 
 - Formal corpus: `F1_CORPUS_MANIFEST_20260915.json`, SHA-256
@@ -152,6 +178,7 @@ PR_MERGED: false
 CODE_REPAIR_STATUS: PASS_OFFLINE
 OFFLINE_REGRESSION_STATUS: PASS (1700 passed, 28 skipped)
 PRODUCTION_INTEGRATION_STATUS: Q STARTED; OUTLINE PROVIDER BLOCKED; NOT_VERIFIED
+AIHUBMIX_OUTLINE_RETRY_STATUS: FOUR PING PROBES PASS; RELATION_ADJUDICATION HTTP 200; LARGE CANDIDATE REQUEST REMOTE-DISCONNECTED; NOT_VERIFIED
 F1_CORPUS_BINDING_STATUS: PASS_MACHINE_SOURCE_BINDING (15/15); HUMAN_SEMANTIC_GROUND_TRUTH_PENDING
 F1_C_D_Q_STATUS: C STAGE1 15/15; D SCOPED_PASS UNDER APPROVED POLICY; Q NOT_VERIFIED
 F1_CONTENT_AND_DOCX_QA_STATUS: NOT_VERIFIED_FOR_FINAL_Q
