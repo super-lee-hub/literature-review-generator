@@ -12,6 +12,8 @@ from runtime.f1_corpus import (
     F1CorpusManifestV1,
     F1CorpusSourceRecordV1,
 )
+from runtime.control_plane import ReviewControlPlane
+from runtime.job_spec import load_runtime_job_spec
 from runtime.release_acceptance import (
     ParentAcceptanceResultV2,
     ReleaseAcceptancePlanV2,
@@ -144,6 +146,27 @@ def test_f1_plan_requires_the_runtime_bound_manifest_selection(
 
     assert plan.child(gate).f1_source_ids == tuple(source_ids)
     assert plan.child(gate).input_manifest == str(manifest_path)
+
+
+def test_outline_gate_f_empty_selection_uses_exact_runtime_binding(tmp_path: Path) -> None:
+    manifest_path, manifest = _write_f1_manifest(tmp_path)
+    runtime_path = _write_f1_runtime_spec(
+        tmp_path,
+        manifest_path=manifest_path,
+        manifest=manifest,
+        gate="Q",
+        source_ids=[f"F1-{number:02d}" for number in range(1, 16)],
+    )
+    spec = load_runtime_job_spec(runtime_path)
+
+    selected_hashes = ReviewControlPlane._acceptance_f1_source_hashes(
+        spec,
+        gate="F",
+        source_ids=(),
+    )
+
+    assert selected_hashes is not None
+    assert len(selected_hashes) == 15
 
 
 def test_f1_manifest_rejects_duplicate_hashes_unsafe_paths_and_tampered_files(

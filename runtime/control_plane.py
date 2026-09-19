@@ -3717,11 +3717,16 @@ class ReviewControlPlane:
         if not manifest_value or not isinstance(raw_bound_ids, (list, tuple)):
             raise ControlPlaneError("F1 source binding is incomplete")
         bound_ids = tuple(str(item).strip() for item in raw_bound_ids)
-        selected_ids = (
+        # Non-F1 gate children (for example the Outline-only Gate F retry)
+        # may intentionally omit a separate child selection.  In that case
+        # the RuntimeJobSpec's exact manifest binding is the authority.  C/D/Q
+        # still receive explicit selections from ReleaseAcceptanceSpec.
+        provided_ids = (
             tuple(str(item).strip() for item in source_ids)
             if source_ids is not None
-            else bound_ids
+            else ()
         )
+        selected_ids = provided_ids or bound_ids
         if (
             not selected_ids
             or any(not item for item in selected_ids)
@@ -3746,10 +3751,23 @@ class ReviewControlPlane:
                 manifest_path,
                 verify_source_files=True,
             )
-            selected = manifest.validate_selection(
-                selected_ids,
-                gate=normalized_gate,
-            )
+            if normalized_gate in {"C", "D", "Q"}:
+                selected = manifest.validate_selection(
+                    selected_ids,
+                    gate=normalized_gate,
+                )
+            else:
+                # Gate F is an Outline-only runtime child, not one of the
+                # C/D/Q corpus gates. Its empty child selection is already
+                # resolved to the exact RuntimeJobSpec binding above; verify
+                # that full set directly without inventing a new gate count.
+                if {
+                    item.casefold() for item in selected_ids
+                } != {item.source_id.casefold() for item in manifest.sources}:
+                    raise ControlPlaneError(
+                        "non-C/D/Q F1 child must bind the complete manifest set"
+                    )
+                selected = tuple(manifest.source_by_id(item) for item in selected_ids)
         except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
             raise ControlPlaneError(
                 f"F1 acceptance source manifest could not be verified: {type(exc).__name__}"
