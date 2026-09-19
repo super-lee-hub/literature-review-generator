@@ -26,7 +26,7 @@
       "gate": "Q",
       "runtime_spec": "Q_RUNTIME_SPEC_20260919_LOCAL_AUTHORIZED.json",
       "workspace": "D:/auto-generate/.acceptance_runs/f1_q_local_r1/f1_acceptance_Q_local_parser__f1-acceptance-Q-20260919-local-r1",
-      "input_manifest": "F1_CORPUS_MANIFEST_20260915.json",
+      "input_manifest": "D:/auto-generate/.acceptance_inputs/f1_d_20260919/f1_manifest.json",
       "f1_source_ids": [
         "F1-01", "F1-02", "F1-03", "F1-04", "F1-05",
         "F1-06", "F1-07", "F1-08", "F1-09", "F1-10",
