@@ -1,9 +1,9 @@
 {
   "project_name": "f1_acceptance_Q_local_parser",
-  "job_id": "f1-acceptance-Q-20260919-local-r2",
+  "job_id": "f1-acceptance-Q-20260919-local-r3",
   "config": "D:/auto-generate/F1_Q_RUNTIME_CONFIG_20260919_LOCAL.ini",
   "action": "run_all",
-  "workspace_path": "D:/auto-generate/.acceptance_runs/f1_q_local_r2/f1_acceptance_Q_local_parser__f1-acceptance-Q-20260919-local-r2",
+  "workspace_path": "D:/auto-generate/.acceptance_runs/f1_q_local_r3/f1_acceptance_Q_local_parser__f1-acceptance-Q-20260919-local-r3",
   "source": {"mode": "direct", "pdf_folder": "D:/auto-generate/.acceptance_inputs/f1_d_20260919/source_corpus"},
   "metadata": {
     "requested_stages": ["source_intake", "analyze", "outline", "review", "validate"],
@@ -28,8 +28,8 @@
       "acknowledged": true,
       "hosts": ["ai.saigou.work", "api.yhlxj.ai"],
       "route_fingerprint": "83f20d460cf21fb67e856c4f5daddaaabeeafbc75bb79742dca7a27b90d4326f",
-      "issued_at": "2026-09-19T04:18:15.6228650Z",
-      "expires_at": "2026-09-25T04:18:15.6228650Z"
+      "issued_at": "2026-09-19T04:18:15.622865Z",
+      "expires_at": "2026-09-25T04:18:15.622865Z"
     },
     "f1_corpus_binding": {
       "schema_version": "f1-corpus-binding-v1",

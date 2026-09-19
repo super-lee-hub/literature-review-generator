@@ -4,6 +4,6 @@
   "acknowledged": true,
   "hosts": ["ai.saigou.work", "api.yhlxj.ai"],
   "route_fingerprint": "83f20d460cf21fb67e856c4f5daddaaabeeafbc75bb79742dca7a27b90d4326f",
-  "issued_at": "2026-09-19T04:18:15.6228650Z",
-  "expires_at": "2026-09-25T04:18:15.6228650Z"
+  "issued_at": "2026-09-19T04:18:15.622865Z",
+  "expires_at": "2026-09-25T04:18:15.622865Z"
 }
