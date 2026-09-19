@@ -207,6 +207,13 @@ dashboard result therefore proves upstream generation/billing, not local Q
 closure. Evidence:
 `F1_AIHUBMIX_R16_UPSTREAM_OUTPUT_CORRELATION_20260920.json`.
 
+The user's subsequent dashboard export shows another successful Opus candidate
+upstream row (`56835 -> 21101`, 347.611 seconds, Trace ID
+`2026091916120684521947133469163`). This strengthens the provider-side output
+correlation but still supplies no local candidate receipt or response hash;
+Q remains `NOT_VERIFIED`. Supplemental evidence:
+`F1_AIHUBMIX_R16_UPSTREAM_OUTPUT_CORRELATION_20260920_R2.json`.
+
 ## F1 corpus and runtime boundary
 
 - Formal corpus: `F1_CORPUS_MANIFEST_20260915.json`, SHA-256

@@ -1,0 +1,23 @@
+{
+  "artifact_type": "f1_aihubmix_r16_upstream_output_correlation_update",
+  "artifact_version": "v1",
+  "observed_at_local": "2026-09-20",
+  "source": "user-provided AihubMix usage/dashboard export",
+  "gateway": "aihubmix.com",
+  "r16_candidate_retry": {
+    "dashboard_model": "AWS/claude-opus-5",
+    "input_tokens": 56835,
+    "output_tokens": 21101,
+    "status": "success",
+    "created_at_local": "2026-09-20 00:17:54",
+    "duration_seconds": 347.611,
+    "trace_id": "2026091916120684521947133469163",
+    "correlation_strength": "same_model_and_actual_provider_input_count; local_response_still_missing"
+  },
+  "acceptance_effect": {
+    "provider_side": "AihubMix reports another successful, billed candidate upstream generation.",
+    "local_side": "No new local candidate response hash, provider receipt, Registry artifact, or closure evidence was produced.",
+    "status": "NOT_VERIFIED",
+    "billing_is_not_local_pass": true
+  }
+}
