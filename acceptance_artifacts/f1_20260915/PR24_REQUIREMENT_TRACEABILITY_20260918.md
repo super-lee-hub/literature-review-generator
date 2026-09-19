@@ -1,7 +1,7 @@
 # PR24 / F1 current-SHA requirement traceability
 
-Checked at: `2026-09-19T12:28:00Z`
-Current checkout: `8415f6b1cefde91ae8d2e0c58311ca9b28468a4b`
+Checked at: `2026-09-19T13:27:00Z`
+Current checkout: `d7c4a4d117ff2706aa673f7f0b4cd029cd66cf51`
 Last executable code SHA used for the D acceptance: `36bcf118c159491aa7ce02a0b941104e8f00dab1`
 Branch: `codex/f1-validation-authority-closure`
 PR: `#24`, OPEN, not merged
@@ -27,6 +27,7 @@ receipts or auxiliary OCR into the F1-15 corpus.
 | F01 | PASS_OFFLINE | Diagnostics expose configured/source state and redact token-bearing fields. | `test_f01_config_loader_diagnostic_never_prints_mineru_token`; targeted result `30 passed`. | Historical logs outside this checkout are not audited. |
 | G01 | PASS_OFFLINE | `ready_to_apply` accepts only a JSON boolean; strings/numbers fail closed. | `test_g01_ready_to_apply_accepts_only_json_boolean`; targeted result `30 passed`. | No live Free Mode route required. |
 | G02 | PASS_OFFLINE | Loopback parsing uses URL/IP normalization and handles IPv4/IPv6 forms without lookalike overmatch. | G02 parameterized tests; targeted result `30 passed`. | No production network call required. |
+| H01 | PASS_OFFLINE | F1-bound Outline reuse retains local PDF source intake for manifest binding instead of converting the source bundle to summary-only. Gate F empty child selection resolves to the exact RuntimeSpec manifest set. | `tests/test_runtime_orchestrator.py::test_f1_bound_outline_with_reused_summary_still_intakes_local_pdfs`; `tests/test_f1_corpus_manifest.py::test_outline_gate_f_empty_selection_uses_exact_runtime_binding`; both focused tests pass. | Current-SHA live Outline remains provider-credential blocked. |
 
 ## Current offline verification
 
@@ -124,6 +125,24 @@ artifact and did not rerun Stage 1 or issue Stage 1 provider calls.
   claimed. Evidence projection:
   `F1_AIHUBMIX_OUTLINE_RETRY_SUMMARY_20260919.json`.
 
+## Current-SHA AihubMix changed-shape retry readback (R13)
+
+The current executable `d7c4a4d117ff2706aa673f7f0b4cd029cd66cf51` was used in a
+clean acceptance worktree. The child reused the exact 15-paper canonical Stage1
+summary artifact, kept `send_original_pdf=never`, and changed only the
+`Outline_API.max_output_tokens` request shape from 65536 to 32000. Runtime
+source intake and Outline call-plan publication completed without Stage1
+provider calls.
+
+- The first persisted provider call was `relation_adjudication` through
+  `aihubmix_claude` / `claude-fable-5-1`; AihubMix returned HTTP 401 with
+  `fatal_config_or_auth` / invalid-key rejection.
+- No candidate-generation request was attempted, so this run does not answer
+  whether the lower output cap fixes the earlier large-request disconnect.
+- Provider calls used: 1; retries: 0. Gate F remains `NOT_VERIFIED` because
+  closure is incomplete. Evidence projection:
+  `F1_AIHUBMIX_OUTLINE_RETRY_SUMMARY_20260919_R13.json`.
+
 ## F1 corpus and runtime boundary
 
 - Formal corpus: `F1_CORPUS_MANIFEST_20260915.json`, SHA-256
@@ -177,15 +196,15 @@ F1-10 duplicate with 1/21 pages and the same SHA as the manifest source. See
 ## Final status matrix
 
 ```text
-FINAL_EXECUTABLE_SHA: 253147ab21ca2e9de69b4c0297025ecae73380ff
-CURRENT_CHECKOUT_SHA: 8415f6b1cefde91ae8d2e0c58311ca9b28468a4b
-EVIDENCE_COMMIT_SHA: 8415f6b1cefde91ae8d2e0c58311ca9b28468a4b (documentation-only)
+FINAL_EXECUTABLE_SHA: d7c4a4d117ff2706aa673f7f0b4cd029cd66cf51
+CURRENT_CHECKOUT_SHA: d7c4a4d117ff2706aa673f7f0b4cd029cd66cf51
+EVIDENCE_COMMIT_SHA: d7c4a4d117ff2706aa673f7f0b4cd029cd66cf51 (execution base)
 PR_STATE: OPEN
 PR_MERGED: false
 CODE_REPAIR_STATUS: PASS_OFFLINE
 OFFLINE_REGRESSION_STATUS: CI PASS (6/6); local sandbox 1689 passed, 28 skipped, 13 named-pipe ACL-blocked; blocked nodes 13/13 pass outside sandbox
-PRODUCTION_INTEGRATION_STATUS: Q STARTED; OUTLINE PROVIDER BLOCKED; NOT_VERIFIED
-AIHUBMIX_OUTLINE_RETRY_STATUS: FOUR PING PROBES PASS; RELATION_ADJUDICATION HTTP 200; LARGE CANDIDATE REQUEST REMOTE-DISCONNECTED; GATE_F NOT_VERIFIED
+PRODUCTION_INTEGRATION_STATUS: CURRENT-SHA OUTLINE ATTEMPTED; PROVIDER AUTH BLOCKED; NOT_VERIFIED
+AIHUBMIX_OUTLINE_RETRY_STATUS: R13 RELATION_ADJUDICATION HTTP 401 INVALID_KEY; CANDIDATE NOT ATTEMPTED; GATE_F NOT_VERIFIED
 F1_CORPUS_BINDING_STATUS: PASS_MACHINE_SOURCE_BINDING (15/15); HUMAN_SEMANTIC_GROUND_TRUTH_PENDING
 F1_C_D_Q_STATUS: C STAGE1 15/15; D SCOPED_PASS UNDER APPROVED POLICY; Q NOT_VERIFIED
 F1_CONTENT_AND_DOCX_QA_STATUS: NOT_VERIFIED_FOR_FINAL_Q
@@ -194,5 +213,5 @@ REAL_OCR_STATUS: PASS_AUXILIARY_ZOTERO_ONLY; NO F1 OCR-PRIMARY SOURCE
 RESUME_AND_BUDGET_STATUS: BUDGETED_Q_ATTEMPTS_RECORDED; CHECKPOINT_READBACK_INCONSISTENT; LIVE MINERU RECOVERY UNVERIFIED
 GOVERNANCE_STATUS: NOT_COMPLETE; main branch protection remains disabled
 FINAL_RELEASE_STATUS: NOT_READY_TO_MERGE
-REMAINING_BLOCKERS: Q Outline/Writer/Validator/DOCX closure; healthy provider route or approved route remap; Q resume checkpoint integrity; human semantic ground truth; live MinerU recovery; full GUI Q; governance/branch protection
+REMAINING_BLOCKERS: valid AihubMix credential; Q Outline/Writer/Validator/DOCX closure; Q resume checkpoint integrity; human semantic ground truth; live MinerU recovery; full GUI Q; governance/branch protection
 ```
