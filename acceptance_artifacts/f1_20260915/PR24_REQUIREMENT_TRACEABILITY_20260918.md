@@ -1,7 +1,7 @@
 # PR24 / F1 current-SHA requirement traceability
 
-Checked at: `2026-09-19T08:17:38Z`
-Current checkout: `39f0a4098b953961ab519d94cc2260994b3c4609`
+Checked at: `2026-09-19T12:28:00Z`
+Current checkout: `8415f6b1cefde91ae8d2e0c58311ca9b28468a4b`
 Last executable code SHA used for the D acceptance: `36bcf118c159491aa7ce02a0b941104e8f00dab1`
 Branch: `codex/f1-validation-authority-closure`
 PR: `#24`, OPEN, not merged
@@ -34,22 +34,28 @@ Commands run from the current worktree:
 
 ```text
 D:\Anaconda\python.exe -m pytest -q tests/test_pr24_final_fixes.py
-30 passed, 1 warning in 6.46s
+30 passed, 1 warning in 11.52s
 
-D:\Anaconda\python.exe -m pytest -q -p no:cacheprovider
-1700 passed, 28 skipped in 2434.50s
+D:\Anaconda\python.exe -m pytest -q
+1689 passed, 28 skipped, 13 failed in 3508.12s
+
+The 13 failures all occurred while creating Windows multiprocessing named
+pipes (`WinError 5`) before test bodies ran in the sandbox. The same 13 node
+IDs reran outside the sandbox and passed: `13 passed in 86.01s`. Hosted CI
+run `35438729262` for current checkout `8415f6b1...` completed all 6 jobs
+successfully. The sandbox full-run result is retained as an environment
+limitation, not relabeled as a product pass.
 
 D:\Anaconda\python.exe -m pip check
-No broken requirements found.
+FAILED in the shared Anaconda environment because of unrelated installed-package conflicts; clean-lock pip check passed in Hosted CI run `35438729262`.
 
 D:\Anaconda\python.exe -m compileall -q runtime preprocess services free_mode config_loader.py reviewctl.py
 PASS
 
-D:\Anaconda\python.exe -m ruff check ... --select E9,F
+D:\Anaconda\python.exe -m ruff check runtime/trust_admission.py runtime/runner.py preprocess/service.py services/credential_provenance.py services/queue_service.py services/stage1_analysis_service.py free_mode/service.py config_loader.py --select E9,F
 All checks passed.
 
-D:\Anaconda\python.exe -m pyright runtime/trust_admission.py runtime/runner.py preprocess/service.py services/credential_provenance.py services/queue_service.py services/stage1_analysis_service.py free_mode/service.py config_loader.py
-0 errors, 0 warnings, 0 informations
+Hosted CI run `35438729262` completed the clean-install Pyright and fatal-Ruff checks successfully.
 ```
 
 The full suite's 28 skips remain explicit capability/environment skips; they
@@ -171,13 +177,13 @@ F1-10 duplicate with 1/21 pages and the same SHA as the manifest source. See
 ## Final status matrix
 
 ```text
-FINAL_EXECUTABLE_SHA: b61e0917346d86d67015cc1ea7bab818ce922f4e
-CURRENT_CHECKOUT_SHA: f77bb18e5a1c8580ea5a1cbca5d63c1789ece1b4
-EVIDENCE_COMMIT_SHA: f77bb18e5a1c8580ea5a1cbca5d63c1789ece1b4 (documentation-only)
+FINAL_EXECUTABLE_SHA: 253147ab21ca2e9de69b4c0297025ecae73380ff
+CURRENT_CHECKOUT_SHA: 8415f6b1cefde91ae8d2e0c58311ca9b28468a4b
+EVIDENCE_COMMIT_SHA: 8415f6b1cefde91ae8d2e0c58311ca9b28468a4b (documentation-only)
 PR_STATE: OPEN
 PR_MERGED: false
 CODE_REPAIR_STATUS: PASS_OFFLINE
-OFFLINE_REGRESSION_STATUS: PASS (1700 passed, 28 skipped)
+OFFLINE_REGRESSION_STATUS: CI PASS (6/6); local sandbox 1689 passed, 28 skipped, 13 named-pipe ACL-blocked; blocked nodes 13/13 pass outside sandbox
 PRODUCTION_INTEGRATION_STATUS: Q STARTED; OUTLINE PROVIDER BLOCKED; NOT_VERIFIED
 AIHUBMIX_OUTLINE_RETRY_STATUS: FOUR PING PROBES PASS; RELATION_ADJUDICATION HTTP 200; LARGE CANDIDATE REQUEST REMOTE-DISCONNECTED; GATE_F NOT_VERIFIED
 F1_CORPUS_BINDING_STATUS: PASS_MACHINE_SOURCE_BINDING (15/15); HUMAN_SEMANTIC_GROUND_TRUTH_PENDING
