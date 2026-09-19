@@ -2949,6 +2949,7 @@ class ReviewControlPlane:
                                     profile_root=evidence_root,
                                     gate=gate,
                                     f1_source_ids=child.f1_source_ids,
+                                    runtime_spec_path=child.runtime_spec,
                                 )
                             )
                         if workspace and Path(workspace).is_dir():
@@ -3765,6 +3766,7 @@ class ReviewControlPlane:
         profile_root: str | Path,
         gate: str = "",
         f1_source_ids: Iterable[str] | None = None,
+        runtime_spec_path: str | Path | None = None,
     ) -> list[dict[str, Any]]:
         """Derive Gate D profiles from published preprocess/Stage 1 artifacts.
 
@@ -3955,7 +3957,12 @@ class ReviewControlPlane:
         ):
             fixture_path = Path(
                 str(d_policy.get("auxiliary_fixture_path") or "")
-            ).expanduser().resolve()
+            ).expanduser()
+            if not fixture_path.is_absolute() and runtime_spec_path:
+                fixture_path = (
+                    Path(runtime_spec_path).expanduser().resolve().parent / fixture_path
+                )
+            fixture_path = fixture_path.resolve()
             if not fixture_path.is_file() or is_reparse_path(fixture_path):
                 raise ControlPlaneError(
                     "modified D policy auxiliary OCR fixture is missing or unsafe"
