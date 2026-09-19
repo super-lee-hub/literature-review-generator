@@ -176,6 +176,18 @@ content hash, schema validation, Registry artifact, or receipt-closure proof;
 Gate F and Q therefore remain `NOT_VERIFIED`. See
 `F1_AIHUBMIX_PROVIDER_DASHBOARD_CORRELATION_20260919.json`.
 
+### AihubMix LLM recovery probe after user-enabled async tasks
+
+After the user reported enabling AihubMix asynchronous tasks, a new single
+candidate probe still ended in `ProxyError: RemoteDisconnected`. The API key
+then returned HTTP 200 with zero LLM recovery tasks for both the exact model
+filter and the account-wide LLM list; twelve additional polls over three
+minutes also returned zero tasks. The two dashboard Tids were not task IDs and
+returned HTTP 404 from the task-detail endpoint. This proves that no
+recoverable response was observable through the API key for this probe; it does
+not prove that upstream computation was discarded. Evidence:
+`F1_AIHUBMIX_RECOVERY_PROBE_20260919.json`.
+
 ## F1 corpus and runtime boundary
 
 - Formal corpus: `F1_CORPUS_MANIFEST_20260915.json`, SHA-256
@@ -237,7 +249,7 @@ PR_MERGED: false
 CODE_REPAIR_STATUS: PASS_OFFLINE
 OFFLINE_REGRESSION_STATUS: CI PASS (6/6); local sandbox 1689 passed, 28 skipped, 13 named-pipe ACL-blocked; blocked nodes 13/13 pass outside sandbox
 PRODUCTION_INTEGRATION_STATUS: CURRENT-SHA OUTLINE ATTEMPTED; SEMANTIC/NETWORK BLOCKED; NOT_VERIFIED
-AIHUBMIX_OUTLINE_RETRY_STATUS: R14 SEMANTIC CONTRACT BLOCK; R15 LOCAL CANDIDATE RECEIPT MISSING AFTER REMOTE-DISCONNECT; PROVIDER DASHBOARD SHOWS CORROBORATING UPSTREAM OUTPUT; NOT_VERIFIED
+AIHUBMIX_OUTLINE_RETRY_STATUS: R14 SEMANTIC CONTRACT BLOCK; R15 LOCAL CANDIDATE RECEIPT MISSING AFTER REMOTE-DISCONNECT; RECOVERY PROBE FOUND NO TASK; PROVIDER DASHBOARD SHOWS CORROBORATING UPSTREAM OUTPUT; NOT_VERIFIED
 F1_CORPUS_BINDING_STATUS: PASS_MACHINE_SOURCE_BINDING (15/15); HUMAN_SEMANTIC_GROUND_TRUTH_PENDING
 F1_C_D_Q_STATUS: C STAGE1 15/15; D SCOPED_PASS UNDER APPROVED POLICY; Q NOT_VERIFIED
 F1_CONTENT_AND_DOCX_QA_STATUS: NOT_VERIFIED_FOR_FINAL_Q
