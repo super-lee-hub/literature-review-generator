@@ -1,7 +1,8 @@
 # PR24 / F1 current-SHA requirement traceability
 
-Checked at: `2026-09-18T15:41:36.4067700Z`
-Executable checkout: `b6fa86b7b75fbd35888f871066e0e00aae70eac0`
+Checked at: `2026-09-19T08:17:38Z`
+Current checkout: `39f0a4098b953961ab519d94cc2260994b3c4609`
+Last executable code SHA used for the D acceptance: `36bcf118c159491aa7ce02a0b941104e8f00dab1`
 Branch: `codex/f1-validation-authority-closure`
 PR: `#24`, OPEN, not merged
 
@@ -54,6 +55,43 @@ D:\Anaconda\python.exe -m pyright runtime/trust_admission.py runtime/runner.py p
 The full suite's 28 skips remain explicit capability/environment skips; they
 are not counted as live Provider, MinerU, GUI, OCR, or F1 semantic passes.
 
+## Current Q execution readback
+
+The Q preparation was executed through the current runtime rather than left at
+preflight:
+
+- Runtime config: `D:/auto-generate/F1_Q_RUNTIME_CONFIG_20260919_LOCAL.ini`;
+  parser mode is local, original-PDF transport is never, and the F1 manifest
+  remains the exact 15-source manifest with SHA-256
+  `f741776ea2eda6b5937f4fc13e40569216eb3173ff597fb80eeea2e46dab3e90`.
+- Acceptance plan: `F1_Q_LIVE_ACCEPTANCE_PLAN_20260919.json`, parent
+  `f1-acceptance-Q-20260919-local-r8`, with the acknowledged two-host policy
+  and the bounded budget of 64 calls / 2,000,000 output tokens / 16 retries /
+  7200 seconds.
+- Durable job workspace:
+  `D:/auto-generate/.acceptance_runs/f1_q_local_r3/f1_acceptance_Q_local_parser__f1-acceptance-Q-20260919-local-r3`.
+  Its Stage 1 progress snapshot records 15 summaries and zero failed papers.
+- Canonical `reviewctl status` readback is `job_status=failed`,
+  `failed_stage=outline`, `attempt_number=6`, with only `source_intake` and
+  `analyze` completed; `outline`, `review`, and `validate` remain absent from
+  the current artifact set.
+- The latest attempt snapshot records the terminal reason
+  `provider transport attempts exceeded the pre-admitted aggregate
+  reservation`. Earlier large Outline requests to the configured
+  `api.yhlxj.ai` route produced the recorded 524/ProxyError failure; the
+  latest retry therefore remains `NOT_VERIFIED`, not a Q pass.
+- The latest `resume_state_report` says `strong_resumable`, but its referenced
+  checkpoint file is not present in the current workspace. Resume integrity is
+  therefore not independently verified and must not be reported as PASS.
+- A current, minimal `Writer_API` probe against `ai.saigou.work` was admitted
+  and made three attempts; the receipt reported HTTP 503 with
+  `error_kind=retryable_http`. This does not establish a usable fallback for
+  the Outline roles and did not send F1 documents.
+
+This section records an incomplete live execution. It does not promote Stage 1
+outputs, the successful relation receipt, a ping probe, or any historical green
+run into full Q acceptance.
+
 ## F1 corpus and runtime boundary
 
 - Formal corpus: `F1_CORPUS_MANIFEST_20260915.json`, SHA-256
@@ -67,13 +105,20 @@ are not counted as live Provider, MinerU, GUI, OCR, or F1 semantic passes.
   `F1_D_MODALITY_ALL_CORPUS_DIAGNOSTICS_20260918.json`, SHA-256
   `7cd113489a288a409069c014fea7205e426afbc47052e6986b141c7a8175f652`.
   All 15 diagnostics were checked; only F1-10 has 1 scanned/OCR page of 21,
-  so no source reaches the 25% `ocr_scanned` primary threshold. `D=FAIL_MODALITY`.
-- Q route admission:
-  `F1_Q_ROUTE_ADMISSION_RECHECK_20260918_R2.json`, SHA-256
-  `25e0035148807aa69ce6a6a268b205693a25674aa6c4e096ea0abb03800071f4`.
-  Fresh v2 ACK validation is PASS for the current five-host policy, but Q made
-  zero calls and remains `BLOCKED_D_PREREQUISITE`.
-- Six synthetic production-path provider probes passed in
+  so no source reaches the 25% `ocr_scanned` primary threshold under the
+  original strict policy; this historical diagnostic is `D=FAIL_MODALITY`.
+- The user-approved D policy was subsequently changed to
+  `f1-two-in-corpus-plus-auxiliary-ocr-v1`. Under that explicitly scoped policy,
+  D child acceptance is PASS at executable SHA `36bcf118c159491aa7ce02a0b941104e8f00dab1`
+  for F1-01/F1-03/F1-14, with two in-corpus modalities and a separate Zotero
+  OCR auxiliary fixture. The D parent is `SCOPED_PASS`, not full-release PASS;
+  F1 Q corpus binding is unchanged.
+- Q route admission and authorization:
+  `F1_EXTERNAL_HOST_ACKNOWLEDGEMENT_20260919_Q_LOCAL.json` and
+  `Q_RUNTIME_SPEC_20260919_LOCAL_AUTHORIZED.json`. The acknowledged hosts are
+  `ai.saigou.work` and `api.yhlxj.ai`; local parsing is enforced and only
+  extracted text/rendered images are in scope for provider transport.
+- Six historical synthetic production-path provider probes passed in
   `F1_PROVIDER_MICRO_PROBE_20260918.json` (SHA-256
   `26f92d8668eb58cb7cf16a074ad633cb7a66b02b06dbffbc2996b24b172d20c2`).
   These used only `ping`; they do not prove Outline quality, Writer, Validator,
@@ -100,19 +145,20 @@ F1-10 duplicate with 1/21 pages and the same SHA as the manifest source. See
 ## Final status matrix
 
 ```text
-FINAL_EXECUTABLE_SHA: b6fa86b7b75fbd35888f871066e0e00aae70eac0
+FINAL_EXECUTABLE_SHA: 36bcf118c159491aa7ce02a0b941104e8f00dab1
+CURRENT_CHECKOUT_SHA: 39f0a4098b953961ab519d94cc2260994b3c4609
 PR_STATE: OPEN
 PR_MERGED: false
 CODE_REPAIR_STATUS: PASS_OFFLINE
 OFFLINE_REGRESSION_STATUS: PASS (1700 passed, 28 skipped)
-PRODUCTION_INTEGRATION_STATUS: SYNTHETIC_ROUTE_REACHABILITY_ONLY; Q NOT STARTED
+PRODUCTION_INTEGRATION_STATUS: Q STARTED; OUTLINE PROVIDER BLOCKED; NOT_VERIFIED
 F1_CORPUS_BINDING_STATUS: PASS_MACHINE_SOURCE_BINDING (15/15); HUMAN_SEMANTIC_GROUND_TRUTH_PENDING
-F1_C_D_Q_STATUS: C/R14 STAGE1 EVIDENCE EXISTS; D FAIL_MODALITY; Q BLOCKED_D_PREREQUISITE
+F1_C_D_Q_STATUS: C STAGE1 15/15; D SCOPED_PASS UNDER APPROVED POLICY; Q NOT_VERIFIED
 F1_CONTENT_AND_DOCX_QA_STATUS: NOT_VERIFIED_FOR_FINAL_Q
 PRODUCTION_GUI_STATUS: SCOPED_GATE_I_ONLY; NOT_FULL_F1_Q
 REAL_OCR_STATUS: PASS_AUXILIARY_ZOTERO_ONLY; NO F1 OCR-PRIMARY SOURCE
-RESUME_AND_BUDGET_STATUS: PASS_OFFLINE_SCOPED; LIVE PROVIDER/MinerU RECOVERY UNVERIFIED
+RESUME_AND_BUDGET_STATUS: BUDGETED_Q_ATTEMPTS_RECORDED; CHECKPOINT_READBACK_INCONSISTENT; LIVE MINERU RECOVERY UNVERIFIED
 GOVERNANCE_STATUS: NOT_COMPLETE; main branch protection remains disabled
 FINAL_RELEASE_STATUS: NOT_READY_TO_MERGE
-REMAINING_BLOCKERS: F1 D modality or explicitly approved D-policy change; human semantic ground truth; Q 15-paper Outline/Writer/Validator/DOCX closure; live MinerU recovery; full GUI Q; governance/branch protection
+REMAINING_BLOCKERS: Q Outline/Writer/Validator/DOCX closure; healthy provider route or approved route remap; Q resume checkpoint integrity; human semantic ground truth; live MinerU recovery; full GUI Q; governance/branch protection
 ```
