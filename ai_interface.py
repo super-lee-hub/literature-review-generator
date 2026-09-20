@@ -299,6 +299,18 @@ def _aihubmix_recover_disconnected_call(
         30,
         _coerce_positive_int(api_config.get("recovery_request_timeout_seconds"), 30),
     )
+    max_polls = min(
+        10,
+        _coerce_positive_int(api_config.get("recovery_max_polls"), 3),
+    )
+    poll_interval_seconds = min(
+        10,
+        _coerce_nonnegative_int(api_config.get("recovery_poll_interval_seconds"), 2),
+    )
+    recovery_deadline = time.monotonic() + min(
+        120,
+        _coerce_positive_int(api_config.get("recovery_deadline_seconds"), 90),
+    )
 
     def get_json(url: str, **kwargs: Any) -> Any:
         if should_bypass_environment_proxy(api_config):
@@ -308,45 +320,58 @@ def _aihubmix_recover_disconnected_call(
         return requests.get(url, **kwargs)
 
     try:
-        listing = get_json(
-            f"{recovery_base}/ai/v1/tasks",
-            params={"object": "llm", "model": model, "limit": 20, "order": "desc"},
-            headers=headers,
-            timeout=timeout_seconds,
-        )
-        if listing.status_code != 200:
+        task = None
+        for poll_index in range(max_polls):
+            remaining = recovery_deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            listing = get_json(
+                f"{recovery_base}/ai/v1/tasks",
+                params={"object": "llm", "model": model, "limit": 20, "order": "desc"},
+                headers=headers,
+                timeout=min(timeout_seconds, max(1, int(remaining))),
+            )
+            if listing.status_code != 200:
+                return None
+            payload = listing.json()
+            rows = payload.get("data") if isinstance(payload, Mapping) else None
+            if not isinstance(rows, list):
+                return None
+            candidates = []
+            for row in rows:
+                if not isinstance(row, Mapping):
+                    continue
+                if str(row.get("id") or "").strip() != proof_task_id:
+                    continue
+                if str(row.get("model") or "").strip() != model:
+                    continue
+                created_at = _epoch_seconds(row.get("created_at"))
+                if created_at is None or created_at < request_started_epoch - 15:
+                    continue
+                candidates.append(row)
+            if len(candidates) > 1:
+                return None
+            if len(candidates) == 1:
+                candidate = candidates[0]
+                output_items = candidate.get("output")
+                if isinstance(output_items, list) and output_items and not any(
+                    bool(item.get("truncated"))
+                    for item in output_items
+                    if isinstance(item, Mapping)
+                ):
+                    task = candidate
+                    break
+            if poll_index + 1 < max_polls and poll_interval_seconds:
+                time.sleep(min(poll_interval_seconds, max(0, recovery_deadline - time.monotonic())))
+        if task is None:
             return None
-        payload = listing.json()
-        rows = payload.get("data") if isinstance(payload, Mapping) else None
-        if not isinstance(rows, list):
-            return None
-        candidates = []
-        for row in rows:
-            if not isinstance(row, Mapping):
-                continue
-            if str(row.get("id") or "").strip() != proof_task_id:
-                continue
-            if str(row.get("model") or "").strip() != model:
-                continue
-            created_at = _epoch_seconds(row.get("created_at"))
-            if created_at is None or created_at < request_started_epoch - 15:
-                continue
-            candidates.append(row)
-        if len(candidates) != 1:
-            return None
-        task = candidates[0]
         task_id = str(task.get("id") or "").strip()
         if not task_id:
-            return None
-        output_items = task.get("output")
-        if not isinstance(output_items, list) or not output_items:
-            return None
-        if any(bool(item.get("truncated")) for item in output_items if isinstance(item, Mapping)):
             return None
         content_response = get_json(
             f"{recovery_base}/ai/v1/tasks/{task_id}/content",
             headers=headers,
-            timeout=max(timeout_seconds, 60),
+            timeout=min(max(timeout_seconds, 60), max(1, int(recovery_deadline - time.monotonic()))),
         )
         if content_response.status_code != 200:
             return None
