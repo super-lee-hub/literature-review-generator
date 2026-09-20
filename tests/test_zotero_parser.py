@@ -303,3 +303,29 @@ def test_parse_result_v1_preserves_localized_zotero_fields_and_unknowns(tmp_path
 
     serialized = result.to_dict()
     assert parser.ZoteroParseResultV1.from_dict(serialized).to_dict() == serialized
+
+
+def test_parse_result_v1_keeps_colon_in_unlabeled_title(tmp_path: Path) -> None:
+    report_path = tmp_path / "colon-title.txt"
+    report_path.write_text(
+        "\n".join(
+            [
+                "*",
+                "Painful Prices: The Moral Harm Model of Price Fairness",
+                "条目类型\t期刊文章",
+                "作者\tMargaret C Campbell",
+                "出版物\tJournal of Consumer Research",
+                "DOI\t10.1093/jcr/ucaf045",
+                "引用关键词\tcampbellPainfulPricesMoral2025",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    parser = __import__("zotero_parser", fromlist=["parse_zotero_report_result"])
+    result = parser.parse_zotero_report_result(str(report_path))
+
+    assert result.status == "ok"
+    assert result.papers[0]["title"] == "Painful Prices: The Moral Harm Model of Price Fairness"
+    assert result.papers[0]["journal"] == "Journal of Consumer Research"
+    assert not result.diagnostics
