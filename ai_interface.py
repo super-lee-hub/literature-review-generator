@@ -2776,7 +2776,7 @@ def _call_ai_api_detailed(
     # Mark this boundary immediately before entering the uninstrumented
     # transport so resume can release only the former case.
     provider_runtime.mark_transport_started(admission)
-    transport_api_config = dict(api_config)
+    transport_api_config: dict[str, Any] = dict(api_config)
     if not str(transport_api_config.get("operation_id") or "").strip():
         transport_api_config["operation_id"] = (
             f"{getattr(provider_runtime, 'job_id', '')}:{getattr(provider_runtime, 'call_id', '')}"
@@ -2791,7 +2791,7 @@ def _call_ai_api_detailed(
         transport_api_config["provider_route"] = str(provider_route or "")
     result = _call_ai_api_detailed_uninstrumented(
         prompt,
-        transport_api_config,
+        cast(APIConfig, transport_api_config),
         system_prompt,
         max_tokens=max_tokens,
         temperature=temperature,
