@@ -370,15 +370,19 @@ def _parse_known_field(line: str) -> Optional[Tuple[str, str, str]]:
 
 
 def _parse_labeled_field(line: str) -> Optional[Tuple[str, str]]:
-    """Parse a label/value line even when the label is not known yet."""
+    """Parse an unknown standard-export label without misreading prose titles.
+
+    Standard Zotero reports use a tab between a field label and its value.
+    Colon-delimited text is intentionally excluded here: article titles and
+    abstract prose commonly contain colons and must remain title/continuation
+    content.  Known colon-delimited fields are still handled by
+    :func:`_parse_known_field` above.
+    """
 
     if "\t" in line:
         key, value = line.split("\t", 1)
         if key.strip():
             return key.strip(), value.strip()
-    match = re.match(r"^\s*([^:：\t]{1,80})\s*[:：]\s*(.*)$", line)
-    if match and match.group(1).strip():
-        return match.group(1).strip(), match.group(2).strip()
     return None
 
 
