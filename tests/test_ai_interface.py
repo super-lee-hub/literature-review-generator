@@ -172,6 +172,32 @@ class TestAIIinterface:
         assert result["error_kind"] == "transient_network"
 
     @patch('ai_interface.requests.post')
+    def test_aihubmix_disconnect_is_unknown_and_not_retried_without_recovery(self, mock_post):
+        """AihubMix POST disconnects are not safe to regenerate automatically."""
+        mock_post.side_effect = ConnectionError("remote end closed connection")
+
+        config = {
+            "api_key": "test_key",
+            "model": "claude-fable-5-1",
+            "api_base": "https://aihubmix.com/v1",
+            "provider_family": "aihubmix_claude",
+            "transport_retries": "4",
+            "aihubmix_recovery_enabled": "false",
+        }
+        with patch('ai_interface.load_config', return_value=_runtime_config(retries="4")), patch(
+            'ai_interface.time.sleep', return_value=None
+        ):
+            result = self.ai_interface._call_ai_api_detailed(
+                "test prompt",
+                config,
+                "system prompt",
+            )
+
+        assert result["status"] == "failed"
+        assert result["error_kind"] == "outcome_unknown"
+        assert mock_post.call_count == 1
+
+    @patch('ai_interface.requests.post')
     def test_call_ai_api_detailed_classifies_retryable_http(self, mock_post):
         mock_response = Mock()
         mock_response.status_code = 503

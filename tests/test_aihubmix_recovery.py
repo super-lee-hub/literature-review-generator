@@ -24,6 +24,8 @@ def _api_config() -> dict[str, object]:
         "model": "claude-opus-5",
         "proxy_mode": "environment",
         "aihubmix_recovery_enabled": "true",
+        "operation_id": "operation-recovery-1",
+        "attempt_id": "attempt-recovery-1",
     }
 
 
@@ -65,6 +67,8 @@ def test_aihubmix_recovery_requires_one_recent_matching_task(monkeypatch) -> Non
         "task_id": "task_recovery_1",
         "request_fingerprint": "test-fingerprint",
         "operator": "test-operator",
+        "operation_id": "operation-recovery-1",
+        "attempt_id": "attempt-recovery-1",
     }
     result = ai_interface._aihubmix_recover_disconnected_call(
         api_config=config,
@@ -99,6 +103,33 @@ def test_aihubmix_recovery_refuses_unique_task_without_identity_proof(monkeypatc
         request_started_epoch=time.time() - 1,
         response_parser=ai_interface.parse_chat_completions_response,
         response_format="json",
+    )
+
+    assert result is None
+
+
+def test_aihubmix_recovery_refuses_proof_bound_to_another_operation(monkeypatch) -> None:
+    config = _api_config()
+    config["aihubmix_recovery_proof"] = {
+        "task_id": "task_recovery_1",
+        "request_fingerprint": "test-fingerprint",
+        "operator": "test-operator",
+        "operation_id": "operation-other",
+        "attempt_id": "attempt-recovery-1",
+    }
+    monkeypatch.setattr(
+        ai_interface.requests,
+        "get",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("mismatched proof must not query tasks")),
+    )
+
+    result = ai_interface._aihubmix_recover_disconnected_call(
+        api_config=config,
+        model="claude-opus-5",
+        request_started_epoch=time.time() - 1,
+        response_parser=ai_interface.parse_chat_completions_response,
+        response_format="json",
+        request_fingerprint="test-fingerprint",
     )
 
     assert result is None

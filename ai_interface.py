@@ -276,10 +276,18 @@ def _aihubmix_recover_disconnected_call(
     proof_task_id = str(proof.get("task_id") or "").strip()
     proof_fingerprint = str(proof.get("request_fingerprint") or "").strip()
     proof_operator = str(proof.get("operator") or "").strip()
+    operation_id = str(api_config.get("operation_id") or "").strip()
+    attempt_id = str(api_config.get("attempt_id") or "").strip()
+    proof_operation_id = str(proof.get("operation_id") or "").strip()
+    proof_attempt_id = str(proof.get("attempt_id") or "").strip()
     if (
         not proof_task_id
         or not proof_fingerprint
         or not proof_operator
+        or not operation_id
+        or not attempt_id
+        or proof_operation_id != operation_id
+        or proof_attempt_id != attempt_id
         or not request_fingerprint
         or proof_fingerprint != request_fingerprint
     ):
@@ -2273,7 +2281,6 @@ def _call_ai_api_detailed_uninstrumented(
         last_failure = _api_result(status="failed", error_kind="invalid_response", message="API call did not run")
         attempt = 0
         strict_retry_budget = attempt_limit is not None or bool(max_retries_per_call)
-        aihubmix_recovery_active = _aihubmix_recovery_enabled(api_config)
 
         def can_start_attempt() -> bool:
             if strict_retry_budget:
@@ -2292,6 +2299,11 @@ def _call_ai_api_detailed_uninstrumented(
                 "model": str(model_name),
                 "response_format": response_format,
                 "payload": payload,
+                "operation_id": str(api_config.get("operation_id") or ""),
+                "attempt_id": str(api_config.get("attempt_id") or ""),
+                "logical_attempt_identity": str(api_config.get("logical_attempt_identity") or ""),
+                "provider_route": str(api_config.get("provider_route") or ""),
+                "source_manifest_sha256": str(api_config.get("source_manifest_sha256") or ""),
             }
             return hashlib.sha256(
                 json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -2323,11 +2335,17 @@ def _call_ai_api_detailed_uninstrumented(
             attempts_used += 1
             # Do not let a previous 429/503 leak into a new transport error.
             response = None
+            transport_attempt_started = False
             try:
                 final_payload = copy.deepcopy(payload)
                 if 'aihubmix.com' in api_base.lower() and logger:
                     logger.info(f"调用AIHubMix API，模型: {final_payload['model']}")
 
+                # Once the POST hand-off begins, a disconnect/timeout cannot
+                # prove that the provider did not process the request.  Keep
+                # this boundary separate from retry configuration so an
+                # unknown outcome is never silently regenerated.
+                transport_attempt_started = True
                 response = _post_with_proxy_mode(
                     api_url,
                     api_config=api_config,
@@ -2550,11 +2568,16 @@ def _call_ai_api_detailed_uninstrumented(
                     http_status = response_status
                     provider_code = None
 
-                if aihubmix_recovery_active and error_kind == "transient_network":
+                if (
+                    transport_attempt_started
+                    and "aihubmix.com" in str(api_base).casefold()
+                    and error_kind == "transient_network"
+                ):
                     error_kind = "outcome_unknown"
                     message = (
                         "AihubMix transport disconnected after the request boundary; "
-                        "the provider outcome is unknown and will not be regenerated automatically"
+                        "the provider outcome is unknown and will not be regenerated automatically; "
+                        "recovery is attempted only when explicitly enabled and identity-bound"
                         + (f": {message}" if message else "")
                     )
 
@@ -2728,9 +2751,22 @@ def _call_ai_api_detailed(
     # Mark this boundary immediately before entering the uninstrumented
     # transport so resume can release only the former case.
     provider_runtime.mark_transport_started(admission)
+    transport_api_config = dict(api_config)
+    if not str(transport_api_config.get("operation_id") or "").strip():
+        transport_api_config["operation_id"] = (
+            f"{getattr(provider_runtime, 'job_id', '')}:{getattr(provider_runtime, 'call_id', '')}"
+        ).strip(":")
+    if not str(transport_api_config.get("attempt_id") or "").strip():
+        transport_api_config["attempt_id"] = str(getattr(provider_runtime, "attempt_id", "") or "")
+    if not str(transport_api_config.get("logical_attempt_identity") or "").strip():
+        transport_api_config["logical_attempt_identity"] = str(
+            getattr(provider_runtime, "logical_attempt_identity", "") or ""
+        )
+    if not str(transport_api_config.get("provider_route") or "").strip():
+        transport_api_config["provider_route"] = str(provider_route or "")
     result = _call_ai_api_detailed_uninstrumented(
         prompt,
-        api_config,
+        transport_api_config,
         system_prompt,
         max_tokens=max_tokens,
         temperature=temperature,
