@@ -333,6 +333,77 @@ def test_relation_shard_plan_is_lossless_and_estimate_is_bounded(tmp_path: Path)
     assert all(item["estimated_input_tokens"] >= 1 for item in plan["shards"])
 
 
+def test_shard_target_changes_real_relation_subrequest_membership(tmp_path: Path) -> None:
+    def run_with_target(target_tokens: int) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        calls: list[dict[str, Any]] = []
+
+        def provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
+            calls.append({"node_id": node_id, "request": dict(request)})
+            ids = [
+                str(item.get("relation_id") or "")
+                for item in request.get("relation_candidates") or ()
+                if isinstance(item, Mapping) and str(item.get("relation_id") or "")
+            ]
+            rejected = [
+                {"relation_id": relation_id, "reason": "not confirmed in fixture"}
+                for relation_id in ids
+                if not relation_id.endswith("0")
+            ]
+            confirmed = [relation_id for relation_id in ids if relation_id not in {item["relation_id"] for item in rejected}]
+            return {
+                "status": "success",
+                "content": {
+                    "confirmed_relation_ids": confirmed,
+                    "rejected_relations": rejected,
+                },
+            }
+
+        executor = _executor(
+            tmp_path / str(target_tokens),
+            provider=provider,
+            stability_mode="off",
+            technical_shard_target_tokens=target_tokens,
+        )
+        evidence = build_outline_evidence_views(executor.summaries, executor.job_id)
+        ledger = build_global_corpus_ledger(evidence)
+        matrix = build_multi_view_matrix(evidence)
+        relation_map = build_global_relation_map(evidence, matrix, ledger)
+        relations = [item.to_dict() for item in relation_map.relations]
+        plan = executor._build_relation_shard_plan(evidence.views, relations)
+        executor._run_hierarchical_relation_adjudication(
+            evidence_views=evidence.views,
+            relation_candidates=relations,
+            shard_plan=plan,
+            relation_contract={
+                "must_return_confirmed_relation_ids": True,
+                "must_reject_without_recorded_evidence": True,
+                "allowed_relation_ids": [item["relation_id"] for item in relations],
+            },
+            relation_dependencies={"evidence": hash_json(evidence.to_dict())},
+        )
+        return plan, calls
+
+    small_plan, small_calls = run_with_target(500)
+    large_plan, large_calls = run_with_target(5_000)
+
+    assert small_plan["shard_count"] > large_plan["shard_count"]
+    assert len(small_calls) > len(large_calls)
+    assert {
+        str((request.get("hierarchy") or {}).get("shard_id") or "")
+        for item in small_calls
+        for request in [item["request"]]
+    } != {
+        str((request.get("hierarchy") or {}).get("shard_id") or "")
+        for item in large_calls
+        for request in [item["request"]]
+    }
+    assert all(
+        (request.get("hierarchy") or {}).get("target_tokens") in {500, 5_000}
+        for item in [*small_calls, *large_calls]
+        for request in [item["request"]]
+    )
+
+
 def test_evidence_projection_preserves_tail_and_chunks_long_view(tmp_path: Path) -> None:
     executor = _executor(
         tmp_path,
