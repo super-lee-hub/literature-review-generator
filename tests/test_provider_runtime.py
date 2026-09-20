@@ -4,12 +4,14 @@ import json
 import threading
 
 import ai_interface
+import pytest
 from runtime.provider_context import ProviderContextProfile
 from runtime.provider_runtime import (
     ProviderAggregateBudgetV1,
     ProviderBudgetController,
     ProviderBudgetExceeded,
     ProviderBudgetV1,
+    ProviderRuntimeContractError,
     ProviderRuntime,
     ProviderRuntimeLedger,
     canonical_provider_request_payload,
@@ -234,10 +236,109 @@ def test_aggregate_output_budget_accounts_for_all_funded_retries(monkeypatch):
 
 
 def test_provider_runtime_budget_mapping_is_fail_closed_for_invalid_limits() -> None:
-    budget = ProviderBudgetV1.from_mapping(
-        {"max_calls": "not-a-number", "max_total_tokens": "-4", "max_elapsed_seconds": "bad"}
+    import pytest
+
+    with pytest.raises(ValueError):
+        ProviderBudgetV1.from_mapping(
+            {"max_calls": "not-a-number", "max_total_tokens": "-4", "max_elapsed_seconds": "bad"}
+        )
+
+    with pytest.raises(ValueError):
+        ProviderBudgetV1.from_mapping({"max_total_tokens": True})
+
+
+def test_local_total_token_budget_is_cumulative_and_survives_restart(tmp_path) -> None:
+    ledger = ProviderRuntimeLedger(tmp_path / "receipts.jsonl")
+    budget = ProviderBudgetV1(max_total_tokens=100)
+    runtime = ProviderRuntime(budget=budget, ledger=ledger, test_only=True)
+
+    admission = runtime.admit(requested_output_tokens=80)
+    runtime.complete(
+        admission=admission,
+        prompt="prompt",
+        input_payload={"input": "value"},
+        api_config={"api_key": "secret", "model": "model", "api_base": "https://provider.example/v1"},
+        result={"status": "success", "content": {"ok": True}, "total_tokens": 80},
     )
-    assert budget == ProviderBudgetV1()
+
+    assert runtime.consumed_tokens == 80
+    with pytest.raises(ProviderBudgetExceeded):
+        runtime.admit(requested_output_tokens=80)
+
+    restarted = ProviderRuntime(budget=budget, ledger=ledger, test_only=True)
+    assert restarted.consumed_tokens == 80
+    with pytest.raises(ProviderBudgetExceeded):
+        restarted.admit(requested_output_tokens=21)
+
+
+def test_unknown_usage_remains_exposed_against_local_total_budget(tmp_path) -> None:
+    runtime = ProviderRuntime(
+        budget=ProviderBudgetV1(max_total_tokens=100),
+        ledger=ProviderRuntimeLedger(tmp_path / "receipts.jsonl"),
+        test_only=True,
+    )
+    admission = runtime.admit(requested_output_tokens=80)
+    runtime.complete(
+        admission=admission,
+        prompt="prompt",
+        input_payload={"input": "value"},
+        api_config={"api_key": "secret", "model": "model", "api_base": "https://provider.example/v1"},
+        result={"status": "success", "content": {"ok": True}},
+    )
+
+    assert runtime.unknown_exposure_tokens == 80
+    with pytest.raises(ProviderBudgetExceeded):
+        runtime.admit(requested_output_tokens=21)
+
+
+def test_response_is_durable_when_aggregate_accounting_fails_and_retries_close_it(
+    tmp_path, monkeypatch
+) -> None:
+    aggregate = ProviderBudgetController(
+        ProviderAggregateBudgetV1(max_provider_calls_total=1, max_output_tokens_total=10)
+    )
+    ledger = ProviderRuntimeLedger(tmp_path / "receipts.jsonl")
+    runtime = ProviderRuntime(aggregate_budget=aggregate, ledger=ledger, test_only=True)
+    admission = runtime.admit(requested_output_tokens=8)
+    original_complete = aggregate.complete
+    failed_once = True
+
+    def fail_once(reservation, result):
+        nonlocal failed_once
+        if failed_once:
+            failed_once = False
+            raise ProviderRuntimeContractError("injected accounting failure")
+        return original_complete(reservation, result)
+
+    monkeypatch.setattr(aggregate, "complete", fail_once)
+    result = {
+        "status": "success",
+        "content": {"ok": True},
+        "total_tokens": 8,
+    }
+    with pytest.raises(ProviderRuntimeContractError):
+        runtime.complete(
+            admission=admission,
+            prompt="prompt",
+            input_payload={"input": "value"},
+            api_config={"api_key": "secret", "model": "model", "api_base": "https://provider.example/v1"},
+            result=result,
+        )
+
+    persisted = ledger.list_receipts()
+    assert len(persisted) == 1
+    assert persisted[0].metadata["accounting_status"] == "pending"
+
+    receipt = runtime.complete(
+        admission=admission,
+        prompt="prompt",
+        input_payload={"input": "value"},
+        api_config={"api_key": "secret", "model": "model", "api_base": "https://provider.example/v1"},
+        result=result,
+    )
+    assert receipt.receipt_id == persisted[0].receipt_id
+    assert len(ledger.list_receipts()) == 1
+    assert aggregate.snapshot()["calls_used"] == 1
 
 
 def test_ai_detailed_call_attaches_durable_provider_receipt(monkeypatch, tmp_path) -> None:

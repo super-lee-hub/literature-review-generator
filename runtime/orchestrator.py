@@ -920,10 +920,16 @@ class InternalStageExecutorRegistry:
                 temperature=0.0,
                 response_format="json",
                 logger=session.stage_host.logger,
-                retry_attempts=int(api_config.get("transport_retries") or session.stage_host.settings.runtime.transport_retries),
+                retry_attempts=self._nonnegative_int(
+                    api_config.get("transport_retries"),
+                    session.stage_host.settings.runtime.transport_retries,
+                ),
                 max_retries_per_call=max(
                     0,
-                    int(api_config.get("transport_retries") or session.stage_host.settings.runtime.node_retry_limit),
+                    self._nonnegative_int(
+                        api_config.get("transport_retries"),
+                        session.stage_host.settings.runtime.node_retry_limit,
+                    ),
                 ),
             )
 

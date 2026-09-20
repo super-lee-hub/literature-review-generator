@@ -31,6 +31,17 @@ def test_build_direct_source_bundle_discovers_pdf_files(tmp_path: Path) -> None:
     assert bundle.source_snapshot["pdf_count"] == 2
 
 
+def test_discover_pdf_files_accepts_case_insensitive_pdf_extensions(tmp_path: Path) -> None:
+    pdf_dir = tmp_path / "papers"
+    pdf_dir.mkdir()
+    (pdf_dir / "UPPER.PDF").write_bytes(b"%PDF-1.4\n%upper\n")
+    (pdf_dir / "not-a-pdf.txt").write_text("text", encoding="utf-8")
+
+    bundle = build_direct_source_bundle(project_name="demo", pdf_folder=str(pdf_dir))
+
+    assert [Path(item.source_pdf).name for item in bundle.paper_work_items] == ["UPPER.PDF"]
+
+
 def test_build_zotero_source_bundle_uses_parser_and_file_matching(monkeypatch, tmp_path: Path) -> None:
     report_path = tmp_path / "report.txt"
     library_path = tmp_path / "library"

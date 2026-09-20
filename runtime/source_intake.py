@@ -20,6 +20,12 @@ def _abs(path: str) -> str:
     return str(Path(path).resolve())
 
 
+def _path_key(path: str) -> str:
+    """Use the host filesystem's case semantics for path identity."""
+
+    return os.path.normcase(_abs(path))
+
+
 def _sha256_file(path: str) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
@@ -29,7 +35,7 @@ def _sha256_file(path: str) -> str:
 
 
 def _identity_cache_key(paper: Mapping[str, Any], path: str) -> str:
-    return f"{_abs(path).casefold()}:{build_canonical_paper_key(paper)}"
+    return f"{_path_key(path)}:{build_canonical_paper_key(paper)}"
 
 
 def _inspect_pdf_candidate(
@@ -43,7 +49,7 @@ def _inspect_pdf_candidate(
     hash_cache: dict[str, str],
 ) -> dict[str, Any]:
     resolved = _abs(path)
-    path_cache_key = resolved.casefold()
+    path_cache_key = _path_key(resolved)
     identity_cache_key = _identity_cache_key(paper, resolved)
     payload: dict[str, Any] = {
         "path": resolved,
@@ -92,7 +98,7 @@ def _select_identity_candidate(
     if len(identity_matches) > 1:
         hashes = {str(item.get("sha256") or "") for item in identity_matches}
         if len(hashes) == 1 and "" not in hashes:
-            selected = min(identity_matches, key=lambda item: str(item["path"]).casefold())
+            selected = min(identity_matches, key=lambda item: _path_key(str(item["path"])))
             return "matched", "duplicate_identical_candidates", selected
         return "ambiguous", "multiple_identity_matches_with_different_hashes", None
     if candidates:
@@ -109,8 +115,8 @@ def discover_pdf_files(pdf_folder: str) -> list[str]:
 
     discovered = sorted(
         str(path.resolve())
-        for path in folder.rglob("*.pdf")
-        if path.is_file()
+        for path in folder.rglob("*")
+        if path.is_file() and path.suffix.casefold() == ".pdf"
     )
     return discovered
 
@@ -175,7 +181,7 @@ def validate_f1_corpus_source_bundle(
     selected_sources = manifest.validate_selection(source_ids, gate=resolved_gate)
     selected_paths = manifest.verify_source_files(source_ids)
     expected_by_path = {
-        _abs(str(path)).casefold(): source
+        _path_key(str(path)): source
         for source, path in zip(selected_sources, selected_paths)
     }
 
@@ -186,7 +192,7 @@ def validate_f1_corpus_source_bundle(
         source_pdf = str(item.source_pdf or "").strip()
         if not source_pdf or not Path(source_pdf).is_file():
             raise ValueError("f1_corpus_binding_source_pdf_missing")
-        resolved_path = _abs(source_pdf).casefold()
+        resolved_path = _path_key(source_pdf)
         if resolved_path in actual_by_path:
             raise ValueError("f1_corpus_binding_duplicate_source_path")
         actual_by_path[resolved_path] = _sha256_file(source_pdf)
@@ -214,7 +220,7 @@ def validate_f1_corpus_source_bundle(
     snapshot["excluded_source_paths"] = [
         str(item.source_pdf)
         for item in bundle.paper_work_items
-        if _abs(str(item.source_pdf)).casefold() not in expected_by_path
+        if _path_key(str(item.source_pdf)) not in expected_by_path
     ]
     snapshot["f1_corpus_binding"] = {
         "schema_version": "f1-corpus-binding-v1",
@@ -275,7 +281,7 @@ def build_zotero_source_bundle(*, project_name: str, zotero_report: str, library
                 hash_cache=hash_cache,
             )
             if candidate_payload["exists"]:
-                candidate_map[candidate_payload["path"].casefold()] = candidate_payload
+                candidate_map[_path_key(candidate_payload["path"])] = candidate_payload
         selected_path = str(getattr(match_result, "selected_path", "") or "")
         if not raw_candidates and selected_path:
             candidate_payload = _inspect_pdf_candidate(
@@ -287,7 +293,7 @@ def build_zotero_source_bundle(*, project_name: str, zotero_report: str, library
                 hash_cache=hash_cache,
             )
             if candidate_payload["exists"]:
-                candidate_map[candidate_payload["path"].casefold()] = candidate_payload
+                candidate_map[_path_key(candidate_payload["path"])] = candidate_payload
 
         relation_paths: set[str] = set()
         for attachment in zotero_resolution.get("attachments", []):
@@ -321,10 +327,10 @@ def build_zotero_source_bundle(*, project_name: str, zotero_report: str, library
                 }
             )
             if candidate_payload["exists"]:
-                relation_paths.add(candidate_payload["path"].casefold())
-                existing = candidate_map.get(candidate_payload["path"].casefold())
+                relation_paths.add(_path_key(candidate_payload["path"]))
+                existing = candidate_map.get(_path_key(candidate_payload["path"]))
                 if existing is None:
-                    candidate_map[candidate_payload["path"].casefold()] = candidate_payload
+                    candidate_map[_path_key(candidate_payload["path"])] = candidate_payload
                 else:
                     existing.update(
                         {
@@ -352,10 +358,10 @@ def build_zotero_source_bundle(*, project_name: str, zotero_report: str, library
 
         candidates = list(candidate_map.values())
         relation_candidates = [
-            item for item in candidates if item["path"].casefold() in relation_paths
+            item for item in candidates if _path_key(item["path"]) in relation_paths
         ]
         other_candidates = [
-            item for item in candidates if item["path"].casefold() not in relation_paths
+            item for item in candidates if _path_key(item["path"]) not in relation_paths
         ]
         selection_candidates = relation_candidates or other_candidates
         canonical_selection = canonicalize_attachment_candidates(

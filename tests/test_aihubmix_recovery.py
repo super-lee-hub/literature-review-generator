@@ -17,7 +17,7 @@ class _Response:
         return self._payload
 
 
-def _api_config() -> dict[str, str]:
+def _api_config() -> dict[str, object]:
     return {
         "api_base": "https://aihubmix.com/v1",
         "api_key": "sk-test-recovery",
@@ -60,12 +60,19 @@ def test_aihubmix_recovery_requires_one_recent_matching_task(monkeypatch) -> Non
         )
 
     monkeypatch.setattr(ai_interface.requests, "get", fake_get)
+    config = _api_config()
+    config["aihubmix_recovery_proof"] = {
+        "task_id": "task_recovery_1",
+        "request_fingerprint": "test-fingerprint",
+        "operator": "test-operator",
+    }
     result = ai_interface._aihubmix_recover_disconnected_call(
-        api_config=_api_config(),
+        api_config=config,
         model="claude-opus-5",
         request_started_epoch=now - 1,
         response_parser=ai_interface.parse_chat_completions_response,
         response_format="json",
+        request_fingerprint="test-fingerprint",
     )
 
     assert result is not None
@@ -79,19 +86,11 @@ def test_aihubmix_recovery_requires_one_recent_matching_task(monkeypatch) -> Non
     ]
 
 
-def test_aihubmix_recovery_refuses_ambiguous_tasks(monkeypatch) -> None:
+def test_aihubmix_recovery_refuses_unique_task_without_identity_proof(monkeypatch) -> None:
     monkeypatch.setattr(
         ai_interface.requests,
         "get",
-        lambda *_args, **_kwargs: _Response(
-            200,
-            {
-                "data": [
-                    {"id": "task_a", "model": "claude-opus-5", "created_at": time.time()},
-                    {"id": "task_b", "model": "claude-opus-5", "created_at": time.time()},
-                ]
-            },
-        ),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unbound recovery must not query tasks")),
     )
 
     result = ai_interface._aihubmix_recover_disconnected_call(

@@ -37,6 +37,7 @@ ProviderErrorKind = Literal[
     "retryable_http",
     "fatal_config_or_auth",
     "transient_network",
+    "outcome_unknown",
     "invalid_response",
     "budget_exhausted",
     "cancelled",
@@ -49,6 +50,7 @@ _ERROR_KINDS = frozenset(
         "retryable_http",
         "fatal_config_or_auth",
         "transient_network",
+        "outcome_unknown",
         "invalid_response",
         "budget_exhausted",
         "cancelled",
@@ -1500,21 +1502,40 @@ class ProviderBudgetV1:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any] | None) -> "ProviderBudgetV1":
-        source = value or {}
+        if value is None:
+            source: Mapping[str, Any] = {}
+        elif not isinstance(value, Mapping):
+            raise ProviderRuntimeContractError("provider budget must be a mapping")
+        else:
+            source = value
 
         def integer(name: str) -> int:
             raw = source.get(name, 0)
-            try:
-                return max(0, int(str(raw).strip()))
-            except (TypeError, ValueError):
+            if raw is None or (isinstance(raw, str) and not raw.strip()):
                 return 0
+            if isinstance(raw, bool):
+                raise ProviderRuntimeContractError(f"{name} must be an integer")
+            try:
+                parsed = int(str(raw).strip())
+            except (TypeError, ValueError) as exc:
+                raise ProviderRuntimeContractError(f"{name} must be an integer") from exc
+            if parsed < 0:
+                raise ProviderRuntimeContractError(f"{name} must be non-negative")
+            return parsed
 
         def real(name: str) -> float:
             raw = source.get(name, 0.0)
-            try:
-                return max(0.0, float(str(raw).strip()))
-            except (TypeError, ValueError):
+            if raw is None or (isinstance(raw, str) and not raw.strip()):
                 return 0.0
+            if isinstance(raw, bool):
+                raise ProviderRuntimeContractError(f"{name} must be a number")
+            try:
+                parsed = float(str(raw).strip())
+            except (TypeError, ValueError) as exc:
+                raise ProviderRuntimeContractError(f"{name} must be a number") from exc
+            if not math.isfinite(parsed) or parsed < 0:
+                raise ProviderRuntimeContractError(f"{name} must be a finite non-negative number")
+            return parsed
 
         return cls(
             max_calls=integer("max_calls"),
@@ -2229,10 +2250,114 @@ class ProviderRuntime:
         self._lock = threading.RLock()
         self._calls = 0
         self._reserved_tokens = 0
+        self._consumed_tokens = 0
+        self._unknown_exposure_tokens = 0
         self._aggregate_reservations: dict[int, ProviderAggregateReservationV1] = {}
         self._receipts: list[ProviderCallReceiptV1] = []
         self._completion_lock = threading.RLock()
         self._completed_receipts: dict[int, ProviderCallReceiptV1] = {}
+        self._accounted_sequences: set[int] = set()
+        self._restore_local_budget_from_ledger()
+
+    @staticmethod
+    def _reported_total_tokens(receipt: ProviderCallReceiptV1) -> int | None:
+        if receipt.total_tokens is not None:
+            return int(receipt.total_tokens)
+        if receipt.input_tokens is not None and receipt.output_tokens is not None:
+            return int(receipt.input_tokens) + int(receipt.output_tokens)
+        return None
+
+    def _restore_local_budget_from_ledger(self) -> None:
+        """Rebuild local cumulative usage so a restart cannot reset the cap."""
+
+        if self.ledger is None:
+            return
+        for receipt in self.ledger.list_receipts():
+            if not self.test_only:
+                identity_matches = (
+                    (not self.job_id or receipt.job_id == self.job_id)
+                    and (not self.attempt_id or receipt.attempt_id == self.attempt_id)
+                    and (not self.stage_name or receipt.stage_name == self.stage_name)
+                    and (not self.call_id or receipt.call_id == self.call_id)
+                )
+                if not identity_matches:
+                    continue
+            self._receipts.append(receipt)
+            if receipt.status == "blocked":
+                continue
+            metadata = receipt.metadata if isinstance(receipt.metadata, Mapping) else {}
+            if str(metadata.get("accounting_status") or "committed") != "pending":
+                self._accounted_sequences.add(int(receipt.sequence))
+            total = self._reported_total_tokens(receipt)
+            if total is not None:
+                self._consumed_tokens += max(0, total)
+                continue
+            try:
+                reserved = int(metadata.get("local_budget_reservation_tokens") or 0)
+            except (TypeError, ValueError):
+                reserved = 0
+            self._unknown_exposure_tokens += max(0, reserved)
+
+    def _existing_receipt_for_admission(
+        self,
+        admission: ProviderCallAdmissionV1,
+        *,
+        prompt: str,
+        input_payload: Any,
+    ) -> ProviderCallReceiptV1 | None:
+        def belongs_to_runtime(receipt: ProviderCallReceiptV1) -> bool:
+            if self.test_only:
+                return True
+            return (
+                (not self.job_id or receipt.job_id == self.job_id)
+                and (not self.attempt_id or receipt.attempt_id == self.attempt_id)
+                and (not self.stage_name or receipt.stage_name == self.stage_name)
+                and (not self.call_id or receipt.call_id == self.call_id)
+            )
+
+        def is_pending_accounting(receipt: ProviderCallReceiptV1) -> bool:
+            metadata = receipt.metadata if isinstance(receipt.metadata, Mapping) else {}
+            return str(metadata.get("accounting_status") or "committed") == "pending"
+
+        candidates = [
+            receipt
+            for receipt in self._receipts
+            if receipt.sequence == admission.sequence
+            and belongs_to_runtime(receipt)
+            and is_pending_accounting(receipt)
+        ]
+        if not candidates and self.ledger is not None:
+            candidates = [
+                receipt
+                for receipt in self.ledger.list_receipts()
+                if receipt.sequence == admission.sequence
+                and belongs_to_runtime(receipt)
+                and is_pending_accounting(receipt)
+            ]
+        if not candidates:
+            return None
+        receipt = candidates[0]
+        if receipt.prompt_hash != hash_text(prompt) or receipt.input_hash != hash_json(input_payload):
+            raise ProviderReceiptConflict(
+                f"admission sequence {admission.sequence} was reused with different input"
+            )
+        return receipt
+
+    def _account_existing_receipt(self, receipt: ProviderCallReceiptV1, admission: ProviderCallAdmissionV1) -> None:
+        if admission.sequence in self._accounted_sequences:
+            return
+        metadata = receipt.metadata if isinstance(receipt.metadata, Mapping) else {}
+        try:
+            reservation_tokens = int(metadata.get("local_budget_reservation_tokens") or 0)
+        except (TypeError, ValueError):
+            reservation_tokens = admission.estimated_tokens + admission.estimated_output_tokens
+        total = self._reported_total_tokens(receipt)
+        self._reserved_tokens = max(0, self._reserved_tokens - reservation_tokens)
+        if total is None:
+            self._unknown_exposure_tokens += max(0, reservation_tokens)
+        else:
+            self._consumed_tokens += max(0, total)
+        self._accounted_sequences.add(admission.sequence)
 
     @property
     def calls(self) -> int:
@@ -2241,6 +2366,14 @@ class ProviderRuntime:
     @property
     def reserved_tokens(self) -> int:
         return self._reserved_tokens
+
+    @property
+    def consumed_tokens(self) -> int:
+        return self._consumed_tokens
+
+    @property
+    def unknown_exposure_tokens(self) -> int:
+        return self._unknown_exposure_tokens
 
     @property
     def receipts(self) -> tuple[ProviderCallReceiptV1, ...]:
@@ -2276,7 +2409,15 @@ class ProviderRuntime:
                 raise ProviderBudgetExceeded("provider runtime elapsed-time budget exhausted")
             if self.budget.max_calls and self._calls >= self.budget.max_calls:
                 raise ProviderBudgetExceeded("provider runtime call budget exhausted")
-            if self.budget.max_total_tokens and self._reserved_tokens + estimated + output > self.budget.max_total_tokens:
+            if (
+                self.budget.max_total_tokens
+                and self._consumed_tokens
+                + self._unknown_exposure_tokens
+                + self._reserved_tokens
+                + estimated
+                + output
+                > self.budget.max_total_tokens
+            ):
                 raise ProviderBudgetExceeded("provider runtime token budget exhausted")
             aggregate_reservation = None
             if self.aggregate_budget is not None:
@@ -2301,7 +2442,12 @@ class ProviderRuntime:
                 estimated_tokens=estimated,
                 admitted_at=utc_now_iso(),
                 remaining_calls=(self.budget.max_calls - self._calls) if self.budget.max_calls else None,
-                remaining_tokens=(self.budget.max_total_tokens - self._reserved_tokens)
+                remaining_tokens=(
+                    self.budget.max_total_tokens
+                    - self._consumed_tokens
+                    - self._unknown_exposure_tokens
+                    - self._reserved_tokens
+                )
                 if self.budget.max_total_tokens
                 else None,
                 estimated_output_tokens=output,
@@ -2357,16 +2503,57 @@ class ProviderRuntime:
         model = str(api_config.get("model") or "")
         endpoint = str(api_config.get("api_base") or "")
         config_hash = hash_json(_redact_mapping(api_config))
+        existing = self._existing_receipt_for_admission(
+            admission,
+            prompt=prompt,
+            input_payload=input_payload,
+        )
+        if existing is not None:
+            with self._lock:
+                aggregate_reservation = self._aggregate_reservations.get(admission.sequence)
+            if self.aggregate_budget is not None and aggregate_reservation is not None:
+                self.aggregate_budget.complete(aggregate_reservation, result)
+                with self._lock:
+                    self._aggregate_reservations.pop(admission.sequence, None)
+                    self._account_existing_receipt(existing, admission)
+            return existing
         aggregate_reservation = None
         aggregate_snapshot: dict[str, Any] | None = None
+        aggregate_error: BaseException | None = None
+        reservation_tokens = admission.estimated_tokens + admission.estimated_output_tokens
+        result_total_tokens = _optional_nonnegative_int(result.get("total_tokens"))
+        if result_total_tokens is None:
+            input_tokens = _optional_nonnegative_int(result.get("input_tokens"))
+            output_tokens = _optional_nonnegative_int(result.get("output_tokens"))
+            if input_tokens is not None and output_tokens is not None:
+                result_total_tokens = input_tokens + output_tokens
         with self._lock:
             aggregate_reservation = self._aggregate_reservations.get(admission.sequence)
         if self.aggregate_budget is not None and aggregate_reservation is not None:
-            aggregate_snapshot = self.aggregate_budget.complete(aggregate_reservation, result)
-        with self._lock:
-            if aggregate_reservation is not None:
-                self._aggregate_reservations.pop(admission.sequence, None)
+            try:
+                aggregate_snapshot = self.aggregate_budget.complete(aggregate_reservation, result)
+            except BaseException as exc:
+                # The provider response must still become durable.  Keep the
+                # reservation live so a later resume can retry accounting
+                # without issuing another provider request.
+                aggregate_error = exc
+            else:
+                with self._lock:
+                    self._aggregate_reservations.pop(admission.sequence, None)
         receipt_metadata = dict(metadata or {})
+        receipt_metadata["local_budget_reservation_tokens"] = reservation_tokens
+        receipt_metadata["local_budget_usage_status"] = (
+            "reported" if result_total_tokens is not None else "unknown"
+        )
+        receipt_metadata["accounting_status"] = "pending" if aggregate_error else "committed"
+        if aggregate_error is not None:
+            receipt_metadata["accounting_error"] = _redact_text(aggregate_error)
+        if (
+            result_total_tokens is not None
+            and self.budget.max_total_tokens
+            and result_total_tokens > self.budget.max_total_tokens
+        ):
+            receipt_metadata["local_budget_accounting_conflict"] = True
         if aggregate_snapshot is not None:
             receipt_metadata["aggregate_budget"] = aggregate_snapshot
         if aggregate_reservation is not None:
@@ -2399,15 +2586,24 @@ class ProviderRuntime:
             prompt_sha256=self.prompt_sha256,
         )
         with self._lock:
-            self._reserved_tokens = max(
-                0,
-                self._reserved_tokens
-                - admission.estimated_tokens
-                - admission.estimated_output_tokens,
-            )
+            if aggregate_error is None:
+                self._reserved_tokens = max(
+                    0,
+                    self._reserved_tokens
+                    - admission.estimated_tokens
+                    - admission.estimated_output_tokens,
+                )
+                if result_total_tokens is None:
+                    self._unknown_exposure_tokens += reservation_tokens
+                else:
+                    self._consumed_tokens += result_total_tokens
             if self.ledger is not None:
                 self.ledger.append(receipt)
             self._receipts.append(receipt)
+            if aggregate_error is None:
+                self._accounted_sequences.add(admission.sequence)
+        if aggregate_error is not None:
+            raise aggregate_error
         return receipt
 
     def mark_transport_started(self, admission: ProviderCallAdmissionV1) -> None:
@@ -2441,7 +2637,12 @@ class ProviderRuntime:
                 estimated_tokens=0,
                 admitted_at=utc_now_iso(),
                 remaining_calls=(self.budget.max_calls - self._calls) if self.budget.max_calls else None,
-                remaining_tokens=self.budget.max_total_tokens - self._reserved_tokens
+                remaining_tokens=(
+                    self.budget.max_total_tokens
+                    - self._consumed_tokens
+                    - self._unknown_exposure_tokens
+                    - self._reserved_tokens
+                )
                 if self.budget.max_total_tokens
                 else None,
                 estimated_output_tokens=0,

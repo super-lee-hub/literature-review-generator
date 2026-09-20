@@ -19,8 +19,14 @@ from runtime.provider_runtime import (
 class _LocalProvider:
     """Small real HTTP server used to exercise the production transport path."""
 
-    def __init__(self, responses: list[tuple[int, Any] | tuple[str, Any]]) -> None:
+    def __init__(
+        self,
+        responses: list[tuple[int, Any] | tuple[str, Any]],
+        *,
+        response_headers: dict[str, str] | None = None,
+    ) -> None:
         self.responses = responses
+        self.response_headers = response_headers or {}
         self.requests: list[dict[str, Any]] = []
         self._next_response = 0
 
@@ -46,6 +52,8 @@ class _LocalProvider:
                     encoded = json.dumps(body, ensure_ascii=False).encode("utf-8")
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
+                for key, value in owner.response_headers.items():
+                    self.send_header(key, value)
                 self.send_header("Content-Length", str(len(encoded)))
                 self.end_headers()
                 self.wfile.write(encoded)
@@ -157,6 +165,67 @@ def test_real_local_http_malformed_json_is_failed_and_usage_is_unreported(tmp_pa
 
 
 @pytest.mark.integration
+def test_real_local_http_sse_is_reassembled_and_honors_response_size_limit(tmp_path) -> None:
+    sse = (
+        b'data: {"choices":[{"delta":{"content":"{\\"ok\\":"}}]}\n\n'
+        b'data: {"choices":[{"delta":{"content":"true}"}}]}\n\n'
+        b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    with _LocalProvider([("raw", sse)]) as provider:
+        runtime, aggregate, ledger = _runtime(tmp_path, max_calls=1, max_output_tokens=8)
+        raw_dir = tmp_path / "raw-responses"
+        config = {
+            **_config(provider.base_url),
+            "provider_stream": "true",
+            "max_response_bytes": "4096",
+            "raw_response_dir": str(raw_dir),
+        }
+        result = ai_interface._call_ai_api_detailed(
+            "sse test",
+            config,
+            "system",
+            max_tokens=8,
+            retry_attempts=1,
+            provider_runtime=runtime,
+        )
+
+    assert len(provider.requests) == 1
+    assert provider.requests[0]["payload"]["stream"] is True
+    assert result["status"] == "success"
+    assert result["content"] == {"ok": True}
+    assert result["response_protocol"] == "sse"
+    assert result["response_complete"] is True
+    assert result["raw_response_sha256"]
+    assert result["response_bytes"] == len(sse)
+    raw_path = raw_dir / f"response-{result['raw_response_sha256']}.bin"
+    assert raw_path.read_bytes() == sse
+    assert result["raw_response_path"] == str(raw_path.resolve())
+    assert ledger.list_receipts()[0].metadata["response_protocol"] == "sse"
+    assert aggregate.snapshot()["calls_used"] == 1
+
+
+@pytest.mark.integration
+def test_real_local_http_sse_without_terminal_event_is_not_success(tmp_path) -> None:
+    sse = b'data: {"choices":[{"delta":{"content":"{\\"ok\\":true}"}}]}\n\n'
+    with _LocalProvider([("raw", sse)]) as provider:
+        runtime, _aggregate, ledger = _runtime(tmp_path, max_calls=1, max_output_tokens=8)
+        result = ai_interface._call_ai_api_detailed(
+            "partial sse test",
+            _config(provider.base_url),
+            "system",
+            max_tokens=8,
+            retry_attempts=1,
+            provider_runtime=runtime,
+        )
+
+    assert len(provider.requests) == 1
+    assert result["status"] == "failed"
+    assert result["error_kind"] == "invalid_response"
+    assert ledger.list_receipts()[0].status == "failed"
+
+
+@pytest.mark.integration
 def test_real_local_http_malformed_response_body_uses_the_configured_retry_budget(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(ai_interface.time, "sleep", lambda _seconds: None)
 
@@ -188,7 +257,7 @@ def test_real_local_http_success_without_usage_is_conservative_and_durable(tmp_p
         "choices": [{"message": {"content": '{"ok": true}'}, "finish_reason": "stop"}],
         "model": "local-test-model",
     }
-    with _LocalProvider([(200, body)]) as provider:
+    with _LocalProvider([(200, body)], response_headers={"X-Aihubmix-Request-Id": "req-local-1"}) as provider:
         runtime, aggregate, ledger = _runtime(tmp_path, max_calls=1, max_output_tokens=8)
         result = ai_interface._call_ai_api_detailed(
             "missing usage test",
@@ -201,10 +270,12 @@ def test_real_local_http_success_without_usage_is_conservative_and_durable(tmp_p
 
     assert len(provider.requests) == 1
     assert result["status"] == "success"
+    assert result["provider_request_id"] == "req-local-1"
     receipt = ledger.list_receipts()[0]
     assert receipt.usage_status == "unreported"
     assert receipt.output_tokens is None
     assert aggregate.snapshot()["output_tokens_used"] == 8
+    assert receipt.metadata["provider_request_id"] == "req-local-1"
 
 
 @pytest.mark.integration

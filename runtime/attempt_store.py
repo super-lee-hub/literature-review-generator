@@ -6,8 +6,10 @@ import os
 from pathlib import Path
 import threading
 from typing import BinaryIO, Iterable, Sequence
+import uuid
 
 from services.artifact_registry import ArtifactRecord, ArtifactRegistry
+from services.durable_io import atomic_replace_with_retry, interprocess_file_lock
 from services.job_outcome import (
     ATTEMPT_ARTIFACT_TYPE,
     ATTEMPT_ARTIFACT_VERSION,
@@ -119,18 +121,41 @@ class StartedAttempt:
 
 
 def _write_json_exclusive(path: Path, payload: dict[str, object]) -> None:
+    """Publish one immutable snapshot without exposing a partial final path."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     encoded = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    descriptor = os.open(path, flags, 0o600)
+    if path.exists():
+        raise FileExistsError(path)
+    temp_path = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+    )
     try:
+        # The temporary name is unique within the process and the final name
+        # is still protected by the caller's inter-process transaction lock.
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        descriptor = os.open(temp_path, flags, 0o600)
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
+        # Validate the bytes that are about to become history before publish.
+        if json.loads(encoded.decode("utf-8")) != payload:
+            raise AttemptStoreCorruption("attempt snapshot serialization changed before publish")
+        atomic_replace_with_retry(temp_path, path, timeout_seconds=5.0)
+        if os.name != "nt":
+            try:
+                directory_fd = os.open(path.parent, os.O_RDONLY)
+            except OSError:
+                directory_fd = -1
+            if directory_fd >= 0:
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
     except BaseException:
         try:
-            path.unlink()
+            temp_path.unlink()
         except FileNotFoundError:
             pass
         raise
@@ -177,27 +202,29 @@ class AttemptStore:
         return history
 
     def append(self, snapshot: AttemptV1) -> ArtifactRecord:
-        history = self.load_history()
-        validated = append_attempt_snapshot(history, snapshot)
-        sequence = len(validated)
-        path = self._snapshot_path(sequence)
-        payload = snapshot.to_dict()
-        payload["snapshot_sequence"] = sequence
-        _write_json_exclusive(path, payload)
-        return self.registry.register_file(
-            artifact_role=ATTEMPT_SNAPSHOT_ROLE,
-            artifact_type=ATTEMPT_ARTIFACT_TYPE,
-            artifact_version=ATTEMPT_ARTIFACT_VERSION,
-            path=path,
-            producer="runtime.attempt_store.AttemptStore",
-            artifact_id=self._artifact_id(snapshot, sequence),
-            metadata={
-                "attempt_id": snapshot.attempt_id,
-                "attempt_number": snapshot.attempt_number,
-                "attempt_status": snapshot.status,
-                "snapshot_sequence": sequence,
-            },
-        )
+        lock_target = self.directory / ".attempt-store-append"
+        with interprocess_file_lock(lock_target):
+            history = self.load_history()
+            validated = append_attempt_snapshot(history, snapshot)
+            sequence = len(validated)
+            path = self._snapshot_path(sequence)
+            payload = snapshot.to_dict()
+            payload["snapshot_sequence"] = sequence
+            _write_json_exclusive(path, payload)
+            return self.registry.register_file(
+                artifact_role=ATTEMPT_SNAPSHOT_ROLE,
+                artifact_type=ATTEMPT_ARTIFACT_TYPE,
+                artifact_version=ATTEMPT_ARTIFACT_VERSION,
+                path=path,
+                producer="runtime.attempt_store.AttemptStore",
+                artifact_id=self._artifact_id(snapshot, sequence),
+                metadata={
+                    "attempt_id": snapshot.attempt_id,
+                    "attempt_number": snapshot.attempt_number,
+                    "attempt_status": snapshot.status,
+                    "snapshot_sequence": sequence,
+                },
+            )
 
     def start(self, *, job_id: str, producer: str) -> StartedAttempt:
         history = self.load_history()

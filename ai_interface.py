@@ -9,7 +9,7 @@ import tempfile
 import time
 import re
 import requests  # type: ignore
-from typing import Union, Dict, Optional, Any, List, Tuple, Callable, Set, Mapping, cast
+from typing import Dict, Optional, Any, List, Tuple, Callable, Set, Mapping, cast
 from urllib.parse import urlparse
 
 from models import APIConfig
@@ -37,7 +37,6 @@ from runtime.provider_runtime import (
 )
 from summary_schema import (
     default_ai_summary,
-    get_ai_summary,
     normalize_ai_summary,
 )
 from services.multimodal_capability import detect_multimodal_capability
@@ -50,6 +49,7 @@ from services.stage1_visual_scan import (
 _DEFAULT_TIMEOUT_SECONDS = 600
 _DEFAULT_API_RETRY_ATTEMPTS = 3
 _MAX_LOCAL_IMAGE_INPUT_BYTES = DEFAULT_MAX_SINGLE_IMAGE_BYTES
+_MAX_PROVIDER_RESPONSE_BYTES = 64 * 1024 * 1024
 _NON_RETRIABLE_HTTP_STATUSES = {400, 401, 402, 403, 404, 422}
 _QUOTA_ERROR_MARKERS = (
     "insufficient_user_quota",
@@ -246,6 +246,7 @@ def _aihubmix_recover_disconnected_call(
     request_started_epoch: float,
     response_parser: Callable[[Dict[str, Any]], Tuple[str, str]],
     response_format: str,
+    request_fingerprint: str = "",
     logger: Any = None,
 ) -> Dict[str, Any] | None:
     """Recover one uniquely matched AihubMix task after a client disconnect.
@@ -266,6 +267,24 @@ def _aihubmix_recover_disconnected_call(
     recovery_base = f"{parsed_base.scheme}://{parsed_base.netloc}"
     api_key = str(api_config.get("api_key") or "").strip()
     if not api_key or is_template_credential(api_key):
+        return None
+    proof = api_config.get("aihubmix_recovery_proof")
+    if not isinstance(proof, Mapping):
+        if logger:
+            logger.warning("AihubMix recovery refused: no operator-bound identity proof was supplied")
+        return None
+    proof_task_id = str(proof.get("task_id") or "").strip()
+    proof_fingerprint = str(proof.get("request_fingerprint") or "").strip()
+    proof_operator = str(proof.get("operator") or "").strip()
+    if (
+        not proof_task_id
+        or not proof_fingerprint
+        or not proof_operator
+        or not request_fingerprint
+        or proof_fingerprint != request_fingerprint
+    ):
+        if logger:
+            logger.warning("AihubMix recovery refused: identity proof does not bind this request")
         return None
     headers = {"Authorization": f"Bearer {api_key}"}
     timeout_seconds = min(
@@ -296,6 +315,8 @@ def _aihubmix_recover_disconnected_call(
         candidates = []
         for row in rows:
             if not isinstance(row, Mapping):
+                continue
+            if str(row.get("id") or "").strip() != proof_task_id:
                 continue
             if str(row.get("model") or "").strip() != model:
                 continue
@@ -342,6 +363,8 @@ def _aihubmix_recover_disconnected_call(
                 "aihubmix_recovery_content_sha256": hashlib.sha256(
                     content_response.content
                 ).hexdigest(),
+                "aihubmix_recovery_operator": proof_operator,
+                "aihubmix_recovery_request_fingerprint": request_fingerprint,
             }
         )
         return formatted
@@ -670,6 +693,8 @@ def build_anthropic_messages_payload(
                 effort,
                 token_limit,
             )
+    if _config_bool(api_config.get("provider_stream")):
+        payload["stream"] = True
     return payload
 
 
@@ -780,6 +805,8 @@ def build_chat_completions_payload(
     }
     if response_format == "json":
         payload["response_format"] = {"type": "json_object"}
+    if _config_bool(api_config.get("provider_stream")):
+        payload["stream"] = True
     apply_reasoning_policy(payload, api_config, capability, logger=logger)
     return payload
 
@@ -825,6 +852,8 @@ def build_responses_payload(
         payload["temperature"] = temperature
     if response_format == "json":
         payload["text"] = {"format": {"type": "json_object"}}
+    if _config_bool(api_config.get("provider_stream")):
+        payload["stream"] = True
     apply_reasoning_policy(payload, api_config, capability, logger=logger)
     return payload
 
@@ -910,9 +939,15 @@ def _format_success_result(content: Any, response_format: str, response: Any, fi
 
 def _post_with_proxy_mode(api_url: str, *, api_config: APIConfig, **kwargs: Any) -> Any:
     if should_bypass_environment_proxy(api_config):
-        with requests.Session() as session:
-            session.trust_env = False
-            return session.post(api_url, **kwargs)
+        session = requests.Session()
+        session.trust_env = False
+        try:
+            response = session.post(api_url, **kwargs)
+        except BaseException:
+            session.close()
+            raise
+        setattr(response, "_codex_owned_session", session)
+        return response
     return requests.post(api_url, **kwargs)
 
 
@@ -1023,6 +1058,230 @@ def build_provider_transport_preflight(
     }
 
 
+def _response_header(response: Any, name: str) -> str:
+    headers = getattr(response, "headers", None)
+    if not isinstance(headers, Mapping):
+        return ""
+    target = name.casefold()
+    for key, value in headers.items():
+        if str(key).casefold() == target:
+            return str(value or "").strip()
+    return ""
+
+
+def _close_provider_response(response: Any) -> None:
+    close = getattr(response, "close", None)
+    if callable(close):
+        close()
+    session = getattr(response, "_codex_owned_session", None)
+    if session is not None:
+        session_close = getattr(session, "close", None)
+        if callable(session_close):
+            session_close()
+
+
+def _read_bounded_response(response: Any, *, max_bytes: int) -> Tuple[bytes, str]:
+    """Read one response body in bounded chunks and always release the session."""
+
+    chunks: List[bytes] = []
+    total = 0
+    try:
+        iterator = None
+        iter_content = getattr(response, "iter_content", None)
+        if callable(iter_content):
+            try:
+                iterator = iter(iter_content(chunk_size=8192))
+            except (AttributeError, TypeError):
+                iterator = None
+        if iterator is not None:
+            for raw_chunk in iterator:
+                if not raw_chunk:
+                    continue
+                chunk = raw_chunk.encode("utf-8") if isinstance(raw_chunk, str) else bytes(raw_chunk)
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ValueError(f"provider response exceeds {max_bytes} bytes")
+                chunks.append(chunk)
+        else:
+            raw_body = getattr(response, "content", b"")
+            if not isinstance(raw_body, (bytes, bytearray)) or not raw_body:
+                try:
+                    raw_body = json.dumps(response.json(), ensure_ascii=False).encode("utf-8")
+                except Exception:
+                    raw_body = str(getattr(response, "text", "") or "").encode("utf-8")
+            if len(raw_body) > max_bytes:
+                raise ValueError(f"provider response exceeds {max_bytes} bytes")
+            chunks.append(bytes(raw_body))
+        return b"".join(chunks), _response_header(response, "content-type")
+    finally:
+        _close_provider_response(response)
+
+
+def _persist_raw_response(body: bytes, *, api_config: Mapping[str, Any]) -> str:
+    """Optionally persist bounded raw bytes under an operator-owned evidence root."""
+
+    raw_root = str(
+        api_config.get("raw_response_dir")
+        or api_config.get("provider_raw_response_dir")
+        or ""
+    ).strip()
+    if not raw_root:
+        return ""
+    root = Path(raw_root).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(body).hexdigest()
+    target = root / f"response-{digest}.bin"
+    if target.exists():
+        existing = target.read_bytes()
+        if hashlib.sha256(existing).hexdigest() != digest:
+            raise ValueError(f"raw response hash collision at {target}")
+        return str(target)
+    fd, temporary_name = tempfile.mkstemp(prefix=".provider-response-", suffix=".tmp", dir=str(root))
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return str(target)
+
+
+def _decode_sse_response(
+    body: bytes,
+    *,
+    content_type: str,
+    endpoint_type: str,
+    model: str,
+) -> Tuple[Dict[str, Any], bool]:
+    """Decode provider SSE events into the same response shape as JSON."""
+
+    text = body.decode("utf-8", errors="replace")
+    looks_like_sse = "text/event-stream" in content_type.casefold() or any(
+        line.lstrip().startswith("data:") for line in text.splitlines()
+    )
+    if not looks_like_sse:
+        payload = json.loads(text)
+        if not isinstance(payload, dict):
+            raise ValueError("provider JSON response must be an object")
+        return payload, True
+
+    events: List[Dict[str, Any]] = []
+    data_lines: List[str] = []
+    saw_done = False
+
+    def flush_event() -> None:
+        nonlocal data_lines, saw_done
+        if not data_lines:
+            return
+        raw = "\n".join(data_lines).strip()
+        data_lines = []
+        if raw == "[DONE]":
+            saw_done = True
+            return
+        if not raw:
+            return
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            events.append(parsed)
+
+    for line in text.splitlines():
+        stripped = line.strip("\r")
+        if not stripped:
+            flush_event()
+        elif stripped.startswith(":"):
+            continue
+        elif stripped.startswith("data:"):
+            data_lines.append(stripped[5:].lstrip())
+    flush_event()
+    if not events or not saw_done and not any(
+        str(event.get("type") or "").casefold() in {"response.completed", "message_stop"}
+        or str(event.get("finish_reason") or "").strip()
+        for event in events
+    ):
+        raise ValueError("SSE response ended without a terminal completion event")
+
+    # Prefer a complete provider event when available; otherwise synthesize a
+    # normal response from deltas so the existing schema/finish validation is
+    # shared by streamed and non-streamed calls.
+    for event in reversed(events):
+        if isinstance(event.get("response"), Mapping):
+            return dict(event["response"]), True
+        if "choices" in event and any(
+            isinstance(choice, Mapping) and isinstance(choice.get("message"), Mapping)
+            for choice in (event.get("choices") or [])
+        ):
+            return event, True
+        if "output" in event:
+            return event, True
+
+    text_parts: List[str] = []
+    finish_reason = ""
+    usage: Mapping[str, Any] | None = None
+    for event in events:
+        event_type = str(event.get("type") or "").casefold()
+        if isinstance(event.get("usage"), Mapping):
+            usage = event["usage"]
+        if endpoint_type == "anthropic" or "message" in event_type:
+            delta = event.get("delta")
+            if isinstance(delta, Mapping) and delta.get("text"):
+                text_parts.append(str(delta["text"]))
+            finish_reason = str(
+                (delta or {}).get("stop_reason") if isinstance(delta, Mapping) else ""
+            ) or finish_reason
+        elif endpoint_type == "responses" or "response." in event_type:
+            if event.get("delta"):
+                text_parts.append(str(event.get("delta")))
+            details = event.get("response") if isinstance(event.get("response"), Mapping) else event
+            status = str(details.get("status") or "").casefold()
+            if status == "completed":
+                finish_reason = "stop"
+            elif status:
+                finish_reason = str((details.get("incomplete_details") or {}).get("reason") or status)
+        else:
+            choices = event.get("choices") or []
+            for choice in choices:
+                if not isinstance(choice, Mapping):
+                    continue
+                delta = choice.get("delta")
+                if isinstance(delta, Mapping) and delta.get("content"):
+                    value = delta["content"]
+                    if isinstance(value, list):
+                        text_parts.extend(
+                            str(item.get("text") or "")
+                            for item in value
+                            if isinstance(item, Mapping)
+                        )
+                    else:
+                        text_parts.append(str(value))
+                finish_reason = str(choice.get("finish_reason") or finish_reason)
+
+    if not text_parts:
+        raise ValueError("SSE response contained no usable content")
+    if endpoint_type == "anthropic":
+        payload: Dict[str, Any] = {
+            "model": model,
+            "content": [{"type": "text", "text": "".join(text_parts)}],
+            "stop_reason": {"stop": "end_turn", "length": "max_tokens"}.get(finish_reason, finish_reason),
+        }
+    elif endpoint_type == "responses":
+        payload = {
+            "model": model,
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "".join(text_parts)}]}],
+            "status": "completed" if finish_reason in {"", "stop"} else "incomplete",
+        }
+    else:
+        payload = {
+            "model": model,
+            "choices": [{"message": {"content": "".join(text_parts)}, "finish_reason": finish_reason or "stop"}],
+        }
+    if usage is not None:
+        payload["usage"] = dict(usage)
+    return payload, True
+
+
 def classify_provider_endpoint(api_base: str, provider_family: str = "") -> dict[str, Any]:
     """Classify a provider host without contacting it or reading credentials."""
 
@@ -1066,6 +1325,20 @@ def _coerce_positive_int(value: Any, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
+def _coerce_nonnegative_int(value: Any, default: int) -> int:
+    """Parse an integer while preserving an explicit zero configuration."""
+
+    if value is None or str(value).strip() == "":
+        return default
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
 def _response_error_details(response: Any, limit: int = 500, *, secret: str = "") -> str:
     if response is None:
         return "HTTP错误 ?"
@@ -1094,7 +1367,7 @@ def _load_api_runtime_settings(api_config: Optional[Mapping[str, Any]] = None) -
             api_config.get("read_timeout_seconds", api_config.get("total_timeout_seconds", timeout_seconds)),
             timeout_seconds,
         )
-        retry_attempts = _coerce_positive_int(
+        retry_attempts = _coerce_nonnegative_int(
             api_config.get("transport_retries", retry_attempts),
             retry_attempts,
         )
@@ -1106,7 +1379,7 @@ def _load_api_runtime_settings(api_config: Optional[Mapping[str, Any]] = None) -
         return timeout_seconds, retry_attempts
 
     runtime = config.get("Runtime", {}) or {}
-    retry_attempts = _coerce_positive_int(
+    retry_attempts = _coerce_nonnegative_int(
         runtime.get("transport_retries", retry_attempts),
         retry_attempts,
     )
@@ -1904,8 +2177,21 @@ def _call_ai_api_detailed_uninstrumented(
             if timeout_seconds is not None
             else configured_timeout_seconds
         )
+        connect_timeout_seconds = _coerce_positive_int(
+            api_config.get("connect_timeout_seconds"),
+            min(10, request_timeout_seconds),
+        )
+        read_timeout_seconds = _coerce_positive_int(
+            api_config.get("read_timeout_seconds"),
+            request_timeout_seconds,
+        )
+        total_timeout_seconds = _coerce_positive_int(
+            api_config.get("total_timeout_seconds"),
+            request_timeout_seconds,
+        )
+        total_deadline = time.monotonic() + total_timeout_seconds
         max_retries = (
-            _coerce_positive_int(retry_attempts, configured_retries)
+            _coerce_nonnegative_int(retry_attempts, configured_retries)
             if retry_attempts is not None
             else configured_retries
         )
@@ -1913,6 +2199,9 @@ def _call_ai_api_detailed_uninstrumented(
             max_retries = min(max_retries, max(1, int(max_retries_per_call)) + 1)
         if attempt_limit is not None:
             max_retries = max(1, int(attempt_limit))
+        # ``transport_retries=0`` means no retry after the initial request,
+        # not zero total requests.
+        max_retries = max(1, max_retries)
         if capability.endpoint_type == "anthropic":
             api_url, headers = anthropic_request_target(api_base, api_config, api_key)
         else:
@@ -1970,18 +2259,35 @@ def _call_ai_api_detailed_uninstrumented(
             )
             response_parser = parse_chat_completions_response
 
-        response = None
         last_failure = _api_result(status="failed", error_kind="invalid_response", message="API call did not run")
         attempt = 0
         strict_retry_budget = attempt_limit is not None or bool(max_retries_per_call)
+        aihubmix_recovery_active = _aihubmix_recovery_enabled(api_config)
 
         def can_start_attempt() -> bool:
             if strict_retry_budget:
                 return attempts_used < max_retries
             return attempt < max_retries
 
+        def sleep_before_retry(seconds: float) -> None:
+            remaining = total_deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(float(seconds), remaining))
+
+        def request_fingerprint() -> str:
+            identity = {
+                "identity_version": "aihubmix-request-fingerprint/v1",
+                "endpoint": api_url,
+                "model": str(model_name),
+                "response_format": response_format,
+                "payload": payload,
+            }
+            return hashlib.sha256(
+                json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+
         def recover_final_transient_failure(failure: Dict[str, Any]) -> Dict[str, Any] | None:
-            if str(failure.get("error_kind") or "") != "transient_network":
+            if str(failure.get("error_kind") or "") not in {"transient_network", "outcome_unknown"}:
                 return None
             return _aihubmix_recover_disconnected_call(
                 api_config=api_config,
@@ -1989,12 +2295,23 @@ def _call_ai_api_detailed_uninstrumented(
                 request_started_epoch=request_started_epoch,
                 response_parser=response_parser,
                 response_format=response_format,
+                request_fingerprint=request_fingerprint(),
                 logger=logger,
             )
 
         while can_start_attempt():
+            if total_deadline <= time.monotonic():
+                return finish(
+                    _api_result(
+                        status="failed",
+                        error_kind="transient_network",
+                        message="provider total transport deadline exhausted before the next attempt",
+                    )
+                )
             attempt += 1
             attempts_used += 1
+            # Do not let a previous 429/503 leak into a new transport error.
+            response = None
             try:
                 final_payload = copy.deepcopy(payload)
                 if 'aihubmix.com' in api_base.lower() and logger:
@@ -2005,13 +2322,42 @@ def _call_ai_api_detailed_uninstrumented(
                     api_config=api_config,
                     headers=headers,
                     json=final_payload,
-                    timeout=request_timeout_seconds,
+                    timeout=(
+                        min(connect_timeout_seconds, max(0.001, total_deadline - time.monotonic())),
+                        min(read_timeout_seconds, max(0.001, total_deadline - time.monotonic())),
+                    ),
+                    stream=True,
                 )
                 response.raise_for_status()
 
                 response_data: Any = None
+                raw_response_body = b""
+                response_protocol = "json"
+                response_complete = False
+                raw_response_path = ""
+                provider_request_id = _response_header(response, "x-aihubmix-request-id")
                 try:
-                    response_data = response.json()
+                    max_response_bytes = _coerce_positive_int(
+                        api_config.get("max_response_bytes"),
+                        _MAX_PROVIDER_RESPONSE_BYTES,
+                    )
+                    raw_response_body, content_type = _read_bounded_response(
+                        response,
+                        max_bytes=max_response_bytes,
+                    )
+                    raw_response_path = _persist_raw_response(raw_response_body, api_config=api_config)
+                    response_data, response_complete = _decode_sse_response(
+                        raw_response_body,
+                        content_type=content_type,
+                        endpoint_type=capability.endpoint_type,
+                        model=str(model_name),
+                    )
+                    response_protocol = (
+                        "sse"
+                        if "text/event-stream" in content_type.casefold()
+                        or any(line.lstrip().startswith("data:") for line in raw_response_body.decode("utf-8", errors="replace").splitlines())
+                        else "json"
+                    )
                     content, finish_reason = response_parser(response_data)
                 except Exception as exc:
                     message = f"Malformed API response: {exc}"
@@ -2025,6 +2371,13 @@ def _call_ai_api_detailed_uninstrumented(
                     )
                 else:
                     formatted = _format_success_result(content, response_format, response, finish_reason, logger=logger)
+
+                formatted["provider_request_id"] = provider_request_id
+                formatted["raw_response_sha256"] = hashlib.sha256(raw_response_body).hexdigest()
+                formatted["response_bytes"] = len(raw_response_body)
+                formatted["response_protocol"] = response_protocol
+                formatted["response_complete"] = bool(response_complete)
+                formatted["raw_response_path"] = raw_response_path
 
                 if isinstance(response_data, dict):
                     provider_model = str(response_data.get("model") or "").strip()
@@ -2071,15 +2424,16 @@ def _call_ai_api_detailed_uninstrumented(
                         logger.warning(
                             f"API returned malformed JSON; retrying structured request in {wait_time:.1f}s..."
                         )
-                    time.sleep(wait_time)
+                    sleep_before_retry(wait_time)
                     last_failure = formatted
                     continue
 
                 return finish(formatted)
 
-            except requests.exceptions.HTTPError:
+            except requests.exceptions.HTTPError as exc:
+                current_response = getattr(exc, "response", None) or response
                 error_kind, http_status, provider_code, message = _classify_http_error(
-                    response,
+                    current_response,
                     secret=api_key,
                 )
                 last_failure = _api_result(
@@ -2087,8 +2441,9 @@ def _call_ai_api_detailed_uninstrumented(
                     error_kind=error_kind,
                     http_status=http_status,
                     provider_code=provider_code,
-                    message=message or _response_error_details(response, limit=500, secret=api_key),
+                    message=message or _response_error_details(current_response, limit=500, secret=api_key),
                 )
+                _close_provider_response(current_response)
                 if (
                     capability.reasoning_param_style == "chat_reasoning"
                     and ("reasoning", "display") not in removed_compat_params
@@ -2160,10 +2515,10 @@ def _call_ai_api_detailed_uninstrumented(
                     wait_time = 2 * (2 ** (attempt - 1))
                     if logger:
                         logger.warning(
-                            f"{_response_error_details(response, limit=200, secret=api_key)}，"
+                            f"{_response_error_details(current_response, limit=200, secret=api_key)}，"
                             f"{wait_time:.1f}秒后重试..."
                         )
-                    time.sleep(wait_time)
+                    sleep_before_retry(wait_time)
                     continue
 
                 if logger:
@@ -2172,16 +2527,25 @@ def _call_ai_api_detailed_uninstrumented(
                 return finish(recovered or last_failure)
 
             except Exception as exc:
-                response_status = getattr(response, "status_code", None)
+                current_response = response
+                response_status = getattr(current_response, "status_code", None)
                 if isinstance(response_status, int) and response_status >= 400:
                     error_kind, http_status, provider_code, message = _classify_http_error(
-                        response,
+                        current_response,
                         secret=api_key,
                     )
                 else:
                     error_kind, message = _classify_exception(exc)
                     http_status = response_status
                     provider_code = None
+
+                if aihubmix_recovery_active and error_kind == "transient_network":
+                    error_kind = "outcome_unknown"
+                    message = (
+                        "AihubMix transport disconnected after the request boundary; "
+                        "the provider outcome is unknown and will not be regenerated automatically"
+                        + (f": {message}" if message else "")
+                    )
 
                 last_failure = _api_result(
                     status="failed",
@@ -2190,16 +2554,21 @@ def _call_ai_api_detailed_uninstrumented(
                     provider_code=provider_code,
                     message=message,
                 )
+                _close_provider_response(current_response)
                 if error_kind in {"quota_exhausted", "fatal_config_or_auth", "invalid_response"}:
                     if logger:
                         logger.error(f"API调用不可重试失败 ({error_kind}): {message}")
                     return finish(last_failure)
 
+                if error_kind == "outcome_unknown":
+                    recovered = recover_final_transient_failure(last_failure)
+                    return finish(recovered or last_failure)
+
                 if can_start_attempt():
                     wait_time = 2 * (2 ** (attempt - 1))
                     if logger:
                         logger.warning(f"API调用失败 ({error_kind}): {message}，{wait_time:.1f}秒后重试...")
-                    time.sleep(wait_time)
+                    sleep_before_retry(wait_time)
                     continue
 
                 if logger:
@@ -2427,6 +2796,14 @@ def _call_ai_api_detailed(
                     "recovered_from_aihubmix_task",
                     "aihubmix_recovery_task_id",
                     "aihubmix_recovery_content_sha256",
+                    "aihubmix_recovery_operator",
+                    "aihubmix_recovery_request_fingerprint",
+                    "provider_request_id",
+                    "raw_response_sha256",
+                    "response_bytes",
+                    "response_protocol",
+                    "response_complete",
+                    "raw_response_path",
                 )
                 if key in result
             },
@@ -2443,6 +2820,17 @@ def _call_ai_api_detailed(
             f"{str(api_config.get('api_base') or '').rstrip('/')}/"
             f"{'responses' if capability.endpoint_type == 'responses' else 'chat/completions'}"
         )
+    configured_timeout, configured_transport_retries = _load_api_runtime_settings(api_config)
+    effective_timeout = (
+        _coerce_positive_int(timeout_seconds, configured_timeout)
+        if timeout_seconds is not None
+        else configured_timeout
+    )
+    effective_transport_retries = (
+        _coerce_nonnegative_int(retry_attempts, configured_transport_retries)
+        if retry_attempts is not None
+        else configured_transport_retries
+    )
     transport_config = {
         "provider_family": capability.provider_family,
         "endpoint_type": capability.endpoint_type,
@@ -2459,8 +2847,25 @@ def _call_ai_api_detailed(
                 separators=(",", ":"),
             ).encode("utf-8")
         ),
-        "timeout_seconds": _load_api_runtime_settings(api_config)[0],
-        "transport_retries": _load_api_runtime_settings(api_config)[1],
+        "timeout_seconds": effective_timeout,
+        "connect_timeout_seconds": _coerce_positive_int(
+            api_config.get("connect_timeout_seconds"),
+            min(10, effective_timeout),
+        ),
+        "read_timeout_seconds": _coerce_positive_int(
+            api_config.get("read_timeout_seconds"),
+            effective_timeout,
+        ),
+        "total_timeout_seconds": _coerce_positive_int(
+            api_config.get("total_timeout_seconds"),
+            effective_timeout,
+        ),
+        "provider_stream": _config_bool(api_config.get("provider_stream")),
+        "max_response_bytes": _coerce_positive_int(
+            api_config.get("max_response_bytes"),
+            _MAX_PROVIDER_RESPONSE_BYTES,
+        ),
+        "transport_retries": effective_transport_retries,
     }
     receipt = provider_runtime.complete(
         admission=admission,

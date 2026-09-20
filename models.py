@@ -13,8 +13,16 @@ class PaperInfo(TypedDict, total=False):
     authors: List[str]
     year: str
     journal: str
+    journal_abbreviation: str
     doi: str
+    doi_raw: str
+    url_raw: str
+    citation_key: str
+    citation_key_raw: str
     attachments: List[str]
+    editors: List[str]
+    tags: List[str]
+    unknown_fields: List[Dict[str, Any]]
     pdf_path: str
     file_index: int
     item_type: str
