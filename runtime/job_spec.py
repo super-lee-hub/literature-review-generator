@@ -43,6 +43,7 @@ _RUNTIME_METADATA_FIELDS = frozenset({
     "validation_required",
     "require_clean_validation",
     "allow_unvalidated_when_validation_optional",
+    "allow_partial_source_quarantine",
     "audit_actor",
     "audit_reason",
     "audit_scope",
@@ -382,6 +383,7 @@ class RuntimeJobSpec:
             "validation_required",
             "require_clean_validation",
             "allow_unvalidated_when_validation_optional",
+            "allow_partial_source_quarantine",
         ):
             if field_name in self.metadata:
                 _optional_bool(self.metadata[field_name], field_name=field_name)
@@ -429,6 +431,9 @@ class RuntimeJobSpec:
             require_clean_validation=self.metadata.get("require_clean_validation"),
             allow_unvalidated_when_validation_optional=self.metadata.get(
                 "allow_unvalidated_when_validation_optional"
+            ),
+            allow_partial_source_quarantine=bool(
+                self.metadata.get("allow_partial_source_quarantine", False)
             ),
             derived_summary_source=bool(self.metadata.get("review_batch_spec")),
         )

@@ -542,8 +542,10 @@ def finalize_job_runtime(
         reason.startswith("source_identity_") or reason == "ambiguous_pdf_match"
         for reason in context.source_degradation_reasons
     )
-    effective_disposition: JobDisposition = job_disposition or (
-        "needs_review" if identity_requires_review else "unvalidated"
+    effective_disposition: JobDisposition = (
+        "needs_review"
+        if identity_requires_review
+        else job_disposition or "unvalidated"
     )
     if canonical_ready is None:
         effective_ready = bool(
@@ -554,6 +556,8 @@ def finalize_job_runtime(
         )
     else:
         effective_ready = bool(canonical_ready)
+    if identity_requires_review:
+        effective_ready = False
     effective_attention = (
         bool(requires_attention)
         if requires_attention is not None

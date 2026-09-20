@@ -63,6 +63,19 @@ def test_runtime_job_spec_defaults_stage1_reuse_for_stage1_actions() -> None:
     assert request.reuse_stage1 is True
 
 
+def test_runtime_job_spec_passes_partial_source_quarantine_policy() -> None:
+    spec = RuntimeJobSpec(
+        project_name="partial-corpus",
+        source=RuntimeSourceSpec(mode="direct", pdf_folder="D:/papers"),
+        action="run_all",
+        metadata={"allow_partial_source_quarantine": True},
+    )
+
+    request = spec.to_job_request()
+
+    assert request.allow_partial_source_quarantine is True
+
+
 def test_runtime_job_spec_preserves_stage1_reuse_opt_out() -> None:
     spec = RuntimeJobSpec(
         project_name="demo",

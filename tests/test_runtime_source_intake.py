@@ -11,7 +11,8 @@ from runtime.source_intake import (
     build_source_bundle_for_request,
     build_zotero_source_bundle,
 )
-from services.job_runner import JobRunRequest
+from runtime.stage_contracts import SourceBundle
+from services.job_runner import JobRunRequest, JobRunner
 from services.source_identity import evaluate_source_identity
 
 
@@ -126,6 +127,52 @@ def test_build_source_bundle_for_request_dispatches_by_source_mode(tmp_path: Pat
     assert bundle.project_name == "demo"
     assert bundle.source_mode == "direct"
     assert bundle.paper_work_items[0].source_pdf == str(pdf_path.resolve())
+
+
+def test_job_runner_allows_ready_items_through_explicit_partial_quarantine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pdf_dir = tmp_path / "papers"
+    pdf_dir.mkdir()
+    pdf_path = pdf_dir / "ready.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n%ready\n")
+    base_bundle = build_direct_source_bundle(
+        project_name="partial-quarantine",
+        pdf_folder=str(pdf_dir),
+    )
+    partial_bundle = SourceBundle(
+        source_mode=base_bundle.source_mode,
+        project_name=base_bundle.project_name,
+        paper_work_items=base_bundle.paper_work_items,
+        source_snapshot={
+            "canonical_ready": False,
+            "quarantined_sources": [{"paper_index": 2, "identity_verdict": "ambiguous"}],
+            "ambiguous_matches": [{"paper_index": 2}],
+            "missing_titles": [],
+        },
+    )
+    monkeypatch.setattr(
+        "services.job_runner.build_source_bundle_for_request",
+        lambda _request, project_name=None: partial_bundle,
+    )
+    request = JobRunRequest(
+        config="config.ini",
+        project_name="partial-quarantine",
+        pdf_folder=str(pdf_dir),
+        action="run_all",
+        allow_partial_source_quarantine=True,
+    )
+
+    prepared = JobRunner()._prepare_source_inventory(
+        generator=object(),
+        request=request,
+        project_name="partial-quarantine",
+    )
+
+    assert prepared.canonical_ready is True
+    assert "source_identity_quarantine" in prepared.degradation_reasons
+    assert prepared.source_bundle is partial_bundle
 
 
 def test_zotero_source_intake_surfaces_ambiguous_pdf_candidates(tmp_path: Path) -> None:

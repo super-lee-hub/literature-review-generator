@@ -82,6 +82,7 @@ class JobRunRequest:
     validation_required: bool | None = None
     require_clean_validation: bool | None = None
     allow_unvalidated_when_validation_optional: bool | None = None
+    allow_partial_source_quarantine: bool = False
     derived_summary_source: bool = False
 
 
@@ -175,6 +176,9 @@ def build_job_request_from_mapping(params: Mapping[str, Any]) -> JobRunRequest:
         require_clean_validation=params.get("require_clean_validation"),
         allow_unvalidated_when_validation_optional=params.get(
             "allow_unvalidated_when_validation_optional"
+        ),
+        allow_partial_source_quarantine=bool(
+            params.get("allow_partial_source_quarantine", False)
         ),
         derived_summary_source=bool(params.get("derived_summary_source", False)),
     )
@@ -358,9 +362,23 @@ class JobRunner:
                 # authority in that case; retain the old verdict fallback for
                 # bundles produced by older callers without that field.
                 if "canonical_ready" in source_snapshot:
-                    canonical_ready = bool(
-                        ready_pdfs and not errors and source_snapshot.get("canonical_ready")
+                    partial_quarantine = bool(
+                        source_snapshot.get("quarantined_sources")
+                        or source_snapshot.get("ambiguous_matches")
                     )
+                    canonical_ready = bool(
+                        ready_pdfs
+                        and not errors
+                        and (
+                            source_snapshot.get("canonical_ready")
+                            or (
+                                request.allow_partial_source_quarantine
+                                and partial_quarantine
+                            )
+                        )
+                    )
+                    if request.allow_partial_source_quarantine and partial_quarantine:
+                        degradation.append("source_identity_quarantine")
                 else:
                     canonical_ready = bool(ready_pdfs and not errors) and not any(
                         item in {"ambiguous", "mismatch"} for item in identity_verdicts

@@ -633,6 +633,46 @@ class OutlineV3Executor:
     def _summary_hashes(self) -> list[str]:
         return sorted(_hash_payload(item) for item in self.summaries)
 
+    @staticmethod
+    def _prompt_evidence_views(views: Sequence[Any]) -> list[dict[str, Any]]:
+        """Bound provider prompt size without weakening local evidence artifacts.
+
+        The complete evidence views remain durable and are hashed in the
+        dependency graph. Provider prompts receive a bounded projection of
+        each view so a large corpus cannot exceed a route's verified context
+        budget before Outline v3 can shard or adjudicate it.
+        """
+
+        bounded_fields = (
+            "research_questions",
+            "theories",
+            "constructs",
+            "mechanisms",
+            "method",
+            "sample_or_context",
+            "findings",
+            "conclusions",
+            "limitations",
+            "research_gaps",
+            "future_directions",
+            "relevance",
+        )
+        prompt_views: list[dict[str, Any]] = []
+        for view in views:
+            payload = view.to_dict() if hasattr(view, "to_dict") else dict(view)
+            compact = dict(payload)
+            for field_name in bounded_fields:
+                raw_values = compact.get(field_name) or []
+                values = raw_values if isinstance(raw_values, list) else [raw_values]
+                compact[field_name] = [str(value)[:1200] for value in values[:10] if str(value).strip()]
+            # Raw field provenance is retained in the local evidence artifact;
+            # it is not needed for cross-paper planning and can dominate the
+            # provider prompt for Zotero-rich records.
+            compact["source_fields"] = {}
+            compact["diagnostics"] = [str(value)[:500] for value in (compact.get("diagnostics") or [])[:6]]
+            prompt_views.append(compact)
+        return prompt_views
+
     def _semantic_node_id(self, node_id: str) -> str:
         """Return the deterministic replay identity for one concrete call."""
 
@@ -785,7 +825,9 @@ class OutlineV3Executor:
                     "stage_name": "outline_v3",
                     "variant_name": variant_name,
                     "node_id": node_id,
-                    "summaries": list(variant_summaries),
+                    "evidence_views": self._prompt_evidence_views(
+                        build_outline_evidence_views(variant_summaries, self.job_id).views
+                    ),
                     "candidate_count": self.candidate_count,
                     "evidence_bound": True,
                 }
@@ -3317,7 +3359,7 @@ class OutlineV3Executor:
             relation_candidates = [relation.to_dict() for relation in candidate_map_model.relations]
             relation_request = {
                 "relation_candidates": relation_candidates,
-                "evidence_views": [view.to_dict() for view in evidence_model.views],
+                "evidence_views": self._prompt_evidence_views(evidence_model.views),
                 "relation_adjudication_contract": {
                     "must_return_confirmed_relation_ids": True,
                     "must_reject_without_recorded_evidence": True,
@@ -3436,11 +3478,9 @@ class OutlineV3Executor:
                 ))
                 paper_keys = [item.paper_key for item in ledger_model.entries]
                 allowed_relation_ids = [item.relation_id for item in confirmed_map_model.relations]
-                candidate_evidence = [
-                    view.to_dict()
-                    for view in evidence_model.views
-                    if view.paper_key in set(paper_keys)
-                ]
+                candidate_evidence = self._prompt_evidence_views(
+                    [view for view in evidence_model.views if view.paper_key in set(paper_keys)]
+                )
                 candidate_relations = [
                     item.to_dict()
                     for item in confirmed_map_model.relations
@@ -3677,8 +3717,16 @@ class OutlineV3Executor:
                     "source_summary_hashes": sorted(evidence_model.source_summary_hashes),
                     "relation_evidence": [item.to_dict() for item in confirmed_map_model.relations],
                     "contradictions": [item.to_dict() for item in confirmed_map_model.relations if item.relation_type in {"contradicts", "explains_discrepancy"}],
-                    "boundaries": [view.to_dict() for view in evidence_model.views if view.limitations],
-                    "gaps": [view.to_dict() for view in evidence_model.views if view.research_gaps or view.future_directions],
+                    "boundaries": self._prompt_evidence_views(
+                        [view for view in evidence_model.views if view.limitations]
+                    ),
+                    "gaps": self._prompt_evidence_views(
+                        [
+                            view
+                            for view in evidence_model.views
+                            if view.research_gaps or view.future_directions
+                        ]
+                    ),
                 },
             }
             for node_id, cls in (("structure_critique", StructureCritique), ("coverage_critique", CoverageCritique), ("evidence_critique", EvidenceCritique)):
@@ -4019,7 +4067,7 @@ class OutlineV3Executor:
                 variant_candidates = build_global_relation_map(variant_evidence, variant_matrix, variant_ledger)
                 variant_relation_request = {
                     "relation_candidates": [item.to_dict() for item in variant_candidates.relations],
-                    "evidence": [view.to_dict() for view in variant_evidence.views],
+                    "evidence": self._prompt_evidence_views(variant_evidence.views),
                     "source_summary_hashes": sorted(variant_evidence.source_summary_hashes),
                     "evidence_shards": evidence_shards,
                     "shard_size": configured_shard_size,
@@ -4076,7 +4124,7 @@ class OutlineV3Executor:
                         "paper_keys": paper_keys,
                         "relation_ids": [item.relation_id for item in variant_relation_map.relations],
                         "relations": [item.to_dict() for item in variant_relation_map.relations],
-                        "evidence": [view.to_dict() for view in variant_evidence.views],
+                        "evidence": self._prompt_evidence_views(variant_evidence.views),
                         "source_summary_hashes": sorted(variant_evidence.source_summary_hashes),
                         "evidence_shards": evidence_shards,
                         "shard_size": configured_shard_size,

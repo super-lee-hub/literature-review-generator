@@ -1543,7 +1543,10 @@ class AgentRuntimeBridge:
                     "summary_sources": [str(item) for item in summary_sources if str(item)],
                 },
             )
-        if bundle.source_snapshot.get("canonical_ready") is False:
+        if (
+            bundle.source_snapshot.get("canonical_ready") is False
+            and not bool(self.job_spec.metadata.get("allow_partial_source_quarantine", False))
+        ):
             return SourceBundle(
                 source_mode=bundle.source_mode,
                 project_name=bundle.project_name,
