@@ -673,6 +673,42 @@ class OutlineV3Executor:
             prompt_views.append(compact)
         return prompt_views
 
+    @staticmethod
+    def _estimate_source_summary_excerpts(
+        summaries: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, str]]:
+        """Keep provider-plan estimates sensitive to source volume.
+
+        Transport requests use the bounded evidence projection above.  The
+        stability estimate still needs a bounded representation of the raw
+        Stage 1 summary volume; otherwise a large summary can become invisible
+        to the cost/context estimate after projection.  Excerpts are used only
+        in the in-memory representative estimate, never in the provider
+        payload or durable evidence artifacts.
+        """
+
+        excerpts: list[dict[str, str]] = []
+        for summary in summaries:
+            paper_info = summary.get("paper_info")
+            core_analysis = summary.get("core_analysis")
+            paper_key = ""
+            if isinstance(paper_info, Mapping):
+                paper_key = str(
+                    paper_info.get("canonical_paper_key")
+                    or paper_info.get("source_paper_id")
+                    or ""
+                )
+            if not isinstance(core_analysis, Mapping):
+                core_analysis = {}
+            source_summary = str(core_analysis.get("summary") or "")
+            excerpts.append(
+                {
+                    "paper_key": paper_key,
+                    "summary_excerpt": source_summary[:1200],
+                }
+            )
+        return excerpts
+
     def _semantic_node_id(self, node_id: str) -> str:
         """Return the deterministic replay identity for one concrete call."""
 
@@ -827,6 +863,9 @@ class OutlineV3Executor:
                     "node_id": node_id,
                     "evidence_views": self._prompt_evidence_views(
                         build_outline_evidence_views(variant_summaries, self.job_id).views
+                    ),
+                    "source_summary_excerpts_for_estimation": self._estimate_source_summary_excerpts(
+                        variant_summaries
                     ),
                     "candidate_count": self.candidate_count,
                     "evidence_bound": True,
