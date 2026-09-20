@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from threading import Thread
 from typing import Any
 
@@ -47,6 +48,18 @@ class _LocalProvider:
                 if status_or_action == "raw":
                     status = 200
                     encoded = bytes(body)
+                elif status_or_action == "partial_close":
+                    status = 200
+                    encoded = bytes(body)
+                    self.send_response(status)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                    self.wfile.write(f"{len(encoded):x}\r\n".encode("ascii"))
+                    self.wfile.write(encoded + b"\r\n")
+                    self.wfile.flush()
+                    self.connection.close()
+                    return
                 else:
                     status = int(status_or_action)
                     encoded = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -297,6 +310,34 @@ def test_real_local_http_disconnect_is_failed_without_false_success(tmp_path) ->
     receipt = ledger.list_receipts()[0]
     assert receipt.status == "failed"
     assert receipt.attempts == 1
+    assert aggregate.snapshot()["calls_used"] == 1
+
+
+@pytest.mark.integration
+def test_real_local_http_200_after_partial_body_is_unknown_without_retry(tmp_path) -> None:
+    partial = b'{"choices":[{"message":{"content":"{\\"ok\\":true}"}}]}'
+    with _LocalProvider([("partial_close", partial)]) as provider:
+        runtime, aggregate, ledger = _runtime(tmp_path, max_calls=1, max_output_tokens=8)
+        raw_dir = tmp_path / "raw-responses"
+        config = {**_config(provider.base_url), "raw_response_dir": str(raw_dir)}
+        result = ai_interface._call_ai_api_detailed(
+            "partial body test",
+            config,
+            "system",
+            max_tokens=8,
+            retry_attempts=1,
+            provider_runtime=runtime,
+        )
+
+    assert len(provider.requests) == 1
+    assert result["status"] == "failed"
+    assert result["error_kind"] == "outcome_unknown"
+    assert result["response_complete"] is False
+    assert result["response_bytes"] == len(partial)
+    raw_path = Path(result["raw_response_path"])
+    assert raw_path.read_bytes() == partial
+    receipt = ledger.list_receipts()[0]
+    assert receipt.status == "failed"
     assert aggregate.snapshot()["calls_used"] == 1
 
 

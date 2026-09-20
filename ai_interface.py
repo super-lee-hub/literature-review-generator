@@ -89,6 +89,20 @@ _PAYLOAD_PARAMETER_ERROR_MARKERS = (
 )
 
 
+class ProviderResponseReadError(RuntimeError):
+    """A response began but its body was not received to completion."""
+
+    def __init__(self, *, partial_body: bytes, content_type: str, cause: BaseException) -> None:
+        super().__init__(str(cause) or "provider response body read failed")
+        self.partial_body = partial_body
+        self.content_type = content_type
+        self.cause = cause
+
+
+class ProviderResponseLimitError(ValueError):
+    """A provider response exceeded the configured bounded-read limit."""
+
+
 def _load_stage1_system_prompt(logger: Any = None) -> str:
     """Load the canonical Stage 1 system prompt through prompt authority."""
 
@@ -1118,6 +1132,7 @@ def _read_bounded_response(response: Any, *, max_bytes: int) -> Tuple[bytes, str
 
     chunks: List[bytes] = []
     total = 0
+    content_type = _response_header(response, "content-type")
     try:
         iterator = None
         iter_content = getattr(response, "iter_content", None)
@@ -1133,7 +1148,9 @@ def _read_bounded_response(response: Any, *, max_bytes: int) -> Tuple[bytes, str
                 chunk = raw_chunk.encode("utf-8") if isinstance(raw_chunk, str) else bytes(raw_chunk)
                 total += len(chunk)
                 if total > max_bytes:
-                    raise ValueError(f"provider response exceeds {max_bytes} bytes")
+                    raise ProviderResponseLimitError(
+                        f"provider response exceeds {max_bytes} bytes"
+                    )
                 chunks.append(chunk)
         else:
             raw_body = getattr(response, "content", b"")
@@ -1143,9 +1160,17 @@ def _read_bounded_response(response: Any, *, max_bytes: int) -> Tuple[bytes, str
                 except Exception:
                     raw_body = str(getattr(response, "text", "") or "").encode("utf-8")
             if len(raw_body) > max_bytes:
-                raise ValueError(f"provider response exceeds {max_bytes} bytes")
+                raise ProviderResponseLimitError(f"provider response exceeds {max_bytes} bytes")
             chunks.append(bytes(raw_body))
-        return b"".join(chunks), _response_header(response, "content-type")
+        return b"".join(chunks), content_type
+    except ProviderResponseLimitError:
+        raise
+    except Exception as exc:
+        raise ProviderResponseReadError(
+            partial_body=b"".join(chunks),
+            content_type=content_type,
+            cause=exc,
+        ) from exc
     finally:
         _close_provider_response(response)
 
@@ -2361,6 +2386,7 @@ def _call_ai_api_detailed_uninstrumented(
             # Do not let a previous 429/503 leak into a new transport error.
             response = None
             transport_attempt_started = False
+            provider_request_id = ""
             try:
                 final_payload = copy.deepcopy(payload)
                 if 'aihubmix.com' in api_base.lower() and logger:
@@ -2382,6 +2408,9 @@ def _call_ai_api_detailed_uninstrumented(
                     ),
                     stream=True,
                 )
+                # Capture the remote identity before status/body handling can
+                # raise for an HTTP error or a truncated body.
+                provider_request_id = _response_header(response, "x-aihubmix-request-id")
                 response.raise_for_status()
 
                 response_data: Any = None
@@ -2389,7 +2418,7 @@ def _call_ai_api_detailed_uninstrumented(
                 response_protocol = "json"
                 response_complete = False
                 raw_response_path = ""
-                provider_request_id = _response_header(response, "x-aihubmix-request-id")
+                response_retryable = True
                 try:
                     max_response_bytes = _coerce_positive_int(
                         api_config.get("max_response_bytes"),
@@ -2413,6 +2442,34 @@ def _call_ai_api_detailed_uninstrumented(
                         else "json"
                     )
                     content, finish_reason = response_parser(response_data)
+                except ProviderResponseReadError as exc:
+                    raw_response_body = exc.partial_body
+                    raw_response_path = _persist_raw_response(
+                        raw_response_body,
+                        api_config=api_config,
+                    )
+                    response_protocol = (
+                        "sse" if "text/event-stream" in exc.content_type.casefold() else "json"
+                    )
+                    response_retryable = False
+                    formatted = _api_result(
+                        status="failed",
+                        error_kind="outcome_unknown",
+                        http_status=getattr(response, "status_code", None),
+                        message=(
+                            "provider response body was incomplete after response headers; "
+                            "partial bytes were retained and the outcome is unknown"
+                            + (f": {exc}" if str(exc) else "")
+                        ),
+                    )
+                except ProviderResponseLimitError as exc:
+                    response_retryable = False
+                    formatted = _api_result(
+                        status="failed",
+                        error_kind="invalid_response",
+                        http_status=getattr(response, "status_code", None),
+                        message=str(exc),
+                    )
                 except Exception as exc:
                     message = f"Malformed API response: {exc}"
                     if logger:
@@ -2471,6 +2528,7 @@ def _call_ai_api_detailed_uninstrumented(
                     formatted.get("status") == "failed"
                     and formatted.get("error_kind") == "invalid_response"
                     and response_format == "json"
+                    and response_retryable
                     and can_start_attempt()
                 ):
                     wait_time = 2 * (2 ** (attempt - 1))
@@ -2481,6 +2539,10 @@ def _call_ai_api_detailed_uninstrumented(
                     sleep_before_retry(wait_time)
                     last_failure = formatted
                     continue
+
+                if formatted.get("error_kind") == "outcome_unknown":
+                    recovered = recover_final_transient_failure(formatted)
+                    return finish(recovered or formatted)
 
                 return finish(formatted)
 
@@ -2496,6 +2558,10 @@ def _call_ai_api_detailed_uninstrumented(
                     http_status=http_status,
                     provider_code=provider_code,
                     message=message or _response_error_details(current_response, limit=500, secret=api_key),
+                )
+                last_failure["provider_request_id"] = (
+                    provider_request_id
+                    or _response_header(current_response, "x-aihubmix-request-id")
                 )
                 _close_provider_response(current_response)
                 if (
@@ -2789,6 +2855,17 @@ def _call_ai_api_detailed(
         )
     if not str(transport_api_config.get("provider_route") or "").strip():
         transport_api_config["provider_route"] = str(provider_route or "")
+    if not str(
+        transport_api_config.get("raw_response_dir")
+        or transport_api_config.get("provider_raw_response_dir")
+        or ""
+    ).strip():
+        runtime_ledger = getattr(provider_runtime, "ledger", None)
+        ledger_path = getattr(runtime_ledger, "path", None)
+        if ledger_path:
+            transport_api_config["raw_response_dir"] = str(
+                Path(str(ledger_path)).resolve().parent / "raw_responses"
+            )
     result = _call_ai_api_detailed_uninstrumented(
         prompt,
         cast(APIConfig, transport_api_config),
