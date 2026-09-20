@@ -1795,14 +1795,19 @@ class OutlineV3Executor:
             for _variant_name, variant_summaries, transport_expected in self._provider_call_plan_variants():
                 if not transport_expected:
                     continue
-                _relation_input, relation_call_count, _relation_plan = (
+                _relation_input, relation_call_count, relation_plan = (
                     self._relation_hierarchical_preflight(
                         variant_summaries,
                         self._role_route("relation_adjudication").profile,
                         variant_name=_variant_name,
                     )
                 )
-                hierarchical_relation_shard_calls += relation_call_count
+                if int(relation_plan.get("shard_count") or 0) > 1:
+                    # The static relation node is replaced by these dynamic
+                    # calls.  The provider-call plan already contains one
+                    # static relation row, so only the surplus dynamic calls
+                    # belong in the extra-call budget.
+                    hierarchical_relation_shard_calls += max(0, relation_call_count - 1)
             if hierarchical_relation_shard_calls:
                 relation_route = self._role_route("relation_adjudication")
                 relation_output = max(1, int(relation_route.profile.max_output_tokens))
@@ -1818,6 +1823,50 @@ class OutlineV3Executor:
                         relation_output / 1000.0 * float(self.output_cost_per_1k_tokens or 0.0)
                         + relation_reasoning / 1000.0 * float(self.reasoning_cost_per_1k_tokens or 0.0)
                     )
+        hierarchical_critique_shard_calls = 0
+        critique_extra_by_role: dict[str, int] = {}
+        if self.technical_shard_target_tokens > 0:
+            critique_roles = {
+                "structure_critique",
+                "coverage_critique",
+                "evidence_critique",
+            }
+            for plan in transport_plans:
+                if plan.node_id not in critique_roles:
+                    continue
+                if plan.estimated_input_tokens <= self.technical_shard_target_tokens:
+                    continue
+                # _run_hierarchical_critique emits one bounded call per
+                # candidate.  The static plan already accounts for one call;
+                # add the remaining candidate calls only for transport-backed
+                # stability variants.
+                extra_calls = max(0, self.candidate_count - 1)
+                hierarchical_critique_shard_calls += extra_calls
+                critique_extra_by_role[plan.node_id] = (
+                    critique_extra_by_role.get(plan.node_id, 0) + extra_calls
+                )
+            if hierarchical_critique_shard_calls:
+                critique_input = max(1, int(self.technical_shard_target_tokens))
+                estimated_provider_calls += hierarchical_critique_shard_calls
+                estimated_input_tokens += hierarchical_critique_shard_calls * critique_input
+                for role, extra_calls in critique_extra_by_role.items():
+                    role_profile = self._role_route(role).profile
+                    critique_output = min(
+                        max(1, int(role_profile.max_output_tokens)),
+                        2048,
+                    )
+                    critique_reasoning = max(0, int(role_profile.reasoning_reserve))
+                    estimated_output_tokens += extra_calls * critique_output
+                    estimated_reasoning_tokens += extra_calls * critique_reasoning
+                    estimated_total_tokens += extra_calls * (
+                        critique_input + critique_output + critique_reasoning
+                    )
+                    if estimated_cost is not None:
+                        estimated_cost += extra_calls * (
+                            critique_input / 1000.0 * float(self.input_cost_per_1k_tokens or 0.0)
+                            + critique_output / 1000.0 * float(self.output_cost_per_1k_tokens or 0.0)
+                            + critique_reasoning / 1000.0 * float(self.reasoning_cost_per_1k_tokens or 0.0)
+                        )
         estimated_input_per_call = max(
             1,
             max((item.estimated_input_tokens for item in transport_plans), default=0),
@@ -1836,6 +1885,7 @@ class OutlineV3Executor:
             "estimated_provider_calls": estimated_provider_calls,
             "hierarchical_candidate_shard_calls": hierarchical_candidate_shard_calls,
             "hierarchical_relation_shard_calls": hierarchical_relation_shard_calls,
+            "hierarchical_critique_shard_calls": hierarchical_critique_shard_calls,
             "estimated_input_tokens": estimated_input_tokens,
             "estimated_output_tokens": estimated_output_tokens,
             "estimated_reasoning_tokens": estimated_reasoning_tokens,
@@ -3397,6 +3447,18 @@ class OutlineV3Executor:
         }[node_id]
 
     @staticmethod
+    def _critique_role_from_node_id(node_id: str) -> str:
+        """Return the semantic critic role from a static or stability node id."""
+
+        text = str(node_id or "")
+        for role in ("structure_critique", "coverage_critique", "evidence_critique"):
+            if text == role or f":{role}" in text or text.startswith(f"{role}:"):
+                return role
+        raise OutlineV3ExecutionError(
+            f"cannot resolve critique role from dynamic node id {node_id!r}"
+        )
+
+    @staticmethod
     def _compact_candidate_for_critique(candidate_id: str, content: Mapping[str, Any]) -> dict[str, Any]:
         """Keep critique inputs bounded while preserving claim/source identity."""
 
@@ -3429,7 +3491,7 @@ class OutlineV3Executor:
         *,
         dependency_hashes: Mapping[str, str],
     ) -> None:
-        base_node_id = str(node_id).split(":", 1)[0]
+        base_node_id = self._critique_role_from_node_id(node_id)
         artifact = self._artifact(
             self._critique_artifact_class(base_node_id),
             payload,
@@ -3478,6 +3540,7 @@ class OutlineV3Executor:
         node_id: str,
         request: Mapping[str, Any],
         dependency_hashes: Mapping[str, str],
+        node_prefix: str = "",
     ) -> dict[str, Any]:
         candidate_contents = request.get("candidate_contents")
         candidate_hashes = request.get("candidate_hashes")
@@ -3611,6 +3674,8 @@ class OutlineV3Executor:
                         )
                     ] if local_views else []
             local_node_id = f"{node_id}:local:{candidate_id}"
+            if node_prefix:
+                local_node_id = f"{node_prefix}:{local_node_id}"
             local_request = self._attach_prompt_authority(local_node_id, local_request)
             content = self._provider_call(
                 local_node_id,
@@ -3663,6 +3728,7 @@ class OutlineV3Executor:
         allowed_relation_ids: Sequence[str],
         generation_deps: Mapping[str, str],
         alias_map: Mapping[str, str] | None,
+        node_prefix: str = "",
     ) -> dict[str, Any]:
         """Generate one candidate from bounded evidence shards and merge locally."""
 
@@ -3711,6 +3777,8 @@ class OutlineV3Executor:
                 ],
             })
             node_id = f"{generation_node_id}:local:{shard_id}"
+            if node_prefix:
+                node_id = f"{node_prefix}:{node_id}"
             request = self._attach_prompt_authority(node_id, request)
             shard_deps = {
                 **dict(generation_deps),
@@ -4179,20 +4247,27 @@ class OutlineV3Executor:
         })
         if completion.status != "complete":
             raise OutlineV3ExecutionError(f"provider output for {node_id} is {completion.status}")
-        if node_id.startswith("stability:"):
-            # Stability calls are real provider calls too.  Persist their
-            # output immediately so the exact-replay variant can resolve the
-            # same ModelCallReplayStore record on its second execution.
-            self._persist_stability_output(
-                node_id,
-                _as_dict(completion.content),
-                dependency_hashes={
-                    f"input_{index}": value
-                    for index, value in enumerate(input_artifact_hashes)
-                },
-                binding=binding,
-            )
-        elif node_id.startswith("relation_adjudication:"):
+        dynamic_dependencies = {
+            f"input_{index}": value
+            for index, value in enumerate(input_artifact_hashes)
+        }
+        is_relation_shard = (
+            node_id.startswith("relation_adjudication:")
+            or (node_id.startswith("stability:") and ":relation_adjudication:" in node_id)
+        )
+        is_candidate_shard = (
+            node_id.startswith("candidate_")
+            and "_provider_generation:local:" in node_id
+        ) or (
+            node_id.startswith("stability:")
+            and "_provider_generation:local:" in node_id
+        )
+        is_critique_shard = any(
+            node_id.startswith(f"{role}:")
+            or (node_id.startswith("stability:") and f":{role}:" in node_id)
+            for role in ("structure_critique", "coverage_critique", "evidence_critique")
+        )
+        if is_relation_shard:
             # Hierarchical local/cross-shard calls are provider calls outside
             # the static DAG.  Their outputs still need Registry identity and
             # replay authority so receipt closure cannot leave dynamic calls
@@ -4200,32 +4275,30 @@ class OutlineV3Executor:
             self._persist_relation_shard_output(
                 node_id,
                 _as_dict(completion.content),
-                dependency_hashes={
-                    f"input_{index}": value
-                    for index, value in enumerate(input_artifact_hashes)
-                },
+                dependency_hashes=dynamic_dependencies,
                 binding=binding,
             )
-        elif node_id.startswith("candidate_") and "_provider_generation:local:" in node_id:
+        elif is_candidate_shard:
             self._persist_candidate_shard_output(
                 node_id,
                 _as_dict(completion.content),
-                dependency_hashes={
-                    f"input_{index}": value
-                    for index, value in enumerate(input_artifact_hashes)
-                },
+                dependency_hashes=dynamic_dependencies,
             )
-        elif any(
-            node_id.startswith(f"{role}:local:")
-            for role in ("structure_critique", "coverage_critique", "evidence_critique")
-        ):
+        elif is_critique_shard:
             self._persist_critique_shard_output(
                 node_id,
                 _as_dict(completion.content),
-                dependency_hashes={
-                    f"input_{index}": value
-                    for index, value in enumerate(input_artifact_hashes)
-                },
+                dependency_hashes=dynamic_dependencies,
+            )
+        elif node_id.startswith("stability:"):
+            # Stability calls are real provider calls too.  Persist their
+            # output immediately so the exact-replay variant can resolve the
+            # same ModelCallReplayStore record on its second execution.
+            self._persist_stability_output(
+                node_id,
+                _as_dict(completion.content),
+                dependency_hashes=dynamic_dependencies,
+                binding=binding,
             )
         return _as_dict(completion.content)
 
@@ -6240,16 +6313,45 @@ class OutlineV3Executor:
                     stability_node_id = (
                         f"stability:{stability_key_hash}:{candidate_id}_provider_generation"
                     )
-                    generated = self._provider_call(
+                    generation_deps = {
+                        "candidate": _hash_payload(request),
+                        "global_relation_map": variant_candidates.content_hash,
+                        "coverage_contract": variant_contract.content_hash,
+                    }
+                    generation_route = self._node_route(
                         stability_node_id,
-                        request,
-                        expect_json=True,
-                        input_artifact_hashes=(
-                            *sorted(variant_evidence.source_summary_hashes),
-                            variant_contract.content_hash,
-                        ),
                         transport_node_id=f"{candidate_id}_provider_generation",
                     )
+                    generation_budget = generation_route.profile.estimate_request(request)
+                    shard_generation = bool(
+                        self.technical_shard_target_tokens > 0
+                        and (
+                            int(generation_budget.get("estimated_input_tokens") or 0)
+                            > int(self.technical_shard_target_tokens)
+                            or not bool(generation_budget.get("within_budget"))
+                        )
+                    )
+                    if shard_generation:
+                        generated = self._run_hierarchical_candidate_generation(
+                            candidate_id=candidate_id,
+                            generation_node_id=f"{candidate_id}_provider_generation",
+                            provider_request=request,
+                            evidence_views=variant_evidence.views,
+                            relation_candidates=[item.to_dict() for item in variant_relation_map.relations],
+                            allowed_paper_keys=paper_keys,
+                            allowed_relation_ids=[item.relation_id for item in variant_relation_map.relations],
+                            generation_deps=generation_deps,
+                            alias_map=None,
+                            node_prefix=f"stability:{stability_key_hash}",
+                        )
+                    else:
+                        generated = self._provider_call(
+                            stability_node_id,
+                            request,
+                            expect_json=True,
+                            input_artifact_hashes=tuple(generation_deps.values()),
+                            transport_node_id=f"{candidate_id}_provider_generation",
+                        )
                     self._validate_candidate_payload(
                         candidate_id,
                         generated,
@@ -6306,16 +6408,38 @@ class OutlineV3Executor:
                 for critique_name, critique_request in variant_critique_requests.items():
                     critique_key_hash = hash_json({"variant": variant_name, "role": critique_name})[:16]
                     critique_audit_node_id = f"stability:{critique_key_hash}:{critique_name}"
-                    critique = self._provider_call(
+                    critique_deps = {
+                        "coverage_contract": variant_contract.content_hash,
+                        "candidate_generations": _hash_payload(variant_generation_hashes),
+                    }
+                    critique_route = self._node_route(
                         critique_audit_node_id,
-                        critique_request,
-                        expect_json=True,
-                        input_artifact_hashes=(
-                            variant_contract.content_hash,
-                            *variant_generation_hashes.values(),
-                        ),
                         transport_node_id=critique_name,
                     )
+                    critique_budget = critique_route.profile.estimate_request(critique_request)
+                    shard_critique = bool(
+                        self.technical_shard_target_tokens > 0
+                        and (
+                            int(critique_budget.get("estimated_input_tokens") or 0)
+                            > int(self.technical_shard_target_tokens)
+                            or not bool(critique_budget.get("within_budget"))
+                        )
+                    )
+                    if shard_critique:
+                        critique = self._run_hierarchical_critique(
+                            node_id=critique_name,
+                            request=critique_request,
+                            dependency_hashes=critique_deps,
+                            node_prefix=f"stability:{critique_key_hash}",
+                        )
+                    else:
+                        critique = self._provider_call(
+                            critique_audit_node_id,
+                            critique_request,
+                            expect_json=True,
+                            input_artifact_hashes=tuple(critique_deps.values()),
+                            transport_node_id=critique_name,
+                        )
                     if not bool(critique.get("passed", True)) or critique.get("blocking_diagnostics"):
                         raise OutlineV3ExecutionError(
                             f"stability {variant_name} {critique_name} returned blocking diagnostics"

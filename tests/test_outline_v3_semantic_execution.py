@@ -8,8 +8,13 @@ from typing import Any, Mapping
 import pytest
 
 from outline.v3_executor import OutlineV3Executor
-from outline.v3_evidence import build_outline_evidence_views
-from runtime.provider_runtime import ProviderRuntimeLedger
+from outline.v3_evidence import (
+    build_global_corpus_ledger,
+    build_multi_view_matrix,
+    build_outline_evidence_views,
+)
+from outline.v3_relations import build_global_relation_map
+from runtime.provider_runtime import ProviderRuntimeLedger, hash_json
 from services.artifact_registry import ArtifactRegistry
 from services.job_workspace import JobWorkspace
 from summary_schema import normalize_ai_summary
@@ -485,6 +490,66 @@ def test_outline_v3_transport_trace_matches_call_plan(
     assert stability["preflight"]["estimated_provider_calls"] == expected_transport_calls
     assert stability["provider_call_count_total"] == expected_transport_calls
     assert stability["transport_call_count_after_stability"] == expected_transport_calls
+
+
+def test_stability_dynamic_candidate_and_critique_shards_are_registry_bound(
+    tmp_path: Path,
+) -> None:
+    executor = _executor(
+        tmp_path,
+        stability_mode="off",
+        technical_shard_target_tokens=1,
+    )
+    evidence = build_outline_evidence_views(executor.summaries, executor.job_id)
+    ledger = build_global_corpus_ledger(evidence)
+    matrix = build_multi_view_matrix(evidence)
+    relation_map = build_global_relation_map(evidence, matrix, ledger)
+    relations = [item.to_dict() for item in relation_map.relations]
+    paper_keys = [view.paper_key for view in evidence.views]
+    relation_ids = [item["relation_id"] for item in relations]
+    candidate_request = {
+        "candidate_id": "candidate_1",
+        "organizing_logic": "evidence",
+        "paper_keys": paper_keys,
+        "relation_ids": relation_ids,
+        "relations": relations,
+        "evidence": executor._prompt_evidence_views(evidence.views),
+    }
+    candidate = executor._run_hierarchical_candidate_generation(
+        candidate_id="candidate_1",
+        generation_node_id="candidate_1_provider_generation",
+        provider_request=candidate_request,
+        evidence_views=evidence.views,
+        relation_candidates=relations,
+        allowed_paper_keys=paper_keys,
+        allowed_relation_ids=relation_ids,
+        generation_deps={"candidate": "candidate-hash"},
+        alias_map=None,
+        node_prefix="stability:test-candidate",
+    )
+    critique = executor._run_hierarchical_critique(
+        node_id="coverage_critique",
+        request={
+            "node_id": "coverage_critique",
+            "candidate_contents": {"candidate_1": candidate},
+            "candidate_hashes": {"candidate_1": hash_json(candidate)},
+            "corpus_ledger": ledger.to_dict(),
+            "relations": relations,
+        },
+        dependency_hashes={"candidate": hash_json(candidate)},
+        node_prefix="stability:test-critique",
+    )
+
+    assert candidate["sections"]
+    assert critique["passed"] is True
+    assert any(
+        node_id.startswith("stability:test-candidate:candidate_1_provider_generation:local:")
+        for node_id in executor.artifact_records
+    )
+    assert any(
+        node_id.startswith("stability:test-critique:coverage_critique:local:")
+        for node_id in executor.artifact_records
+    )
 
 
 def test_outline_v3_actual_usage_and_cost_are_reported_without_billing_claim(tmp_path: Path) -> None:
