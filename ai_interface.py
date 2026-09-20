@@ -9,7 +9,7 @@ import tempfile
 import time
 import re
 import requests  # type: ignore
-from typing import Dict, Optional, Any, List, Tuple, Callable, Set, Mapping, cast
+from typing import Dict, Optional, Any, List, Tuple, Callable, Set, Mapping, Iterable, cast
 from urllib.parse import urlparse
 
 from models import APIConfig
@@ -1090,7 +1090,7 @@ def _read_bounded_response(response: Any, *, max_bytes: int) -> Tuple[bytes, str
         iter_content = getattr(response, "iter_content", None)
         if callable(iter_content):
             try:
-                iterator = iter(iter_content(chunk_size=8192))
+                iterator = iter(cast(Iterable[Any], iter_content(chunk_size=8192)))
             except (AttributeError, TypeError):
                 iterator = None
         if iterator is not None:
@@ -1234,12 +1234,23 @@ def _decode_sse_response(
         elif endpoint_type == "responses" or "response." in event_type:
             if event.get("delta"):
                 text_parts.append(str(event.get("delta")))
-            details = event.get("response") if isinstance(event.get("response"), Mapping) else event
+            raw_details = event.get("response")
+            details: Mapping[str, Any] = (
+                cast(Mapping[str, Any], raw_details)
+                if isinstance(raw_details, Mapping)
+                else event
+            )
             status = str(details.get("status") or "").casefold()
             if status == "completed":
                 finish_reason = "stop"
             elif status:
-                finish_reason = str((details.get("incomplete_details") or {}).get("reason") or status)
+                incomplete_details = details.get("incomplete_details")
+                reason = (
+                    incomplete_details.get("reason")
+                    if isinstance(incomplete_details, Mapping)
+                    else ""
+                )
+                finish_reason = str(reason or status)
         else:
             choices = event.get("choices") or []
             for choice in choices:
