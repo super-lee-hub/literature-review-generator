@@ -7,6 +7,7 @@ from typing import Any, Mapping
 import pytest
 
 from outline.v3_executor import OutlineV3Executor
+from outline.v3_evidence import build_outline_evidence_views
 from runtime.provider_runtime import ProviderRuntimeLedger
 from services.artifact_registry import ArtifactRegistry
 from services.job_workspace import JobWorkspace
@@ -112,6 +113,7 @@ def _executor(
     max_estimated_total_tokens: int | None = 5_000_000,
     pricing_source: str | None = "tests:explicit-rates-v1",
     candidate_count: int = 2,
+    technical_shard_target_tokens: int = 0,
 ) -> OutlineV3Executor:
     workspace = JobWorkspace.create(str(tmp_path), "outline", job_id="outline-job")
     registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
@@ -133,6 +135,7 @@ def _executor(
         input_cost_per_1k_tokens=0.0,
         output_cost_per_1k_tokens=0.001,
         reasoning_cost_per_1k_tokens=0.001,
+        technical_shard_target_tokens=technical_shard_target_tokens,
         cache_read_cost_per_1k_tokens=0.0,
         cache_write_cost_per_1k_tokens=0.0,
     )
@@ -292,6 +295,84 @@ def test_outline_v3_explicit_pricing_estimate_changes_with_input_volume(tmp_path
     assert short_estimate is not None
     assert long_estimate is not None
     assert long_estimate > short_estimate
+
+
+def test_relation_shard_plan_is_lossless_and_estimate_is_bounded(tmp_path: Path) -> None:
+    executor = _executor(
+        tmp_path,
+        stability_mode="off",
+        technical_shard_target_tokens=1,
+    )
+    evidence = build_outline_evidence_views(executor.summaries, executor.job_id)
+    plan = executor._build_relation_shard_plan(evidence.views, [])
+
+    assert plan["shard_count"] == len(evidence.views)
+    assert plan["coverage"]["input_view_count"] == len(evidence.views)
+    assert plan["coverage"]["planned_view_count"] == len(evidence.views)
+    assert plan["coverage"]["missing_view_hashes"] == []
+    assert all(item["estimated_input_tokens"] >= 1 for item in plan["shards"])
+
+
+def test_outline_preflight_counts_hierarchical_relation_calls(tmp_path: Path) -> None:
+    executor = _executor(
+        tmp_path,
+        stability_mode="off",
+        technical_shard_target_tokens=1,
+    )
+    executor._preflight_stability_budget()
+
+    assert executor.stability_preflight["hierarchical_relation_shard_calls"] > 0
+    assert executor.stability_preflight["estimated_provider_calls"] > len(
+        executor._provider_node_ids()
+    )
+
+
+def test_hierarchical_relation_adjudication_emits_local_and_cross_shard_calls(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+
+    def provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        calls.append(node_id)
+        relation_ids = [
+            str(item.get("relation_id") or "")
+            for item in request.get("relation_candidates") or ()
+            if isinstance(item, Mapping)
+        ]
+        return {
+            "status": "success",
+            "content": {
+                "confirmed_relation_ids": relation_ids,
+                "rejected_relations": [],
+            },
+        }
+
+    executor = _executor(
+        tmp_path,
+        provider=provider,
+        stability_mode="off",
+        technical_shard_target_tokens=1,
+    )
+    evidence = build_outline_evidence_views(executor.summaries, executor.job_id)
+    relations = [
+        {"relation_id": "r_local_a", "paper_keys": ["paper-a"]},
+        {"relation_id": "r_local_b", "paper_keys": ["paper-b"]},
+        {"relation_id": "r_cross", "paper_keys": ["paper-a", "paper-b"]},
+    ]
+    plan = executor._build_relation_shard_plan(evidence.views, relations)
+    content, digests = executor._run_hierarchical_relation_adjudication(
+        evidence_views=evidence.views,
+        relation_candidates=relations,
+        shard_plan=plan,
+        relation_contract={"output_fields": {}, "allowed_relation_ids": []},
+        relation_dependencies={"evidence": "evidence-hash", "plan": "plan-hash"},
+    )
+
+    assert len(plan["shards"]) == 2
+    assert len(calls) == 3
+    assert sorted(content["confirmed_relation_ids"]) == ["r_cross", "r_local_a", "r_local_b"]
+    assert len(digests) == 3
+    assert {item["level"] for item in digests} == {"local_shard", "cross_shard"}
 
 
 @pytest.mark.parametrize(

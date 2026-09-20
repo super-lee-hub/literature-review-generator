@@ -1106,6 +1106,7 @@ class InternalStageExecutorRegistry:
             pricing_effective_date=stability.pricing_effective_date,
             max_smoke_overhead_ratio=stability.max_smoke_overhead_ratio,
             max_source_prompt_tokens=stability.max_source_prompt_tokens or None,
+            technical_shard_target_tokens=settings.outline.technical_shard_target_tokens,
         )
         execution = executor.run()
         if not execution.ok:
