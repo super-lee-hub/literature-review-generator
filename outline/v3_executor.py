@@ -2616,13 +2616,18 @@ class OutlineV3Executor:
         profile = route.profile
         budget = profile.estimate_request(request)
         api_config = self._route_transport_identity(route)
-        binding = self._provider_binding(
-            node_id,
-            request,
-            expect_json=expect_json,
-            input_artifact_hashes=input_artifact_hashes,
-            route=route,
-        )
+        # Keep the ordinary node path compatible with callers that decorate
+        # ``_provider_binding`` for replay tests or local instrumentation.  A
+        # normal node resolves its route from ``node_id`` inside the binding
+        # method; only a dynamic transport identity needs the explicit route
+        # that cannot be recovered from the physical shard node id.
+        binding_kwargs: dict[str, Any] = {
+            "expect_json": expect_json,
+            "input_artifact_hashes": input_artifact_hashes,
+        }
+        if transport_node_id is not None:
+            binding_kwargs["route"] = route
+        binding = self._provider_binding(node_id, request, **binding_kwargs)
         call_id = self._register_expected_from_binding(node_id, binding)
         semantic_node_id = self._semantic_node_id(node_id)
         replay_key = ModelCallReplayKey(
