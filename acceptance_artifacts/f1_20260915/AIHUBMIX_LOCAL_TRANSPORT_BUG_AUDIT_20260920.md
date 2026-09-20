@@ -1,6 +1,6 @@
 # AihubMix 本地 Transport / Receipt Closure Bug Audit
 
-日期：2026-09-20  
+日期：2026-09-20
 审查对象：PR #24，当前分支 `codex/f1-validation-authority-closure`
 审查范围：AihubMix 长响应没有回到本地运行时的原因；不重新发送 provider 请求。
 
