@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
@@ -59,6 +60,24 @@ class _LocalProvider:
                     self.wfile.write(encoded + b"\r\n")
                     self.wfile.flush()
                     self.connection.close()
+                    return
+                elif status_or_action == "slow_raw":
+                    delay_seconds, chunks = body
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                    try:
+                        for chunk in chunks:
+                            encoded_chunk = bytes(chunk)
+                            self.wfile.write(f"{len(encoded_chunk):x}\r\n".encode("ascii"))
+                            self.wfile.write(encoded_chunk + b"\r\n")
+                            self.wfile.flush()
+                            time.sleep(float(delay_seconds))
+                        self.wfile.write(b"0\r\n\r\n")
+                        self.wfile.flush()
+                    except OSError:
+                        return
                     return
                 else:
                     status = int(status_or_action)
@@ -151,6 +170,43 @@ def test_real_local_http_statuses_are_recorded_once(tmp_path, status: int, error
     receipt = ledger.list_receipts()[0]
     assert receipt.http_status == status
     assert receipt.attempts == 1
+    assert aggregate.snapshot()["calls_used"] == 1
+
+
+@pytest.mark.integration
+def test_real_local_http_error_preserves_request_id_and_bounded_error_body(tmp_path) -> None:
+    body = {
+        "error": {
+            "code": "insufficient_user_quota",
+            "message": "quota trace tid=err-tid-123",
+        }
+    }
+    with _LocalProvider(
+        [(403, body)],
+        response_headers={"X-Aihubmix-Request-Id": "req-error-1"},
+    ) as provider:
+        runtime, aggregate, ledger = _runtime(tmp_path, max_calls=1, max_output_tokens=8)
+        raw_dir = tmp_path / "raw-responses"
+        result = ai_interface._call_ai_api_detailed(
+            "error evidence test",
+            {**_config(provider.base_url), "raw_response_dir": str(raw_dir)},
+            "system",
+            max_tokens=8,
+            retry_attempts=1,
+            provider_runtime=runtime,
+        )
+
+    assert len(provider.requests) == 1
+    assert result["error_kind"] == "quota_exhausted"
+    assert result["provider_request_id"] == "req-error-1"
+    assert result["provider_error_trace_id"] == "req-error-1"
+    assert result["error_response_bytes"] > 0
+    assert result["error_response_sha256"]
+    error_path = Path(result["error_response_path"])
+    assert error_path.read_bytes() == json.dumps(body, ensure_ascii=False).encode("utf-8")
+    receipt = ledger.list_receipts()[0]
+    assert receipt.metadata["provider_request_id"] == "req-error-1"
+    assert receipt.metadata["error_response_sha256"] == result["error_response_sha256"]
     assert aggregate.snapshot()["calls_used"] == 1
 
 
@@ -336,8 +392,48 @@ def test_real_local_http_200_after_partial_body_is_unknown_without_retry(tmp_pat
     assert result["response_bytes"] == len(partial)
     raw_path = Path(result["raw_response_path"])
     assert raw_path.read_bytes() == partial
+    spool_path = Path(result["raw_response_spool_path"])
+    assert spool_path.read_bytes() == partial
     receipt = ledger.list_receipts()[0]
     assert receipt.status == "failed"
+    assert aggregate.snapshot()["calls_used"] == 1
+
+
+@pytest.mark.integration
+def test_real_local_http_total_deadline_stops_slow_stream_and_keeps_spool(tmp_path) -> None:
+    chunks = [
+        b'data: {"choices":[{"delta":{"content":"{\\"ok\\":"}}]}\n\n',
+        b'data: {"choices":[{"delta":{"content":"true"}}]}\n\n',
+        b'data: {"choices":[{"delta":{"content":"}"}}]}\n\n',
+        b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+    ]
+    with _LocalProvider([("slow_raw", (0.4, chunks))]) as provider:
+        runtime, aggregate, ledger = _runtime(tmp_path, max_calls=1, max_output_tokens=8)
+        raw_dir = tmp_path / "raw-responses"
+        config = {
+            **_config(provider.base_url),
+            "total_timeout_seconds": "1",
+            "read_timeout_seconds": "2",
+            "provider_stream": "true",
+            "raw_response_dir": str(raw_dir),
+        }
+        result = ai_interface._call_ai_api_detailed(
+            "slow stream deadline test",
+            config,
+            "system",
+            max_tokens=8,
+            retry_attempts=1,
+            provider_runtime=runtime,
+        )
+
+    assert len(provider.requests) == 1
+    assert result["status"] == "failed"
+    assert result["error_kind"] == "outcome_unknown"
+    assert result["response_complete"] is False
+    spool_path = Path(result["raw_response_spool_path"])
+    assert spool_path.is_file()
+    assert spool_path.stat().st_size == result["response_bytes"]
+    assert ledger.list_receipts()[0].status == "failed"
     assert aggregate.snapshot()["calls_used"] == 1
 
 

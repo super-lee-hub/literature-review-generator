@@ -2,16 +2,24 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 
 import ai_interface
 
 
 class _Response:
-    def __init__(self, status_code: int, payload: object) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        payload: object,
+        *,
+        raw_body: bytes | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.status_code = status_code
         self._payload = payload
-        self.content = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.headers = {"content-type": "application/json"}
+        self.content = raw_body or json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.headers = headers or {"content-type": "application/json"}
 
     def json(self) -> object:
         return self._payload
@@ -35,18 +43,14 @@ def test_aihubmix_recovery_requires_one_recent_matching_task(monkeypatch) -> Non
 
     def fake_get(url: str, **kwargs):
         calls.append(url)
-        if url.endswith("/ai/v1/tasks"):
+        if url.endswith("/ai/v1/tasks/task_recovery_1"):
             return _Response(
                 200,
                 {
-                    "data": [
-                        {
-                            "id": "task_recovery_1",
-                            "model": "claude-opus-5",
-                            "created_at": now,
-                            "output": [{"type": "response", "truncated": False}],
-                        }
-                    ]
+                    "id": "task_recovery_1",
+                    "model": "claude-opus-5",
+                    "created_at": now,
+                    "output": [{"type": "response", "truncated": False}],
                 },
             )
         return _Response(
@@ -85,7 +89,7 @@ def test_aihubmix_recovery_requires_one_recent_matching_task(monkeypatch) -> Non
     assert result["recovered_from_aihubmix_task"] is True
     assert result["aihubmix_recovery_task_id"] == "task_recovery_1"
     assert calls == [
-        "https://aihubmix.com/ai/v1/tasks",
+        "https://aihubmix.com/ai/v1/tasks/task_recovery_1",
         "https://aihubmix.com/ai/v1/tasks/task_recovery_1/content",
     ]
 
@@ -137,24 +141,20 @@ def test_aihubmix_recovery_refuses_proof_bound_to_another_operation(monkeypatch)
 
 def test_aihubmix_recovery_polls_delayed_task(monkeypatch) -> None:
     now = time.time()
-    listing_calls = 0
+    detail_calls = 0
 
     def fake_get(url: str, **kwargs):
-        nonlocal listing_calls
-        if url.endswith("/ai/v1/tasks"):
-            listing_calls += 1
-            output = [] if listing_calls == 1 else [{"type": "response", "truncated": False}]
+        nonlocal detail_calls
+        if url.endswith("/ai/v1/tasks/task_recovery_1"):
+            detail_calls += 1
+            output = [] if detail_calls == 1 else [{"type": "response", "truncated": False}]
             return _Response(
                 200,
                 {
-                    "data": [
-                        {
-                            "id": "task_recovery_1",
-                            "model": "claude-opus-5",
-                            "created_at": now,
-                            "output": output,
-                        }
-                    ]
+                    "id": "task_recovery_1",
+                    "model": "claude-opus-5",
+                    "created_at": now,
+                    "output": output,
                 },
             )
         return _Response(
@@ -193,7 +193,64 @@ def test_aihubmix_recovery_polls_delayed_task(monkeypatch) -> None:
 
     assert result is not None
     assert result["content"] == {"ok": True}
-    assert listing_calls == 2
+    assert detail_calls == 2
+
+
+def test_aihubmix_recovery_decodes_sse_content_and_persists_transport_facts(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    now = time.time()
+    raw_sse = (
+        b'data: {"choices":[{"delta":{"content":"{\\"ok\\":true}"}}]}\n\n'
+        b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+
+    def fake_get(url: str, **kwargs):
+        if url.endswith("/ai/v1/tasks/task_recovery_1"):
+            return _Response(
+                200,
+                {
+                    "id": "task_recovery_1",
+                    "model": "claude-opus-5",
+                    "created_at": now,
+                    "output": [{"type": "response", "truncated": False}],
+                },
+            )
+        return _Response(
+            200,
+            {},
+            raw_body=raw_sse,
+            headers={"content-type": "text/event-stream"},
+        )
+
+    monkeypatch.setattr(ai_interface.requests, "get", fake_get)
+    config = _api_config()
+    config["raw_response_dir"] = str(tmp_path / "recovery-raw")
+    config["aihubmix_recovery_proof"] = {
+        "task_id": "task_recovery_1",
+        "request_fingerprint": "test-fingerprint",
+        "operator": "test-operator",
+        "operation_id": "operation-recovery-1",
+        "attempt_id": "attempt-recovery-1",
+    }
+
+    result = ai_interface._aihubmix_recover_disconnected_call(
+        api_config=config,
+        model="claude-opus-5",
+        request_started_epoch=now - 1,
+        response_parser=ai_interface.parse_chat_completions_response,
+        response_format="json",
+        request_fingerprint="test-fingerprint",
+    )
+
+    assert result is not None
+    assert result["status"] == "success"
+    assert result["content"] == {"ok": True}
+    assert result["response_protocol"] == "sse"
+    assert result["response_complete"] is True
+    assert Path(result["raw_response_path"]).read_bytes() == raw_sse
 
 
 def test_aihubmix_recovery_is_opt_in(monkeypatch) -> None:

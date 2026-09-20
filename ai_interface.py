@@ -92,15 +92,28 @@ _PAYLOAD_PARAMETER_ERROR_MARKERS = (
 class ProviderResponseReadError(RuntimeError):
     """A response began but its body was not received to completion."""
 
-    def __init__(self, *, partial_body: bytes, content_type: str, cause: BaseException) -> None:
+    def __init__(
+        self,
+        *,
+        partial_body: bytes,
+        content_type: str,
+        cause: BaseException,
+        spool_path: str = "",
+    ) -> None:
         super().__init__(str(cause) or "provider response body read failed")
         self.partial_body = partial_body
         self.content_type = content_type
         self.cause = cause
+        self.spool_path = spool_path
 
 
 class ProviderResponseLimitError(ValueError):
     """A provider response exceeded the configured bounded-read limit."""
+
+    def __init__(self, message: str, *, partial_body: bytes = b"", spool_path: str = "") -> None:
+        super().__init__(message)
+        self.partial_body = partial_body
+        self.spool_path = spool_path
 
 
 def _load_stage1_system_prompt(logger: Any = None) -> str:
@@ -328,52 +341,165 @@ def _aihubmix_recover_disconnected_call(
 
     def get_json(url: str, **kwargs: Any) -> Any:
         if should_bypass_environment_proxy(api_config):
-            with requests.Session() as session:
-                session.trust_env = False
-                return session.get(url, **kwargs)
+            session = requests.Session()
+            session.trust_env = False
+            try:
+                response = session.get(url, **kwargs)
+            except BaseException:
+                session.close()
+                raise
+            setattr(response, "_codex_owned_session", session)
+            return response
         return requests.get(url, **kwargs)
+
+    def task_row_from_payload(payload: Any) -> Mapping[str, Any] | None:
+        if isinstance(payload, Mapping):
+            data = payload.get("data")
+            if isinstance(data, Mapping):
+                return data
+            if str(payload.get("id") or "").strip():
+                return payload
+        return None
+
+    def task_is_usable(row: Mapping[str, Any]) -> bool:
+        if str(row.get("id") or "").strip() != proof_task_id:
+            return False
+        if str(row.get("model") or "").strip() != model:
+            return False
+        created_at = _epoch_seconds(row.get("created_at"))
+        if created_at is None or created_at < request_started_epoch - 15:
+            return False
+        output_items = row.get("output")
+        return isinstance(output_items, list) and bool(output_items) and not any(
+            bool(item.get("truncated"))
+            for item in output_items
+            if isinstance(item, Mapping)
+        )
+
+    def fetch_task_detail(
+        url: str,
+        remaining: float,
+    ) -> tuple[int, Mapping[str, Any] | None]:
+        response = get_json(
+            url,
+            headers=headers,
+            timeout=min(timeout_seconds, max(1, int(remaining))),
+        )
+        try:
+            if response.status_code != 200:
+                return int(response.status_code), None
+            return int(response.status_code), task_row_from_payload(response.json())
+        finally:
+            _close_provider_response(response)
+
+    def recover_content(response: Any) -> Dict[str, Any] | None:
+        """Decode JSON or SSE recovery content through the bounded reader."""
+
+        raw_body = b""
+        content_type = _response_header(response, "content-type")
+        recovery_spool_path = ""
+        try:
+            recovery_root = str(
+                api_config.get("raw_response_dir")
+                or api_config.get("provider_raw_response_dir")
+                or ""
+            ).strip()
+            if recovery_root:
+                recovery_dir = Path(recovery_root).expanduser().resolve()
+                recovery_dir.mkdir(parents=True, exist_ok=True)
+                recovery_spool_path = str(
+                    recovery_dir / f"recovery-{proof_task_id}.spool"
+                )
+            raw_body, content_type = _read_bounded_response(
+                response,
+                max_bytes=_coerce_positive_int(
+                    api_config.get("max_response_bytes"),
+                    _MAX_PROVIDER_RESPONSE_BYTES,
+                ),
+                total_deadline=recovery_deadline,
+                spool_path=recovery_spool_path,
+            )
+            payload, response_complete = _decode_sse_response(
+                raw_body,
+                content_type=content_type,
+                endpoint_type=resolve_model_capability(api_config).endpoint_type,
+                model=model,
+            )
+            content, finish_reason = response_parser(payload)
+            formatted = _format_success_result(
+                content,
+                response_format,
+                response,
+                finish_reason,
+                logger=logger,
+            )
+            formatted["response_complete"] = bool(response_complete)
+            formatted["response_protocol"] = (
+                "sse"
+                if "text/event-stream" in content_type.casefold()
+                or any(
+                    line.lstrip().startswith("data:")
+                    for line in raw_body.decode("utf-8", errors="replace").splitlines()
+                )
+                else "json"
+            )
+            formatted["response_bytes"] = len(raw_body)
+            formatted["raw_response_sha256"] = (
+                hashlib.sha256(raw_body).hexdigest() if raw_body else ""
+            )
+            formatted["raw_response_path"] = _persist_raw_response(
+                raw_body,
+                api_config=api_config,
+            )
+            if recovery_spool_path:
+                Path(recovery_spool_path).unlink(missing_ok=True)
+            return formatted
+        except (ProviderResponseReadError, ProviderResponseLimitError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            return None
 
     try:
         task = None
+        detail_url = f"{recovery_base}/ai/v1/tasks/{proof_task_id}"
+        detail_supported = True
         for poll_index in range(max_polls):
             remaining = recovery_deadline - time.monotonic()
             if remaining <= 0:
                 return None
-            listing = get_json(
-                f"{recovery_base}/ai/v1/tasks",
-                params={"object": "llm", "model": model, "limit": 20, "order": "desc"},
-                headers=headers,
-                timeout=min(timeout_seconds, max(1, int(remaining))),
-            )
-            if listing.status_code != 200:
-                return None
-            payload = listing.json()
-            rows = payload.get("data") if isinstance(payload, Mapping) else None
-            if not isinstance(rows, list):
-                return None
-            candidates = []
-            for row in rows:
-                if not isinstance(row, Mapping):
-                    continue
-                if str(row.get("id") or "").strip() != proof_task_id:
-                    continue
-                if str(row.get("model") or "").strip() != model:
-                    continue
-                created_at = _epoch_seconds(row.get("created_at"))
-                if created_at is None or created_at < request_started_epoch - 15:
-                    continue
-                candidates.append(row)
-            if len(candidates) > 1:
-                return None
-            if len(candidates) == 1:
-                candidate = candidates[0]
-                output_items = candidate.get("output")
-                if isinstance(output_items, list) and output_items and not any(
-                    bool(item.get("truncated"))
-                    for item in output_items
-                    if isinstance(item, Mapping)
-                ):
-                    task = candidate
+            if detail_supported:
+                detail_status, task = fetch_task_detail(detail_url, remaining)
+                # Older gateways may not expose the detail route. Only then
+                # fall back to the bounded list path; a successful detail
+                # response remains the authoritative task identity.
+                if detail_status in {404, 405}:
+                    detail_supported = False
+                elif detail_status != 200:
+                    return None
+                if task is not None and task_is_usable(task):
+                    break
+            if not detail_supported:
+                listing = get_json(
+                    f"{recovery_base}/ai/v1/tasks",
+                    params={"object": "llm", "model": model, "limit": 20, "order": "desc"},
+                    headers=headers,
+                    timeout=min(timeout_seconds, max(1, int(remaining))),
+                )
+                try:
+                    if listing.status_code != 200:
+                        return None
+                    payload = listing.json()
+                    rows = payload.get("data") if isinstance(payload, Mapping) else None
+                    if not isinstance(rows, list):
+                        return None
+                    candidates = [
+                        row for row in rows
+                        if isinstance(row, Mapping) and task_is_usable(row)
+                    ]
+                    if len(candidates) > 1:
+                        return None
+                    task = candidates[0] if candidates else None
+                finally:
+                    _close_provider_response(listing)
+                if task is not None:
                     break
             if poll_index + 1 < max_polls and poll_interval_seconds:
                 time.sleep(min(poll_interval_seconds, max(0, recovery_deadline - time.monotonic())))
@@ -388,18 +514,11 @@ def _aihubmix_recover_disconnected_call(
             timeout=min(max(timeout_seconds, 60), max(1, int(recovery_deadline - time.monotonic()))),
         )
         if content_response.status_code != 200:
+            _close_provider_response(content_response)
             return None
-        recovered_payload = content_response.json()
-        if not isinstance(recovered_payload, dict):
+        formatted = recover_content(content_response)
+        if formatted is None:
             return None
-        content, finish_reason = response_parser(recovered_payload)
-        formatted = _format_success_result(
-            content,
-            response_format,
-            content_response,
-            finish_reason,
-            logger=logger,
-        )
         if formatted.get("status") != "success":
             return None
         formatted.update(
@@ -407,9 +526,9 @@ def _aihubmix_recover_disconnected_call(
                 "http_status": 200,
                 "recovered_from_aihubmix_task": True,
                 "aihubmix_recovery_task_id": task_id,
-                "aihubmix_recovery_content_sha256": hashlib.sha256(
-                    content_response.content
-                ).hexdigest(),
+                "aihubmix_recovery_content_sha256": str(
+                    formatted.get("raw_response_sha256") or ""
+                ),
                 "aihubmix_recovery_operator": proof_operator,
                 "aihubmix_recovery_request_fingerprint": request_fingerprint,
             }
@@ -1127,13 +1246,58 @@ def _close_provider_response(response: Any) -> None:
             session_close()
 
 
-def _read_bounded_response(response: Any, *, max_bytes: int) -> Tuple[bytes, str]:
-    """Read one response body in bounded chunks and always release the session."""
+def _read_bounded_response(
+    response: Any,
+    *,
+    max_bytes: int,
+    spool_path: str = "",
+    total_deadline: float | None = None,
+    cancelled: Callable[[], bool] | None = None,
+) -> Tuple[bytes, str]:
+    """Read one body with bounded chunks, durable attempt spooling and deadlines."""
 
     chunks: List[bytes] = []
     total = 0
     content_type = _response_header(response, "content-type")
+    spool_handle = None
+    normalized_spool_path = str(spool_path or "").strip()
     try:
+        if normalized_spool_path:
+            spool_target = Path(normalized_spool_path).expanduser().resolve()
+            spool_target.parent.mkdir(parents=True, exist_ok=True)
+            spool_handle = spool_target.open("wb")
+
+        def check_deadline() -> None:
+            if cancelled is not None and cancelled():
+                raise TimeoutError("provider response read cancelled")
+            if total_deadline is not None and time.monotonic() >= total_deadline:
+                raise TimeoutError("provider response total deadline exceeded")
+
+        def record_chunk(chunk: bytes) -> None:
+            nonlocal total
+            check_deadline()
+            remaining = max_bytes - total
+            if len(chunk) > remaining:
+                accepted = chunk[: max(0, remaining)]
+                if accepted:
+                    chunks.append(accepted)
+                    total += len(accepted)
+                    if spool_handle is not None:
+                        spool_handle.write(accepted)
+                        spool_handle.flush()
+                        os.fsync(spool_handle.fileno())
+                raise ProviderResponseLimitError(
+                    f"provider response exceeds {max_bytes} bytes",
+                    partial_body=b"".join(chunks),
+                    spool_path=normalized_spool_path,
+                )
+            chunks.append(chunk)
+            total += len(chunk)
+            if spool_handle is not None:
+                spool_handle.write(chunk)
+                spool_handle.flush()
+                os.fsync(spool_handle.fileno())
+
         iterator = None
         iter_content = getattr(response, "iter_content", None)
         if callable(iter_content):
@@ -1143,25 +1307,20 @@ def _read_bounded_response(response: Any, *, max_bytes: int) -> Tuple[bytes, str
                 iterator = None
         if iterator is not None:
             for raw_chunk in iterator:
+                check_deadline()
                 if not raw_chunk:
                     continue
                 chunk = raw_chunk.encode("utf-8") if isinstance(raw_chunk, str) else bytes(raw_chunk)
-                total += len(chunk)
-                if total > max_bytes:
-                    raise ProviderResponseLimitError(
-                        f"provider response exceeds {max_bytes} bytes"
-                    )
-                chunks.append(chunk)
+                record_chunk(chunk)
         else:
+            check_deadline()
             raw_body = getattr(response, "content", b"")
             if not isinstance(raw_body, (bytes, bytearray)) or not raw_body:
                 try:
                     raw_body = json.dumps(response.json(), ensure_ascii=False).encode("utf-8")
                 except Exception:
                     raw_body = str(getattr(response, "text", "") or "").encode("utf-8")
-            if len(raw_body) > max_bytes:
-                raise ProviderResponseLimitError(f"provider response exceeds {max_bytes} bytes")
-            chunks.append(bytes(raw_body))
+            record_chunk(bytes(raw_body))
         return b"".join(chunks), content_type
     except ProviderResponseLimitError:
         raise
@@ -1170,14 +1329,24 @@ def _read_bounded_response(response: Any, *, max_bytes: int) -> Tuple[bytes, str
             partial_body=b"".join(chunks),
             content_type=content_type,
             cause=exc,
+            spool_path=normalized_spool_path,
         ) from exc
     finally:
+        if spool_handle is not None:
+            try:
+                spool_handle.flush()
+                os.fsync(spool_handle.fileno())
+            except OSError:
+                pass
+            spool_handle.close()
         _close_provider_response(response)
 
 
 def _persist_raw_response(body: bytes, *, api_config: Mapping[str, Any]) -> str:
     """Optionally persist bounded raw bytes under an operator-owned evidence root."""
 
+    if not body:
+        return ""
     raw_root = str(
         api_config.get("raw_response_dir")
         or api_config.get("provider_raw_response_dir")
@@ -2387,6 +2556,7 @@ def _call_ai_api_detailed_uninstrumented(
             response = None
             transport_attempt_started = False
             provider_request_id = ""
+            response_spool_path = ""
             try:
                 final_payload = copy.deepcopy(payload)
                 if 'aihubmix.com' in api_base.lower() and logger:
@@ -2413,6 +2583,19 @@ def _call_ai_api_detailed_uninstrumented(
                 provider_request_id = _response_header(response, "x-aihubmix-request-id")
                 response.raise_for_status()
 
+                raw_root = str(
+                    api_config.get("raw_response_dir")
+                    or api_config.get("provider_raw_response_dir")
+                    or ""
+                ).strip()
+                if raw_root:
+                    spool_root = Path(raw_root).expanduser().resolve()
+                    spool_root.mkdir(parents=True, exist_ok=True)
+                    response_spool_path = str(
+                        spool_root
+                        / f"attempt-{attempt}-{request_fingerprint()[:16]}.spool"
+                    )
+
                 response_data: Any = None
                 raw_response_body = b""
                 response_protocol = "json"
@@ -2427,8 +2610,13 @@ def _call_ai_api_detailed_uninstrumented(
                     raw_response_body, content_type = _read_bounded_response(
                         response,
                         max_bytes=max_response_bytes,
+                        spool_path=response_spool_path,
+                        total_deadline=total_deadline,
                     )
                     raw_response_path = _persist_raw_response(raw_response_body, api_config=api_config)
+                    if response_spool_path:
+                        Path(response_spool_path).unlink(missing_ok=True)
+                        response_spool_path = ""
                     response_data, response_complete = _decode_sse_response(
                         raw_response_body,
                         content_type=content_type,
@@ -2448,6 +2636,7 @@ def _call_ai_api_detailed_uninstrumented(
                         raw_response_body,
                         api_config=api_config,
                     )
+                    response_spool_path = exc.spool_path or response_spool_path
                     response_protocol = (
                         "sse" if "text/event-stream" in exc.content_type.casefold() else "json"
                     )
@@ -2463,6 +2652,12 @@ def _call_ai_api_detailed_uninstrumented(
                         ),
                     )
                 except ProviderResponseLimitError as exc:
+                    raw_response_body = exc.partial_body
+                    raw_response_path = _persist_raw_response(
+                        raw_response_body,
+                        api_config=api_config,
+                    )
+                    response_spool_path = exc.spool_path or response_spool_path
                     response_retryable = False
                     formatted = _api_result(
                         status="failed",
@@ -2484,11 +2679,16 @@ def _call_ai_api_detailed_uninstrumented(
                     formatted = _format_success_result(content, response_format, response, finish_reason, logger=logger)
 
                 formatted["provider_request_id"] = provider_request_id
-                formatted["raw_response_sha256"] = hashlib.sha256(raw_response_body).hexdigest()
+                formatted["raw_response_sha256"] = (
+                    hashlib.sha256(raw_response_body).hexdigest()
+                    if raw_response_body
+                    else ""
+                )
                 formatted["response_bytes"] = len(raw_response_body)
                 formatted["response_protocol"] = response_protocol
                 formatted["response_complete"] = bool(response_complete)
                 formatted["raw_response_path"] = raw_response_path
+                formatted["raw_response_spool_path"] = response_spool_path
 
                 if isinstance(response_data, dict):
                     provider_model = str(response_data.get("model") or "").strip()
@@ -2552,6 +2752,73 @@ def _call_ai_api_detailed_uninstrumented(
                     current_response,
                     secret=api_key,
                 )
+                error_body = b""
+                error_content_type = _response_header(current_response, "content-type")
+                error_response_path = ""
+                error_response_spool_path = ""
+                try:
+                    error_root = str(
+                        api_config.get("raw_response_dir")
+                        or api_config.get("provider_raw_response_dir")
+                        or ""
+                    ).strip()
+                    if error_root:
+                        error_spool_root = Path(error_root).expanduser().resolve()
+                        error_spool_root.mkdir(parents=True, exist_ok=True)
+                        error_response_spool_path = str(
+                            error_spool_root
+                            / f"attempt-{attempt}-{request_fingerprint()[:16]}.error.spool"
+                        )
+                    error_body, error_content_type = _read_bounded_response(
+                        current_response,
+                        max_bytes=_coerce_positive_int(
+                            api_config.get("max_response_bytes"),
+                            _MAX_PROVIDER_RESPONSE_BYTES,
+                        ),
+                        spool_path=error_response_spool_path,
+                        total_deadline=total_deadline,
+                    )
+                    error_response_path = _persist_raw_response(
+                        error_body,
+                        api_config=api_config,
+                    )
+                    if error_response_spool_path:
+                        Path(error_response_spool_path).unlink(missing_ok=True)
+                        error_response_spool_path = ""
+                except ProviderResponseReadError as read_error:
+                    error_body = read_error.partial_body
+                    error_response_spool_path = read_error.spool_path or error_response_spool_path
+                    try:
+                        error_response_path = _persist_raw_response(
+                            error_body,
+                            api_config=api_config,
+                        )
+                    except OSError:
+                        error_response_path = ""
+                except ProviderResponseLimitError as limit_error:
+                    error_body = limit_error.partial_body
+                    error_response_spool_path = limit_error.spool_path or error_response_spool_path
+                    try:
+                        error_response_path = _persist_raw_response(
+                            error_body,
+                            api_config=api_config,
+                        )
+                    except OSError:
+                        error_response_path = ""
+                except (OSError, ValueError):
+                    error_response_path = ""
+                error_trace_id = (
+                    provider_request_id
+                    or _response_header(current_response, "x-request-id")
+                    or _response_header(current_response, "x-aihubmix-request-id")
+                )
+                if not error_trace_id and error_body:
+                    trace_match = re.search(
+                        rb"(?:tid|trace_id|request_id)\"?\s*[:=]\s*\"?([A-Za-z0-9_.:-]+)",
+                        error_body,
+                    )
+                    if trace_match:
+                        error_trace_id = trace_match.group(1).decode("utf-8", errors="replace")
                 last_failure = _api_result(
                     status="failed",
                     error_kind=error_kind,
@@ -2562,6 +2829,16 @@ def _call_ai_api_detailed_uninstrumented(
                 last_failure["provider_request_id"] = (
                     provider_request_id
                     or _response_header(current_response, "x-aihubmix-request-id")
+                )
+                last_failure["provider_error_trace_id"] = error_trace_id
+                last_failure["error_response_sha256"] = (
+                    hashlib.sha256(error_body).hexdigest() if error_body else ""
+                )
+                last_failure["error_response_bytes"] = len(error_body)
+                last_failure["error_response_path"] = error_response_path
+                last_failure["error_response_spool_path"] = error_response_spool_path
+                last_failure["error_response_protocol"] = (
+                    "sse" if "text/event-stream" in error_content_type.casefold() else "json"
                 )
                 _close_provider_response(current_response)
                 if (
@@ -2953,6 +3230,12 @@ def _call_ai_api_detailed(
                     "response_protocol",
                     "response_complete",
                     "raw_response_path",
+                    "raw_response_spool_path",
+                    "provider_error_trace_id",
+                    "error_response_sha256",
+                    "error_response_bytes",
+                    "error_response_path",
+                    "error_response_spool_path",
                 )
                 if key in result
             },
