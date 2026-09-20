@@ -432,6 +432,12 @@ class OutlineV3Executor:
         self.replay_diagnostics: list[str] = []
         self._blocking_critic_diagnostics: dict[str, tuple[str, ...]] = {}
         self._payloads: dict[str, dict[str, Any]] = {}
+        # The audit records only hashes, sizes, route identity, source
+        # membership and durable references.  It never stores provider prompt
+        # bodies or source text, so the evidence can be inspected without
+        # widening the original full-text transport boundary.
+        self._request_payload_audit: list[dict[str, Any]] = []
+        self._audit_artifacts_persisted = False
         ledger_root = Path(
             getattr(self.workspace, "root_dir", None) or self._path("")
         ) / ".publication-staging" / "provider-receipts"
@@ -490,6 +496,322 @@ class OutlineV3Executor:
     def _node_path(self, node_id: str) -> str:
         safe = node_id.replace("/", "_").replace("\\", "_").replace(":", "_")
         return self._path(f"outline_v3/artifacts/{safe}.json")
+
+    @staticmethod
+    def _request_members(request: Mapping[str, Any]) -> dict[str, list[str]]:
+        """Extract bounded provenance identities without retaining prompt text."""
+
+        paper_keys: set[str] = set()
+        evidence_view_hashes: set[str] = set()
+        relation_candidate_ids: set[str] = set()
+
+        def visit(value: Any) -> None:
+            if isinstance(value, Mapping):
+                for field_name in ("paper_keys", "canonical_paper_keys"):
+                    for item in value.get(field_name) or ():
+                        text = str(item).strip()
+                        if text:
+                            paper_keys.add(text)
+                for field_name in ("relation_candidate_ids", "relation_ids"):
+                    for item in value.get(field_name) or ():
+                        text = str(item).strip()
+                        if text:
+                            relation_candidate_ids.add(text)
+                for field_name in ("view_hashes", "evidence_view_hashes", "evidence_view_hash"):
+                    raw = value.get(field_name)
+                    values = raw if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)) else [raw]
+                    for item in values:
+                        text = str(item or "").strip()
+                        if text:
+                            evidence_view_hashes.add(text)
+                for item in value.values():
+                    visit(item)
+            elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+                for item in value:
+                    visit(item)
+
+        visit(request)
+        for item in request.get("relation_candidates") or ():
+            if not isinstance(item, Mapping):
+                continue
+            relation_id = str(item.get("relation_id") or "").strip()
+            if relation_id:
+                relation_candidate_ids.add(relation_id)
+            for paper_key in item.get("paper_keys") or ():
+                value = str(paper_key).strip()
+                if value:
+                    paper_keys.add(value)
+        for item in request.get("evidence_views") or ():
+            if not isinstance(item, Mapping):
+                continue
+            for field_name in ("paper_key", "canonical_paper_key"):
+                value = str(item.get(field_name) or "").strip()
+                if value:
+                    paper_keys.add(value)
+                    break
+            for field_name in ("view_hash", "evidence_view_hash", "source_summary_hash"):
+                value = str(item.get(field_name) or "").strip()
+                if value:
+                    evidence_view_hashes.add(value)
+                    break
+        hierarchy = request.get("hierarchy")
+        if isinstance(hierarchy, Mapping):
+            for value in hierarchy.get("paper_keys") or ():
+                text = str(value).strip()
+                if text:
+                    paper_keys.add(text)
+            for value in hierarchy.get("relation_candidate_ids") or ():
+                text = str(value).strip()
+                if text:
+                    relation_candidate_ids.add(text)
+            for value in hierarchy.get("evidence_view_hashes") or ():
+                text = str(value).strip()
+                if text:
+                    evidence_view_hashes.add(text)
+        return {
+            "paper_keys": sorted(paper_keys),
+            "evidence_view_hashes": sorted(evidence_view_hashes),
+            "relation_candidate_ids": sorted(relation_candidate_ids),
+        }
+
+    def _begin_request_payload_audit(
+        self,
+        *,
+        node_id: str,
+        request: Mapping[str, Any],
+        route: OutlineRoleRoute,
+        profile: ProviderContextProfile,
+        binding: Mapping[str, Any],
+        api_config: Mapping[str, Any],
+        call_id: str,
+        semantic_node_id: str,
+        transport_node_id: str | None,
+        replay_key_hash: str,
+        replay_status: str,
+        transport: Any,
+        budget: Mapping[str, Any],
+    ) -> int:
+        serialized = json.dumps(request, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        members = self._request_members(request)
+        hierarchy = request.get("hierarchy")
+        hierarchy_map = hierarchy if isinstance(hierarchy, Mapping) else {}
+        shard_id = str(hierarchy_map.get("shard_id") or "").strip()
+        parent_node = str(hierarchy_map.get("parent_node") or "").strip()
+        if not parent_node:
+            if transport_node_id == "relation_adjudication" or semantic_node_id == "relation_adjudication":
+                parent_node = "relation_shard_plan"
+            elif node_id.endswith("_provider_generation"):
+                parent_node = node_id.removesuffix("_provider_generation")
+            elif node_id in {"structure_critique", "coverage_critique", "evidence_critique"}:
+                parent_node = "candidate_provider_generation"
+            elif node_id == "arbitration":
+                parent_node = "structure_critique,coverage_critique,evidence_critique"
+        record = {
+            "schema_version": "outline_request_payload_audit/v1",
+            "job_id": self.job_id,
+            "stage_name": "outline_v3",
+            "operation_id": self.logical_attempt_identity,
+            "attempt_id": call_id,
+            "physical_attempt_id": f"pending:{call_id}:{len(self._request_payload_audit) + 1}",
+            "closure_epoch_id": self.closure_epoch_id,
+            "node_id": node_id,
+            "semantic_node_id": semantic_node_id,
+            "parent_node": parent_node,
+            "role": str(transport_node_id or semantic_node_id),
+            "route": {
+                "config_section": route.config_section,
+                "provider": route.provider_name,
+                "model": route.model,
+                "endpoint_type": route.endpoint_type,
+                "api_base_host": route.api_base_host,
+            },
+            "route_fingerprint": route.safe_config_fingerprint(),
+            "config_hash": hash_json(api_config),
+            "schema_hash": str(binding.get("schema_hash") or ""),
+            "payload_hash": hash_json(request),
+            "replay_key_hash": replay_key_hash,
+            "replay_status": replay_status,
+            "serialized_bytes": len(serialized),
+            "estimated_input_tokens": int(budget.get("estimated_input_tokens") or profile.estimate_tokens(request)),
+            "input_cap": int(profile.input_budget),
+            "output_cap": int(profile.max_output_tokens),
+            "reasoning_reserve": int(profile.reasoning_reserve),
+            "mock_live": (
+                "mock"
+                if transport is None or route.endpoint_type in {"internal", "fixture"}
+                or route.provider_name in {"fixture", "configured", "test"}
+                else "live"
+            ),
+            "provider_invoked": False,
+            "status": "pending",
+            "error": "",
+            "shard_ids": [shard_id] if shard_id else [],
+            "paper_keys": members["paper_keys"],
+            "evidence_view_hashes": members["evidence_view_hashes"],
+            "relation_candidate_ids": members["relation_candidate_ids"],
+            "input_artifact_hashes": sorted(str(item) for item in binding.get("dependency_hashes", {}).values()),
+            "receipt_ids": [],
+            "raw_response_refs": [],
+            "artifact_refs": [],
+        }
+        self._request_payload_audit.append(record)
+        return len(self._request_payload_audit) - 1
+
+    def _finish_request_payload_audit(self, index: int, **updates: Any) -> None:
+        if 0 <= index < len(self._request_payload_audit):
+            self._request_payload_audit[index].update(updates)
+
+    def _update_request_audit_artifact_ref(self, node_id: str, record: ArtifactRecord) -> None:
+        for audit in self._request_payload_audit:
+            if str(audit.get("node_id") or "") == node_id:
+                refs = list(audit.get("artifact_refs") or [])
+                reference = {
+                    "artifact_id": record.artifact_id,
+                    "path": record.path,
+                    "content_hash": record.content_hash,
+                }
+                if reference not in refs:
+                    refs.append(reference)
+                audit["artifact_refs"] = refs
+
+    def _persist_audit_evidence(self) -> None:
+        """Publish the no-prompt-body request audit and actual call graph."""
+
+        if self._audit_artifacts_persisted:
+            return
+        audit_lines = "".join(
+            json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+            for item in self._request_payload_audit
+        ).encode("utf-8")
+        dependency_ids = [
+            node_id
+            for node_id in (
+                "provider_call_plan",
+                "relation_shard_plan",
+                "relation_shard_digests",
+                "provider_receipt_closure",
+            )
+            if node_id in self.artifact_records
+        ]
+        audit_record = publish_bytes_artifact(
+            self.publication_context,
+            self.registry,
+            self._path("R1_REQUEST_PAYLOAD_AUDIT.jsonl"),
+            audit_lines,
+            artifact_role="outline_request_payload_audit",
+            artifact_type="outline_request_payload_audit",
+            artifact_version="v1",
+            producer="outline.v3_executor.OutlineV3Executor",
+            artifact_id=f"outline-v3:request_payload_audit:{self.closure_epoch_id}",
+            depends_on=self._dependency_refs(dependency_ids),
+            metadata={
+                "job_id": self.job_id,
+                "stage_name": "outline_v3",
+                "closure_epoch_id": self.closure_epoch_id,
+                "record_count": len(self._request_payload_audit),
+                "contains_prompt_bodies": False,
+            },
+        )
+        self.artifact_paths["request_payload_audit"] = audit_record.path
+        self.artifact_records["request_payload_audit"] = audit_record
+
+        dag = self._node_store.load() or self._dag
+        local_nodes = [node.to_dict() for node in dag.nodes]
+        edges: set[tuple[str, str, str]] = set()
+        for node in dag.nodes:
+            for dependency in node.depends_on:
+                edges.add((str(dependency), str(node.node_id), "dag_dependency"))
+        provider_nodes: list[dict[str, Any]] = []
+        for index, audit in enumerate(self._request_payload_audit, start=1):
+            provider_id = f"provider_call:{index}:{audit.get('node_id') or 'unknown'}"
+            provider_nodes.append(
+                {
+                    "id": provider_id,
+                    "node_id": audit.get("node_id", ""),
+                    "semantic_node_id": audit.get("semantic_node_id", ""),
+                    "status": audit.get("status", ""),
+                    "mock_live": audit.get("mock_live", ""),
+                    "provider_invoked": bool(audit.get("provider_invoked")),
+                    "receipt_ids": list(audit.get("receipt_ids") or []),
+                    "artifact_refs": list(audit.get("artifact_refs") or []),
+                }
+            )
+            parent = str(audit.get("parent_node") or "").strip()
+            if parent:
+                edges.add((parent, provider_id, "provider_input"))
+            node_id = str(audit.get("node_id") or "")
+            if node_id.startswith("relation_adjudication:local:"):
+                edges.add((provider_id, "relation_shard_digests", "local_digest"))
+            elif node_id == "relation_adjudication:cross_shard":
+                edges.add((provider_id, "relation_adjudication", "cross_shard_merge"))
+            elif node_id:
+                edges.add((provider_id, node_id, "provider_output"))
+        coverage = {
+            "paper_keys": sorted({
+                value
+                for item in self._request_payload_audit
+                for value in item.get("paper_keys") or ()
+                if str(value)
+            }),
+            "evidence_view_hashes": sorted({
+                value
+                for item in self._request_payload_audit
+                for value in item.get("evidence_view_hashes") or ()
+                if str(value)
+            }),
+            "relation_candidate_ids": sorted({
+                value
+                for item in self._request_payload_audit
+                for value in item.get("relation_candidate_ids") or ()
+                if str(value)
+            }),
+            "shard_ids": sorted({
+                value
+                for item in self._request_payload_audit
+                for value in item.get("shard_ids") or ()
+                if str(value)
+            }),
+        }
+        graph_base = {
+            "schema_version": "outline_hierarchical_call_graph/v1",
+            "job_id": self.job_id,
+            "stage_name": "outline_v3",
+            "operation_id": self.logical_attempt_identity,
+            "closure_epoch_id": self.closure_epoch_id,
+            "expected_call_graph_hash": self.expected_call_graph_hash,
+            "request_payload_audit_artifact_id": audit_record.artifact_id,
+            "local_dag_nodes": local_nodes,
+            "provider_calls": provider_nodes,
+            "edges": [
+                {"from": source, "to": target, "kind": kind}
+                for source, target, kind in sorted(edges)
+            ],
+            "coverage": coverage,
+        }
+        graph_payload = {
+            **graph_base,
+            "graph_hash": compute_v3_hash(graph_base),
+        }
+        graph_record = publish_json_artifact(
+            self.publication_context,
+            self.registry,
+            self._path("R1_HIERARCHICAL_CALL_GRAPH.json"),
+            graph_payload,
+            artifact_role="outline_hierarchical_call_graph",
+            artifact_type="outline_hierarchical_call_graph",
+            artifact_version="v1",
+            producer="outline.v3_executor.OutlineV3Executor",
+            artifact_id=f"outline-v3:hierarchical_call_graph:{self.closure_epoch_id}",
+            depends_on=self._dependency_refs([*dependency_ids, "request_payload_audit"]),
+            metadata={
+                "job_id": self.job_id,
+                "stage_name": "outline_v3",
+                "closure_epoch_id": self.closure_epoch_id,
+            },
+        )
+        self.artifact_paths["hierarchical_call_graph"] = graph_record.path
+        self.artifact_records["hierarchical_call_graph"] = graph_record
+        self._audit_artifacts_persisted = True
 
     def _provider_node_ids(self) -> tuple[str, ...]:
         roles = self.enabled_semantic_roles
@@ -639,15 +961,49 @@ class OutlineV3Executor:
 
     @staticmethod
     def _prompt_evidence_views(views: Sequence[Any]) -> list[dict[str, Any]]:
-        """Bound provider prompt size without weakening local evidence artifacts.
+        """Project complete evidence views without silent semantic truncation.
 
-        The complete evidence views remain durable and are hashed in the
-        dependency graph. Provider prompts receive a bounded projection of
-        each view so a large corpus cannot exceed a route's verified context
-        budget before Outline v3 can shard or adjudicate it.
+        Size control belongs to the token-aware shard planner.  This helper is
+        used by non-sharded nodes as well, so it must not erase the eleventh
+        finding or the tail of a long evidence item merely because a legacy
+        character heuristic happened to be reached.  The local evidence
+        artifact remains the source of truth and this projection carries the
+        same identity fields and all structured evidence values.
         """
 
-        bounded_fields = (
+        prompt_views: list[dict[str, Any]] = []
+        for view in views:
+            payload = view.to_dict() if hasattr(view, "to_dict") else dict(view)
+            compact = dict(payload)
+            # Raw source-field provenance can contain parser internals and is
+            # not needed by the cross-paper Outline roles.  All semantic
+            # evidence fields above it remain complete.
+            compact["source_fields"] = {}
+            prompt_views.append(compact)
+        return prompt_views
+
+    @staticmethod
+    def _prompt_evidence_chunks(view: Any) -> list[dict[str, Any]]:
+        """Split one evidence view into lossless, source-identifiable chunks."""
+
+        payload = view.to_dict() if hasattr(view, "to_dict") else dict(view)
+        identity_fields = {
+            "paper_key",
+            "canonical_paper_key",
+            "title",
+            "authors",
+            "year",
+            "paper_type",
+            "source_summary_hash",
+            "doi",
+            "source_paper_id",
+            "aliases",
+            "identity_source",
+            "source_summary_hashes",
+            "classification",
+            "must_use",
+        }
+        semantic_fields = (
             "research_questions",
             "theories",
             "constructs",
@@ -660,22 +1016,73 @@ class OutlineV3Executor:
             "research_gaps",
             "future_directions",
             "relevance",
+            "diagnostics",
         )
-        prompt_views: list[dict[str, Any]] = []
-        for view in views:
-            payload = view.to_dict() if hasattr(view, "to_dict") else dict(view)
-            compact = dict(payload)
-            for field_name in bounded_fields:
-                raw_values = compact.get(field_name) or []
-                values = raw_values if isinstance(raw_values, list) else [raw_values]
-                compact[field_name] = [str(value)[:1200] for value in values[:10] if str(value).strip()]
-            # Raw field provenance is retained in the local evidence artifact;
-            # it is not needed for cross-paper planning and can dominate the
-            # provider prompt for Zotero-rich records.
-            compact["source_fields"] = {}
-            compact["diagnostics"] = [str(value)[:500] for value in (compact.get("diagnostics") or [])[:6]]
-            prompt_views.append(compact)
-        return prompt_views
+        base = {key: payload.get(key) for key in identity_fields if key in payload}
+        base["source_fields"] = {}
+        source_hash = str(payload.get("view_hash") or "")
+        if not source_hash:
+            # ``view_hash`` is not part of every serialized view; preserve the
+            # canonical source identity when the richer object is available.
+            source_hash = str(getattr(view, "view_hash", "") or payload.get("source_summary_hash") or "")
+
+        def split_text(value: Any) -> list[str]:
+            text = str(value or "")
+            if not text.strip():
+                return []
+            # 1200 is a chunk size, not a truncation limit.  Every subsequent
+            # piece is retained and carries the same source view identity.
+            return [text[offset : offset + 1200] for offset in range(0, len(text), 1200)]
+
+        needs_split = False
+        for field_name in semantic_fields:
+            raw_values = payload.get(field_name) or []
+            values = raw_values if isinstance(raw_values, list) else [raw_values]
+            if len(values) > 10 or any(len(str(value or "")) > 1200 for value in values):
+                needs_split = True
+                break
+        if not needs_split:
+            chunk = dict(OutlineV3Executor._prompt_evidence_views([view])[0])
+            chunk["evidence_source_view_hash"] = source_hash
+            chunk["evidence_field"] = ""
+            chunk["evidence_value_index"] = 0
+            chunk["evidence_text_chunk_index"] = 0
+            chunks = [chunk]
+            chunk["evidence_chunk_id"] = f"{source_hash or chunk.get('paper_key') or 'unknown'}:1"
+            chunk["evidence_chunk_index"] = 0
+            chunk["evidence_chunk_count"] = 1
+            return chunks
+
+        chunks: list[dict[str, Any]] = []
+        for field_name in semantic_fields:
+            raw_values = payload.get(field_name) or []
+            values = raw_values if isinstance(raw_values, list) else [raw_values]
+            for value_index, value in enumerate(values):
+                for text_index, text in enumerate(split_text(value)):
+                    chunk = dict(base)
+                    for semantic_field in semantic_fields:
+                        chunk[semantic_field] = []
+                    chunk[field_name] = [text]
+                    chunk["evidence_source_view_hash"] = source_hash
+                    chunk["evidence_field"] = field_name
+                    chunk["evidence_value_index"] = value_index
+                    chunk["evidence_text_chunk_index"] = text_index
+                    chunks.append(chunk)
+        if not chunks:
+            chunk = dict(base)
+            for semantic_field in semantic_fields:
+                chunk[semantic_field] = []
+            chunk["evidence_source_view_hash"] = source_hash
+            chunk["evidence_field"] = ""
+            chunk["evidence_value_index"] = 0
+            chunk["evidence_text_chunk_index"] = 0
+            chunks.append(chunk)
+        total = len(chunks)
+        for index, chunk in enumerate(chunks):
+            chunk["evidence_chunk_id"] = f"{source_hash or chunk.get('paper_key') or 'unknown'}:{index + 1}"
+            chunk["evidence_chunk_index"] = index
+            chunk["evidence_chunk_count"] = total
+        return chunks
 
     @staticmethod
     def _estimate_source_summary_excerpts(
@@ -738,59 +1145,92 @@ class OutlineV3Executor:
                 "coverage": {"input_view_count": 0, "planned_view_count": 0, "missing_view_hashes": []},
             }
 
+        route_profile = self._role_route("relation_adjudication").profile
+        evidence_chunks = [
+            chunk
+            for view in ordered_views
+            for chunk in self._prompt_evidence_chunks(view)
+        ]
         shards: list[dict[str, Any]] = []
-        current_views: list[Any] = []
+        current_chunks: list[dict[str, Any]] = []
         current_estimate = 0
 
-        def estimate(view: Any) -> int:
-            request = {"evidence_views": self._prompt_evidence_views([view])}
-            return max(1, int(self.profile.estimate_tokens(request)))
+        def estimate(chunk: Mapping[str, Any]) -> int:
+            request = {"evidence_views": [dict(chunk)]}
+            return max(1, int(route_profile.estimate_tokens(request)))
 
         def flush() -> None:
-            nonlocal current_views, current_estimate
-            if not current_views:
+            nonlocal current_chunks, current_estimate
+            if not current_chunks:
                 return
-            paper_keys = [str(getattr(view, "paper_key", "")) for view in current_views]
-            paper_key_set = {value for value in paper_keys if value}
-            view_hashes = [str(getattr(view, "view_hash", "")) for view in current_views]
-            relation_ids = [
-                str(item.get("relation_id") or "")
-                for item in relation_candidates
-                if isinstance(item, Mapping)
-                and set(str(value) for value in (item.get("paper_keys") or ()) if str(value))
-                .issubset(paper_key_set)
-            ]
+            paper_keys = list(dict.fromkeys(
+                str(chunk.get("paper_key") or "")
+                for chunk in current_chunks
+                if str(chunk.get("paper_key") or "")
+            ))
+            view_hashes = list(dict.fromkeys(
+                str(chunk.get("evidence_source_view_hash") or "")
+                for chunk in current_chunks
+                if str(chunk.get("evidence_source_view_hash") or "")
+            ))
             shards.append(
                 {
                     "shard_id": f"relation_shard_{len(shards) + 1}",
                     "paper_keys": paper_keys,
                     "view_hashes": view_hashes,
+                    "chunk_ids": [str(chunk.get("evidence_chunk_id") or "") for chunk in current_chunks],
+                    "evidence_chunks": [dict(chunk) for chunk in current_chunks],
                     "estimated_input_tokens": current_estimate,
-                    "relation_candidate_ids": relation_ids,
+                    "relation_candidate_ids": [],
                 }
             )
-            current_views = []
+            current_chunks = []
             current_estimate = 0
 
-        for view in ordered_views:
-            view_estimate = estimate(view)
-            if target > 0 and current_views and current_estimate + view_estimate > target:
+        for chunk in evidence_chunks:
+            chunk_estimate = estimate(chunk)
+            if target > 0 and current_chunks and current_estimate + chunk_estimate > target:
                 flush()
-            current_views.append(view)
-            current_estimate += view_estimate
-            if target > 0 and view_estimate > target:
-                # An oversized single view is retained intact and explicitly
-                # marked; it cannot be silently truncated or dropped.
+            current_chunks.append(chunk)
+            current_estimate += chunk_estimate
+            if target > 0 and chunk_estimate > target:
+                # A single oversized evidence item is retained in its own
+                # source-identifiable chunk; it is never silently truncated.
                 flush()
         flush()
 
+        assigned_relation_ids: set[str] = set()
+        for shard in shards:
+            paper_key_set = set(str(value) for value in shard.get("paper_keys") or () if str(value))
+            relation_ids: list[str] = []
+            for item in relation_candidates:
+                if not isinstance(item, Mapping):
+                    continue
+                relation_id = str(item.get("relation_id") or "").strip()
+                relation_keys = set(str(value) for value in (item.get("paper_keys") or ()) if str(value))
+                if relation_id and relation_id not in assigned_relation_ids and relation_keys and relation_keys.issubset(paper_key_set):
+                    relation_ids.append(relation_id)
+                    assigned_relation_ids.add(relation_id)
+            shard["relation_candidate_ids"] = relation_ids
+
+        planned_chunk_ids = [
+            chunk_id
+            for shard in shards
+            for chunk_id in shard["chunk_ids"]
+            if chunk_id
+        ]
+        all_chunk_ids = [str(chunk.get("evidence_chunk_id") or "") for chunk in evidence_chunks]
+        all_hashes = [
+            str(getattr(view, "view_hash", "") or "")
+            for view in ordered_views
+            if str(getattr(view, "view_hash", "") or "")
+        ]
         planned_hashes = [
             view_hash
             for shard in shards
             for view_hash in shard["view_hashes"]
             if view_hash
         ]
-        all_hashes = [str(getattr(view, "view_hash", "")) for view in ordered_views]
         return {
             "schema_version": "outline-relation-shard-plan-v1",
             "target_tokens": target,
@@ -798,10 +1238,19 @@ class OutlineV3Executor:
             "shards": shards,
             "coverage": {
                 "input_view_count": len(ordered_views),
-                "planned_view_count": len(planned_hashes),
+                "planned_view_count": len(set(planned_hashes)),
+                "input_chunk_count": len(evidence_chunks),
+                "planned_chunk_count": len(planned_chunk_ids),
+                "missing_chunk_ids": sorted(set(all_chunk_ids) - set(planned_chunk_ids)),
                 "missing_view_hashes": sorted(set(all_hashes) - set(planned_hashes)),
                 "duplicate_view_hashes": sorted(
                     value for value in set(planned_hashes) if planned_hashes.count(value) > 1
+                ),
+                "unassigned_relation_candidate_ids": sorted(
+                    str(item.get("relation_id") or "")
+                    for item in relation_candidates
+                    if isinstance(item, Mapping)
+                    and str(item.get("relation_id") or "") not in assigned_relation_ids
                 ),
             },
         }
@@ -2225,6 +2674,7 @@ class OutlineV3Executor:
         self.artifact_paths[node_id] = record.path
         self.artifact_records[node_id] = record
         self._payloads[node_id] = dict(artifact.payload)
+        self._update_request_audit_artifact_ref(node_id, record)
         binding = dict(execution_binding or self.build_current_node_binding(
             node_id,
             artifact_type=artifact.artifact_type,
@@ -2643,7 +3093,27 @@ class OutlineV3Executor:
             config_hash=hash_json(api_config),
             execution_binding_hash=self._replay_binding_hash(binding),
         )
+        transport_for_audit = self._resolve_node_transport(node_id, route)
+        audit_index = self._begin_request_payload_audit(
+            node_id=node_id,
+            request=request,
+            route=route,
+            profile=profile,
+            binding=binding,
+            api_config=api_config,
+            call_id=call_id,
+            semantic_node_id=semantic_node_id,
+            transport_node_id=transport_node_id,
+            replay_key_hash=replay_key.key_hash,
+            replay_status="pending",
+            transport=transport_for_audit,
+            budget=budget,
+        )
         replay_lookup = self._replay_store.lookup(replay_key)
+        self._finish_request_payload_audit(
+            audit_index,
+            replay_status=replay_lookup.status,
+        )
         if replay_lookup.reusable and replay_lookup.record is not None:
             for artifact_id in replay_lookup.record.output_artifact_ids:
                 replay_record = self.registry.get(artifact_id)
@@ -2736,6 +3206,25 @@ class OutlineV3Executor:
                         "reused_artifact_id": str(replay_lookup.record.output_artifact_ids[0]) if replay_lookup.record.output_artifact_ids else "",
                         "reused_receipt_id": str(replay_lookup.record.receipt_ids[0]) if replay_lookup.record.receipt_ids else "",
                     })
+                    self._finish_request_payload_audit(
+                        audit_index,
+                        physical_attempt_id=(
+                            f"reused:{replay_lookup.record.receipt_ids[0]}"
+                            if replay_lookup.record.receipt_ids
+                            else "reused"
+                        ),
+                        provider_invoked=False,
+                        status="reused",
+                        receipt_ids=list(replay_lookup.record.receipt_ids),
+                        artifact_refs=[
+                            {
+                                "artifact_id": artifact_id,
+                                "path": str(replay_record.path),
+                                "content_hash": str(replay_record.content_hash),
+                            }
+                            for artifact_id in replay_lookup.record.output_artifact_ids
+                        ],
+                    )
                     return dict(payload)
         if replay_lookup.status == "stale":
             self.replay_diagnostics.append(
@@ -2764,6 +3253,12 @@ class OutlineV3Executor:
         if not budget["within_budget"]:
             receipt = runtime.blocked_receipt(prompt=json.dumps(request, sort_keys=True, ensure_ascii=False), input_payload=request, api_config=api_config, message="provider input exceeds verified context budget")
             self.receipts.append(receipt.receipt_id)
+            self._finish_request_payload_audit(
+                audit_index,
+                physical_attempt_id=receipt.receipt_id,
+                status="blocked_context_budget",
+                receipt_ids=[receipt.receipt_id],
+            )
             raise OutlineV3ExecutionError(f"provider budget blocked node {node_id}")
         requested_attempts = max(1, int(api_config.get("transport_retries") or 1))
         effective_attempts = runtime.max_attempts_for_call(requested_attempts)
@@ -2773,13 +3268,21 @@ class OutlineV3Executor:
             requested_retry_attempts=max(0, effective_attempts - 1),
         )
         if self.max_provider_calls is not None and self._provider_call_count >= self.max_provider_calls:
+            self._finish_request_payload_audit(
+                audit_index,
+                status="blocked_provider_call_budget",
+            )
             raise OutlineV3ExecutionError(
                 f"outline provider call budget exhausted before {node_id}"
             )
         self._provider_call_count += 1
-        transport = self._resolve_node_transport(node_id, route)
+        transport = transport_for_audit
         if transport is None:
             if node_id.startswith("stability:"):
+                self._finish_request_payload_audit(
+                    audit_index,
+                    status="blocked_stability_transport",
+                )
                 raise OutlineV3ExecutionError(
                     "stability audit requires a configured provider; fixture responses are not admissible"
                 )
@@ -2788,11 +3291,25 @@ class OutlineV3Executor:
             self._transport_call_count += 1
             runtime.mark_transport_started(admission)
             provider_node_id = str(transport_node_id or node_id)
-            raw = (
-                transport(provider_node_id, request)
-                if callable(transport)
-                else transport.call(provider_node_id, request)
+            self._finish_request_payload_audit(
+                audit_index,
+                physical_attempt_id=f"transport:{call_id}:{self._transport_call_count}",
+                provider_invoked=True,
+                status="transport_started",
             )
+            try:
+                raw = (
+                    transport(provider_node_id, request)
+                    if callable(transport)
+                    else transport.call(provider_node_id, request)
+                )
+            except Exception as exc:
+                self._finish_request_payload_audit(
+                    audit_index,
+                    status="transport_exception",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                raise
         response = _provider_result(raw)
         completion = ProviderCompletionEvaluator.evaluate(response, minimum_output=2, expect_json=expect_json)
         result = dict(response)
@@ -2821,6 +3338,13 @@ class OutlineV3Executor:
             },
         )
         self.receipts.append(receipt.receipt_id)
+        self._finish_request_payload_audit(
+            audit_index,
+            physical_attempt_id=receipt.receipt_id,
+            provider_invoked=transport is not None,
+            status=str(receipt.status),
+            receipt_ids=[receipt.receipt_id],
+        )
         normalized_hash = hash_json(completion.content) if completion.status == "complete" else ""
         self._expected_provider_calls[call_id] = replace(
             self._expected_provider_calls[call_id],
@@ -3033,6 +3557,15 @@ class OutlineV3Executor:
                     "relation_id": relation_id,
                     "reason": str(item.get("reason") or f"rejected by {level} relation review"),
                 }
+            request_views = [
+                item for item in request.get("evidence_views") or ()
+                if isinstance(item, Mapping)
+            ]
+            request_view_hashes = list(dict.fromkeys(
+                str(item.get("evidence_source_view_hash") or item.get("view_hash") or "")
+                for item in request_views
+                if str(item.get("evidence_source_view_hash") or item.get("view_hash") or "")
+            ))
             digests.append(
                 {
                     "level": level,
@@ -3042,7 +3575,7 @@ class OutlineV3Executor:
                     "relation_candidate_ids": sorted(allowed_ids),
                     "confirmed_relation_ids": confirmed_ids,
                     "rejected_relation_ids": rejected_ids,
-                    "evidence_view_hashes": [
+                    "evidence_view_hashes": request_view_hashes or [
                         str(getattr(view_by_key[key], "view_hash", ""))
                         for key in paper_keys
                         if key in view_by_key
@@ -3076,6 +3609,11 @@ class OutlineV3Executor:
             if not shard_id or not local_ids:
                 continue
             local_candidates = [candidate_by_id[item] for item in sorted(local_ids)]
+            local_chunks = [
+                dict(item)
+                for item in shard.get("evidence_chunks") or ()
+                if isinstance(item, Mapping)
+            ]
             local_views = [view_by_key[key] for key in paper_keys if key in view_by_key]
             local_contract = dict(relation_contract)
             local_contract["allowed_relation_ids"] = sorted(local_ids)
@@ -3084,9 +3622,12 @@ class OutlineV3Executor:
                     "level": "local_shard",
                     "shard_id": shard_id,
                     "target_tokens": self.technical_shard_target_tokens,
+                    "paper_keys": paper_keys,
+                    "relation_candidate_ids": sorted(local_ids),
+                    "evidence_view_hashes": list(shard.get("view_hashes") or ()),
                 },
                 "relation_candidates": local_candidates,
-                "evidence_views": self._prompt_evidence_views(local_views),
+                "evidence_views": local_chunks or self._prompt_evidence_views(local_views),
                 "relation_adjudication_contract": local_contract,
             }
             node_id = f"relation_adjudication:local:{shard_id}"
@@ -3120,6 +3661,19 @@ class OutlineV3Executor:
                 for key in item.get("paper_keys") or ()
                 if str(key)
             })
+            cross_chunks: list[dict[str, Any]] = []
+            seen_chunk_ids: set[str] = set()
+            for shard in shard_plan.get("shards") or ():
+                if not isinstance(shard, Mapping):
+                    continue
+                for item in shard.get("evidence_chunks") or ():
+                    if not isinstance(item, Mapping):
+                        continue
+                    chunk_id = str(item.get("evidence_chunk_id") or "")
+                    paper_key = str(item.get("paper_key") or "")
+                    if paper_key in cross_keys and chunk_id not in seen_chunk_ids:
+                        cross_chunks.append(dict(item))
+                        seen_chunk_ids.add(chunk_id)
             cross_views = [view_by_key[key] for key in cross_keys if key in view_by_key]
             cross_contract = dict(relation_contract)
             cross_contract["allowed_relation_ids"] = sorted(remaining_ids)
@@ -3128,9 +3682,16 @@ class OutlineV3Executor:
                     "level": "cross_shard",
                     "shard_id": "cross_shard_review",
                     "target_tokens": self.technical_shard_target_tokens,
+                    "paper_keys": cross_keys,
+                    "relation_candidate_ids": sorted(remaining_ids),
+                    "evidence_view_hashes": list(dict.fromkeys(
+                        str(item.get("evidence_source_view_hash") or item.get("view_hash") or "")
+                        for item in cross_chunks
+                        if str(item.get("evidence_source_view_hash") or item.get("view_hash") or "")
+                    )),
                 },
                 "relation_candidates": cross_candidates,
-                "evidence_views": self._prompt_evidence_views(cross_views),
+                "evidence_views": cross_chunks or self._prompt_evidence_views(cross_views),
                 "relation_adjudication_contract": cross_contract,
             }
             node_id = "relation_adjudication:cross_shard"
@@ -5160,6 +5721,12 @@ class OutlineV3Executor:
                 if refreshed_closure_record is not None:
                     closure_record = refreshed_closure_record
                     self.artifact_records["provider_receipt_closure"] = refreshed_closure_record
+            try:
+                self._persist_audit_evidence()
+            except Exception as exc:
+                self.diagnostics.append(
+                    f"outline audit evidence publication failed: {type(exc).__name__}: {exc}"
+                )
             health_diagnostics = list(self.diagnostics)
             if not coverage_passed:
                 health_diagnostics.append("coverage audit did not satisfy the explicit corpus contract")
@@ -5191,6 +5758,16 @@ class OutlineV3Executor:
                         "coverage_audit_hash": self.artifact_records["coverage_audit"].content_hash,
                         "stability_audit_hash": self.artifact_records["stability_audit"].content_hash,
                         "provider_receipt_closure_hash": closure_record.content_hash,
+                        "request_payload_audit_artifact_id": (
+                            self.artifact_records["request_payload_audit"].artifact_id
+                            if "request_payload_audit" in self.artifact_records
+                            else ""
+                        ),
+                        "hierarchical_call_graph_artifact_id": (
+                            self.artifact_records["hierarchical_call_graph"].artifact_id
+                            if "hierarchical_call_graph" in self.artifact_records
+                            else ""
+                        ),
                         "provider_receipt_closure": closure_payload,
                     },
                     {
@@ -5200,7 +5777,18 @@ class OutlineV3Executor:
                         "provider_receipt_closure": closure_record.content_hash,
                     },
                 ),
-                depends_on=("stability_audit", "coverage_audit", "arbitration", "provider_receipt_closure"),
+                depends_on=tuple(
+                    item
+                    for item in (
+                        "stability_audit",
+                        "coverage_audit",
+                        "arbitration",
+                        "provider_receipt_closure",
+                        "request_payload_audit",
+                        "hierarchical_call_graph",
+                    )
+                    if item in self.artifact_records
+                ),
                 model="deterministic",
                 provider="local",
             )
@@ -5241,6 +5829,12 @@ class OutlineV3Executor:
                 self._register_receipt_ledger()
             except Exception as ledger_error:
                 self.diagnostics.append(f"provider receipt ledger registration failed: {ledger_error}")
+            try:
+                self._persist_audit_evidence()
+            except Exception as audit_error:
+                self.diagnostics.append(
+                    f"outline audit evidence publication failed: {type(audit_error).__name__}: {audit_error}"
+                )
             try:
                 loaded_dag = self._node_store.load()
                 if loaded_dag is not None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -161,6 +162,20 @@ def test_outline_v3_fixture_executes_evidence_bound_adoption(tmp_path: Path) -> 
     ledger = ProviderRuntimeLedger(result.artifacts["provider_receipts"])
     assert ledger.list_receipts()
 
+    audit_path = Path(result.artifacts["request_payload_audit"])
+    audit_rows = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert audit_rows
+    assert all(row["schema_version"] == "outline_request_payload_audit/v1" for row in audit_rows)
+    assert all(row["serialized_bytes"] > 0 for row in audit_rows)
+    assert all(row["mock_live"] == "mock" for row in audit_rows)
+    assert {"paper-a", "paper-b"}.issubset({key for row in audit_rows for key in row["paper_keys"]})
+
+    graph = json.loads(Path(result.artifacts["hierarchical_call_graph"]).read_text(encoding="utf-8"))
+    assert graph["schema_version"] == "outline_hierarchical_call_graph/v1"
+    assert graph["provider_calls"]
+    assert graph["edges"]
+    assert {"paper-a", "paper-b"}.issubset(set(graph["coverage"]["paper_keys"]))
+
 
 def test_outline_v3_without_explicit_adoption_stops_at_ready_for_adoption(tmp_path: Path) -> None:
     result = _executor(tmp_path).run()
@@ -311,6 +326,35 @@ def test_relation_shard_plan_is_lossless_and_estimate_is_bounded(tmp_path: Path)
     assert plan["coverage"]["planned_view_count"] == len(evidence.views)
     assert plan["coverage"]["missing_view_hashes"] == []
     assert all(item["estimated_input_tokens"] >= 1 for item in plan["shards"])
+
+
+def test_evidence_projection_preserves_tail_and_chunks_long_view(tmp_path: Path) -> None:
+    executor = _executor(
+        tmp_path,
+        stability_mode="off",
+        technical_shard_target_tokens=1,
+    )
+    evidence = build_outline_evidence_views(executor.summaries, executor.job_id)
+    view = replace(
+        evidence.views[0],
+        findings=[f"finding-{index}" for index in range(1, 12)],
+        theories=["theory-tail-" + ("x" * 1400)],
+    )
+
+    projected = executor._prompt_evidence_views([view])[0]
+    assert len(projected["findings"]) == 11
+    assert projected["findings"][-1] == "finding-11"
+    chunks = executor._prompt_evidence_chunks(view)
+    assert len(chunks) > 1
+    assert any("theory-tail-" in value for chunk in chunks for value in chunk["theories"])
+    assert any("finding-11" in value for chunk in chunks for value in chunk["findings"])
+
+    plan = executor._build_relation_shard_plan(
+        [view],
+        [{"relation_id": "r-long", "paper_keys": [view.paper_key]}],
+    )
+    assert plan["coverage"]["missing_chunk_ids"] == []
+    assert plan["coverage"]["input_chunk_count"] == len(chunks)
 
 
 def test_outline_preflight_counts_hierarchical_relation_calls(tmp_path: Path) -> None:

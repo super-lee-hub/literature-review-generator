@@ -87,6 +87,8 @@ CURRENT_PRODUCTION_ARTIFACT_TYPES = frozenset(
         "current_artifact_set_pointer",
         "current_artifact_pointer",
         "outline_adoption_pointer",
+        "outline_request_payload_audit",
+        "outline_hierarchical_call_graph",
         "export_bundle",
         "forensic_attestation",
         "provider_receipt_ledger",
@@ -1226,6 +1228,158 @@ def _validate_outline_provider_call_plan(record: Any, _path: str | Path, root: M
             raise ArtifactSchemaError(f"outline_provider_call_plan[{index}].assumptions must be an array")
         if not isinstance(item.get("upper_bound"), bool) or not isinstance(item.get("transport_expected"), bool):
             raise ArtifactSchemaError(f"outline_provider_call_plan[{index}] has invalid bound flags")
+
+
+def _validate_outline_request_payload_audit(
+    record: Any,
+    path: str | Path,
+    _root: Mapping[str, Any] | None = None,
+) -> None:
+    """Validate the hash/size-only Outline request audit JSONL."""
+
+    if str(getattr(record, "artifact_version", "") or "") != "v1":
+        raise ArtifactSchemaError("outline_request_payload_audit must use artifact_version v1")
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise ArtifactSchemaError(f"outline_request_payload_audit cannot be read: {path}") from exc
+    required = (
+        "schema_version",
+        "job_id",
+        "stage_name",
+        "operation_id",
+        "attempt_id",
+        "physical_attempt_id",
+        "closure_epoch_id",
+        "node_id",
+        "semantic_node_id",
+        "route",
+        "payload_hash",
+        "config_hash",
+        "serialized_bytes",
+        "estimated_input_tokens",
+        "input_cap",
+        "output_cap",
+        "mock_live",
+        "status",
+        "shard_ids",
+        "paper_keys",
+        "evidence_view_hashes",
+        "relation_candidate_ids",
+        "receipt_ids",
+        "artifact_refs",
+    )
+    records = 0
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ArtifactSchemaError(
+                f"outline_request_payload_audit line {line_number} is not valid JSON"
+            ) from exc
+        if not isinstance(payload, Mapping):
+            raise ArtifactSchemaError(
+                f"outline_request_payload_audit line {line_number} is not an object"
+            )
+        _require_fields(payload, required, f"outline_request_payload_audit line {line_number}")
+        if str(payload.get("schema_version") or "") != "outline_request_payload_audit/v1":
+            raise ArtifactSchemaError("outline_request_payload_audit schema version is invalid")
+        if str(payload.get("stage_name") or "") != "outline_v3":
+            raise ArtifactSchemaError("outline_request_payload_audit stage_name is invalid")
+        for field_name in ("payload_hash", "config_hash"):
+            value = str(payload.get(field_name) or "")
+            if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+                raise ArtifactSchemaError(
+                    f"outline_request_payload_audit {field_name} is not a SHA-256"
+                )
+        for field_name in ("serialized_bytes", "estimated_input_tokens", "input_cap", "output_cap"):
+            try:
+                value = int(str(payload.get(field_name)))
+            except (TypeError, ValueError) as exc:
+                raise ArtifactSchemaError(
+                    f"outline_request_payload_audit {field_name} must be an integer"
+                ) from exc
+            if value < 0:
+                raise ArtifactSchemaError(
+                    f"outline_request_payload_audit {field_name} cannot be negative"
+                )
+        if payload.get("mock_live") not in {"mock", "live"}:
+            raise ArtifactSchemaError("outline_request_payload_audit mock_live is invalid")
+        if not isinstance(payload.get("route"), Mapping):
+            raise ArtifactSchemaError("outline_request_payload_audit route must be an object")
+        for field_name in (
+            "shard_ids",
+            "paper_keys",
+            "evidence_view_hashes",
+            "relation_candidate_ids",
+            "receipt_ids",
+            "artifact_refs",
+        ):
+            if not isinstance(payload.get(field_name), list):
+                raise ArtifactSchemaError(
+                    f"outline_request_payload_audit {field_name} must be an array"
+                )
+        records += 1
+    if records and str(getattr(record, "job_id", "") or ""):
+        for line in lines:
+            if not line.strip():
+                continue
+            payload = json.loads(line)
+            if str(payload.get("job_id") or "") != str(getattr(record, "job_id", "") or ""):
+                raise ArtifactSchemaError("outline_request_payload_audit job_id mismatch")
+
+
+def _validate_outline_hierarchical_call_graph(
+    record: Any,
+    _path: str | Path,
+    root: Mapping[str, Any],
+) -> None:
+    """Validate the actual local-DAG/provider-call graph projection."""
+
+    _require_fields(
+        root,
+        (
+            "schema_version",
+            "job_id",
+            "stage_name",
+            "operation_id",
+            "closure_epoch_id",
+            "expected_call_graph_hash",
+            "request_payload_audit_artifact_id",
+            "local_dag_nodes",
+            "provider_calls",
+            "edges",
+            "coverage",
+            "graph_hash",
+        ),
+        "outline_hierarchical_call_graph",
+    )
+    if str(root.get("schema_version") or "") != "outline_hierarchical_call_graph/v1":
+        raise ArtifactSchemaError("outline_hierarchical_call_graph schema version is invalid")
+    if str(root.get("stage_name") or "") != "outline_v3":
+        raise ArtifactSchemaError("outline_hierarchical_call_graph stage_name is invalid")
+    if str(root.get("job_id") or "") != str(getattr(record, "job_id", "") or ""):
+        raise ArtifactSchemaError("outline_hierarchical_call_graph job_id mismatch")
+    for field_name in ("expected_call_graph_hash", "graph_hash"):
+        value = str(root.get(field_name) or "")
+        if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+            raise ArtifactSchemaError(
+                f"outline_hierarchical_call_graph {field_name} is not a SHA-256"
+            )
+    if not isinstance(root.get("local_dag_nodes"), list):
+        raise ArtifactSchemaError("outline_hierarchical_call_graph local_dag_nodes must be an array")
+    if not isinstance(root.get("provider_calls"), list):
+        raise ArtifactSchemaError("outline_hierarchical_call_graph provider_calls must be an array")
+    if not isinstance(root.get("edges"), list):
+        raise ArtifactSchemaError("outline_hierarchical_call_graph edges must be an array")
+    if not isinstance(root.get("coverage"), Mapping):
+        raise ArtifactSchemaError("outline_hierarchical_call_graph coverage must be an object")
+    graph_base = dict(root)
+    graph_base.pop("graph_hash", None)
+    if str(root.get("graph_hash") or "") != compute_v3_hash(graph_base):
+        raise ArtifactSchemaError("outline_hierarchical_call_graph graph_hash mismatch")
 
 
 def _validate_validation_disposition(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
@@ -2479,6 +2633,8 @@ def _validate_current_production_artifact(record: Any, path: str | Path, root: M
         ("stage1_portable_provider_closure", "v1"): _validate_stage1_portable_provider_closure,
         ("stage1_portable_provider_ledger", "v1"): _validate_stage1_portable_provider_ledger,
         ("outline_provider_call_plan", "v1"): _validate_outline_provider_call_plan,
+        ("outline_request_payload_audit", "v1"): _validate_outline_request_payload_audit,
+        ("outline_hierarchical_call_graph", "v1"): _validate_outline_hierarchical_call_graph,
         ("validation_disposition", "v1"): _validate_validation_disposition,
         ("lease_publication_manifest", "v1"): _validate_lease_publication_manifest,
         ("provider_receipt_ledger", "v1"): _validate_receipt_ledger,
@@ -2551,6 +2707,7 @@ def validate_registered_artifact(record: Any, path: str | Path) -> None:
             "review_replay_ledger",
             "stage1_portable_summary_source",
             "stage1_portable_provider_ledger",
+            "outline_request_payload_audit",
             "playwright_trace",
         }:
             root = None
