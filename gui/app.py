@@ -2708,6 +2708,14 @@ class WorkspaceController:
         self.refresh_lifecycle(notify_user=False)
         return result
 
+    def export_current_workspace(self) -> Dict[str, Any]:
+        """Export the current canonical workspace through ReviewControlPlane."""
+
+        result = self._control_plane_call("export")
+        self._notify_control_plane_result(result)
+        self.refresh_lifecycle(notify_user=False)
+        return result
+
     def create_repair_plan_from_gui(self) -> Dict[str, Any]:
         result = self._control_plane_call("repair_plan")
         self._notify_control_plane_result(result)
@@ -3250,6 +3258,7 @@ def _render_lifecycle_card(controller: WorkspaceController) -> None:
                 ui.button(t("Run validation"), on_click=execute_validation).props("unelevated size=sm")
                 ui.button(t("Resume workspace"), on_click=lambda: (controller.resume_current_workspace(), render_panel.refresh())).props("outline size=sm")
                 ui.button(t("Request cancellation"), on_click=lambda: (controller.cancel_current_workspace(), render_panel.refresh())).props("outline color=negative size=sm")
+                ui.button(t("Export workspace"), on_click=lambda: (controller.export_current_workspace(), render_panel.refresh())).props("outline size=sm")
                 ui.button(t("Create report-only repair plan"), on_click=lambda: (controller.create_repair_plan_from_gui(), render_panel.refresh())).props("outline size=sm")
                 ui.button(t("Apply verified repair plan"), on_click=lambda: (controller.apply_repair_plan_from_gui(), render_panel.refresh())).props("outline size=sm")
 

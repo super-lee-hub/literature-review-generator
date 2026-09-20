@@ -507,6 +507,21 @@ def test_logs_and_guide_pages_render(page, gui_server):
     expect(page.get_by_text("关于 OCR、MinerU、复用和工作区", exact=True)).to_be_visible()
 
 
+def test_gui_lifecycle_start_cancel_resume_export_are_wired_fail_closed(page, gui_server):
+    _open_page(page, f'{gui_server["base_url"]}/workflow')
+    _set_path_value(page, open_button_name="选择 PDF 文件夹", label_text="PDF 文件夹", value=str(gui_server["pdf_dir"]))
+    _editable_field_input(page, "项目名").fill("GUI Lifecycle Smoke")
+    page.get_by_role("button", name="仅分析文献").click()
+    expect(_notification(page)).to_contain_text("测试模式：已模拟提交")
+
+    _open_page(page, f'{gui_server["base_url"]}/logs')
+    for button_name in ["Resume workspace", "Request cancellation", "Export workspace"]:
+        button = page.get_by_role("button", name=button_name)
+        expect(button).to_be_visible()
+        button.click()
+        expect(_notification(page)).to_contain_text("no canonical job workspace is available")
+
+
 def test_language_switch_changes_labels(page, gui_server):
     _open_page(page, gui_server["base_url"])
 
