@@ -58,6 +58,106 @@ from services.queue_service import CancelToken
 from services.stage1_analysis_service import Stage1AnalysisService
 
 
+class _OutlineProviderTransportAdapter:
+    """Runtime-owned Outline transport with one authoritative attempt policy.
+
+    ``OutlineV3Executor`` performs the durable admission and receipt closure.
+    This adapter deliberately uses the uninstrumented socket layer only after
+    receiving that admission, passing the exact physical-attempt limit and
+    operation identity into the wire call.  The adapter's plain ``__call__``
+    remains for compatibility, while the executor uses ``call_with_runtime``
+    whenever the method is available.
+    """
+
+    def __init__(
+        self,
+        *,
+        api_config: Mapping[str, Any],
+        profile: ProviderContextProfile,
+        logger: Any,
+        system_prompt: str,
+    ) -> None:
+        self.api_config = dict(api_config)
+        self.profile = profile
+        self.logger = logger
+        self.system_prompt = system_prompt
+
+    @staticmethod
+    def _configured_attempt_limit(api_config: Mapping[str, Any]) -> int:
+        raw = api_config.get("transport_retries")
+        try:
+            return max(1, int(str(raw)) + 1)
+        except (TypeError, ValueError):
+            return 1
+
+    def _call(
+        self,
+        node_id: str,
+        request: Mapping[str, Any],
+        *,
+        attempt_limit: int,
+        output_tokens: int | None = None,
+        runtime: Any | None = None,
+    ) -> Any:
+        from ai_interface import _call_ai_api_detailed_uninstrumented
+
+        config = dict(self.api_config)
+        if runtime is not None:
+            config.setdefault(
+                "operation_id",
+                f"{getattr(runtime, 'job_id', '')}:{getattr(runtime, 'call_id', '')}".strip(":"),
+            )
+            config.setdefault("attempt_id", str(getattr(runtime, "attempt_id", "") or ""))
+            config.setdefault(
+                "logical_attempt_identity",
+                str(getattr(runtime, "logical_attempt_identity", "") or ""),
+            )
+            config.setdefault("provider_route", str(getattr(runtime, "route", "") or ""))
+            ledger_path = getattr(getattr(runtime, "ledger", None), "path", None)
+            if ledger_path and not str(config.get("raw_response_dir") or "").strip():
+                config["raw_response_dir"] = str(Path(str(ledger_path)).resolve().parent / "raw_responses")
+        return _call_ai_api_detailed_uninstrumented(
+            json.dumps(
+                {"node_id": node_id, "request": dict(request)},
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            cast(Any, config),
+            self.system_prompt,
+            max_tokens=int(output_tokens or self.profile.max_output_tokens),
+            temperature=0.0,
+            response_format="json",
+            logger=self.logger,
+            retry_attempts=max(1, int(attempt_limit)),
+            max_retries_per_call=max(0, int(attempt_limit) - 1),
+            attempt_limit=max(1, int(attempt_limit)),
+        )
+
+    def __call__(self, node_id: str, request: Mapping[str, Any]) -> Any:
+        return self._call(
+            node_id,
+            request,
+            attempt_limit=self._configured_attempt_limit(self.api_config),
+        )
+
+    def call_with_runtime(
+        self,
+        node_id: str,
+        request: Mapping[str, Any],
+        *,
+        runtime: Any,
+        attempt_limit: int,
+        output_tokens: int | None = None,
+    ) -> Any:
+        return self._call(
+            node_id,
+            request,
+            attempt_limit=attempt_limit,
+            output_tokens=output_tokens,
+            runtime=runtime,
+        )
+
+
 class _RuntimeStageHost:
     """Small runtime-owned host for stage services.
 
@@ -909,31 +1009,18 @@ class InternalStageExecutorRegistry:
         profile: ProviderContextProfile,
         api_config: Mapping[str, Any],
     ) -> Callable[[str, Mapping[str, Any]], Any]:
-        from ai_interface import _call_ai_api_detailed_uninstrumented
-
-        def call(node_id: str, request: Mapping[str, Any]) -> Any:
-            return _call_ai_api_detailed_uninstrumented(
-                json.dumps({"node_id": node_id, "request": dict(request)}, ensure_ascii=False, sort_keys=True),
-                cast(Any, dict(api_config)),
-                "You are the built-in Outline v3 stage executor. Return only valid JSON.",
-                max_tokens=profile.max_output_tokens,
-                temperature=0.0,
-                response_format="json",
-                logger=session.stage_host.logger,
-                retry_attempts=self._nonnegative_int(
-                    api_config.get("transport_retries"),
-                    session.stage_host.settings.runtime.transport_retries,
-                ),
-                max_retries_per_call=max(
-                    0,
-                    self._nonnegative_int(
-                        api_config.get("transport_retries"),
-                        session.stage_host.settings.runtime.node_retry_limit,
-                    ),
-                ),
+        resolved_api_config = dict(api_config)
+        if str(resolved_api_config.get("transport_retries") or "").strip() == "":
+            resolved_api_config["transport_retries"] = self._nonnegative_int(
+                None,
+                session.stage_host.settings.runtime.transport_retries,
             )
-
-        return call
+        return _OutlineProviderTransportAdapter(
+            api_config=resolved_api_config,
+            profile=profile,
+            logger=session.stage_host.logger,
+            system_prompt="You are the built-in Outline v3 stage executor. Return only valid JSON.",
+        )
 
     def _outline_route_for_section(
         self,

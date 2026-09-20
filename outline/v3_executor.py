@@ -1396,41 +1396,268 @@ class OutlineV3Executor:
             planned.append(("exact_replay_resume", self.summaries, False))
         return planned
 
+    def _relation_hierarchical_preflight(
+        self,
+        summaries: Sequence[Mapping[str, Any]],
+        profile: ProviderContextProfile,
+        *,
+        variant_name: str,
+    ) -> tuple[int, int, dict[str, Any]]:
+        """Estimate the actual local/cross relation requests, not a monolith."""
+
+        evidence = build_outline_evidence_views(summaries, self.job_id)
+        ledger = build_global_corpus_ledger(evidence)
+        matrix = build_multi_view_matrix(evidence)
+        candidates = build_global_relation_map(evidence, matrix, ledger)
+        relation_candidates = [item.to_dict() for item in candidates.relations]
+        plan = self._build_relation_shard_plan(evidence.views, relation_candidates)
+        candidate_by_id = {
+            str(item.get("relation_id") or ""): item
+            for item in relation_candidates
+            if str(item.get("relation_id") or "")
+        }
+        contract = {
+            "allowed_relation_ids": sorted(candidate_by_id),
+            "must_return_confirmed_relation_ids": True,
+            "must_reject_without_recorded_evidence": True,
+        }
+        requests: list[dict[str, Any]] = []
+        reviewed: set[str] = set()
+        for shard in plan.get("shards") or ():
+            if not isinstance(shard, Mapping):
+                continue
+            shard_id = str(shard.get("shard_id") or "")
+            relation_ids = {
+                str(item)
+                for item in shard.get("relation_candidate_ids") or ()
+                if str(item) in candidate_by_id
+            }
+            if not relation_ids:
+                continue
+            reviewed.update(relation_ids)
+            requests.append({
+                "hierarchy": {
+                    "level": "local_shard",
+                    "shard_id": shard_id,
+                    "target_tokens": self.technical_shard_target_tokens,
+                    "paper_keys": list(shard.get("paper_keys") or ()),
+                    "relation_candidate_ids": sorted(relation_ids),
+                    "evidence_view_hashes": list(shard.get("view_hashes") or ()),
+                },
+                "relation_candidates": [candidate_by_id[item] for item in sorted(relation_ids)],
+                "evidence_views": [dict(item) for item in shard.get("evidence_chunks") or () if isinstance(item, Mapping)],
+                "relation_adjudication_contract": {
+                    **contract,
+                    "allowed_relation_ids": sorted(relation_ids),
+                },
+            })
+        remaining = set(candidate_by_id) - reviewed
+        if remaining:
+            compact_preflight_views = [
+                self._compact_relation_digest(
+                    request,
+                    [str(item) for item in request.get("relation_candidate_ids") or () if str(item)],
+                    [],
+                    [],
+                )
+                for request in requests
+            ]
+            requests.extend(
+                request
+                for _node_id, request, _batch_ids in self._relation_cross_batch_requests(
+                    candidate_by_id=candidate_by_id,
+                    relation_ids=sorted(remaining),
+                    shard_plan=plan,
+                    relation_contract=contract,
+                    profile=profile,
+                    node_prefix=f"preflight:{variant_name}",
+                    evidence_views_override=compact_preflight_views,
+                )
+            )
+        estimates: list[int] = []
+        for index, request in enumerate(requests, start=1):
+            enriched = self._attach_prompt_authority(
+                f"relation_adjudication:preflight:{variant_name}:{index}",
+                request,
+            )
+            budget = profile.estimate_request(enriched)
+            estimates.append(max(1, int(budget.get("estimated_input_tokens") or profile.estimate_tokens(enriched))))
+        return max(estimates, default=1), len(requests), plan
+
+    def _candidate_hierarchical_preflight(
+        self,
+        summaries: Sequence[Mapping[str, Any]],
+        profile: ProviderContextProfile,
+        *,
+        variant_name: str,
+    ) -> tuple[int, int]:
+        """Estimate candidate-generation shard requests at their final shape."""
+
+        evidence = build_outline_evidence_views(summaries, self.job_id)
+        ledger = build_global_corpus_ledger(evidence)
+        matrix = build_multi_view_matrix(evidence)
+        candidates = build_global_relation_map(evidence, matrix, ledger)
+        relation_candidates = [item.to_dict() for item in candidates.relations]
+        plan = self._build_relation_shard_plan(evidence.views, relation_candidates)
+        estimates: list[int] = []
+        for index, shard in enumerate(plan.get("shards") or (), start=1):
+            if not isinstance(shard, Mapping):
+                continue
+            shard_data: dict[str, Any] = dict(shard)
+            raw_paper_keys = shard_data.get("paper_keys")
+            raw_relation_ids = shard_data.get("relation_candidate_ids")
+            raw_evidence_chunks = shard_data.get("evidence_chunks")
+            paper_keys = [str(item) for item in raw_paper_keys if str(item)] if isinstance(raw_paper_keys, list) else []
+            relation_ids = [str(item) for item in raw_relation_ids if str(item)] if isinstance(raw_relation_ids, list) else []
+            request = {
+                "candidate_id": "candidate_1",
+                "variant_name": variant_name,
+                "hierarchy": {
+                    "level": "candidate_local_shard",
+                    "shard_id": str(shard_data.get("shard_id") or f"candidate_shard_{index}"),
+                    "target_tokens": self.technical_shard_target_tokens,
+                    "paper_keys": paper_keys,
+                    "relation_candidate_ids": relation_ids,
+                },
+                "paper_keys": paper_keys,
+                "relation_ids": relation_ids,
+                "relations": [
+                    item for item in relation_candidates
+                    if str(item.get("relation_id") or "") in set(relation_ids)
+                ],
+                "evidence": [
+                    dict(item)
+                    for item in raw_evidence_chunks
+                    if isinstance(item, Mapping)
+                ] if isinstance(raw_evidence_chunks, list) else [],
+                "source_summary_hashes": sorted(evidence.source_summary_hashes),
+                "candidate_count": self.candidate_count,
+                "evidence_bound": True,
+            }
+            enriched = self._attach_prompt_authority(
+                f"candidate_1_provider_generation:preflight:{variant_name}:{index}",
+                request,
+            )
+            budget = profile.estimate_request(enriched)
+            estimates.append(max(1, int(budget.get("estimated_input_tokens") or profile.estimate_tokens(enriched))))
+        return max(estimates, default=1), len(estimates)
+
     def _build_provider_call_plans(self) -> tuple[OutlineProviderCallPlan, ...]:
         plans: list[OutlineProviderCallPlan] = []
         for variant_name, variant_summaries, transport_expected in self._provider_call_plan_variants():
             for node_id in self._provider_node_ids():
                 route = self._role_route(node_id)
                 profile = route.profile
-                representative_request = {
-                    "job_id": self.job_id,
-                    "stage_name": "outline_v3",
-                    "variant_name": variant_name,
-                    "node_id": node_id,
-                    "evidence_views": self._prompt_evidence_views(
-                        build_outline_evidence_views(variant_summaries, self.job_id).views
-                    ),
-                    "source_summary_excerpts_for_estimation": self._estimate_source_summary_excerpts(
-                        variant_summaries
-                    ),
-                    "candidate_count": self.candidate_count,
-                    "evidence_bound": True,
-                }
+                hierarchical_relation_input: int | None = None
+                candidate_shard_multiplier = 1
+                if node_id == "relation_adjudication" and self.technical_shard_target_tokens > 0:
+                    hierarchical_relation_input, _hierarchical_calls, _hierarchical_plan = (
+                        self._relation_hierarchical_preflight(
+                            variant_summaries,
+                            profile,
+                            variant_name=variant_name,
+                        )
+                    )
+                elif node_id.endswith("_provider_generation") and self.technical_shard_target_tokens > 0:
+                    hierarchical_relation_input, candidate_shard_multiplier = self._candidate_hierarchical_preflight(
+                        variant_summaries,
+                        profile,
+                        variant_name=variant_name,
+                    )
+                elif (
+                    node_id in {"structure_critique", "coverage_critique", "evidence_critique", "arbitration"}
+                    and self.technical_shard_target_tokens > 0
+                ):
+                    _candidate_input, candidate_shard_multiplier = self._candidate_hierarchical_preflight(
+                        variant_summaries,
+                        self._role_route("candidate_1_provider_generation").profile,
+                        variant_name=variant_name,
+                    )
+                if hierarchical_relation_input is not None:
+                    representative_request = {
+                        "job_id": self.job_id,
+                        "stage_name": "outline_v3",
+                        "variant_name": variant_name,
+                        "node_id": node_id,
+                        "hierarchical_relation_request": True,
+                        "estimated_shard_input_tokens": hierarchical_relation_input,
+                        "candidate_count": self.candidate_count,
+                        "evidence_bound": True,
+                    }
+                elif node_id in {"structure_critique", "coverage_critique", "evidence_critique", "arbitration"}:
+                    representative_request = {
+                        "job_id": self.job_id,
+                        "stage_name": "outline_v3",
+                        "variant_name": variant_name,
+                        "node_id": node_id,
+                        "candidate_output_upper_bound": self.candidate_count
+                        * max(1, candidate_shard_multiplier)
+                        * int(self._role_route("candidate_1_provider_generation").profile.max_output_tokens),
+                        "paper_count": len(variant_summaries),
+                        "source_summary_hash_count": len(variant_summaries),
+                        "evidence_bound": True,
+                    }
+                else:
+                    representative_request = {
+                        "job_id": self.job_id,
+                        "stage_name": "outline_v3",
+                        "variant_name": variant_name,
+                        "node_id": node_id,
+                        "evidence_views": self._prompt_evidence_views(
+                            build_outline_evidence_views(variant_summaries, self.job_id).views
+                        ),
+                        "source_summary_excerpts_for_estimation": self._estimate_source_summary_excerpts(
+                            variant_summaries
+                        ),
+                        "candidate_count": self.candidate_count,
+                        "evidence_bound": True,
+                    }
                 budget = profile.estimate_request(representative_request)
                 estimated_input = max(
                     1,
-                    int(budget.get("estimated_input_tokens") or profile.estimate_tokens(representative_request)),
+                    int(
+                        hierarchical_relation_input
+                        or budget.get("estimated_input_tokens")
+                        or profile.estimate_tokens(representative_request)
+                    ),
                 )
                 base_input_estimate = estimated_input
                 estimated_output = max(1, int(profile.max_output_tokens))
+                if node_id.endswith("_provider_generation") and candidate_shard_multiplier > 1:
+                    estimated_output = min(estimated_output, 1024)
                 estimated_reasoning = max(0, int(profile.reasoning_reserve))
-                candidate_output_upper_bound = self.candidate_count * estimated_output
+                candidate_output_cap = (
+                    min(estimated_output, 1024)
+                    if self.technical_shard_target_tokens > 0 and candidate_shard_multiplier > 1
+                    else estimated_output
+                )
+                candidate_output_upper_bound = (
+                    self.candidate_count
+                    * max(1, candidate_shard_multiplier)
+                    * candidate_output_cap
+                )
                 critic_input_upper_bound = 0
-                if node_id in {"structure_critique", "coverage_critique", "evidence_critique"}:
+                if (
+                    self.technical_shard_target_tokens > 0
+                    and node_id in {"structure_critique", "coverage_critique", "evidence_critique", "arbitration"}
+                ):
+                    # These nodes consume merged candidate/critique outputs,
+                    # not the full Stage 1 evidence views.  Estimate their
+                    # final bounded representation directly instead of using
+                    # the old monolithic representative object.
+                    critic_input_upper_bound = candidate_output_upper_bound
+                    if node_id == "arbitration":
+                        critic_input_upper_bound += 3 * estimated_output
+                    estimated_input = critic_input_upper_bound + 8_192
+                    base_input_estimate = estimated_input
+                elif node_id in {"structure_critique", "coverage_critique", "evidence_critique"}:
                     critic_input_upper_bound = candidate_output_upper_bound
                 elif node_id == "arbitration":
                     critic_input_upper_bound = candidate_output_upper_bound + 3 * estimated_output
-                if critic_input_upper_bound:
+                if critic_input_upper_bound and not (
+                    self.technical_shard_target_tokens > 0
+                    and node_id in {"structure_critique", "coverage_critique", "evidence_critique", "arbitration"}
+                ):
                     estimated_input = max(
                         estimated_input,
                         base_input_estimate + critic_input_upper_bound,
@@ -1535,19 +1762,47 @@ class OutlineV3Executor:
             if len(known_estimated_costs) == len(estimated_cost_values)
             else None
         )
+        hierarchical_candidate_shard_calls = 0
+        if self.technical_shard_target_tokens > 0:
+            for variant_name, variant_summaries, transport_expected in self._provider_call_plan_variants():
+                if not transport_expected:
+                    continue
+                candidate_route = self._role_route("candidate_1_provider_generation")
+                _candidate_input, candidate_shard_count = self._candidate_hierarchical_preflight(
+                    variant_summaries,
+                    candidate_route.profile,
+                    variant_name=variant_name,
+                )
+                if candidate_shard_count > 1:
+                    hierarchical_candidate_shard_calls += self.candidate_count * (candidate_shard_count - 1)
+            if hierarchical_candidate_shard_calls:
+                candidate_route = self._role_route("candidate_1_provider_generation")
+                candidate_output = min(max(1, int(candidate_route.profile.max_output_tokens)), 1024)
+                candidate_reasoning = max(0, int(candidate_route.profile.reasoning_reserve))
+                estimated_provider_calls += hierarchical_candidate_shard_calls
+                estimated_output_tokens += hierarchical_candidate_shard_calls * candidate_output
+                estimated_reasoning_tokens += hierarchical_candidate_shard_calls * candidate_reasoning
+                estimated_total_tokens += hierarchical_candidate_shard_calls * (
+                    candidate_output + candidate_reasoning
+                )
+                if estimated_cost is not None:
+                    estimated_cost += hierarchical_candidate_shard_calls * (
+                        candidate_output / 1000.0 * float(self.output_cost_per_1k_tokens or 0.0)
+                        + candidate_reasoning / 1000.0 * float(self.reasoning_cost_per_1k_tokens or 0.0)
+                    )
         hierarchical_relation_shard_calls = 0
         if self.technical_shard_target_tokens > 0 and "relation_adjudication" in self._provider_node_ids():
             for _variant_name, variant_summaries, transport_expected in self._provider_call_plan_variants():
                 if not transport_expected:
                     continue
-                variant_evidence = build_outline_evidence_views(variant_summaries, self.job_id)
-                variant_plan = self._build_relation_shard_plan(variant_evidence.views, [])
-                shard_count = int(variant_plan.get("shard_count") or 0)
-                if shard_count > 1:
-                    # The local shard calls plus a possible cross-shard batch
-                    # are conservative additions to the canonical relation
-                    # row; the actual graph records every physical node.
-                    hierarchical_relation_shard_calls += shard_count
+                _relation_input, relation_call_count, _relation_plan = (
+                    self._relation_hierarchical_preflight(
+                        variant_summaries,
+                        self._role_route("relation_adjudication").profile,
+                        variant_name=_variant_name,
+                    )
+                )
+                hierarchical_relation_shard_calls += relation_call_count
             if hierarchical_relation_shard_calls:
                 relation_route = self._role_route("relation_adjudication")
                 relation_output = max(1, int(relation_route.profile.max_output_tokens))
@@ -1579,6 +1834,7 @@ class OutlineV3Executor:
             "provider_nodes_per_decision": core_calls,
             "variant_names": [name for name, _summaries, _order, _definition in variants],
             "estimated_provider_calls": estimated_provider_calls,
+            "hierarchical_candidate_shard_calls": hierarchical_candidate_shard_calls,
             "hierarchical_relation_shard_calls": hierarchical_relation_shard_calls,
             "estimated_input_tokens": estimated_input_tokens,
             "estimated_output_tokens": estimated_output_tokens,
@@ -1804,7 +2060,16 @@ class OutlineV3Executor:
             "section_evidence_packets", "final_outline", "coverage_audit", "stability_audit",
             "provider_receipt_closure", "stage_health",
         }
-        provider_node = node_id in self._provider_node_ids() or node_id.startswith("stability:")
+        provider_node = (
+            node_id in self._provider_node_ids()
+            or node_id.startswith("stability:")
+            or node_id.startswith("relation_adjudication:")
+            or (node_id.startswith("candidate_") and "_provider_generation:" in node_id)
+            or any(
+                node_id.startswith(f"{role}:")
+                for role in ("structure_critique", "coverage_critique", "evidence_critique")
+            )
+        )
         resolved_route = route if route is not None else (self._node_route(node_id) if provider_node else None)
         if provider_node and resolved_route is not None:
             bind_provider = resolved_route.provider_name
@@ -3008,6 +3273,539 @@ class OutlineV3Executor:
                     replay_output_hash=normalized_hash,
                 )
 
+    def _persist_relation_shard_output(
+        self,
+        node_id: str,
+        payload: Mapping[str, Any],
+        *,
+        dependency_hashes: Mapping[str, str],
+        binding: Mapping[str, Any],
+    ) -> None:
+        """Persist a dynamic relation shard result without mutating the DAG."""
+
+        artifact = self._artifact(RelationAdjudicationResult, payload, dependency_hashes)
+        artifact_id = (
+            f"outline-v3:relation-shard:{self.closure_epoch_id}:{hash_text(node_id)[:16]}"
+        )
+        record = publish_json_artifact(
+            self.publication_context,
+            self.registry,
+            self._node_path(node_id),
+            artifact.to_dict(),
+            artifact_role="outline_v3_relation_shard_output",
+            artifact_type=artifact.artifact_type,
+            artifact_version=artifact.artifact_version,
+            producer="outline.v3_executor.OutlineV3Executor",
+            artifact_id=artifact_id,
+            metadata={
+                "job_id": self.job_id,
+                "node_id": node_id,
+                "parent_node": "relation_shard_plan",
+                "content_hash": artifact.content_hash,
+                "closure_epoch_id": self.closure_epoch_id,
+            },
+        )
+        self.artifact_paths[node_id] = record.path
+        self.artifact_records[node_id] = record
+        self._payloads[node_id] = dict(payload)
+        self._update_request_audit_artifact_ref(node_id, record)
+        expected = self._expected_provider_calls.get(self._provider_call_id(node_id))
+        if expected is None:
+            return
+        expected = replace(
+            expected,
+            artifact_payload_hash=hash_json(payload),
+            artifact_content_hash=artifact.content_hash,
+            registry_file_hash=record.content_hash,
+            artifact_path=record.path,
+            registered_artifact_hash=artifact.content_hash,
+            node_output_hash=artifact.content_hash,
+        )
+        self._expected_provider_calls[expected.call_id] = expected
+        pending = self._pending_replays.pop(node_id, None)
+        if pending is None or not expected.normalized_output_hash:
+            return
+        replay_key, normalized_hash, receipt_id = pending
+        self._replay_store.append(
+            replay_key,
+            output_hash=normalized_hash,
+            normalized_output_hash=normalized_hash,
+            registered_artifact_hash=artifact.content_hash,
+            node_output_hash=artifact.content_hash,
+            output_artifact_ids=(artifact_id,),
+            receipt_ids=(receipt_id,),
+            audit_node_id=node_id,
+            closure_epoch_id=self.closure_epoch_id,
+        )
+        self._expected_provider_calls[expected.call_id] = replace(
+            self._expected_provider_calls[expected.call_id],
+            replay_output_hash=normalized_hash,
+        )
+
+    def _persist_candidate_shard_output(
+        self,
+        node_id: str,
+        payload: Mapping[str, Any],
+        *,
+        dependency_hashes: Mapping[str, str],
+    ) -> None:
+        """Persist one dynamic candidate-generation shard without a DAG node."""
+
+        artifact = self._artifact(OutlineCandidate, payload, dependency_hashes)
+        artifact_id = (
+            f"outline-v3:candidate-shard:{self.closure_epoch_id}:{hash_text(node_id)[:16]}"
+        )
+        record = publish_json_artifact(
+            self.publication_context,
+            self.registry,
+            self._node_path(node_id),
+            artifact.to_dict(),
+            artifact_role="outline_v3_candidate_shard_output",
+            artifact_type=artifact.artifact_type,
+            artifact_version=artifact.artifact_version,
+            producer="outline.v3_executor.OutlineV3Executor",
+            artifact_id=artifact_id,
+            metadata={
+                "job_id": self.job_id,
+                "node_id": node_id,
+                "parent_node": "candidate_provider_generation",
+                "content_hash": artifact.content_hash,
+                "closure_epoch_id": self.closure_epoch_id,
+            },
+        )
+        self.artifact_paths[node_id] = record.path
+        self.artifact_records[node_id] = record
+        self._payloads[node_id] = dict(payload)
+        self._update_request_audit_artifact_ref(node_id, record)
+        expected = self._expected_provider_calls.get(self._provider_call_id(node_id))
+        if expected is not None:
+            self._expected_provider_calls[expected.call_id] = replace(
+                expected,
+                artifact_payload_hash=hash_json(payload),
+                artifact_content_hash=artifact.content_hash,
+                registry_file_hash=record.content_hash,
+                artifact_path=record.path,
+                registered_artifact_hash=artifact.content_hash,
+                node_output_hash=artifact.content_hash,
+            )
+
+    def _critique_artifact_class(self, node_id: str) -> type[OutlineArtifact]:
+        return {
+            "structure_critique": StructureCritique,
+            "coverage_critique": CoverageCritique,
+            "evidence_critique": EvidenceCritique,
+        }[node_id]
+
+    @staticmethod
+    def _compact_candidate_for_critique(candidate_id: str, content: Mapping[str, Any]) -> dict[str, Any]:
+        """Keep critique inputs bounded while preserving claim/source identity."""
+
+        sections: list[dict[str, Any]] = []
+        for section in content.get("sections") or ():
+            if not isinstance(section, Mapping):
+                continue
+            claims = [str(item) for item in section.get("claims") or () if str(item).strip()]
+            sections.append({
+                "section_id": str(section.get("section_id") or ""),
+                "title": str(section.get("title") or "")[:400],
+                "goal": str(section.get("goal") or "")[:600],
+                "paper_keys": [str(item) for item in section.get("paper_keys") or () if str(item)],
+                "relation_ids": [str(item) for item in section.get("relation_ids") or () if str(item)],
+                "claims": [item[:600] for item in claims[:8]],
+                "claim_count": len(claims),
+            })
+        return {
+            "candidate_id": candidate_id,
+            "organizing_logic": str(content.get("organizing_logic") or ""),
+            "sections": sections,
+            "planned_claims": [str(item)[:600] for item in content.get("claims") or () if str(item).strip()][:32],
+            "source_summary_hashes": list(content.get("source_summary_hashes") or ()),
+        }
+
+    def _persist_critique_shard_output(
+        self,
+        node_id: str,
+        payload: Mapping[str, Any],
+        *,
+        dependency_hashes: Mapping[str, str],
+    ) -> None:
+        base_node_id = str(node_id).split(":", 1)[0]
+        artifact = self._artifact(
+            self._critique_artifact_class(base_node_id),
+            payload,
+            dependency_hashes,
+        )
+        artifact_id = (
+            f"outline-v3:critique-shard:{self.closure_epoch_id}:{hash_text(node_id)[:16]}"
+        )
+        record = publish_json_artifact(
+            self.publication_context,
+            self.registry,
+            self._node_path(node_id),
+            artifact.to_dict(),
+            artifact_role="outline_v3_critique_shard_output",
+            artifact_type=artifact.artifact_type,
+            artifact_version=artifact.artifact_version,
+            producer="outline.v3_executor.OutlineV3Executor",
+            artifact_id=artifact_id,
+            metadata={
+                "job_id": self.job_id,
+                "node_id": node_id,
+                "parent_node": base_node_id,
+                "content_hash": artifact.content_hash,
+                "closure_epoch_id": self.closure_epoch_id,
+            },
+        )
+        self.artifact_paths[node_id] = record.path
+        self.artifact_records[node_id] = record
+        self._payloads[node_id] = dict(payload)
+        self._update_request_audit_artifact_ref(node_id, record)
+        expected = self._expected_provider_calls.get(self._provider_call_id(node_id))
+        if expected is not None:
+            self._expected_provider_calls[expected.call_id] = replace(
+                expected,
+                artifact_payload_hash=hash_json(payload),
+                artifact_content_hash=artifact.content_hash,
+                registry_file_hash=record.content_hash,
+                artifact_path=record.path,
+                registered_artifact_hash=artifact.content_hash,
+                node_output_hash=artifact.content_hash,
+            )
+
+    def _run_hierarchical_critique(
+        self,
+        *,
+        node_id: str,
+        request: Mapping[str, Any],
+        dependency_hashes: Mapping[str, str],
+    ) -> dict[str, Any]:
+        candidate_contents = request.get("candidate_contents")
+        candidate_hashes = request.get("candidate_hashes")
+        if not isinstance(candidate_contents, Mapping) or not candidate_contents:
+            raise OutlineV3ExecutionError(f"{node_id} cannot shard without candidate contents")
+        shard_results: list[dict[str, Any]] = []
+        for candidate_id in sorted(str(item) for item in candidate_contents):
+            local_request = dict(request)
+            candidate_content = candidate_contents[candidate_id]
+            compact_candidate = self._compact_candidate_for_critique(
+                candidate_id,
+                candidate_content if isinstance(candidate_content, Mapping) else {},
+            )
+            local_request["hierarchy"] = {
+                "level": "critique_candidate_shard",
+                "shard_id": candidate_id,
+                "target_tokens": self.technical_shard_target_tokens,
+                "candidate_id": candidate_id,
+            }
+            local_request["candidate_contents"] = {
+                candidate_id: compact_candidate
+            }
+            if isinstance(candidate_hashes, Mapping):
+                local_request["candidate_hashes"] = {
+                    candidate_id: candidate_hashes.get(candidate_id, "")
+                }
+            candidate_papers = {
+                str(paper_key)
+                for section in compact_candidate.get("sections") or ()
+                if isinstance(section, Mapping)
+                for paper_key in section.get("paper_keys") or ()
+                if str(paper_key)
+            }
+            if isinstance(local_request.get("candidate_claims"), Mapping):
+                local_request["candidate_claims"] = {
+                    candidate_id: [
+                        str(item)[:600]
+                        for item in list(local_request["candidate_claims"].get(candidate_id) or ())[:32]
+                        if str(item).strip()
+                    ]
+                }
+            if isinstance(local_request.get("section_evidence"), Mapping):
+                local_request["section_evidence"] = {
+                    candidate_id: [
+                        {
+                            "section_id": str(section.get("section_id") or ""),
+                            "title": str(section.get("title") or "")[:400],
+                            "paper_keys": [str(value) for value in section.get("paper_keys") or () if str(value)],
+                            "relation_ids": [str(value) for value in section.get("relation_ids") or () if str(value)],
+                            "claims": [str(value)[:600] for value in section.get("claims") or () if str(value)][:8],
+                        }
+                        for section in local_request["section_evidence"].get(candidate_id) or ()
+                        if isinstance(section, Mapping)
+                    ]
+                }
+            if isinstance(local_request.get("corpus_ledger"), Mapping):
+                ledger = dict(local_request["corpus_ledger"])
+                entries = []
+                for entry in ledger.get("entries") or ():
+                    if not isinstance(entry, Mapping):
+                        continue
+                    paper_key = str(
+                        entry.get("paper_key")
+                        or entry.get("canonical_paper_key")
+                        or (entry.get("paper_info") or {}).get("canonical_paper_key")
+                        if isinstance(entry.get("paper_info"), Mapping)
+                        else ""
+                    )
+                    if paper_key and (not candidate_papers or paper_key in candidate_papers):
+                        entries.append({
+                            "paper_key": paper_key,
+                            "title": str(entry.get("title") or (entry.get("paper_info") or {}).get("title") or "")[:400],
+                            "year": entry.get("year") or (entry.get("paper_info") or {}).get("year"),
+                            "classification": entry.get("classification") or (entry.get("paper_info") or {}).get("classification"),
+                            "must_use": bool(entry.get("must_use") or (entry.get("paper_info") or {}).get("must_use")),
+                            "source_summary_hash": str(entry.get("source_summary_hash") or ""),
+                        })
+                ledger["entries"] = entries
+                local_request["corpus_ledger"] = ledger
+            if isinstance(local_request.get("relations"), list):
+                local_request["relations"] = [
+                    {
+                        "relation_id": str(relation.get("relation_id") or ""),
+                        "relation_type": str(relation.get("relation_type") or ""),
+                        "paper_keys": [str(value) for value in relation.get("paper_keys") or () if str(value)],
+                        "dimension": str(relation.get("dimension") or ""),
+                        "confidence": str(relation.get("confidence") or ""),
+                        "supporting_labels": [str(value)[:200] for value in relation.get("supporting_labels") or () if str(value)][:6],
+                        "evidence_fields": {
+                            str(key): [str(value) for value in values if str(value)]
+                            for key, values in (relation.get("evidence_fields") or {}).items()
+                            if isinstance(values, list)
+                        },
+                    }
+                    for relation in local_request["relations"]
+                    if isinstance(relation, Mapping)
+                    and candidate_papers.intersection(
+                        str(value) for value in relation.get("paper_keys") or () if str(value)
+                    )
+                ]
+            for relation_field in ("relation_evidence", "contradictions", "gaps"):
+                if isinstance(local_request.get(relation_field), list):
+                    local_request[relation_field] = [
+                        {
+                            "relation_id": str(relation.get("relation_id") or ""),
+                            "relation_type": str(relation.get("relation_type") or ""),
+                            "paper_keys": [str(value) for value in relation.get("paper_keys") or () if str(value)],
+                            "dimension": str(relation.get("dimension") or ""),
+                            "confidence": str(relation.get("confidence") or ""),
+                            "supporting_labels": [str(value)[:200] for value in relation.get("supporting_labels") or () if str(value)][:6],
+                        }
+                        for relation in local_request[relation_field]
+                        if isinstance(relation, Mapping)
+                        and (not candidate_papers or candidate_papers.intersection(
+                            str(value) for value in relation.get("paper_keys") or () if str(value)
+                        ))
+                    ]
+            for field_name in ("boundaries", "gaps"):
+                if isinstance(local_request.get(field_name), list):
+                    local_views = [
+                        view for view in local_request[field_name]
+                        if isinstance(view, Mapping)
+                        and str(view.get("paper_key") or view.get("canonical_paper_key") or "") in candidate_papers
+                    ]
+                    local_request[field_name] = [
+                        self._compact_relation_digest(
+                            {"evidence_views": local_views},
+                            [],
+                            [],
+                            [],
+                        )
+                    ] if local_views else []
+            local_node_id = f"{node_id}:local:{candidate_id}"
+            local_request = self._attach_prompt_authority(local_node_id, local_request)
+            content = self._provider_call(
+                local_node_id,
+                local_request,
+                expect_json=True,
+                input_artifact_hashes=(
+                    *dependency_hashes.values(),
+                    hash_json({"candidate_id": candidate_id}),
+                ),
+                transport_node_id=node_id,
+                output_tokens=min(int(self._node_route(node_id).profile.max_output_tokens), 2048),
+            )
+            shard_results.append(dict(content))
+        blocking = [
+            str(item)
+            for result in shard_results
+            for item in result.get("blocking_diagnostics") or ()
+            if str(item).strip()
+        ]
+        recommendations = [
+            str(item)
+            for result in shard_results
+            for item in result.get("recommendations") or ()
+            if str(item).strip()
+        ]
+        merged: dict[str, Any] = {
+            "node_id": node_id,
+            "passed": all(bool(result.get("passed", True)) for result in shard_results),
+            "blocking_diagnostics": blocking,
+            "recommendations": recommendations,
+            "score": min(float(result.get("score", 1.0) or 0.0) for result in shard_results),
+            "coverage_metrics": {},
+            "evidence_metrics": {},
+            "structure_metrics": {},
+            "candidate_shard_results": {
+                str(index + 1): result for index, result in enumerate(shard_results)
+            },
+        }
+        return merged
+
+    def _run_hierarchical_candidate_generation(
+        self,
+        *,
+        candidate_id: str,
+        generation_node_id: str,
+        provider_request: Mapping[str, Any],
+        evidence_views: Sequence[Any],
+        relation_candidates: Sequence[Mapping[str, Any]],
+        allowed_paper_keys: Sequence[str],
+        allowed_relation_ids: Sequence[str],
+        generation_deps: Mapping[str, str],
+        alias_map: Mapping[str, str] | None,
+    ) -> dict[str, Any]:
+        """Generate one candidate from bounded evidence shards and merge locally."""
+
+        shard_plan = self._build_relation_shard_plan(evidence_views, relation_candidates)
+        sections: list[dict[str, Any]] = []
+        section_by_paper: dict[str, dict[str, Any]] = {}
+        assigned_papers: set[str] = set()
+        claims: list[str] = []
+        shard_outputs: list[dict[str, Any]] = []
+        for shard in shard_plan.get("shards") or ():
+            if not isinstance(shard, Mapping):
+                continue
+            shard_id = str(shard.get("shard_id") or "").strip()
+            paper_keys = [str(item) for item in shard.get("paper_keys") or () if str(item)]
+            if not shard_id or not paper_keys:
+                continue
+            shard_key_set = set(paper_keys)
+            shard_relation_ids = [
+                str(item.get("relation_id") or "")
+                for item in relation_candidates
+                if isinstance(item, Mapping)
+                and set(str(value) for value in item.get("paper_keys") or () if str(value)).issubset(shard_key_set)
+            ]
+            request = dict(provider_request)
+            request.update({
+                "hierarchy": {
+                    "level": "candidate_local_shard",
+                    "shard_id": shard_id,
+                    "target_tokens": self.technical_shard_target_tokens,
+                    "paper_keys": paper_keys,
+                    "relation_candidate_ids": sorted(shard_relation_ids),
+                    "evidence_view_hashes": list(shard.get("view_hashes") or ()),
+                },
+                "paper_keys": paper_keys,
+                "relation_ids": sorted(shard_relation_ids),
+                "relations": [
+                    dict(item)
+                    for item in relation_candidates
+                    if isinstance(item, Mapping)
+                    and str(item.get("relation_id") or "") in set(shard_relation_ids)
+                ],
+                "evidence": [
+                    dict(item)
+                    for item in shard.get("evidence_chunks") or ()
+                    if isinstance(item, Mapping)
+                ],
+            })
+            node_id = f"{generation_node_id}:local:{shard_id}"
+            request = self._attach_prompt_authority(node_id, request)
+            shard_deps = {
+                **dict(generation_deps),
+                "relation_shard": _hash_payload(dict(shard)),
+            }
+            raw = self._provider_call(
+                node_id,
+                request,
+                expect_json=True,
+                input_artifact_hashes=tuple(shard_deps.values()),
+                transport_node_id=generation_node_id,
+                output_tokens=min(
+                    int(self._node_route(generation_node_id).profile.max_output_tokens),
+                    1024,
+                ),
+            )
+            content = (
+                canonicalize_structural(dict(raw), alias_map)
+                if alias_map is not None
+                else dict(raw)
+            )
+            self._validate_candidate_payload(
+                candidate_id,
+                content,
+                allowed_paper_keys=paper_keys,
+                allowed_relation_ids=shard_relation_ids,
+            )
+            self._persist_candidate_shard_output(
+                node_id,
+                content,
+                dependency_hashes=shard_deps,
+            )
+            shard_outputs.append(content)
+            for section in content.get("sections") or ():
+                if not isinstance(section, Mapping):
+                    continue
+                section_payload = dict(section)
+                raw_section_papers = [
+                    str(value) for value in section_payload.get("paper_keys") or () if str(value)
+                ]
+                new_section_papers = [
+                    value for value in raw_section_papers if value not in assigned_papers
+                ]
+                if not new_section_papers:
+                    # A long paper may span multiple evidence chunks. Merge
+                    # its later shard claims into the first assigned section
+                    # instead of assigning the same paper twice.
+                    for paper_key in raw_section_papers:
+                        existing = section_by_paper.get(paper_key)
+                        if existing is not None:
+                            existing_claims = list(existing.get("claims") or [])
+                            existing_claims.extend(
+                                str(value) for value in section_payload.get("claims") or () if str(value).strip()
+                            )
+                            existing["claims"] = list(dict.fromkeys(existing_claims))
+                    continue
+                assigned_papers.update(new_section_papers)
+                section_payload["paper_keys"] = new_section_papers
+                section_payload["relation_ids"] = [
+                    str(value) for value in section_payload.get("relation_ids") or () if str(value)
+                ]
+                section_payload["section_id"] = f"{section_payload.get('section_id') or candidate_id}__{shard_id}"
+                sections.append(section_payload)
+                for paper_key in new_section_papers:
+                    section_by_paper[paper_key] = section_payload
+            claims.extend(str(item) for item in content.get("claims") or () if str(item).strip())
+        if not sections:
+            raise OutlineV3ExecutionError(f"{generation_node_id} produced no shard sections")
+        planned_view_hashes = list(dict.fromkeys(
+            str(item)
+            for shard in shard_plan.get("shards") or ()
+            if isinstance(shard, Mapping)
+            for item in shard.get("view_hashes") or ()
+            if str(item)
+        ))
+        merged = {
+            "candidate_id": candidate_id,
+            "organizing_logic": provider_request.get("organizing_logic") or "evidence",
+            "sections": sections,
+            "claims": claims,
+            "shard_plan": {
+                "shard_count": int(shard_plan.get("shard_count") or 0),
+                "paper_keys": list(allowed_paper_keys),
+                "relation_ids": list(allowed_relation_ids),
+                "source_view_hashes": planned_view_hashes,
+            },
+        }
+        self._validate_candidate_payload(
+            candidate_id,
+            merged,
+            allowed_paper_keys=allowed_paper_keys,
+            allowed_relation_ids=allowed_relation_ids,
+        )
+        return merged
+
     def _provider_call(
         self,
         node_id: str,
@@ -3016,6 +3814,7 @@ class OutlineV3Executor:
         expect_json: bool = True,
         input_artifact_hashes: Sequence[str] = (),
         transport_node_id: str | None = None,
+        output_tokens: int | None = None,
     ) -> dict[str, Any]:
         request = self._attach_prompt_authority(node_id, request)
         # Critics must return an explicit envelope (passed + blocking
@@ -3264,7 +4063,7 @@ class OutlineV3Executor:
         effective_attempts = runtime.max_attempts_for_call(requested_attempts)
         admission = runtime.admit(
             estimated_tokens=int(budget["estimated_input_tokens"]),
-            requested_output_tokens=int(profile.max_output_tokens),
+            requested_output_tokens=int(output_tokens or profile.max_output_tokens),
             requested_retry_attempts=max(0, effective_attempts - 1),
         )
         if self.max_provider_calls is not None and self._provider_call_count >= self.max_provider_calls:
@@ -3298,11 +4097,21 @@ class OutlineV3Executor:
                 status="transport_started",
             )
             try:
-                raw = (
-                    transport(provider_node_id, request)
-                    if callable(transport)
-                    else transport.call(provider_node_id, request)
-                )
+                call_with_runtime = getattr(transport, "call_with_runtime", None)
+                if callable(call_with_runtime):
+                    raw = call_with_runtime(
+                        provider_node_id,
+                        request,
+                        runtime=runtime,
+                        attempt_limit=effective_attempts,
+                        output_tokens=output_tokens,
+                    )
+                else:
+                    raw = (
+                        transport(provider_node_id, request)
+                        if callable(transport)
+                        else transport.call(provider_node_id, request)
+                    )
             except Exception as exc:
                 self._finish_request_payload_audit(
                     audit_index,
@@ -3382,6 +4191,41 @@ class OutlineV3Executor:
                     for index, value in enumerate(input_artifact_hashes)
                 },
                 binding=binding,
+            )
+        elif node_id.startswith("relation_adjudication:"):
+            # Hierarchical local/cross-shard calls are provider calls outside
+            # the static DAG.  Their outputs still need Registry identity and
+            # replay authority so receipt closure cannot leave dynamic calls
+            # incomplete or silently repeat them on resume.
+            self._persist_relation_shard_output(
+                node_id,
+                _as_dict(completion.content),
+                dependency_hashes={
+                    f"input_{index}": value
+                    for index, value in enumerate(input_artifact_hashes)
+                },
+                binding=binding,
+            )
+        elif node_id.startswith("candidate_") and "_provider_generation:local:" in node_id:
+            self._persist_candidate_shard_output(
+                node_id,
+                _as_dict(completion.content),
+                dependency_hashes={
+                    f"input_{index}": value
+                    for index, value in enumerate(input_artifact_hashes)
+                },
+            )
+        elif any(
+            node_id.startswith(f"{role}:local:")
+            for role in ("structure_critique", "coverage_critique", "evidence_critique")
+        ):
+            self._persist_critique_shard_output(
+                node_id,
+                _as_dict(completion.content),
+                dependency_hashes={
+                    f"input_{index}": value
+                    for index, value in enumerate(input_artifact_hashes)
+                },
             )
         return _as_dict(completion.content)
 
@@ -3497,6 +4341,176 @@ class OutlineV3Executor:
         route = self._node_route(node_id)
         return self._artifact(cls, content, deps), tuple(deps), route.model, route.provider_name
 
+    @staticmethod
+    def _compact_relation_digest(
+        request: Mapping[str, Any],
+        relation_ids: Sequence[str],
+        confirmed_ids: Sequence[str],
+        rejected_ids: Sequence[str],
+    ) -> dict[str, Any]:
+        """Create an explicit bounded digest for cross-shard alignment."""
+
+        views = [
+            item for item in request.get("evidence_views") or ()
+            if isinstance(item, Mapping)
+        ]
+        paper_keys = sorted({
+            str(value)
+            for item in views
+            for value in (
+                item.get("paper_keys") or [item.get("paper_key") or item.get("canonical_paper_key")]
+            )
+            if str(value)
+        })
+        view_hashes = sorted({
+            str(item.get("evidence_source_view_hash") or item.get("view_hash") or item.get("source_summary_hash") or "")
+            for item in views
+            if str(item.get("evidence_source_view_hash") or item.get("view_hash") or item.get("source_summary_hash") or "")
+        })
+        fields = {
+            "research_questions": "research_questions",
+            "theories": "theories",
+            "constructs": "constructs",
+            "mechanisms": "mechanisms",
+            "method": "methods",
+            "sample_or_context": "contexts",
+            "findings": "findings",
+            "conclusions": "conclusions",
+            "limitations": "limitations",
+            "research_gaps": "gaps",
+            "future_directions": "future_directions",
+        }
+        digest: dict[str, Any] = {
+            "digest_type": "outline_relation_compact_digest/v1",
+            "paper_keys": paper_keys,
+            "evidence_view_hashes": view_hashes,
+            "relation_candidate_ids": sorted(str(item) for item in relation_ids if str(item)),
+            "confirmed_relation_ids": sorted(str(item) for item in confirmed_ids if str(item)),
+            "rejected_relation_ids": sorted(str(item) for item in rejected_ids if str(item)),
+            "field_counts": {},
+            "omitted_value_counts": {},
+        }
+        for source_field, digest_field in fields.items():
+            values: list[str] = []
+            total = 0
+            for view in views:
+                raw = view.get(source_field) or []
+                raw_values = raw if isinstance(raw, list) else [raw]
+                total += len(raw_values)
+                values.extend(str(value) for value in raw_values if str(value).strip())
+            unique_values = list(dict.fromkeys(values))
+            digest[digest_field] = [value[:600] for value in unique_values[:8]]
+            digest["field_counts"][digest_field] = total
+            digest["omitted_value_counts"][digest_field] = max(0, len(unique_values) - 8)
+        digest["unresolved_items"] = [
+            "cross-shard alignment uses compact evidence; retrieve local shard evidence by evidence_view_hashes when needed"
+        ]
+        return digest
+
+    def _relation_cross_batch_requests(
+        self,
+        *,
+        candidate_by_id: Mapping[str, Mapping[str, Any]],
+        relation_ids: Sequence[str],
+        shard_plan: Mapping[str, Any],
+        relation_contract: Mapping[str, Any],
+        profile: ProviderContextProfile,
+        node_prefix: str = "",
+        evidence_views_override: Sequence[Mapping[str, Any]] | None = None,
+    ) -> list[tuple[str, dict[str, Any], set[str]]]:
+        """Partition cross-shard relation review by the actual request budget."""
+
+        ordered_ids = [str(item) for item in relation_ids if str(item) in candidate_by_id]
+        if not ordered_ids:
+            return []
+        all_chunks: list[dict[str, Any]] = []
+        seen_chunks: set[str] = set()
+        if evidence_views_override is not None:
+            all_chunks = [dict(item) for item in evidence_views_override if isinstance(item, Mapping)]
+        else:
+            for shard in shard_plan.get("shards") or ():
+                if not isinstance(shard, Mapping):
+                    continue
+                for item in shard.get("evidence_chunks") or ():
+                    if not isinstance(item, Mapping):
+                        continue
+                    chunk_id = str(item.get("evidence_chunk_id") or "")
+                    if chunk_id not in seen_chunks:
+                        all_chunks.append(dict(item))
+                        seen_chunks.add(chunk_id)
+
+        def build_request(batch_ids: Sequence[str]) -> dict[str, Any]:
+            batch_keys = sorted({
+                str(key)
+                for relation_id in batch_ids
+                for key in candidate_by_id[relation_id].get("paper_keys") or ()
+                if str(key)
+            })
+            batch_key_set = set(batch_keys)
+            chunks = []
+            for item in all_chunks:
+                item_keys = set(str(value) for value in item.get("paper_keys") or () if str(value))
+                item_key = str(item.get("paper_key") or "")
+                if item_key in batch_key_set or item_keys.intersection(batch_key_set):
+                    chunks.append(dict(item))
+            batch_contract = dict(relation_contract)
+            batch_contract["allowed_relation_ids"] = sorted(batch_ids)
+            shard_id = (
+                "cross_shard_review"
+                if not node_prefix
+                else f"cross_shard_review_{len(batch_ids)}"
+            )
+            return {
+                "hierarchy": {
+                    "level": "cross_shard",
+                    "shard_id": shard_id,
+                    "target_tokens": self.technical_shard_target_tokens,
+                    "paper_keys": batch_keys,
+                    "relation_candidate_ids": sorted(batch_ids),
+                    "evidence_view_hashes": list(dict.fromkeys(
+                        str(item.get("evidence_source_view_hash") or item.get("view_hash") or "")
+                        for item in chunks
+                        if str(item.get("evidence_source_view_hash") or item.get("view_hash") or "")
+                    )),
+                },
+                "relation_candidates": [candidate_by_id[item] for item in sorted(batch_ids)],
+                "evidence_views": chunks,
+                "relation_adjudication_contract": batch_contract,
+            }
+
+        batches: list[tuple[str, dict[str, Any], set[str]]] = []
+        current: list[str] = []
+        for relation_id in ordered_ids:
+            trial = [*current, relation_id]
+            trial_request = build_request(trial)
+            estimate_request = self._attach_prompt_authority(
+                f"{node_prefix + ':' if node_prefix else ''}relation_adjudication:preflight:cross_shard",
+                trial_request,
+            )
+            estimated = profile.estimate_tokens(estimate_request)
+            limit = int(self.technical_shard_target_tokens or 0) or int(profile.input_budget)
+            if current and estimated > limit:
+                batch_index = len(batches) + 1
+                batch_ids = set(current)
+                node_id = "relation_adjudication:cross_shard"
+                if len(ordered_ids) > len(current):
+                    node_id = f"relation_adjudication:cross_shard_batch_{batch_index}"
+                if node_prefix:
+                    node_id = f"{node_prefix}:{node_id}"
+                batches.append((node_id, build_request(current), batch_ids))
+                current = [relation_id]
+            else:
+                current = trial
+        if current:
+            batch_index = len(batches) + 1
+            node_id = "relation_adjudication:cross_shard"
+            if len(batches) > 0:
+                node_id = f"relation_adjudication:cross_shard_batch_{batch_index}"
+            if node_prefix:
+                node_id = f"{node_prefix}:{node_id}"
+            batches.append((node_id, build_request(current), set(current)))
+        return batches
+
     def _run_hierarchical_relation_adjudication(
         self,
         *,
@@ -3505,6 +4519,7 @@ class OutlineV3Executor:
         shard_plan: Mapping[str, Any],
         relation_contract: Mapping[str, Any],
         relation_dependencies: Mapping[str, str],
+        node_prefix: str = "",
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         """Adjudicate relations in bounded local shards plus cross-shard batches."""
 
@@ -3566,6 +4581,12 @@ class OutlineV3Executor:
                 for item in request_views
                 if str(item.get("evidence_source_view_hash") or item.get("view_hash") or "")
             ))
+            compact_digest = self._compact_relation_digest(
+                request,
+                sorted(allowed_ids),
+                confirmed_ids,
+                rejected_ids,
+            )
             digests.append(
                 {
                     "level": level,
@@ -3580,6 +4601,7 @@ class OutlineV3Executor:
                         for key in paper_keys
                         if key in view_by_key
                     ],
+                    "compact_digest": compact_digest,
                     "request_payload_audit": {
                         "serialized_bytes": len(
                             json.dumps(request, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -3631,6 +4653,8 @@ class OutlineV3Executor:
                 "relation_adjudication_contract": local_contract,
             }
             node_id = f"relation_adjudication:local:{shard_id}"
+            if node_prefix:
+                node_id = f"{node_prefix}:{node_id}"
             request = self._attach_prompt_authority(node_id, request)
             content = self._provider_call(
                 node_id,
@@ -3654,67 +4678,46 @@ class OutlineV3Executor:
 
         remaining_ids = set(candidate_by_id) - reviewed
         if remaining_ids:
-            cross_candidates = [candidate_by_id[item] for item in sorted(remaining_ids)]
-            cross_keys = sorted({
-                str(key)
-                for item in cross_candidates
-                for key in item.get("paper_keys") or ()
-                if str(key)
-            })
-            cross_chunks: list[dict[str, Any]] = []
-            seen_chunk_ids: set[str] = set()
-            for shard in shard_plan.get("shards") or ():
-                if not isinstance(shard, Mapping):
-                    continue
-                for item in shard.get("evidence_chunks") or ():
-                    if not isinstance(item, Mapping):
-                        continue
-                    chunk_id = str(item.get("evidence_chunk_id") or "")
-                    paper_key = str(item.get("paper_key") or "")
-                    if paper_key in cross_keys and chunk_id not in seen_chunk_ids:
-                        cross_chunks.append(dict(item))
-                        seen_chunk_ids.add(chunk_id)
-            cross_views = [view_by_key[key] for key in cross_keys if key in view_by_key]
-            cross_contract = dict(relation_contract)
-            cross_contract["allowed_relation_ids"] = sorted(remaining_ids)
-            request = {
-                "hierarchy": {
-                    "level": "cross_shard",
-                    "shard_id": "cross_shard_review",
-                    "target_tokens": self.technical_shard_target_tokens,
-                    "paper_keys": cross_keys,
-                    "relation_candidate_ids": sorted(remaining_ids),
-                    "evidence_view_hashes": list(dict.fromkeys(
-                        str(item.get("evidence_source_view_hash") or item.get("view_hash") or "")
-                        for item in cross_chunks
-                        if str(item.get("evidence_source_view_hash") or item.get("view_hash") or "")
-                    )),
-                },
-                "relation_candidates": cross_candidates,
-                "evidence_views": cross_chunks or self._prompt_evidence_views(cross_views),
-                "relation_adjudication_contract": cross_contract,
-            }
-            node_id = "relation_adjudication:cross_shard"
-            request = self._attach_prompt_authority(node_id, request)
-            content = self._provider_call(
-                node_id,
-                request,
-                expect_json=True,
-                input_artifact_hashes=(
-                    *relation_dependencies.values(),
-                    hash_json({"level": "cross_shard", "relation_ids": sorted(remaining_ids)}),
-                ),
-                transport_node_id="relation_adjudication",
+            relation_batch_requests = self._relation_cross_batch_requests(
+                candidate_by_id=candidate_by_id,
+                relation_ids=sorted(remaining_ids),
+                shard_plan=shard_plan,
+                relation_contract=relation_contract,
+                profile=self._role_route("relation_adjudication").profile,
+                node_prefix=node_prefix,
+                evidence_views_override=[
+                    dict(item["compact_digest"])
+                    for item in digests
+                    if item.get("level") == "local_shard" and isinstance(item.get("compact_digest"), Mapping)
+                ],
             )
-            classify(
-                content,
-                remaining_ids,
-                node_id=node_id,
-                level="cross_shard",
-                shard_id="cross_shard_review",
-                paper_keys=cross_keys,
-                request=request,
-            )
+            for node_id, request, batch_ids in relation_batch_requests:
+                request = self._attach_prompt_authority(node_id, request)
+                content = self._provider_call(
+                    node_id,
+                    request,
+                    expect_json=True,
+                    input_artifact_hashes=(
+                        *relation_dependencies.values(),
+                        hash_json({"level": "cross_shard", "relation_ids": sorted(batch_ids)}),
+                    ),
+                    transport_node_id="relation_adjudication",
+                )
+                paper_keys = sorted({
+                    str(key)
+                    for relation_id in batch_ids
+                    for key in candidate_by_id[relation_id].get("paper_keys") or ()
+                    if str(key)
+                })
+                classify(
+                    content,
+                    batch_ids,
+                    node_id=node_id,
+                    level="cross_shard",
+                    shard_id=str((request.get("hierarchy") or {}).get("shard_id") or "cross_shard_review"),
+                    paper_keys=paper_keys,
+                    request=request,
+                )
 
         if reviewed != set(candidate_by_id):
             raise OutlineV3ExecutionError("hierarchical relation adjudication left candidates unreviewed")
@@ -4348,6 +5351,14 @@ class OutlineV3Executor:
                         relation_dependencies=relation_deps,
                     )
                 )
+                # The static base relation node is replaced by the dynamic
+                # local/cross-shard provider calls.  Remove its hydrated
+                # expectation so receipt closure does not report a provider
+                # call that was intentionally never sent.
+                self._expected_provider_calls.pop(
+                    self._provider_call_id("relation_adjudication"),
+                    None,
+                )
             shard_digest_record = self._run_node("relation_shard_digests", lambda: (
                 self._artifact(
                     OutlineArtifact,
@@ -4410,6 +5421,15 @@ class OutlineV3Executor:
                         "relation_adjudication", relation_request, expect_json=True,
                         input_artifact_hashes=tuple(relation_deps.values()),
                     ),
+                )
+            if hierarchical_content is not None:
+                # ``_run_node`` hydrates the static base binding for the local
+                # artifact wrapper.  The actual provider work was already
+                # represented by the dynamic shard calls, so the static
+                # expectation must not survive into receipt closure.
+                self._expected_provider_calls.pop(
+                    self._provider_call_id("relation_adjudication"),
+                    None,
                 )
             candidate_by_id = {str(item["relation_id"]): item for item in relation_candidates}
             if not isinstance(adjudication.get("confirmed_relation_ids"), list) or not isinstance(adjudication.get("rejected_relations"), list):
@@ -4575,18 +5595,47 @@ class OutlineV3Executor:
                     generation_node_id, provider_request, expect_json=True,
                     input_artifact_hashes=tuple(generation_deps.values()),
                 )
+                generation_route = self._node_route(generation_node_id)
+                generation_budget = generation_route.profile.estimate_request(provider_request)
+                sharded_generation = bool(
+                    self.technical_shard_target_tokens > 0
+                    and (
+                        int(generation_budget.get("estimated_input_tokens") or 0)
+                        > int(self.technical_shard_target_tokens)
+                        or not bool(generation_budget.get("within_budget"))
+                    )
+                )
                 # Transport first (registers the expected call + receipt), then
                 # validate, then bounded repair, then persist ONLY the adopted
                 # canonical content.  Persisting before validation would give a
                 # second executor replay a poisoned candidate artifact.
                 try:
                     self._check(generation_node_id)
-                    raw_generation = self._provider_call(
-                        generation_node_id,
-                        provider_request,
-                        expect_json=True,
-                        input_artifact_hashes=tuple(generation_deps.values()),
-                    )
+                    if sharded_generation:
+                        raw_generation = self._run_hierarchical_candidate_generation(
+                            candidate_id=candidate_id,
+                            generation_node_id=generation_node_id,
+                            provider_request=provider_request,
+                            evidence_views=evidence_model.views,
+                            relation_candidates=candidate_relations,
+                            allowed_paper_keys=paper_keys,
+                            allowed_relation_ids=allowed_relation_ids,
+                            generation_deps=generation_deps,
+                            alias_map=alias_map,
+                        )
+                        # The static candidate provider node is represented by
+                        # the merged local shard calls in receipt closure.
+                        self._expected_provider_calls.pop(
+                            self._provider_call_id(generation_node_id),
+                            None,
+                        )
+                    else:
+                        raw_generation = self._provider_call(
+                            generation_node_id,
+                            provider_request,
+                            expect_json=True,
+                            input_artifact_hashes=tuple(generation_deps.values()),
+                        )
                     content = (
                         canonicalize_structural(dict(raw_generation), alias_map)
                         if alias_map is not None
@@ -4620,7 +5669,6 @@ class OutlineV3Executor:
                         except OutlineV3ExecutionError as repair_failure:
                             self._publish_repair_failure(candidate_id, repair_failure)
                             raise
-                    generation_route = self._node_route(generation_node_id)
                     self._persist(
                         generation_node_id,
                         self._artifact(OutlineCandidate, content, generation_deps),
@@ -4751,13 +5799,48 @@ class OutlineV3Executor:
                         ),
                     )
                 else:
-                    critiques[node_id] = self._run_node(
-                        node_id,
-                        lambda request=request, cls=cls, node_id=node_id, critique_deps=critique_deps: self._run_provider_node(node_id, request, cls, critique_deps),
-                        expected_binding=self._provider_binding(
-                            node_id, request, expect_json=True, input_artifact_hashes=tuple(critique_deps.values()),
-                        ),
+                    critique_route = self._node_route(node_id)
+                    critique_budget = critique_route.profile.estimate_request(request)
+                    shard_critique = bool(
+                        self.technical_shard_target_tokens > 0
+                        and (
+                            int(critique_budget.get("estimated_input_tokens") or 0)
+                            > int(self.technical_shard_target_tokens)
+                            or not bool(critique_budget.get("within_budget"))
+                        )
                     )
+                    critique_binding = self._provider_binding(
+                        node_id,
+                        request,
+                        expect_json=True,
+                        input_artifact_hashes=tuple(critique_deps.values()),
+                    )
+                    if shard_critique:
+                        merged_critique = self._run_hierarchical_critique(
+                            node_id=node_id,
+                            request=request,
+                            dependency_hashes=critique_deps,
+                        )
+                        critiques[node_id] = self._run_node(
+                            node_id,
+                            lambda merged=merged_critique, cls=cls, critique_deps=critique_deps: (
+                                self._artifact(cls, merged, critique_deps),
+                                ("candidate_generations",),
+                                "hierarchical",
+                                "local",
+                            ),
+                            expected_binding=critique_binding,
+                        )
+                        self._expected_provider_calls.pop(
+                            self._provider_call_id(node_id),
+                            None,
+                        )
+                    else:
+                        critiques[node_id] = self._run_node(
+                            node_id,
+                            lambda request=request, cls=cls, node_id=node_id, critique_deps=critique_deps: self._run_provider_node(node_id, request, cls, critique_deps),
+                            expected_binding=critique_binding,
+                        )
 
             # Only candidates that no critic explicitly flagged are eligible
             # for arbitration.  This is a deterministic prefilter, not a gate
@@ -5059,26 +6142,53 @@ class OutlineV3Executor:
                 variant_ledger = build_global_corpus_ledger(variant_evidence)
                 variant_matrix = build_multi_view_matrix(variant_evidence)
                 variant_candidates = build_global_relation_map(variant_evidence, variant_matrix, variant_ledger)
-                variant_relation_request = {
-                    "relation_candidates": [item.to_dict() for item in variant_candidates.relations],
-                    "evidence": self._prompt_evidence_views(variant_evidence.views),
-                    "source_summary_hashes": sorted(variant_evidence.source_summary_hashes),
-                    "evidence_shards": evidence_shards,
-                    "shard_size": configured_shard_size,
-                    "shard_order": str(definition.get("shard_order") or "canonical"),
-                }
                 relation_key_hash = hash_json({"variant": variant_name, "role": "relation_adjudication"})[:16]
-                relation_audit_node_id = f"stability:{relation_key_hash}:relation_adjudication"
-                relation_adjudication = self._provider_call(
-                    relation_audit_node_id,
-                    variant_relation_request,
-                    expect_json=True,
-                    input_artifact_hashes=(
-                        *sorted(variant_evidence.source_summary_hashes),
-                        variant_candidates.content_hash,
-                    ),
-                    transport_node_id="relation_adjudication",
+                relation_dependencies = {
+                    "variant_source_summaries": hash_json(sorted(variant_evidence.source_summary_hashes)),
+                    "variant_relation_candidates": variant_candidates.content_hash,
+                }
+                variant_relation_plan = self._build_relation_shard_plan(
+                    variant_evidence.views,
+                    [item.to_dict() for item in variant_candidates.relations],
                 )
+                if (
+                    self.technical_shard_target_tokens > 0
+                    and int(variant_relation_plan.get("shard_count") or 0) > 1
+                ):
+                    relation_adjudication, _variant_relation_digests = (
+                        self._run_hierarchical_relation_adjudication(
+                            evidence_views=variant_evidence.views,
+                            relation_candidates=[item.to_dict() for item in variant_candidates.relations],
+                            shard_plan=variant_relation_plan,
+                            relation_contract={
+                                "allowed_relation_ids": [item.relation_id for item in variant_candidates.relations],
+                                "must_return_confirmed_relation_ids": True,
+                                "must_reject_without_recorded_evidence": True,
+                            },
+                            relation_dependencies=relation_dependencies,
+                            node_prefix=f"stability:{relation_key_hash}",
+                        )
+                    )
+                else:
+                    variant_relation_request = {
+                        "relation_candidates": [item.to_dict() for item in variant_candidates.relations],
+                        "evidence": self._prompt_evidence_views(variant_evidence.views),
+                        "source_summary_hashes": sorted(variant_evidence.source_summary_hashes),
+                        "evidence_shards": evidence_shards,
+                        "shard_size": configured_shard_size,
+                        "shard_order": str(definition.get("shard_order") or "canonical"),
+                    }
+                    relation_audit_node_id = f"stability:{relation_key_hash}:relation_adjudication"
+                    relation_adjudication = self._provider_call(
+                        relation_audit_node_id,
+                        variant_relation_request,
+                        expect_json=True,
+                        input_artifact_hashes=(
+                            *sorted(variant_evidence.source_summary_hashes),
+                            variant_candidates.content_hash,
+                        ),
+                        transport_node_id="relation_adjudication",
+                    )
                 confirmed_relation_ids = {
                     str(item).strip()
                     for item in relation_adjudication.get("confirmed_relation_ids") or ()
