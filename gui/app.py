@@ -13,7 +13,11 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 
 from free_mode.profile_manager import get_profile_path, normalize_profile
-from free_mode.service import generate_free_mode_profile, plan_free_mode_chat_turn
+from free_mode.service import (
+    apply_free_mode_profile,
+    generate_free_mode_profile,
+    plan_free_mode_chat_turn,
+)
 from ai_interface import classify_provider_endpoint
 from config_loader import provider_sections_for_stage_plan
 from services.configuration_service import (
@@ -2362,6 +2366,11 @@ class WorkspaceController:
             output_dir = str(self.state["paths"]["output_path"] or "./output")
             if self.test_mode:
                 profile = normalize_profile(self.free_mode_profile_draft)
+                profile_path = apply_free_mode_profile(
+                    profile,
+                    output_dir=output_dir,
+                    project_name=project_name,
+                )
             else:
                 profile = await asyncio.to_thread(
                     generate_free_mode_profile,
@@ -2371,6 +2380,7 @@ class WorkspaceController:
                     project_name=project_name,
                     conversation_messages=list(self.free_mode_messages),
                 )
+                profile_path = get_profile_path(output_dir, project_name)
 
             if not profile:
                 self.set_status(self.t("自由模式 profile 应用失败，请检查 Free_Mode_API / Outline_API 配置后重试。"))
@@ -2378,7 +2388,7 @@ class WorkspaceController:
                 return
 
             self.free_mode_profile_draft = normalize_profile(profile)
-            self.free_mode_profile_path = get_profile_path(output_dir, project_name)
+            self.free_mode_profile_path = profile_path
             self.free_mode_ready_to_apply = True
             self.set_status(self.tf("自由模式已应用到本次任务：{target}", target=self.free_mode_profile_path))
             self.notify(self.status_message, color="positive", multi_line=True)
