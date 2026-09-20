@@ -1,13 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
 import hashlib
 import json
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping
 
 from services.source_normalizer import (
     SourcePaperDescriptor,
+    fingerprint_pdf_file,
     normalize_source_papers,
+    validate_source_paper_uniqueness,
 )
 
 
@@ -46,6 +49,36 @@ class PaperWorkItem:
         )
 
 
+def _source_identity_payload(item: PaperWorkItem) -> Dict[str, str]:
+    """Recompute a readable PDF SHA before downstream work consumes the item."""
+
+    source_pdf = str(item.source_pdf or "").strip()
+    descriptor = item.source_descriptor if isinstance(item.source_descriptor, Mapping) else {}
+    paper_info = item.paper_info if isinstance(item.paper_info, Mapping) else {}
+    declared_fingerprint = str(
+        descriptor.get("source_pdf_fingerprint")
+        or paper_info.get("source_pdf_fingerprint")
+        or ""
+    ).strip().casefold()
+    content_fingerprint = declared_fingerprint
+    if source_pdf and Path(source_pdf).is_file():
+        try:
+            content_fingerprint = fingerprint_pdf_file(source_pdf)
+        except OSError as exc:
+            raise ValueError("source_identity_pdf_sha256_unavailable") from exc
+        # The descriptor is a snapshot from source intake and may be stale if
+        # the caller intentionally reruns after a PDF was replaced.  Use the
+        # bytes reopened now as the current identity so Stage 1 reuse
+        # adjudication can invalidate the old summary and regenerate.  F1
+        # manifest-bound runs perform a stricter path/hash comparison in
+        # ``validate_f1_corpus_source_bundle`` before preprocessing.
+    return {
+        "canonical_paper_key": str(item.canonical_paper_key or ""),
+        "source_pdf": source_pdf,
+        "source_pdf_fingerprint": content_fingerprint,
+    }
+
+
 @dataclass(frozen=True)
 class SourceBundle:
     source_mode: str
@@ -58,8 +91,11 @@ class SourceBundle:
             raise ValueError(f"unsupported source mode: {self.source_mode}")
         if not self.project_name:
             raise ValueError("SourceBundle.project_name is required")
+        source_identities: list[Dict[str, str]] = []
         for item in self.paper_work_items:
             item.validate()
+            source_identities.append(_source_identity_payload(item))
+        validate_source_paper_uniqueness(source_identities)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -71,7 +107,7 @@ class SourceBundle:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "SourceBundle":
-        return cls(
+        bundle = cls(
             source_mode=str(payload.get("source_mode") or ""),
             project_name=str(payload.get("project_name") or ""),
             paper_work_items=[
@@ -81,6 +117,8 @@ class SourceBundle:
             ],
             source_snapshot=dict(payload.get("source_snapshot") or {}),
         )
+        bundle.validate()
+        return bundle
 
     def fingerprint(self) -> str:
         return _stable_hash(self.to_dict())

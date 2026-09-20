@@ -8,6 +8,7 @@ from .evidence_resolver import (
 from .evidence_loader import (
     PreprocessEvidence,
     PreprocessEvidenceLoader,
+    ValidationSourceAuthorityError,
     build_evidence_context_from_preprocess,
 )
 from validation.review_validator import (
@@ -83,6 +84,7 @@ __all__ = [
     "build_evidence_resolver_context",
     "PreprocessEvidence",
     "PreprocessEvidenceLoader",
+    "ValidationSourceAuthorityError",
     "build_evidence_context_from_preprocess",
     "CitationValidationResult",
     "ReviewValidationReport",

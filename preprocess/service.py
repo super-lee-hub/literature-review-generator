@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import io
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -12,9 +14,12 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import zipfile
-from dataclasses import asdict, dataclass
-from typing import Any, Dict, Iterable, List, Optional
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, cast
 from urllib.parse import urljoin, urlparse
 
 try:
@@ -23,16 +28,325 @@ except ImportError:  # pragma: no cover - compatibility with older PyMuPDF relea
     import fitz  # type: ignore
 import requests  # type: ignore
 
-from services.stage1_input_selector import Stage1InputSelection, select_stage1_input
-from services.stage1_input_completeness import build_completeness_metrics, has_blocking_stage1_reason
 from preprocess.provider_circuit import ProviderCircuitBreaker, ProviderCircuitOpen
-
-DEFAULT_MINERU_ALLOWED_URL_HOSTS = frozenset(
-    {
-        "mineru.oss-cn-shanghai.aliyuncs.com",
-        "cdn-mineru.openxlab.org.cn",
-    }
+from services.durable_io import atomic_replace_with_retry, interprocess_file_lock
+from services.job_workspace import atomic_write_json, is_reparse_path
+from services.stage1_input_completeness import (
+    build_completeness_metrics,
+    has_blocking_stage1_reason,
 )
+from services.stage1_input_selector import Stage1InputSelection, select_stage1_input
+from services.mineru_policy import (
+    DEFAULT_MINERU_ALLOWED_URL_HOSTS as SHARED_DEFAULT_MINERU_ALLOWED_URL_HOSTS,
+    effective_mineru_allowed_url_hosts,
+    normalize_exact_mineru_host,
+    parse_mineru_http_url,
+)
+from services.settings import (
+    PreprocessParserPolicy,
+    resolve_preprocess_parser_policy,
+)
+
+DEFAULT_MINERU_ALLOWED_URL_HOSTS = SHARED_DEFAULT_MINERU_ALLOWED_URL_HOSTS
+DEFAULT_MINERU_RESPONSE_MAX_BYTES = 64 * 1024 * 1024
+DEFAULT_MINERU_ZIP_MAX_ENTRIES = 4096
+DEFAULT_MINERU_ZIP_MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
+DEFAULT_MINERU_ZIP_MAX_ENTRY_BYTES = 64 * 1024 * 1024
+DEFAULT_MINERU_ZIP_MAX_COMPRESSION_RATIO = 200.0
+DEFAULT_MINERU_JSON_MAX_BYTES = 32 * 1024 * 1024
+DEFAULT_MINERU_TEXT_MAX_BYTES = 64 * 1024 * 1024
+DEFAULT_MINERU_SOURCE_PDF_MAX_BYTES = 128 * 1024 * 1024
+DEFAULT_MINERU_REQUEST_TIMEOUT_SECONDS = 60.0
+DEFAULT_MINERU_UPLOAD_TIMEOUT_SECONDS = 120.0
+DEFAULT_MINERU_DOWNLOAD_TIMEOUT_SECONDS = 120.0
+DEFAULT_MINERU_POLL_INTERVAL_SECONDS = 3.0
+DEFAULT_MINERU_POLL_TIMEOUT_SECONDS = 900.0
+DEFAULT_MINERU_REQUEST_MAX_RETRIES = 2
+DEFAULT_MINERU_RETRY_BACKOFF_SECONDS = 1.5
+DEFAULT_MINERU_MAX_REMOTE_TASKS = 50
+DEFAULT_MINERU_MAX_REMOTE_HTTP_CALLS = 500
+DEFAULT_MINERU_MAX_REMOTE_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
+PREPROCESS_MANIFEST_SCHEMA_VERSION = "preprocess-manifest-v2"
+PREPROCESS_ACTIVE_POINTER_SCHEMA_VERSION = "preprocess-active-generation-v1"
+PREPROCESS_GENERATION_LEASE_SCHEMA_VERSION = "preprocess-generation-lease-v1"
+DEFAULT_PREPROCESS_GENERATION_LEASE_TTL_SECONDS = 6 * 60 * 60
+STAGE1_INPUT_SELECTOR_VERSION = "stage1-input-selector-v1"
+PREPROCESS_IMPLEMENTATION_VERSION = "preprocess-service-20260915-v3"
+
+
+class MineruArtifactError(RuntimeError):
+    """Base class for malformed or resource-exhausting remote artifacts."""
+
+
+class MineruArtifactLimitError(MineruArtifactError):
+    """Raised when a remote response/archive exceeds a configured bound."""
+
+
+class MineruArtifactFormatError(MineruArtifactError):
+    """Raised when a remote artifact is not a valid supported archive."""
+
+
+class MineruConfigurationError(MineruArtifactError):
+    """Raised before transport when a MinerU execution bound is invalid."""
+
+
+class MineruBudgetExceeded(MineruArtifactError):
+    """Raised before transport when the run-owned remote-parser budget is spent."""
+
+
+class MineruSubmissionUncertainError(MineruArtifactError):
+    """A task-create POST may have been accepted but cannot be proved safe to retry."""
+
+
+@dataclass
+class MineruRemoteBudget:
+    """Shared, finite accounting for one job's remote-parser side effects."""
+
+    max_tasks: int | None = None
+    max_http_calls: int | None = None
+    max_upload_bytes: int | None = None
+    tasks_used: int = 0
+    http_calls_used: int = 0
+    upload_bytes_used: int = 0
+    state_path: str | Path | None = None
+    _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+    _reservations: dict[str, dict[str, Any]] = field(default_factory=dict, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.state_path:
+            self.state_path = str(Path(self.state_path).expanduser().resolve())
+
+    def _durable_path(self) -> Path | None:
+        if not self.state_path:
+            return None
+        return Path(self.state_path).expanduser().resolve()
+
+    @staticmethod
+    def _integer(value: Any, *, field_name: str) -> int:
+        if isinstance(value, bool):
+            raise MineruConfigurationError(f"MinerU budget field {field_name} must be an integer")
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise MineruConfigurationError(
+                f"MinerU budget field {field_name} must be an integer"
+            ) from exc
+        if parsed < 0:
+            raise MineruConfigurationError(
+                f"MinerU budget field {field_name} must be non-negative"
+            )
+        return parsed
+
+    def _read_state_unlocked(self) -> Mapping[str, Any] | None:
+        target = self._durable_path()
+        if target is None or not target.is_file():
+            return None
+        try:
+            payload = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise MineruConfigurationError("MinerU budget state is unreadable") from exc
+        if not isinstance(payload, Mapping) or payload.get("schema_version") != "mineru-remote-budget-v1":
+            raise MineruConfigurationError("MinerU budget state schema is invalid")
+        return payload
+
+    def _apply_state_unlocked(self, payload: Mapping[str, Any]) -> None:
+        limits = payload.get("limits")
+        if not isinstance(limits, Mapping):
+            raise MineruConfigurationError("MinerU budget state limits are missing")
+        stored_limits = (
+            self._integer(limits.get("max_tasks"), field_name="max_tasks"),
+            self._integer(limits.get("max_http_calls"), field_name="max_http_calls"),
+            self._integer(limits.get("max_upload_bytes"), field_name="max_upload_bytes"),
+        )
+        current_limits = (self.max_tasks, self.max_http_calls, self.max_upload_bytes)
+        if any(value is not None for value in current_limits):
+            if any(
+                value is not None and value != stored
+                for value, stored in zip(current_limits, stored_limits, strict=True)
+            ):
+                raise MineruConfigurationError("MinerU budget state limits changed")
+        self.max_tasks, self.max_http_calls, self.max_upload_bytes = stored_limits
+        self.tasks_used = self._integer(payload.get("tasks_used", 0), field_name="tasks_used")
+        self.http_calls_used = self._integer(
+            payload.get("http_calls_used", 0), field_name="http_calls_used"
+        )
+        self.upload_bytes_used = self._integer(
+            payload.get("upload_bytes_used", 0), field_name="upload_bytes_used"
+        )
+        raw_reservations = payload.get("reservations", {})
+        if not isinstance(raw_reservations, Mapping):
+            raise MineruConfigurationError("MinerU budget reservations are invalid")
+        self._reservations = {
+            str(key): dict(value)
+            for key, value in raw_reservations.items()
+            if isinstance(value, Mapping)
+        }
+
+    def _state_payload_unlocked(self) -> dict[str, Any]:
+        return {
+            "schema_version": "mineru-remote-budget-v1",
+            "limits": {
+                "max_tasks": int(self.max_tasks or 0),
+                "max_http_calls": int(self.max_http_calls or 0),
+                "max_upload_bytes": int(self.max_upload_bytes or 0),
+            },
+            "tasks_used": int(self.tasks_used),
+            "http_calls_used": int(self.http_calls_used),
+            "upload_bytes_used": int(self.upload_bytes_used),
+            "reservations": {
+                str(key): dict(value) for key, value in self._reservations.items()
+            },
+        }
+
+    def _persist_state_unlocked(self) -> None:
+        target = self._durable_path()
+        if target is not None:
+            atomic_write_json(str(target), self._state_payload_unlocked())
+
+    def bind_limits(
+        self,
+        *,
+        max_tasks: int,
+        max_http_calls: int,
+        max_upload_bytes: int,
+    ) -> None:
+        """Bind one configuration exactly once for a shared job budget."""
+
+        requested = (
+            self._integer(max_tasks, field_name="max_tasks"),
+            self._integer(max_http_calls, field_name="max_http_calls"),
+            self._integer(max_upload_bytes, field_name="max_upload_bytes"),
+        )
+        with self._lock:
+            current = (self.max_tasks, self.max_http_calls, self.max_upload_bytes)
+            target = self._durable_path()
+            if target is not None:
+                with interprocess_file_lock(target):
+                    existing = self._read_state_unlocked()
+                    if existing is not None:
+                        stored_limits = existing.get("limits")
+                        if not isinstance(stored_limits, Mapping):
+                            raise MineruConfigurationError("MinerU budget state limits are missing")
+                        stored = (
+                            self._integer(stored_limits.get("max_tasks"), field_name="max_tasks"),
+                            self._integer(stored_limits.get("max_http_calls"), field_name="max_http_calls"),
+                            self._integer(stored_limits.get("max_upload_bytes"), field_name="max_upload_bytes"),
+                        )
+                        if stored != requested:
+                            raise MineruConfigurationError("MinerU budget state limits changed")
+                        self._apply_state_unlocked(existing)
+                    elif any(value is not None for value in current) and tuple(current) != requested:
+                        raise MineruConfigurationError(
+                            "shared MinerU budget cannot change after remote preprocessing starts"
+                        )
+                    self.max_tasks, self.max_http_calls, self.max_upload_bytes = requested
+                    self._persist_state_unlocked()
+                return
+            if any(value is not None for value in current):
+                if tuple(current) != requested:
+                    raise MineruConfigurationError(
+                        "shared MinerU budget cannot change after remote preprocessing starts"
+                    )
+                return
+            self.max_tasks, self.max_http_calls, self.max_upload_bytes = requested
+
+    def reserve_task(self, *, reservation_id: str = "") -> str:
+        reservation = str(reservation_id or uuid.uuid4().hex).strip()
+        if not reservation:
+            raise MineruConfigurationError("MinerU task reservation ID is required")
+        with self._lock:
+            target = self._durable_path()
+            lock = interprocess_file_lock(target) if target is not None else None
+            if lock is not None:
+                with lock:
+                    existing = self._read_state_unlocked()
+                    if existing is not None:
+                        self._apply_state_unlocked(existing)
+                    self._reserve_task_unlocked(reservation)
+                    self._persist_state_unlocked()
+            else:
+                self._reserve_task_unlocked(reservation)
+        return reservation
+
+    def _reserve_task_unlocked(self, reservation: str) -> None:
+        existing = self._reservations.get(reservation)
+        if existing is not None:
+            if str(existing.get("kind") or "") != "task":
+                raise MineruConfigurationError("MinerU reservation ID has a conflicting kind")
+            return
+        if self.max_tasks is None:
+            raise MineruConfigurationError("MinerU remote-task budget is not configured")
+        if self.tasks_used >= self.max_tasks:
+            raise MineruBudgetExceeded("MinerU remote-task budget exhausted")
+        self.tasks_used += 1
+        self._reservations[reservation] = {"kind": "task", "amount": 0}
+
+    def reserve_http_call(
+        self,
+        *,
+        upload_bytes: int = 0,
+        reservation_id: str = "",
+    ) -> str:
+        if isinstance(upload_bytes, bool):
+            raise MineruConfigurationError("MinerU upload byte reservation must be an integer")
+        try:
+            payload_bytes = int(upload_bytes)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise MineruConfigurationError("MinerU upload byte reservation must be an integer") from exc
+        if payload_bytes < 0:
+            raise MineruConfigurationError("MinerU upload byte reservation must be non-negative")
+        reservation = str(reservation_id or uuid.uuid4().hex).strip()
+        if not reservation:
+            raise MineruConfigurationError("MinerU transport reservation ID is required")
+        with self._lock:
+            target = self._durable_path()
+            lock = interprocess_file_lock(target) if target is not None else None
+            if lock is not None:
+                with lock:
+                    existing = self._read_state_unlocked()
+                    if existing is not None:
+                        self._apply_state_unlocked(existing)
+                    self._reserve_http_call_unlocked(reservation, payload_bytes)
+                    self._persist_state_unlocked()
+            else:
+                self._reserve_http_call_unlocked(reservation, payload_bytes)
+        return reservation
+
+    def _reserve_http_call_unlocked(self, reservation: str, payload_bytes: int) -> None:
+        existing = self._reservations.get(reservation)
+        if existing is not None:
+            if (
+                str(existing.get("kind") or "") != "http"
+                or int(existing.get("upload_bytes") or 0) != payload_bytes
+            ):
+                raise MineruConfigurationError("MinerU reservation ID has conflicting transport data")
+            return
+        if self.max_http_calls is None or self.max_upload_bytes is None:
+            raise MineruConfigurationError("MinerU remote transport budget is not configured")
+        if self.http_calls_used >= self.max_http_calls:
+            raise MineruBudgetExceeded("MinerU remote HTTP-call budget exhausted")
+        if self.upload_bytes_used + payload_bytes > self.max_upload_bytes:
+            raise MineruBudgetExceeded("MinerU remote upload-byte budget exhausted")
+        self.http_calls_used += 1
+        self.upload_bytes_used += payload_bytes
+        self._reservations[reservation] = {"kind": "http", "upload_bytes": payload_bytes}
+
+    def snapshot(self) -> dict[str, int]:
+        with self._lock:
+            target = self._durable_path()
+            if target is not None:
+                with interprocess_file_lock(target):
+                    existing = self._read_state_unlocked()
+                    if existing is not None:
+                        self._apply_state_unlocked(existing)
+            return {
+                "max_tasks": int(self.max_tasks or 0),
+                "max_http_calls": int(self.max_http_calls or 0),
+                "max_upload_bytes": int(self.max_upload_bytes or 0),
+                "tasks_used": self.tasks_used,
+                "http_calls_used": self.http_calls_used,
+                "upload_bytes_used": self.upload_bytes_used,
+            }
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -57,6 +371,156 @@ def _as_int(value: Any, default: int) -> int:
         return default
 
 
+def _bounded_int(
+    value: Any,
+    default: int,
+    *,
+    minimum: int,
+    maximum: int,
+    field_name: str,
+) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise MineruConfigurationError(
+            f"{field_name} must be an integer between {minimum} and {maximum}"
+        ) from exc
+    if parsed < minimum or parsed > maximum:
+        raise MineruConfigurationError(
+            f"{field_name} must be between {minimum} and {maximum}"
+        )
+    return parsed
+
+
+def _bounded_float(
+    value: Any,
+    default: float,
+    *,
+    minimum: float,
+    maximum: float,
+    field_name: str,
+) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise MineruConfigurationError(
+            f"{field_name} must be a finite number between {minimum:g} and {maximum:g}"
+        ) from exc
+    if not math.isfinite(parsed) or parsed < minimum or parsed > maximum:
+        raise MineruConfigurationError(
+            f"{field_name} must be a finite number between {minimum:g} and {maximum:g}"
+        )
+    return parsed
+
+
+def _stable_hash(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
+
+
+@dataclass(frozen=True)
+class PreprocessGenerationLeaseV1:
+    lease_id: str
+    job_id: str
+    paper_key: str
+    generation_id: str
+    manifest_path: str
+    manifest_sha256: str
+    created_at: str
+    expires_at: str
+    parent_run_id: str = ""
+    lifecycle_state: str = "active"
+    schema_version: str = PREPROCESS_GENERATION_LEASE_SCHEMA_VERSION
+
+    @classmethod
+    def from_mapping(cls, raw: Mapping[str, Any]) -> "PreprocessGenerationLeaseV1":
+        allowed = {
+            "schema_version",
+            "lease_id",
+            "job_id",
+            "paper_key",
+            "parent_run_id",
+            "generation_id",
+            "manifest_path",
+            "manifest_sha256",
+            "created_at",
+            "expires_at",
+            "lifecycle_state",
+        }
+        unknown = sorted(str(key) for key in raw if str(key) not in allowed)
+        if unknown:
+            raise ValueError(
+                "preprocess generation lease has unknown fields: " + ", ".join(unknown)
+            )
+        lease = cls(
+            schema_version=str(raw.get("schema_version") or ""),
+            lease_id=str(raw.get("lease_id") or "").strip(),
+            job_id=str(raw.get("job_id") or "").strip(),
+            paper_key=str(raw.get("paper_key") or "").strip(),
+            parent_run_id=str(raw.get("parent_run_id") or "").strip(),
+            generation_id=str(raw.get("generation_id") or "").strip(),
+            manifest_path=str(raw.get("manifest_path") or "").strip(),
+            manifest_sha256=str(raw.get("manifest_sha256") or "").strip().lower(),
+            created_at=str(raw.get("created_at") or "").strip(),
+            expires_at=str(raw.get("expires_at") or "").strip(),
+            lifecycle_state=str(raw.get("lifecycle_state") or "").strip(),
+        )
+        return lease.validate()
+
+    def validate(self) -> "PreprocessGenerationLeaseV1":
+        if self.schema_version != PREPROCESS_GENERATION_LEASE_SCHEMA_VERSION:
+            raise ValueError("preprocess generation lease schema is invalid")
+        if not self.lease_id or not self.job_id or not self.paper_key:
+            raise ValueError(
+                "preprocess generation lease requires lease_id, job_id, and paper_key"
+            )
+        if (
+            not self.generation_id.startswith("generation-")
+            or os.path.basename(self.generation_id) != self.generation_id
+            or self.generation_id in {"generation-", ".", ".."}
+        ):
+            raise ValueError("preprocess generation lease generation_id is invalid")
+        if not os.path.isabs(self.manifest_path):
+            raise ValueError("preprocess generation lease manifest_path must be absolute")
+        if len(self.manifest_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in self.manifest_sha256
+        ):
+            raise ValueError("preprocess generation lease manifest_sha256 is invalid")
+        created = self.parse_timestamp(self.created_at)
+        expires = self.parse_timestamp(self.expires_at)
+        if created >= expires:
+            raise ValueError("preprocess generation lease expiry must follow creation")
+        if self.lifecycle_state != "active":
+            raise ValueError("preprocess generation lease lifecycle_state is invalid")
+        return self
+
+    @staticmethod
+    def parse_timestamp(value: object) -> datetime:
+        raw = str(value or "").strip()
+        if not raw:
+            raise ValueError("preprocess generation lease timestamp is required")
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError("preprocess generation lease timestamp must be timezone-aware")
+        return parsed.astimezone(timezone.utc)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "lease_id": self.lease_id,
+            "job_id": self.job_id,
+            "paper_key": self.paper_key,
+            "parent_run_id": self.parent_run_id,
+            "generation_id": self.generation_id,
+            "manifest_path": self.manifest_path,
+            "manifest_sha256": self.manifest_sha256,
+            "created_at": self.created_at,
+            "expires_at": self.expires_at,
+            "lifecycle_state": self.lifecycle_state,
+        }
+
+
 @dataclass
 class PageDiagnostics:
     page_number: int
@@ -76,6 +540,8 @@ class PreprocessResult:
     page_index_path: str
     chunks_path: str
     diagnostics_path: str
+    ocr_diagnostics_path: str
+    ocr_artifact_path: str
     structured_json_path: str
     manifest_path: str
     stage1_input_path: str
@@ -104,6 +570,8 @@ class PreprocessResult:
     mineru_base_url: str
     selected_text_source: str
     stage1_quality_level: str
+    stage1_quality_reasons: List[str] = field(default_factory=list)
+    mineru_receipt: Dict[str, Any] = field(default_factory=dict)
 
 
 class PreprocessManager:
@@ -111,15 +579,28 @@ class PreprocessManager:
 
     def __init__(
         self,
-        config: Optional[Dict[str, Any]] = None,
+        config: Mapping[str, Any] | None = None,
         logger: Any = None,
         *,
         mineru_circuit_breaker: ProviderCircuitBreaker | None = None,
+        preprocess_environment_resolved: bool | None = None,
+        mineru_budget: MineruRemoteBudget | None = None,
+        mineru_budget_state_path: str | Path | None = None,
+        mineru_trace_state_path: str | Path | None = None,
+        cancellation_checker: Callable[[], None] | None = None,
+        mineru_receipt_sink: Callable[[Mapping[str, Any]], None] | None = None,
     ):
         self.config = config or {}
         self.logger = logger
-        preprocess_section = self.config.get("Preprocess", {}) if isinstance(self.config, dict) else {}
-        paths_section = self.config.get("Paths", {}) if isinstance(self.config, dict) else {}
+        self._ocr_engines_used: set[str] = set()
+        self.cancellation_checker = cancellation_checker
+        preprocess_section = self.config.get("Preprocess", {}) if isinstance(self.config, Mapping) else {}
+        paths_section = self.config.get("Paths", {}) if isinstance(self.config, Mapping) else {}
+        self.preprocess_environment_resolved = (
+            bool(preprocess_environment_resolved)
+            if preprocess_environment_resolved is not None
+            else bool(getattr(self.config, "preprocess_environment_resolved", False))
+        )
 
         self.enabled = _as_bool(preprocess_section.get("enabled", "true"), default=True)
         self.cache_root = preprocess_section.get("cache_dir") or os.path.join(
@@ -130,8 +611,31 @@ class PreprocessManager:
         self.ocr_mode = str(preprocess_section.get("ocr_mode", "auto")).strip().lower()
         self.ocr_languages = str(preprocess_section.get("ocr_languages", "eng")).strip() or "eng"
         self.force_rebuild = _as_bool(preprocess_section.get("force_rebuild", "false"))
+        self.generation_lease_ttl_seconds = max(
+            60.0,
+            _as_float(
+                preprocess_section.get(
+                    "generation_lease_ttl_seconds",
+                    DEFAULT_PREPROCESS_GENERATION_LEASE_TTL_SECONDS,
+                ),
+                DEFAULT_PREPROCESS_GENERATION_LEASE_TTL_SECONDS,
+            ),
+        )
         self.enable_local_rag = _as_bool(preprocess_section.get("enable_local_rag", "false"))
         self.rag_backend = str(preprocess_section.get("rag_backend", "chroma")).strip().lower()
+        self.local_rag_allow_model_download = _as_bool(
+            preprocess_section.get("local_rag_allow_model_download", "false")
+        )
+        self.local_rag_retain_recent_identities = min(
+            1000,
+            max(
+                0,
+                _as_int(
+                    preprocess_section.get("local_rag_retain_recent_identities", "2"),
+                    2,
+                ),
+            ),
+        )
         self.rag_persist_dir = os.path.join(self.cache_root, "_rag")
 
         self.parser_mode = str(preprocess_section.get("parser_mode", "local")).strip().lower() or "local"
@@ -145,13 +649,29 @@ class PreprocessManager:
         self.retain_page_index = _as_bool(preprocess_section.get("retain_page_index", "true"), default=True)
         self.retain_diagnostics = _as_bool(preprocess_section.get("retain_diagnostics", "true"), default=True)
         self.force_docling_strategy = False
+        def setting(key: str, env_name: str, default: str) -> str:
+            if not self.preprocess_environment_resolved:
+                process_value = str(os.environ.get(env_name) or "").strip()
+                if process_value:
+                    return process_value
+            return str(preprocess_section.get(key, default)).strip()
 
-        self.mineru_base_url = str(os.getenv("MINERU_BASE_URL", "https://mineru.net/api/v4")).strip().rstrip("/")
-        self.mineru_api_token = str(os.getenv("MINERU_API_TOKEN", "")).strip()
-        self.mineru_model_version = str(os.getenv("MINERU_MODEL_VERSION", "vlm")).strip() or "vlm"
-        self.mineru_upload_endpoint = str(os.getenv("MINERU_UPLOAD_ENDPOINT", "/file-urls/batch")).strip() or "/file-urls/batch"
-        templates_raw = os.getenv(
-            "MINERU_POLL_ENDPOINT_TEMPLATES",
+        self.source_pdf_max_bytes = max(
+            1,
+            _as_int(
+                setting(
+                    "source_pdf_max_bytes",
+                    "MINERU_SOURCE_PDF_MAX_BYTES",
+                    str(DEFAULT_MINERU_SOURCE_PDF_MAX_BYTES),
+                ),
+                DEFAULT_MINERU_SOURCE_PDF_MAX_BYTES,
+            ),
+        )
+        self.mineru_base_url = setting("mineru_base_url", "MINERU_BASE_URL", "https://mineru.net/api/v4").rstrip("/")
+        self.mineru_api_token = setting("mineru_api_token", "MINERU_API_TOKEN", "")
+        self.mineru_model_version = setting("mineru_model_version", "MINERU_MODEL_VERSION", "vlm") or "vlm"
+        self.mineru_upload_endpoint = setting("mineru_upload_endpoint", "MINERU_UPLOAD_ENDPOINT", "/file-urls/batch") or "/file-urls/batch"
+        templates_raw = setting("mineru_poll_endpoint_templates", "MINERU_POLL_ENDPOINT_TEMPLATES",
             "/extract-results/batch/{batch_id},/extract-results/{batch_id},/extract/task/{batch_id}",
         )
         self.mineru_poll_endpoint_templates = [
@@ -159,87 +679,693 @@ class PreprocessManager:
             for item in str(templates_raw).split(",")
             if item.strip()
         ]
-        self.mineru_poll_interval_seconds = _as_float(os.getenv("MINERU_POLL_INTERVAL_SECONDS", "3"), 3.0)
-        self.mineru_poll_timeout_seconds = _as_float(os.getenv("MINERU_POLL_TIMEOUT_SECONDS", "900"), 900.0)
-        self.mineru_request_max_retries = _as_int(os.getenv("MINERU_REQUEST_MAX_RETRIES", "2"), 2)
-        self.mineru_retry_backoff_seconds = _as_float(os.getenv("MINERU_RETRY_BACKOFF_SECONDS", "1.5"), 1.5)
-        configured_allowed_hosts = {
-            item.strip().lower()
-            for item in str(os.getenv("MINERU_ALLOWED_URL_HOSTS", "")).split(",")
-            if item.strip()
-        }
-        self.mineru_invalid_allowed_url_hosts = {
-            item
-            for item in configured_allowed_hosts
-            if not self._is_safe_exact_mineru_host(item)
-        }
-        self.mineru_allowed_url_hosts = set(DEFAULT_MINERU_ALLOWED_URL_HOSTS)
-        self.mineru_allowed_url_hosts.update(
-            item
-            for item in configured_allowed_hosts
-            if item not in self.mineru_invalid_allowed_url_hosts
+        self.mineru_poll_interval_seconds = _bounded_float(
+            setting("mineru_poll_interval_seconds", "MINERU_POLL_INTERVAL_SECONDS", str(DEFAULT_MINERU_POLL_INTERVAL_SECONDS)),
+            DEFAULT_MINERU_POLL_INTERVAL_SECONDS,
+            minimum=0.1,
+            maximum=60.0,
+            field_name="mineru_poll_interval_seconds",
         )
-        self.allow_local_parse_fallback = _as_bool(os.getenv("ALLOW_LOCAL_PARSE_FALLBACK", "true"), default=True)
-        self.docling_timeout_seconds = _as_float(
-            preprocess_section.get("docling_timeout_seconds", os.getenv("DOCLING_TIMEOUT_SECONDS", "300")),
+        self.mineru_poll_timeout_seconds = _bounded_float(
+            setting("mineru_poll_timeout_seconds", "MINERU_POLL_TIMEOUT_SECONDS", str(DEFAULT_MINERU_POLL_TIMEOUT_SECONDS)),
+            DEFAULT_MINERU_POLL_TIMEOUT_SECONDS,
+            minimum=1.0,
+            maximum=3600.0,
+            field_name="mineru_poll_timeout_seconds",
+        )
+        self.mineru_request_timeout_seconds = _bounded_float(
+            setting("mineru_request_timeout_seconds", "MINERU_REQUEST_TIMEOUT_SECONDS", str(DEFAULT_MINERU_REQUEST_TIMEOUT_SECONDS)),
+            DEFAULT_MINERU_REQUEST_TIMEOUT_SECONDS,
+            minimum=1.0,
+            maximum=600.0,
+            field_name="mineru_request_timeout_seconds",
+        )
+        self.mineru_upload_timeout_seconds = _bounded_float(
+            setting("mineru_upload_timeout_seconds", "MINERU_UPLOAD_TIMEOUT_SECONDS", str(DEFAULT_MINERU_UPLOAD_TIMEOUT_SECONDS)),
+            DEFAULT_MINERU_UPLOAD_TIMEOUT_SECONDS,
+            minimum=1.0,
+            maximum=900.0,
+            field_name="mineru_upload_timeout_seconds",
+        )
+        self.mineru_download_timeout_seconds = _bounded_float(
+            setting("mineru_download_timeout_seconds", "MINERU_DOWNLOAD_TIMEOUT_SECONDS", str(DEFAULT_MINERU_DOWNLOAD_TIMEOUT_SECONDS)),
+            DEFAULT_MINERU_DOWNLOAD_TIMEOUT_SECONDS,
+            minimum=1.0,
+            maximum=900.0,
+            field_name="mineru_download_timeout_seconds",
+        )
+        self.mineru_request_max_retries = _bounded_int(
+            setting("mineru_request_max_retries", "MINERU_REQUEST_MAX_RETRIES", str(DEFAULT_MINERU_REQUEST_MAX_RETRIES)),
+            DEFAULT_MINERU_REQUEST_MAX_RETRIES,
+            minimum=0,
+            maximum=5,
+            field_name="mineru_request_max_retries",
+        )
+        self.mineru_retry_backoff_seconds = _bounded_float(
+            setting("mineru_retry_backoff_seconds", "MINERU_RETRY_BACKOFF_SECONDS", str(DEFAULT_MINERU_RETRY_BACKOFF_SECONDS)),
+            DEFAULT_MINERU_RETRY_BACKOFF_SECONDS,
+            minimum=0.0,
+            maximum=60.0,
+            field_name="mineru_retry_backoff_seconds",
+        )
+        self.mineru_response_max_bytes = max(
+            1,
+            _as_int(
+                setting("mineru_response_max_bytes", "MINERU_RESPONSE_MAX_BYTES", str(DEFAULT_MINERU_RESPONSE_MAX_BYTES)),
+                DEFAULT_MINERU_RESPONSE_MAX_BYTES,
+            ),
+        )
+        self.mineru_zip_max_entries = max(
+            1,
+            _as_int(
+                setting("mineru_zip_max_entries", "MINERU_ZIP_MAX_ENTRIES", str(DEFAULT_MINERU_ZIP_MAX_ENTRIES)),
+                DEFAULT_MINERU_ZIP_MAX_ENTRIES,
+            ),
+        )
+        self.mineru_zip_max_uncompressed_bytes = max(
+            1,
+            _as_int(
+                setting("mineru_zip_max_uncompressed_bytes", "MINERU_ZIP_MAX_UNCOMPRESSED_BYTES", str(DEFAULT_MINERU_ZIP_MAX_UNCOMPRESSED_BYTES)),
+                DEFAULT_MINERU_ZIP_MAX_UNCOMPRESSED_BYTES,
+            ),
+        )
+        self.mineru_zip_max_entry_bytes = max(
+            1,
+            _as_int(
+                setting("mineru_zip_max_entry_bytes", "MINERU_ZIP_MAX_ENTRY_BYTES", str(DEFAULT_MINERU_ZIP_MAX_ENTRY_BYTES)),
+                DEFAULT_MINERU_ZIP_MAX_ENTRY_BYTES,
+            ),
+        )
+        self.mineru_zip_max_compression_ratio = max(
+            1.0,
+            _as_float(
+                    setting("mineru_zip_max_compression_ratio", "MINERU_ZIP_MAX_COMPRESSION_RATIO", str(DEFAULT_MINERU_ZIP_MAX_COMPRESSION_RATIO)),
+                DEFAULT_MINERU_ZIP_MAX_COMPRESSION_RATIO,
+            ),
+        )
+        self.mineru_json_max_bytes = max(
+            1,
+            _as_int(
+                setting("mineru_json_max_bytes", "MINERU_JSON_MAX_BYTES", str(DEFAULT_MINERU_JSON_MAX_BYTES)),
+                DEFAULT_MINERU_JSON_MAX_BYTES,
+            ),
+        )
+        self.mineru_text_max_bytes = max(
+            1,
+            _as_int(
+                setting("mineru_text_max_bytes", "MINERU_TEXT_MAX_BYTES", str(DEFAULT_MINERU_TEXT_MAX_BYTES)),
+                DEFAULT_MINERU_TEXT_MAX_BYTES,
+            ),
+        )
+        configured_allowed_hosts = setting(
+            "mineru_allowed_url_hosts", "MINERU_ALLOWED_URL_HOSTS", ""
+        )
+        (
+            effective_allowed_hosts,
+            invalid_allowed_hosts,
+        ) = effective_mineru_allowed_url_hosts(configured_allowed_hosts)
+        self.mineru_invalid_allowed_url_hosts = set(invalid_allowed_hosts)
+        # This is the one effective destination set used by preflight and the
+        # result URL validator.  Trust admission imports the same helper and
+        # therefore acknowledges precisely this set, including defaults.
+        self.mineru_allowed_url_hosts = set(effective_allowed_hosts)
+        legacy_local_fallback = setting(
+            "allow_local_parse_fallback", "ALLOW_LOCAL_PARSE_FALLBACK", "true"
+        )
+        try:
+            self.parser_policy: PreprocessParserPolicy = resolve_preprocess_parser_policy(
+                self.parser_mode,
+                self.primary_parser,
+                self.fallback_parser,
+                allow_local_parse_fallback=legacy_local_fallback,
+            )
+        except ValueError as exc:
+            raise MineruConfigurationError(str(exc)) from exc
+        self.parser_mode = self.parser_policy.parser_mode
+        self.primary_parser = self.parser_policy.primary_parser
+        self.fallback_parser = self.parser_policy.fallback_parser
+        self.allow_local_parse_fallback = self.parser_policy.local_fallback_allowed
+        self.docling_timeout_seconds = _bounded_float(
+            setting("docling_timeout_seconds", "DOCLING_TIMEOUT_SECONDS", "300"),
             300.0,
+            minimum=1.0,
+            maximum=900.0,
+            field_name="docling_timeout_seconds",
         )
-        self.ocr_timeout_seconds = _as_float(
-            preprocess_section.get("ocr_timeout_seconds", os.getenv("OCR_TIMEOUT_SECONDS", "120")),
+        self.ocr_timeout_seconds = _bounded_float(
+            setting("ocr_timeout_seconds", "OCR_TIMEOUT_SECONDS", "120"),
             120.0,
+            minimum=1.0,
+            maximum=600.0,
+            field_name="ocr_timeout_seconds",
         )
+        self.mineru_max_remote_tasks = _bounded_int(
+            setting("mineru_max_remote_tasks", "MINERU_MAX_REMOTE_TASKS", str(DEFAULT_MINERU_MAX_REMOTE_TASKS)),
+            DEFAULT_MINERU_MAX_REMOTE_TASKS,
+            minimum=1,
+            maximum=1000,
+            field_name="mineru_max_remote_tasks",
+        )
+        self.mineru_max_remote_http_calls = _bounded_int(
+            setting("mineru_max_remote_http_calls", "MINERU_MAX_REMOTE_HTTP_CALLS", str(DEFAULT_MINERU_MAX_REMOTE_HTTP_CALLS)),
+            DEFAULT_MINERU_MAX_REMOTE_HTTP_CALLS,
+            minimum=1,
+            maximum=10000,
+            field_name="mineru_max_remote_http_calls",
+        )
+        self.mineru_max_remote_upload_bytes = _bounded_int(
+            setting("mineru_max_remote_upload_bytes", "MINERU_MAX_REMOTE_UPLOAD_BYTES", str(DEFAULT_MINERU_MAX_REMOTE_UPLOAD_BYTES)),
+            DEFAULT_MINERU_MAX_REMOTE_UPLOAD_BYTES,
+            minimum=1,
+            maximum=10_000_000_000,
+            field_name="mineru_max_remote_upload_bytes",
+        )
+        self.mineru_budget = mineru_budget or MineruRemoteBudget(
+            state_path=mineru_budget_state_path
+        )
+        self.mineru_budget.bind_limits(
+            max_tasks=self.mineru_max_remote_tasks,
+            max_http_calls=self.mineru_max_remote_http_calls,
+            max_upload_bytes=self.mineru_max_remote_upload_bytes,
+        )
+        self.mineru_receipt_sink = mineru_receipt_sink
+        self._active_mineru_trace: dict[str, Any] | None = None
+        self._active_mineru_private: dict[str, Any] | None = None
+        self._resumed_mineru_payload: dict[str, Any] | None = None
+        self._mineru_trace_state_path = (
+            Path(mineru_trace_state_path).expanduser().resolve()
+            if mineru_trace_state_path
+            else None
+        )
+        self._last_mineru_receipt: dict[str, Any] = {}
         self.mineru_circuit_breaker = mineru_circuit_breaker or ProviderCircuitBreaker("mineru")
+        self.processing_fingerprint = self._processing_fingerprint()
+        self._last_mineru_upload_bytes = 0
 
     def preflight_mineru(self) -> None:
         """Validate local route configuration before creating a remote task."""
         self.mineru_circuit_breaker.ensure_closed()
         if not self.mineru_api_token:
             raise ValueError("MINERU_API_TOKEN is not configured")
-        parsed = urlparse(self.mineru_base_url)
-        if parsed.scheme.lower() != "https" or not parsed.hostname:
-            raise ValueError("MINERU_BASE_URL must be an absolute HTTPS URL")
+        try:
+            parse_mineru_http_url(self.mineru_base_url, require_https=True)
+        except ValueError as exc:
+            raise ValueError("MINERU_BASE_URL must be an absolute HTTPS URL without userinfo") from exc
         self._validate_mineru_url(
             self.mineru_base_url,
             purpose="preflight URL",
             require_mineru_origin=True,
         )
 
-    def prepare_pdf(self, pdf_path: str) -> Optional[PreprocessResult]:
+    def _mineru_config_fingerprint(self) -> str:
+        """Return a secret-free identity for the parser route and its bounds."""
+
+        return _stable_hash(
+            {
+                "base_url": self.mineru_base_url,
+                "model_version": self.mineru_model_version,
+                "parser_mode": self.parser_policy.parser_mode,
+                "primary_parser": self.parser_policy.primary_parser,
+                "fallback_parser": self.parser_policy.fallback_parser,
+                "request_timeout_seconds": self.mineru_request_timeout_seconds,
+                "upload_timeout_seconds": self.mineru_upload_timeout_seconds,
+                "download_timeout_seconds": self.mineru_download_timeout_seconds,
+                "poll_interval_seconds": self.mineru_poll_interval_seconds,
+                "poll_timeout_seconds": self.mineru_poll_timeout_seconds,
+                "request_max_retries": self.mineru_request_max_retries,
+                "allowed_url_hosts": sorted(self.mineru_allowed_url_hosts),
+                "budget_limits": {
+                    "max_tasks": self.mineru_max_remote_tasks,
+                    "max_http_calls": self.mineru_max_remote_http_calls,
+                    "max_upload_bytes": self.mineru_max_remote_upload_bytes,
+                },
+            }
+        )
+
+    def _begin_mineru_trace(self, *, pdf_path: str, request_payload: Mapping[str, Any]) -> None:
+        """Reserve the charged task before its non-idempotent create request."""
+
+        if self._active_mineru_trace is not None:
+            raise MineruConfigurationError("MinerU trace is already active")
+        source_identity = self._source_identity(pdf_path)
+        source_sha256 = str(source_identity["sha256"])
+        request_hash = _stable_hash(dict(request_payload))
+        config_hash = self._mineru_config_fingerprint()
+        pending = self._read_mineru_trace_state()
+        if pending is not None and pending.get("state") == "in_progress":
+            pending_trace = pending.get("trace")
+            pending_private = pending.get("private")
+            if not isinstance(pending_trace, Mapping) or not isinstance(pending_private, Mapping):
+                raise MineruSubmissionUncertainError(
+                    "MinerU has an unreadable pending submission; refusing to create another task"
+                )
+            if (
+                str(pending_trace.get("source_pdf_sha256") or "") != source_sha256
+                or str(pending_trace.get("request_hash") or "") != request_hash
+                or str(pending_trace.get("config_hash") or "") != config_hash
+            ):
+                raise MineruSubmissionUncertainError(
+                    "MinerU has a pending submission for a different source or configuration"
+                )
+            task_id = str(pending_private.get("task_id") or "").strip()
+            if bool(pending_private.get("post_sent")) and not task_id:
+                raise MineruSubmissionUncertainError(
+                    "MinerU task-create outcome is unknown; refusing to retry the POST"
+                )
+            self._active_mineru_trace = dict(pending_trace)
+            self._active_mineru_private = dict(pending_private)
+            if not bool(self._active_mineru_private.get("budget_reserved")):
+                task_reservation_id = str(
+                    self._active_mineru_private.get("task_reservation_id") or ""
+                ).strip()
+                if not task_reservation_id:
+                    raise MineruSubmissionUncertainError(
+                        "MinerU pending submission has no stable task reservation ID"
+                    )
+                # A crash between the pending marker and the reservation must
+                # not turn the next process into an unbudgeted POST.  Reusing
+                # the stable reservation ID is idempotent in the durable
+                # budget ledger.
+                self.mineru_budget.reserve_task(reservation_id=task_reservation_id)
+                self._active_mineru_private["budget_reserved"] = True
+                self._persist_mineru_trace()
+            create_response = self._active_mineru_private.get("create_response")
+            self._resumed_mineru_payload = (
+                dict(create_response) if isinstance(create_response, Mapping) else None
+            )
+            return
+
+        receipt_id = f"mineru-receipt-{uuid.uuid4().hex}"
+        task_reservation_id = f"task:{receipt_id}"
+        self._active_mineru_trace = {
+            "artifact_type": "mineru_remote_receipt",
+            "artifact_version": "v1",
+            "receipt_id": receipt_id,
+            "source_pdf_sha256": str(source_sha256),
+            "source_pdf_size": int(source_identity.get("size") or 0),
+            "request_hash": request_hash,
+            "config_hash": config_hash,
+            "schema_hash": _stable_hash({"schema": "mineru-remote-receipt-v1"}),
+            "task_id_hash": "",
+            "response_hash": "",
+            "status": "in_progress",
+            "network_calls": 0,
+            "upload_bytes": 0,
+            "transport_events": [],
+            "transport_sequence": 0,
+            "transport_events_truncated": 0,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._active_mineru_private = {
+            "source_pdf_path": str(pdf_path),
+            "task_reservation_id": task_reservation_id,
+            "budget_reserved": False,
+            "post_sent": False,
+            "task_id": "",
+            "create_response": {},
+            "upload_targets": [],
+            "uploaded_target_hashes": [],
+        }
+        # Persist the pending marker before reserving the budget.  The
+        # reservation uses a stable ID, so a restart can safely complete the
+        # same reservation instead of allocating a second task allowance.
+        self._persist_mineru_trace()
+        self.mineru_budget.reserve_task(reservation_id=task_reservation_id)
+        self._active_mineru_private["budget_reserved"] = True
+        self._persist_mineru_trace()
+
+    def _read_mineru_trace_state(self) -> dict[str, Any] | None:
+        path = self._mineru_trace_state_path
+        if path is None or not path.is_file():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise MineruSubmissionUncertainError(
+                "MinerU pending submission state is unreadable"
+            ) from exc
+        if not isinstance(payload, Mapping) or payload.get("schema_version") != "mineru-remote-trace-v1":
+            raise MineruSubmissionUncertainError("MinerU pending submission state schema is invalid")
+        return dict(payload)
+
+    def _persist_mineru_trace(self) -> None:
+        path = self._mineru_trace_state_path
+        trace = self._active_mineru_trace
+        private = self._active_mineru_private
+        if path is None or trace is None or private is None:
+            return
+        atomic_write_json(
+            str(path),
+            {
+                "schema_version": "mineru-remote-trace-v1",
+                "state": "in_progress",
+                "trace": self._make_json_safe(trace),
+                # This file is job-owned recovery state, not a shareable
+                # receipt.  Presigned targets and task IDs never reach the
+                # public receipt sink below.
+                "private": self._make_json_safe(private),
+            },
+        )
+
+    def _remember_mineru_create_response(
+        self,
+        response: Mapping[str, Any],
+        upload_targets: Iterable[str],
+    ) -> None:
+        if self._active_mineru_private is None:
+            return
+        self._active_mineru_private["create_response"] = dict(response)
+        self._active_mineru_private["upload_targets"] = [
+            str(item) for item in upload_targets if str(item).strip()
+        ]
+        self._persist_mineru_trace()
+
+    def _clear_mineru_source_copy(self, private: Mapping[str, Any] | None) -> None:
+        raw = str((private or {}).get("source_pdf_path") or "").strip()
+        if not raw:
+            return
+        cache_root = Path(self.cache_root).expanduser().resolve()
+        try:
+            if os.path.commonpath([str(cache_root), str(Path(raw).expanduser().resolve())]) != str(
+                cache_root
+            ):
+                return
+        except ValueError:
+            return
+        try:
+            Path(raw).unlink(missing_ok=True)
+            parent = Path(raw).parent
+            if parent.name.startswith("mineru-source-") and not any(parent.iterdir()):
+                parent.rmdir()
+        except OSError:
+            pass
+
+    def _reserve_mineru_transport(
+        self,
+        *,
+        kind: str,
+        url: str,
+        upload_bytes: int = 0,
+    ) -> None:
+        """Account for every physical MinerU HTTP call before it is sent."""
+
+        trace = self._active_mineru_trace
+        if trace is None:
+            self.mineru_budget.reserve_http_call(upload_bytes=upload_bytes)
+            return
+        sequence = int(trace.get("transport_sequence") or 0) + 1
+        transport_id = f"transport:{trace.get('receipt_id')}:{sequence}"
+        reservation_id = f"http:{trace.get('receipt_id')}:{sequence}"
+        self.mineru_budget.reserve_http_call(
+            upload_bytes=upload_bytes,
+            reservation_id=reservation_id,
+        )
+        trace["transport_sequence"] = sequence
+        trace["network_calls"] = int(trace.get("network_calls") or 0) + 1
+        trace["upload_bytes"] = int(trace.get("upload_bytes") or 0) + max(0, int(upload_bytes))
+        events = list(trace.get("transport_events") or [])
+        # Retain bounded, non-secret request identity. The full URL can carry
+        # presigned query credentials and must never enter durable evidence.
+        parsed = urlparse(url)
+        event = {
+            "transport_id": transport_id,
+            "sequence": sequence,
+            "kind": str(kind),
+            "host": str(parsed.hostname or "").lower(),
+            "path_hash": _stable_hash(str(parsed.path or "")),
+            "status_code": None,
+        }
+        if len(events) < 64:
+            event["host"] = str(parsed.hostname or "").lower()
+            event["path_hash"] = _stable_hash(str(parsed.path or ""))
+            events.append(event)
+        else:
+            trace["transport_events_truncated"] = int(
+                trace.get("transport_events_truncated") or 0
+            ) + 1
+        trace["_active_transport_id"] = transport_id
+        if self._active_mineru_private is not None:
+            self._active_mineru_private["last_transport_id"] = transport_id
+            if str(kind) == "json_post":
+                self._active_mineru_private["post_sent"] = True
+        trace["transport_events"] = events
+        self._persist_mineru_trace()
+
+    def _record_mineru_transport_result(self, *, status_code: Any = None) -> None:
+        trace = self._active_mineru_trace
+        if trace is None:
+            return
+        events = list(trace.get("transport_events") or [])
+        try:
+            normalized = int(status_code) if status_code is not None else None
+        except (TypeError, ValueError):
+            normalized = None
+        active_id = str(trace.pop("_active_transport_id", "") or "")
+        for index, event in enumerate(events):
+            if str(event.get("transport_id") or "") == active_id:
+                events[index] = {**dict(event), "status_code": normalized}
+                break
+        else:
+            # The event may be outside the bounded public prefix.  Never
+            # mutate a prior event merely because the new event was omitted.
+            trace["unrecorded_transport_results"] = int(
+                trace.get("unrecorded_transport_results") or 0
+            ) + 1
+        trace["transport_events"] = events
+        if self._active_mineru_private is not None:
+            self._active_mineru_private.pop("last_transport_id", None)
+        self._persist_mineru_trace()
+
+    def _set_mineru_task_id(self, value: Any) -> None:
+        trace = self._active_mineru_trace
+        task_id = str(value or "").strip()
+        if trace is not None and task_id:
+            trace["task_id_hash"] = hashlib.sha256(task_id.encode("utf-8")).hexdigest()
+            if self._active_mineru_private is not None:
+                self._active_mineru_private["task_id"] = task_id
+            self._persist_mineru_trace()
+
+    def _finish_mineru_trace(
+        self,
+        *,
+        status: str,
+        response_identity: Mapping[str, Any] | None = None,
+        error: BaseException | None = None,
+    ) -> dict[str, Any]:
+        trace = self._active_mineru_trace
+        if trace is None:
+            return {}
+        trace["status"] = str(status)
+        if response_identity is not None:
+            trace["response_hash"] = _stable_hash(dict(response_identity))
+        if error is not None:
+            trace["error_type"] = type(error).__name__
+            trace["error_hash"] = _stable_hash(
+                {"type": type(error).__name__, "message": str(error)}
+            )
+        trace["budget"] = self.mineru_budget.snapshot()
+        trace["finished_at"] = datetime.now(timezone.utc).isoformat()
+        completed = self._make_json_safe(trace)
+        private = dict(self._active_mineru_private or {})
+        if self._mineru_trace_state_path is not None:
+            atomic_write_json(
+                str(self._mineru_trace_state_path),
+                {
+                    "schema_version": "mineru-remote-trace-v1",
+                    "state": "terminal",
+                    "trace": completed,
+                },
+            )
+        self._active_mineru_trace = None
+        self._active_mineru_private = None
+        self._resumed_mineru_payload = None
+        self._last_mineru_receipt = dict(completed)
+        if self.mineru_receipt_sink is not None:
+            self.mineru_receipt_sink(dict(completed))
+        self._clear_mineru_source_copy(private)
+        return dict(completed)
+
+    def _mark_mineru_submission_uncertain(self, error: BaseException) -> None:
+        """Keep an unresolved create/upload boundary resumable but non-retryable."""
+
+        trace = self._active_mineru_trace
+        if trace is None:
+            return
+        trace["status"] = "submission_uncertain"
+        trace["error_type"] = type(error).__name__
+        trace["error_hash"] = _stable_hash(
+            {"type": type(error).__name__, "message": str(error)}
+        )
+        trace["budget"] = self.mineru_budget.snapshot()
+        self._persist_mineru_trace()
+
+    @staticmethod
+    def _mineru_response_identity(result: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "markdown_hash": hashlib.sha256(
+                str(result.get("markdown_text") or "").encode("utf-8")
+            ).hexdigest(),
+            "plain_text_hash": hashlib.sha256(
+                str(result.get("plain_text") or "").encode("utf-8")
+            ).hexdigest(),
+            "structured_hash": _stable_hash(result.get("structured_payload") or {}),
+        }
+
+    def prepare_pdf(
+        self,
+        pdf_path: str,
+        *,
+        pin_id: str = "",
+        lease_id: str = "",
+        lease_job_id: str = "",
+        lease_paper_key: str = "",
+        lease_parent_run_id: str = "",
+    ) -> Optional[PreprocessResult]:
         """Build or reuse cached preprocess artifacts for a PDF."""
 
         if not pdf_path or not os.path.exists(pdf_path):
             return None
         if not self.enabled:
             return None
+        if lease_id and (not str(lease_job_id).strip() or not str(lease_paper_key).strip()):
+            raise ValueError(
+                "preprocess generation lease requires lease_job_id and lease_paper_key"
+            )
+        if not lease_id and any(
+            str(value or "").strip()
+            for value in (lease_job_id, lease_paper_key, lease_parent_run_id)
+        ):
+            raise ValueError("preprocess generation lease metadata requires lease_id")
 
-        cache_dir = os.path.join(self.cache_root, self._pdf_cache_key(pdf_path))
-        artifact_paths = self._artifact_paths(cache_dir)
-
-        required_paths = [
-            artifact_paths["manifest_path"],
-            artifact_paths["markdown_path"],
-            artifact_paths["plain_text_path"],
-            artifact_paths["page_index_path"],
-            artifact_paths["chunks_path"],
-            artifact_paths["diagnostics_path"],
-            artifact_paths["structured_json_path"],
-        ]
-        if (not self.force_rebuild) and self._cache_is_fresh(pdf_path, artifact_paths["manifest_path"], *required_paths[1:]):
-            return self._load_cached_result(
-                pdf_path=pdf_path,
+        source_identity = self._source_identity(pdf_path)
+        cache_dir = os.path.join(self.cache_root, self._pdf_cache_key(pdf_path, source_identity))
+        os.makedirs(cache_dir, exist_ok=True)
+        with interprocess_file_lock(Path(cache_dir) / ".preprocess-cache"):
+            return self._prepare_pdf_locked(
+                pdf_path,
+                source_identity=source_identity,
                 cache_dir=cache_dir,
-                markdown_path=artifact_paths["markdown_path"],
-                plain_text_path=artifact_paths["plain_text_path"],
-                page_index_path=artifact_paths["page_index_path"],
-                chunks_path=artifact_paths["chunks_path"],
-                diagnostics_path=artifact_paths["diagnostics_path"],
-                structured_json_path=artifact_paths["structured_json_path"],
-                manifest_path=artifact_paths["manifest_path"],
+                pin_id=pin_id,
+                lease_id=lease_id,
+                lease_job_id=lease_job_id,
+                lease_paper_key=lease_paper_key,
+                lease_parent_run_id=lease_parent_run_id,
             )
 
-        os.makedirs(cache_dir, exist_ok=True)
+    def _prepare_pdf_locked(
+        self,
+        pdf_path: str,
+        *,
+        source_identity: Dict[str, Any],
+        cache_dir: str,
+        pin_id: str = "",
+        lease_id: str = "",
+        lease_job_id: str = "",
+        lease_paper_key: str = "",
+        lease_parent_run_id: str = "",
+    ) -> Optional[PreprocessResult]:
+        try:
+            return self._prepare_pdf_locked_impl(
+                pdf_path,
+                source_identity=source_identity,
+                cache_dir=cache_dir,
+                pin_id=pin_id,
+                lease_id=lease_id,
+                lease_job_id=lease_job_id,
+                lease_paper_key=lease_paper_key,
+                lease_parent_run_id=lease_parent_run_id,
+            )
+        except BaseException:
+            # The cache-key lock makes it safe to clean all staging siblings:
+            # no other prepare_pdf process can be building this key here.
+            self._gc_generations(cache_dir, temp_ttl_seconds=0)
+            raise
+
+    def _prepare_pdf_locked_impl(
+        self,
+        pdf_path: str,
+        *,
+        source_identity: Dict[str, Any],
+        cache_dir: str,
+        pin_id: str = "",
+        lease_id: str = "",
+        lease_job_id: str = "",
+        lease_paper_key: str = "",
+        lease_parent_run_id: str = "",
+    ) -> Optional[PreprocessResult]:
+        """Build or reuse one source cache while holding its per-key lock."""
+
+        self._gc_generations(cache_dir)
+        active = self._active_generation(cache_dir)
+        if (not self.force_rebuild) and active is not None:
+            generation_dir, active_paths = active
+            required_paths = [
+                active_paths["markdown_path"],
+                active_paths["plain_text_path"],
+                active_paths["page_index_path"],
+                active_paths["chunks_path"],
+                active_paths["diagnostics_path"],
+                active_paths["ocr_diagnostics_path"],
+                active_paths["ocr_artifact_path"],
+                active_paths["structured_json_path"],
+                active_paths["stage1_input_path"],
+                active_paths["stage1_input_manifest_path"],
+                active_paths["stage1_quality_report_path"],
+            ]
+            if self._cache_is_fresh(
+                pdf_path,
+                active_paths["manifest_path"],
+                *required_paths,
+            ):
+                cached = self._load_cached_result(
+                    pdf_path=pdf_path,
+                    cache_dir=cache_dir,
+                    generation_dir=generation_dir,
+                    markdown_path=active_paths["markdown_path"],
+                    plain_text_path=active_paths["plain_text_path"],
+                    page_index_path=active_paths["page_index_path"],
+                    chunks_path=active_paths["chunks_path"],
+                    diagnostics_path=active_paths["diagnostics_path"],
+                    ocr_diagnostics_path=active_paths["ocr_diagnostics_path"],
+                    ocr_artifact_path=active_paths["ocr_artifact_path"],
+                    structured_json_path=active_paths["structured_json_path"],
+                    manifest_path=active_paths["manifest_path"],
+                )
+                if cached is not None:
+                    if pin_id:
+                        # Only pin after the complete freshness/hash check has
+                        # accepted this generation.  A stale active generation
+                        # must remain eligible for collection.
+                        self._pin_generation(
+                            cache_dir,
+                            Path(generation_dir).name,
+                            pin_id=pin_id,
+                        )
+                    if lease_id:
+                        self._acquire_generation_lease_locked(
+                            cache_dir,
+                            generation_id=Path(generation_dir).name,
+                            lease_id=lease_id,
+                            job_id=lease_job_id,
+                            paper_key=lease_paper_key,
+                            parent_run_id=lease_parent_run_id,
+                        )
+                    return cached
+
+        staging_dir = tempfile.mkdtemp(prefix=".generation.tmp-", dir=cache_dir)
+        generation_id = f"generation-{uuid.uuid4().hex}"
+        generation_dir = os.path.join(cache_dir, generation_id)
+        artifact_paths = self._artifact_paths(staging_dir)
+        published_artifact_paths = self._artifact_paths(generation_dir)
         extraction = self._extract_preferred_content(pdf_path)
         if not extraction:
+            # A normal extraction failure is still a staging failure.  Remove
+            # the temporary generation immediately; the TTL collector is only
+            # crash recovery and must not be the normal cleanup path.
+            try:
+                shutil.rmtree(staging_dir)
+            except OSError:
+                pass
             return None
 
         markdown_text = str(extraction.get("markdown_text", "") or "")
@@ -261,6 +1387,7 @@ class PreprocessManager:
             markdown_text=markdown_text,
             plain_text=plain_text,
             page_index=page_index,
+            text_layer_complete=self._has_complete_native_text_layer(page_index),
         )
         chunks = self._build_chunks(stage1_selection.selected_text, page_index)
         stage1_manifest_payload, stage1_quality_report_payload = self._stage1_selection_payloads(
@@ -272,8 +1399,10 @@ class PreprocessManager:
         scanned_like = any(item.scanned_candidate for item in page_diagnostics)
         used_ocr = any(item.used_ocr for item in page_diagnostics) or bool(extraction.get("used_ocr"))
         local_rag_built = self._maybe_build_local_rag(
-            collection_name=self._pdf_cache_key(pdf_path),
+            collection_name=self._pdf_cache_key(pdf_path, source_identity),
             chunks=chunks,
+            source_pdf_sha256=str(source_identity["sha256"]),
+            processing_fingerprint=self.processing_fingerprint,
         )
 
         extractor_used = str(extraction.get("extractor_used", "fitz") or "fitz")
@@ -284,7 +1413,28 @@ class PreprocessManager:
         mineru_token_present = bool(extraction.get("mineru_token_present"))
         mineru_remote_requested = bool(extraction.get("mineru_remote_requested"))
         mineru_remote_enabled = bool(extraction.get("mineru_remote_enabled"))
+        mineru_receipt = dict(extraction.get("mineru_receipt") or {})
         structured_payload = extraction.get("structured_payload", {})
+        ocr_page_numbers = [
+            int(item.page_number)
+            for item in page_diagnostics
+            if bool(item.used_ocr)
+        ]
+        ocr_page_text_hashes = {
+            str(item.page_number): hashlib.sha256(
+                str(next(
+                    (
+                        page.get("text")
+                        for page in page_index
+                        if isinstance(page, Mapping)
+                        and int(page.get("page_number") or 0) == int(item.page_number)
+                    ),
+                    "",
+                ) or "").encode("utf-8")
+            ).hexdigest()
+            for item in page_diagnostics
+            if bool(item.used_ocr)
+        }
 
         diagnostics_payload = {
             "extractor_used": extractor_used,
@@ -295,6 +1445,7 @@ class PreprocessManager:
             "used_ocr": used_ocr,
             "ocr_available": self._ocr_available(),
             "local_rag_enabled": self.enable_local_rag,
+            "local_rag_allow_model_download": self.local_rag_allow_model_download,
             "local_rag_built": local_rag_built,
             "mineru_attempted": mineru_attempted,
             "mineru_succeeded": mineru_succeeded,
@@ -302,6 +1453,8 @@ class PreprocessManager:
             "mineru_remote_requested": mineru_remote_requested,
             "mineru_remote_enabled": mineru_remote_enabled,
             "mineru_base_url": self.mineru_base_url,
+            "mineru_upload_bytes": int(extraction.get("mineru_upload_bytes") or self._last_mineru_upload_bytes),
+            "mineru_receipt": mineru_receipt,
             "page_diagnostics": [asdict(item) for item in page_diagnostics],
             "artifact_paths": {
                 "normalized_md": artifact_paths["markdown_path"],
@@ -310,6 +1463,8 @@ class PreprocessManager:
                 "structured": artifact_paths["structured_json_path"],
                 "chunks": artifact_paths["chunks_path"],
                 "diagnostics": artifact_paths["diagnostics_path"],
+                "ocr_diagnostics": artifact_paths["ocr_diagnostics_path"],
+                "ocr_artifact": artifact_paths["ocr_artifact_path"],
                 "prepare_manifest": artifact_paths["manifest_path"],
                 "stage1_input": artifact_paths["stage1_input_path"],
                 "stage1_input_manifest": artifact_paths["stage1_input_manifest_path"],
@@ -325,10 +1480,45 @@ class PreprocessManager:
                 "stage1_quality_report_path": artifact_paths["stage1_quality_report_path"],
             },
         }
+        ocr_diagnostics_payload = {
+            "artifact_type": "ocr_diagnostics",
+            "artifact_version": "v1",
+            "schema_version": "ocr-diagnostics-v1",
+            "source_pdf_sha256": str(source_identity["sha256"]),
+            "ocr_engine": str(
+                extraction.get("ocr_engine")
+                or (self._ocr_engine_label() if ocr_page_numbers else "none")
+            ),
+            "ocr_engine_version": "runtime-detected" if ocr_page_numbers else "not-used",
+            "page_numbers": ocr_page_numbers,
+            "ocr_page_count": len(ocr_page_numbers),
+            "output_artifact_hashes": dict(ocr_page_text_hashes),
+        }
+        ocr_artifact_payload = {
+            "artifact_type": "ocr_artifact",
+            "artifact_version": "v1",
+            "schema_version": "ocr-artifact-v1",
+            "source_pdf_sha256": str(source_identity["sha256"]),
+            "diagnostics_sha256": "",
+            "page_numbers": ocr_page_numbers,
+            "page_text_hashes": dict(ocr_page_text_hashes),
+            "stage1_input_sha256": hashlib.sha256(
+                str(stage1_selection.selected_text or "").encode("utf-8")
+            ).hexdigest(),
+        }
         manifest_payload = {
+            "schema_version": PREPROCESS_MANIFEST_SCHEMA_VERSION,
+            "implementation_version": PREPROCESS_IMPLEMENTATION_VERSION,
+            "generation_id": os.path.basename(generation_dir),
             "pdf_path": pdf_path,
-            "file_size": os.path.getsize(pdf_path),
-            "modified_time": os.path.getmtime(pdf_path),
+            "canonical_source_path": source_identity["canonical_path"],
+            "source_pdf_sha256": source_identity["sha256"],
+            "source_pdf_size": source_identity["size"],
+            "file_size": source_identity["size"],
+            "modified_time": source_identity["mtime"],
+            "source_pdf_mtime_ns": source_identity["mtime_ns"],
+            "source_pdf_file_id": source_identity["file_id"],
+            "processing_fingerprint": self.processing_fingerprint,
             "extractor_used": extractor_used,
             "layout_fidelity": layout_fidelity,
             "conversion_used": conversion_used,
@@ -337,6 +1527,7 @@ class PreprocessManager:
             "scanned_like": scanned_like,
             "used_ocr": used_ocr,
             "local_rag_enabled": self.enable_local_rag,
+            "local_rag_allow_model_download": self.local_rag_allow_model_download,
             "local_rag_built": local_rag_built,
             "local_rag_persist_dir": self.rag_persist_dir,
             "mineru_attempted": mineru_attempted,
@@ -345,6 +1536,8 @@ class PreprocessManager:
             "mineru_remote_requested": mineru_remote_requested,
             "mineru_remote_enabled": mineru_remote_enabled,
             "mineru_base_url": self.mineru_base_url,
+            "mineru_upload_bytes": int(extraction.get("mineru_upload_bytes") or self._last_mineru_upload_bytes),
+            "mineru_receipt": mineru_receipt,
             "selected_text_source": stage1_selection.selected_source,
             "stage1_quality_level": stage1_selection.quality_level,
             "stage1_quality_reasons": stage1_selection.stage1_quality_reasons,
@@ -353,53 +1546,104 @@ class PreprocessManager:
             "stage1_quality_report_path": artifact_paths["stage1_quality_report_path"],
             "artifacts": diagnostics_payload["artifact_paths"],
         }
-
-        with open(artifact_paths["markdown_path"], "w", encoding="utf-8") as handle:
-            handle.write(markdown_text)
-        with open(artifact_paths["plain_text_path"], "w", encoding="utf-8") as handle:
-            handle.write(plain_text)
-        with open(artifact_paths["page_index_path"], "w", encoding="utf-8") as handle:
-            json.dump(page_index, handle, ensure_ascii=False, indent=2)
-        with open(artifact_paths["chunks_path"], "w", encoding="utf-8") as handle:
-            json.dump(chunks, handle, ensure_ascii=False, indent=2)
-        with open(artifact_paths["stage1_input_path"], "w", encoding="utf-8") as handle:
-            handle.write(stage1_selection.selected_text)
-        with open(artifact_paths["stage1_input_manifest_path"], "w", encoding="utf-8") as handle:
-            json.dump(stage1_manifest_payload, handle, ensure_ascii=False, indent=2)
-        with open(artifact_paths["stage1_quality_report_path"], "w", encoding="utf-8") as handle:
-            json.dump(stage1_quality_report_payload, handle, ensure_ascii=False, indent=2)
-        with open(artifact_paths["diagnostics_path"], "w", encoding="utf-8") as handle:
-            json.dump(diagnostics_payload, handle, ensure_ascii=False, indent=2)
-        with open(artifact_paths["structured_json_path"], "w", encoding="utf-8") as handle:
-            json.dump(
-                {
-                    "pages": page_blocks,
-                    "page_index": page_index,
-                    "plain_text": plain_text,
-                    "markdown_text": markdown_text,
-                    "stage1_input_text": stage1_selection.selected_text,
-                    "source_payload": self._make_json_safe(structured_payload),
-                },
-                handle,
-                ensure_ascii=False,
-                indent=2,
+        # Keep all metadata path references stable across the staging-directory
+        # rename below.
+        stage1_manifest_payload = self._rewrite_generation_paths(
+            stage1_manifest_payload,
+            staging_dir,
+            generation_dir,
+        )
+        stage1_quality_report_payload = self._rewrite_generation_paths(
+            stage1_quality_report_payload,
+            staging_dir,
+            generation_dir,
+        )
+        diagnostics_payload = self._rewrite_generation_paths(
+            diagnostics_payload,
+            staging_dir,
+            generation_dir,
+        )
+        self._write_text_durable(artifact_paths["markdown_path"], markdown_text)
+        self._write_text_durable(artifact_paths["plain_text_path"], plain_text)
+        self._write_json_durable(artifact_paths["page_index_path"], page_index)
+        self._write_json_durable(artifact_paths["chunks_path"], chunks)
+        self._write_text_durable(artifact_paths["stage1_input_path"], stage1_selection.selected_text)
+        self._write_json_durable(artifact_paths["stage1_input_manifest_path"], stage1_manifest_payload)
+        self._write_json_durable(artifact_paths["stage1_quality_report_path"], stage1_quality_report_payload)
+        self._write_json_durable(artifact_paths["diagnostics_path"], diagnostics_payload)
+        self._write_json_durable(
+            artifact_paths["ocr_diagnostics_path"],
+            ocr_diagnostics_payload,
+        )
+        ocr_artifact_payload["diagnostics_sha256"] = self._file_sha256(
+            artifact_paths["ocr_diagnostics_path"]
+        )
+        self._write_json_durable(
+            artifact_paths["ocr_artifact_path"],
+            ocr_artifact_payload,
+        )
+        self._write_json_durable(
+            artifact_paths["structured_json_path"],
+            {
+                "pages": page_blocks,
+                "page_index": page_index,
+                "plain_text": plain_text,
+                "markdown_text": markdown_text,
+                "stage1_input_text": stage1_selection.selected_text,
+                "source_payload": self._make_json_safe(structured_payload),
+            },
+        )
+        manifest_payload["artifact_hashes"] = self._artifact_hashes(
+            artifact_paths,
+            exclude={"manifest_path"},
+        )
+        # Metadata is durable evidence and must never retain the staging path
+        # which disappears when the generation is atomically published.
+        manifest_payload = self._rewrite_generation_paths(
+            manifest_payload,
+            staging_dir,
+            generation_dir,
+        )
+        self._write_json_durable(artifact_paths["manifest_path"], manifest_payload)
+        # Windows scanners/indexers can briefly hold a generated leaf while
+        # the complete generation is being published.  Use the same bounded
+        # replace primitive as Registry/Queue so a transient sharing denial
+        # cannot turn an otherwise complete preprocess result into a job-wide
+        # failure, while a persistent denial still fails closed.
+        atomic_replace_with_retry(staging_dir, generation_dir, timeout_seconds=5.0)
+        self._publish_active_generation(
+            cache_dir,
+            generation_dir,
+            manifest_path=published_artifact_paths["manifest_path"],
+        )
+        if pin_id:
+            self._pin_generation(cache_dir, generation_id, pin_id=pin_id)
+        if lease_id:
+            self._acquire_generation_lease_locked(
+                cache_dir,
+                generation_id=generation_id,
+                lease_id=lease_id,
+                job_id=lease_job_id,
+                paper_key=lease_paper_key,
+                parent_run_id=lease_parent_run_id,
             )
-        with open(artifact_paths["manifest_path"], "w", encoding="utf-8") as handle:
-            json.dump(manifest_payload, handle, ensure_ascii=False, indent=2)
+        self._gc_generations(cache_dir, active_generation_id=generation_id)
 
         return PreprocessResult(
             pdf_path=pdf_path,
             cache_dir=cache_dir,
-            markdown_path=artifact_paths["markdown_path"],
-            plain_text_path=artifact_paths["plain_text_path"],
-            page_index_path=artifact_paths["page_index_path"],
-            chunks_path=artifact_paths["chunks_path"],
-            diagnostics_path=artifact_paths["diagnostics_path"],
-            structured_json_path=artifact_paths["structured_json_path"],
-            manifest_path=artifact_paths["manifest_path"],
-            stage1_input_path=artifact_paths["stage1_input_path"],
-            stage1_input_manifest_path=artifact_paths["stage1_input_manifest_path"],
-            stage1_quality_report_path=artifact_paths["stage1_quality_report_path"],
+            markdown_path=published_artifact_paths["markdown_path"],
+            plain_text_path=published_artifact_paths["plain_text_path"],
+            page_index_path=published_artifact_paths["page_index_path"],
+            chunks_path=published_artifact_paths["chunks_path"],
+            diagnostics_path=published_artifact_paths["diagnostics_path"],
+            ocr_diagnostics_path=published_artifact_paths["ocr_diagnostics_path"],
+            ocr_artifact_path=published_artifact_paths["ocr_artifact_path"],
+            structured_json_path=published_artifact_paths["structured_json_path"],
+            manifest_path=published_artifact_paths["manifest_path"],
+            stage1_input_path=published_artifact_paths["stage1_input_path"],
+            stage1_input_manifest_path=published_artifact_paths["stage1_input_manifest_path"],
+            stage1_quality_report_path=published_artifact_paths["stage1_quality_report_path"],
             markdown_text=markdown_text,
             plain_text=plain_text,
             stage1_input_text=stage1_selection.selected_text,
@@ -423,6 +1667,8 @@ class PreprocessManager:
             mineru_base_url=self.mineru_base_url,
             selected_text_source=stage1_selection.selected_source,
             stage1_quality_level=stage1_selection.quality_level,
+            stage1_quality_reasons=list(stage1_selection.stage1_quality_reasons),
+            mineru_receipt=mineru_receipt,
         )
 
     def _artifact_paths(self, cache_dir: str) -> Dict[str, str]:
@@ -432,12 +1678,646 @@ class PreprocessManager:
             "page_index_path": os.path.join(cache_dir, "page_index.json"),
             "chunks_path": os.path.join(cache_dir, "chunks.json"),
             "diagnostics_path": os.path.join(cache_dir, "diagnostics.json"),
+            "ocr_diagnostics_path": os.path.join(cache_dir, "ocr_diagnostics.json"),
+            "ocr_artifact_path": os.path.join(cache_dir, "ocr_artifact.json"),
             "structured_json_path": os.path.join(cache_dir, "structured.json"),
             "manifest_path": os.path.join(cache_dir, "prepare_manifest.json"),
             "stage1_input_path": os.path.join(cache_dir, "stage1_input.md"),
             "stage1_input_manifest_path": os.path.join(cache_dir, "stage1_input_manifest.json"),
             "stage1_quality_report_path": os.path.join(cache_dir, "stage1_text_quality_report.json"),
         }
+
+    @staticmethod
+    def _rewrite_generation_paths(value: Any, staging_dir: str, generation_dir: str) -> Any:
+        """Rewrite only exact staging prefixes inside durable metadata."""
+
+        if isinstance(value, str):
+            prefix = os.path.abspath(staging_dir)
+            candidate = os.path.abspath(value) if os.path.isabs(value) else value
+            if isinstance(candidate, str) and candidate.startswith(prefix):
+                return os.path.abspath(generation_dir) + candidate[len(prefix):]
+            return value
+        if isinstance(value, dict):
+            return {
+                key: PreprocessManager._rewrite_generation_paths(
+                    item, staging_dir, generation_dir
+                )
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [
+                PreprocessManager._rewrite_generation_paths(item, staging_dir, generation_dir)
+                for item in value
+            ]
+        if isinstance(value, tuple):
+            return tuple(
+                PreprocessManager._rewrite_generation_paths(item, staging_dir, generation_dir)
+                for item in value
+            )
+        return value
+
+    def _gc_generations(
+        self,
+        cache_dir: str,
+        *,
+        active_generation_id: str | None = None,
+        keep_generations: int = 1,
+        temp_ttl_seconds: float = 24 * 60 * 60,
+    ) -> dict[str, list[str]]:
+        """Safely remove only stale, non-active cache generations."""
+
+        root = self._validated_cache_root(cache_dir)
+        active_id = str(active_generation_id or "").strip()
+        if not active_id:
+            try:
+                pointer = json.loads((root / "active_generation.json").read_text(encoding="utf-8"))
+                active_id = str(pointer.get("generation_id") or "").strip()
+            except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+                active_id = ""
+        now = time.time()
+        removed_tmp: list[str] = []
+        removed_generations: list[str] = []
+        generation_dirs: list[tuple[float, Path]] = []
+        for child in root.iterdir() if root.is_dir() else ():
+            if is_reparse_path(child):
+                if child.name.startswith(("generation-", ".generation.tmp-")):
+                    raise RuntimeError(
+                        f"preprocess generation cache contains a reparse path: {child}"
+                    )
+                continue
+            if child.is_dir() and child.name.startswith(".generation.tmp-"):
+                try:
+                    if now - child.stat().st_mtime >= max(0.0, float(temp_ttl_seconds)):
+                        shutil.rmtree(child)
+                        removed_tmp.append(str(child))
+                except OSError:
+                    continue
+            elif child.is_dir() and child.name.startswith("generation-"):
+                try:
+                    generation_dirs.append((child.stat().st_mtime, child))
+                except OSError:
+                    continue
+        generation_dirs.sort(key=lambda item: item[0], reverse=True)
+        keep_count = max(1, int(keep_generations))
+        keep_names = {path.name for _mtime, path in generation_dirs[:keep_count]}
+        keep_names.update(self._pinned_generation_ids(root))
+        keep_names.update(self._leased_generation_ids(root))
+        if active_id:
+            keep_names.add(active_id)
+        for _mtime, child in generation_dirs:
+            if child.name in keep_names:
+                continue
+            try:
+                shutil.rmtree(child)
+                removed_generations.append(str(child))
+            except OSError:
+                continue
+        return {
+            "removed_tmp": removed_tmp,
+            "removed_generations": removed_generations,
+        }
+
+    def _pin_generation(self, cache_dir: str, generation_id: str, *, pin_id: str) -> Path:
+        """Persist a job-owned pin so cache GC cannot remove its authority."""
+
+        generation_name = str(generation_id or "").strip()
+        if not generation_name.startswith("generation-") or os.path.basename(generation_name) != generation_name:
+            raise ValueError("preprocess generation pin requires a finalized generation")
+        generation_dir = Path(cache_dir).expanduser().resolve() / generation_name
+        manifest_path = generation_dir / "prepare_manifest.json"
+        if not generation_dir.is_dir() or not manifest_path.is_file():
+            raise FileNotFoundError(f"cannot pin missing preprocess generation: {generation_dir}")
+        safe_pin = hashlib.sha256(str(pin_id).encode("utf-8")).hexdigest()
+        pin_dir = Path(cache_dir).expanduser().resolve() / "generation_pins"
+        pin_path = pin_dir / f"{safe_pin}-{generation_name}.json"
+        atomic_write_json(
+            str(pin_path),
+            {
+                "schema_version": "preprocess-generation-pin-v1",
+                "pin_id": str(pin_id),
+                "generation_id": generation_name,
+                "manifest_path": str(manifest_path),
+                "manifest_sha256": self._file_sha256(str(manifest_path)),
+            },
+        )
+        return pin_path
+
+    def acquire_generation_lease(
+        self,
+        cache_dir: str,
+        *,
+        generation_id: str,
+        lease_id: str,
+        job_id: str,
+        paper_key: str,
+        parent_run_id: str = "",
+        ttl_seconds: float | None = None,
+    ) -> Path:
+        """Acquire a validated, short-lived generation lease.
+
+        The lease is intentionally separate from the legacy pin format so a
+        cache reference can be released after job-owned authority is published.
+        """
+
+        root = self._validated_cache_root(cache_dir)
+        with interprocess_file_lock(root / ".preprocess-cache"):
+            return self._acquire_generation_lease_locked(
+                str(root),
+                generation_id=generation_id,
+                lease_id=lease_id,
+                job_id=job_id,
+                paper_key=paper_key,
+                parent_run_id=parent_run_id,
+                ttl_seconds=ttl_seconds,
+            )
+
+    def _acquire_generation_lease_locked(
+        self,
+        cache_dir: str,
+        *,
+        generation_id: str,
+        lease_id: str,
+        job_id: str,
+        paper_key: str,
+        parent_run_id: str = "",
+        ttl_seconds: float | None = None,
+    ) -> Path:
+        generation_name = self._validated_generation_name(generation_id)
+        lease_name = str(lease_id or "").strip()
+        owner_job_id = str(job_id or "").strip()
+        owner_paper_key = str(paper_key or "").strip()
+        if not lease_name or not owner_job_id or not owner_paper_key:
+            raise ValueError(
+                "preprocess generation lease requires lease_id, job_id, and paper_key"
+            )
+        root = self._validated_cache_root(cache_dir)
+        _generation_root, manifest_path = self._validated_generation_manifest(
+            root, generation_name
+        )
+        lease_dir = self._validated_lease_directory(root, create=True)
+        if lease_dir is None:  # pragma: no cover - create=True is total.
+            raise RuntimeError("preprocess generation lease directory was not created")
+        lease_path = lease_dir / (
+            f"{hashlib.sha256(lease_name.encode('utf-8')).hexdigest()}-"
+            f"{generation_name}.json"
+        )
+        if lease_path.exists() and is_reparse_path(lease_path):
+            raise RuntimeError(
+                f"preprocess generation lease path is a reparse point: {lease_path}"
+            )
+        lease_ttl = max(
+            60.0,
+            float(
+                self.generation_lease_ttl_seconds
+                if ttl_seconds is None
+                else ttl_seconds
+            ),
+        )
+        created = datetime.now(timezone.utc)
+        expires = created + timedelta(seconds=lease_ttl)
+        lease = PreprocessGenerationLeaseV1(
+            lease_id=lease_name,
+            job_id=owner_job_id,
+            paper_key=owner_paper_key,
+            parent_run_id=str(parent_run_id or "").strip(),
+            generation_id=generation_name,
+            manifest_path=str(manifest_path),
+            manifest_sha256=self._file_sha256(str(manifest_path)),
+            created_at=self._utc_iso(created),
+            expires_at=self._utc_iso(expires),
+        ).validate()
+        atomic_write_json(
+            str(lease_path),
+            lease.to_dict(),
+        )
+        return lease_path
+
+    def release_generation_lease(
+        self,
+        cache_dir: str,
+        *,
+        lease_id: str,
+        generation_id: str = "",
+    ) -> int:
+        """Release one short-lived generation lease after authority publication."""
+
+        try:
+            root = self._validated_cache_root(cache_dir)
+        except FileNotFoundError:
+            return 0
+        lease_name = str(lease_id or "").strip()
+        if not lease_name:
+            raise ValueError("preprocess generation lease release requires lease_id")
+        safe_lease = hashlib.sha256(lease_name.encode("utf-8")).hexdigest()
+        wanted_generation = (
+            self._validated_generation_name(generation_id) if generation_id else ""
+        )
+        removed = 0
+        with interprocess_file_lock(root / ".preprocess-cache"):
+            lease_dir = self._validated_lease_directory(root, create=False)
+            if lease_dir is None:
+                return 0
+            for lease_path in lease_dir.glob(f"{safe_lease}-*.json"):
+                if is_reparse_path(lease_path):
+                    raise RuntimeError(
+                        f"preprocess generation lease path is a reparse point: {lease_path}"
+                    )
+                if wanted_generation and not lease_path.name.endswith(f"-{wanted_generation}.json"):
+                    continue
+                try:
+                    payload = json.loads(lease_path.read_text(encoding="utf-8"))
+                    if not isinstance(payload, Mapping):
+                        raise TypeError("preprocess generation lease must be an object")
+                    lease = PreprocessGenerationLeaseV1.from_mapping(payload)
+                    if lease.lease_id != lease_name:
+                        raise RuntimeError(
+                            f"preprocess generation lease identity is invalid: {lease_path}"
+                        )
+                    lease_path.unlink()
+                    removed += 1
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    continue
+        return removed
+
+    def _leased_generation_ids(self, root: Path) -> set[str]:
+        lease_dir = self._validated_lease_directory(root, create=False)
+        if lease_dir is None:
+            return set()
+        now = datetime.now(timezone.utc)
+        leased: set[str] = set()
+        for lease_path in lease_dir.glob("*.json"):
+            if is_reparse_path(lease_path):
+                raise RuntimeError(
+                    f"preprocess generation lease path is a reparse point: {lease_path}"
+                )
+            remove_invalid = False
+            try:
+                payload = json.loads(lease_path.read_text(encoding="utf-8"))
+                if not isinstance(payload, Mapping):
+                    raise TypeError("lease payload must be an object")
+                lease = PreprocessGenerationLeaseV1.from_mapping(payload)
+                generation_id = lease.generation_id
+                created_at = lease.parse_timestamp(lease.created_at)
+                expires_at = lease.parse_timestamp(lease.expires_at)
+                expected_name = (
+                    f"{hashlib.sha256(lease.lease_id.encode('utf-8')).hexdigest()}-"
+                    f"{generation_id}.json"
+                )
+                if (
+                    lease_path.name != expected_name
+                    or created_at > now + timedelta(minutes=5)
+                    or expires_at <= now
+                ):
+                    remove_invalid = True
+                else:
+                    _generation_root, manifest_path = self._validated_generation_manifest(
+                        root, generation_id
+                    )
+                    stored_manifest = Path(
+                        os.path.abspath(
+                            os.path.expanduser(lease.manifest_path)
+                        )
+                    )
+                    if (
+                        os.path.normcase(str(stored_manifest))
+                        != os.path.normcase(str(manifest_path))
+                        or self._file_sha256(str(manifest_path))
+                        != lease.manifest_sha256
+                    ):
+                        remove_invalid = True
+                    else:
+                        leased.add(generation_id)
+            except (
+                FileNotFoundError,
+                OSError,
+                TypeError,
+                ValueError,
+                UnicodeError,
+                json.JSONDecodeError,
+            ):
+                remove_invalid = True
+            if remove_invalid:
+                try:
+                    lease_path.unlink()
+                except OSError:
+                    pass
+        return leased
+
+    @staticmethod
+    def _validated_generation_name(generation_id: object) -> str:
+        generation_name = str(generation_id or "").strip()
+        if (
+            not generation_name.startswith("generation-")
+            or os.path.basename(generation_name) != generation_name
+            or generation_name in {"generation-", ".", ".."}
+        ):
+            raise ValueError(
+                "preprocess generation lease requires a finalized generation"
+            )
+        return generation_name
+
+    @staticmethod
+    def _reject_reparse_components(path: Path) -> None:
+        current = Path(os.path.abspath(os.path.expanduser(str(path))))
+        while True:
+            if current.exists() and is_reparse_path(current):
+                raise RuntimeError(
+                    f"preprocess cache path contains a reparse point: {current}"
+                )
+            parent = current.parent
+            if parent == current:
+                return
+            current = parent
+
+    def _validated_cache_root(self, cache_dir: str | os.PathLike[str]) -> Path:
+        root = Path(os.path.abspath(os.path.expanduser(str(cache_dir))))
+        if not root.is_dir():
+            raise FileNotFoundError(f"preprocess cache root is missing: {root}")
+        self._reject_reparse_components(root)
+        return root.resolve(strict=True)
+
+    def _validated_generation_manifest(
+        self,
+        root: Path,
+        generation_id: str,
+    ) -> tuple[Path, Path]:
+        generation_name = self._validated_generation_name(generation_id)
+        generation_lexical = root / generation_name
+        if is_reparse_path(generation_lexical):
+            raise RuntimeError(
+                "preprocess generation lease rejects a reparse generation: "
+                f"{generation_lexical}"
+            )
+        if not generation_lexical.is_dir():
+            raise FileNotFoundError(
+                f"cannot lease missing preprocess generation: {generation_lexical}"
+            )
+        generation_root = generation_lexical.resolve(strict=True)
+        if os.path.normcase(str(generation_root.parent)) != os.path.normcase(str(root)):
+            raise RuntimeError(
+                f"preprocess generation lease escapes the cache root: {generation_lexical}"
+            )
+        manifest_lexical = generation_lexical / "prepare_manifest.json"
+        if is_reparse_path(manifest_lexical):
+            raise RuntimeError(
+                "preprocess generation lease rejects a reparse manifest: "
+                f"{manifest_lexical}"
+            )
+        if not manifest_lexical.is_file():
+            raise FileNotFoundError(
+                f"cannot lease missing preprocess manifest: {manifest_lexical}"
+            )
+        manifest_path = manifest_lexical.resolve(strict=True)
+        if os.path.normcase(str(manifest_path.parent)) != os.path.normcase(
+            str(generation_root)
+        ):
+            raise RuntimeError(
+                f"preprocess generation manifest escapes its generation: {manifest_lexical}"
+            )
+        return generation_root, manifest_path
+
+    def _validated_lease_directory(
+        self,
+        root: Path,
+        *,
+        create: bool,
+    ) -> Path | None:
+        lease_dir = root / "generation_leases"
+        if lease_dir.exists():
+            if is_reparse_path(lease_dir) or not lease_dir.is_dir():
+                raise RuntimeError(
+                    f"preprocess generation lease directory is unsafe: {lease_dir}"
+                )
+        elif not create:
+            return None
+        else:
+            lease_dir.mkdir(parents=False, exist_ok=False)
+        self._reject_reparse_components(lease_dir)
+        return lease_dir.resolve(strict=True)
+
+    @staticmethod
+    def _utc_iso(value: datetime) -> str:
+        return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def release_pin(self, cache_dir: str, *, pin_id: str, generation_id: str = "") -> int:
+        """Release a short-lived cache pin after job-owned snapshot publication."""
+
+        root = Path(cache_dir).expanduser().resolve()
+        if not root.is_dir() or root.is_symlink():
+            return 0
+        safe_pin = hashlib.sha256(str(pin_id).encode("utf-8")).hexdigest()
+        wanted_generation = str(generation_id or "").strip()
+        removed = 0
+        with interprocess_file_lock(root / ".preprocess-cache"):
+            pin_dir = root / "generation_pins"
+            if not pin_dir.is_dir() or pin_dir.is_symlink():
+                return 0
+            for pin_path in pin_dir.glob(f"{safe_pin}-*.json"):
+                if pin_path.is_symlink():
+                    continue
+                if wanted_generation and not pin_path.name.endswith(f"-{wanted_generation}.json"):
+                    continue
+                try:
+                    pin_path.unlink()
+                    removed += 1
+                except OSError:
+                    continue
+        return removed
+
+    @staticmethod
+    def _pinned_generation_ids(root: Path) -> set[str]:
+        pin_dir = root / "generation_pins"
+        pinned: set[str] = set()
+        if not pin_dir.is_dir() or pin_dir.is_symlink():
+            return pinned
+        for pin_path in pin_dir.glob("*.json"):
+            if pin_path.is_symlink():
+                continue
+            try:
+                payload = json.loads(pin_path.read_text(encoding="utf-8"))
+                generation_id = str(payload.get("generation_id") or "").strip()
+                manifest_path = Path(str(payload.get("manifest_path") or "")).expanduser().resolve()
+                expected_hash = str(payload.get("manifest_sha256") or "").strip().lower()
+                generation_root = (root / generation_id).resolve()
+                if (
+                    payload.get("schema_version") == "preprocess-generation-pin-v1"
+                    and generation_id.startswith("generation-")
+                    and os.path.basename(generation_id) == generation_id
+                    and manifest_path.parent == generation_root
+                    and manifest_path.is_file()
+                    and expected_hash
+                    and PreprocessManager._file_sha256(str(manifest_path)) == expected_hash
+                ):
+                    pinned.add(generation_id)
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+        return pinned
+
+    @staticmethod
+    def _write_text_durable(path: str, value: str) -> None:
+        directory = os.path.dirname(os.path.abspath(path))
+        os.makedirs(directory, exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(str(value))
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    @staticmethod
+    def _write_json_durable(path: str, value: Any) -> None:
+        directory = os.path.dirname(os.path.abspath(path))
+        os.makedirs(directory, exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(value, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    @staticmethod
+    def _file_sha256(path: str) -> str:
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _source_identity(self, pdf_path: str) -> Dict[str, Any]:
+        canonical_path = os.path.realpath(os.path.abspath(pdf_path))
+        with open(canonical_path, "rb") as handle:
+            before = os.fstat(handle.fileno())
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+            after_handle = os.fstat(handle.fileno())
+        after_path = os.stat(canonical_path)
+        before_tuple = (
+            int(before.st_dev),
+            int(getattr(before, "st_ino", 0)),
+            int(before.st_size),
+            int(getattr(before, "st_mtime_ns", int(before.st_mtime * 1_000_000_000))),
+        )
+        after_tuple = (
+            int(after_path.st_dev),
+            int(getattr(after_path, "st_ino", 0)),
+            int(after_path.st_size),
+            int(getattr(after_path, "st_mtime_ns", int(after_path.st_mtime * 1_000_000_000))),
+        )
+        handle_tuple = (
+            int(after_handle.st_dev),
+            int(getattr(after_handle, "st_ino", 0)),
+            int(after_handle.st_size),
+            int(getattr(after_handle, "st_mtime_ns", int(after_handle.st_mtime * 1_000_000_000))),
+        )
+        if before_tuple != handle_tuple or before_tuple != after_tuple:
+            raise RuntimeError(
+                "source PDF changed while its content hash and stable file identity were being computed"
+            )
+        return {
+            "canonical_path": canonical_path,
+            "size": int(after_path.st_size),
+            "mtime": float(after_path.st_mtime),
+            "mtime_ns": int(after_path.st_mtime_ns),
+            "file_id": f"{int(after_path.st_dev)}:{int(getattr(after_path, 'st_ino', 0))}",
+            "sha256": digest.hexdigest(),
+        }
+
+    def _processing_fingerprint(self) -> str:
+        payload = {
+            "schema_version": PREPROCESS_MANIFEST_SCHEMA_VERSION,
+            "implementation_version": PREPROCESS_IMPLEMENTATION_VERSION,
+            "stage1_input_selector_version": STAGE1_INPUT_SELECTOR_VERSION,
+            "preprocess": self._make_json_safe(self.config.get("Preprocess", {})),
+            "stage1_input": self._make_json_safe(self.config.get("Stage1_Input", {})),
+            "stage1_visual": self._make_json_safe(self.config.get("Stage1_Visual", {})),
+            "extractor_profile": self.extractor_profile,
+            "parser_mode": self.parser_mode,
+            "primary_parser": self.primary_parser,
+            "fallback_parser": self.fallback_parser,
+            "local_fallback_allowed": self.parser_policy.local_fallback_allowed,
+            "ocr_mode": self.ocr_mode,
+            "ocr_languages": self.ocr_languages,
+            "mineru_model_version": self.mineru_model_version,
+            "source_pdf_max_bytes": self.source_pdf_max_bytes,
+            "mineru_remote_budget": {
+                "max_tasks": self.mineru_max_remote_tasks,
+                "max_http_calls": self.mineru_max_remote_http_calls,
+                "max_upload_bytes": self.mineru_max_remote_upload_bytes,
+            },
+            "local_rag_allow_model_download": self.local_rag_allow_model_download,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def _active_generation(self, cache_dir: str) -> Optional[tuple[str, Dict[str, str]]]:
+        pointer_path = os.path.join(cache_dir, "active_generation.json")
+        if not os.path.isfile(pointer_path) or os.path.islink(pointer_path):
+            return None
+        try:
+            with open(pointer_path, "r", encoding="utf-8") as handle:
+                pointer = json.load(handle)
+            if not isinstance(pointer, dict):
+                return None
+            if pointer.get("schema_version") != PREPROCESS_ACTIVE_POINTER_SCHEMA_VERSION:
+                return None
+            generation_name = str(pointer.get("generation_id") or "").strip()
+            if (
+                not generation_name
+                or os.path.basename(generation_name) != generation_name
+                or not generation_name.startswith("generation-")
+            ):
+                return None
+            generation_dir = os.path.join(cache_dir, generation_name)
+            if os.path.realpath(generation_dir) != os.path.abspath(generation_dir):
+                return None
+            paths = self._artifact_paths(generation_dir)
+            manifest_path = paths["manifest_path"]
+            if str(pointer.get("manifest_sha256") or "") != self._file_sha256(manifest_path):
+                return None
+            return generation_dir, paths
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return None
+
+    def _publish_active_generation(
+        self,
+        cache_dir: str,
+        generation_dir: str,
+        *,
+        manifest_path: str,
+    ) -> None:
+        generation_name = os.path.basename(generation_dir)
+        if not generation_name.startswith("generation-"):
+            raise RuntimeError("preprocess active-generation pointer requires a finalized generation")
+        pointer_path = os.path.join(cache_dir, "active_generation.json")
+        if os.path.islink(pointer_path):
+            raise RuntimeError("preprocess active-generation pointer is a symlink")
+        atomic_write_json(
+            pointer_path,
+            {
+                "schema_version": PREPROCESS_ACTIVE_POINTER_SCHEMA_VERSION,
+                "generation_id": generation_name,
+                "manifest_sha256": self._file_sha256(manifest_path),
+            },
+        )
+
+    def _artifact_hashes(
+        self,
+        artifact_paths: Mapping[str, str],
+        *,
+        exclude: set[str] | None = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        ignored = exclude or set()
+        result: Dict[str, Dict[str, Any]] = {}
+        for key, path in artifact_paths.items():
+            if key in ignored:
+                continue
+            target = Path(path)
+            result[target.name] = {
+                "relative_path": target.name,
+                "type": "json" if target.suffix.casefold() == ".json" else "text",
+                "schema_version": PREPROCESS_MANIFEST_SCHEMA_VERSION,
+                "size": int(os.path.getsize(path)),
+                "sha256": self._file_sha256(path),
+            }
+        return result
 
     def _extract_preferred_content(self, pdf_path: str) -> Optional[Dict[str, Any]]:
         baseline_plain_text, baseline_page_diagnostics, baseline_page_blocks = self._extract_local_page_data(
@@ -450,10 +2330,10 @@ class PreprocessManager:
         mineru_attempted = False
         mineru_succeeded = False
 
-        remote_requested = self.parser_mode in {"remote", "remote_first"} or (
-            self.parser_mode == "hybrid" and self.primary_parser == "mineru_remote"
-        )
+        remote_requested = self.parser_policy.remote_requested
         remote_enabled = remote_requested
+        hybrid_local_selection = False
+        remote_error: BaseException | None = None
         circuit_snapshot = self.mineru_circuit_breaker.snapshot
         if remote_requested and circuit_snapshot.open:
             remote_enabled = False
@@ -461,12 +2341,14 @@ class PreprocessManager:
                 f"MinerU disabled for this job because its circuit is open: {circuit_snapshot.reason}",
                 level="warning",
             )
-        if self.parser_mode == "hybrid" and remote_requested:
-            remote_enabled = remote_enabled and self._should_try_remote_in_hybrid(
+        if self.parser_policy.hybrid and remote_requested:
+            should_try_remote = self._should_try_remote_in_hybrid(
                 baseline_plain_text=baseline_plain_text,
                 baseline_page_diagnostics=baseline_page_diagnostics,
             )
-            if not remote_enabled:
+            hybrid_local_selection = not should_try_remote
+            remote_enabled = remote_enabled and should_try_remote
+            if hybrid_local_selection:
                 baseline_text_length = len((baseline_plain_text or "").strip())
                 total_pages = len(baseline_page_diagnostics)
                 low_quality_pages = sum(1 for item in baseline_page_diagnostics if item.low_quality)
@@ -488,19 +2370,61 @@ class PreprocessManager:
                     baseline_page_index=baseline_page_index,
                 )
                 if remote_result and (remote_result.get("markdown_text") or remote_result.get("plain_text")):
+                    mineru_succeeded = True
+                    receipt = self._finish_mineru_trace(
+                        status="remote_success",
+                        response_identity=self._mineru_response_identity(remote_result),
+                    )
                     remote_result["mineru_attempted"] = True
                     remote_result["mineru_succeeded"] = True
                     remote_result["mineru_token_present"] = mineru_token_present
                     remote_result["mineru_remote_requested"] = remote_requested
                     remote_result["mineru_remote_enabled"] = remote_enabled
+                    remote_result["mineru_receipt"] = receipt
                     return remote_result
+                remote_error = RuntimeError("MinerU remote parser returned no usable content")
+            except MineruArtifactError as exc:
+                private = self._active_mineru_private or {}
+                if bool(private.get("post_sent")) and not str(
+                    private.get("task_id") or ""
+                ).strip():
+                    # A response-size/format/error boundary after the
+                    # non-idempotent POST may mean the server accepted it.
+                    # Preserve the pending marker so a restart refuses to
+                    # create a duplicate task.
+                    self._mark_mineru_submission_uncertain(exc)
+                else:
+                    self._finish_mineru_trace(status="blocked", error=exc)
+                raise
             except Exception as exc:  # pragma: no cover - remote integration path.
+                remote_error = exc
+                private = self._active_mineru_private or {}
+                if bool(private.get("post_sent")) and not str(
+                    private.get("task_id") or ""
+                ).strip():
+                    # A non-MinerU parsing/normalization exception can still
+                    # occur after the non-idempotent POST returned an
+                    # unexpected shape.  Do not turn that unknown outcome
+                    # into a local fallback or a second POST on resume.
+                    self._mark_mineru_submission_uncertain(exc)
+                    raise MineruSubmissionUncertainError(
+                        "MinerU task-create outcome is unknown; refusing local fallback"
+                    ) from exc
                 self._log(f"MinerU remote parsing failed, falling back to local parser: {exc}", level="warning")
 
         if remote_enabled and not mineru_token_present:
             self._log("MinerU remote parsing skipped because MINERU_API_TOKEN is not configured.", level="info")
 
-        if not self.allow_local_parse_fallback and remote_requested and not mineru_succeeded:
+        if (
+            remote_requested
+            and not self.parser_policy.local_fallback_allowed
+            and not hybrid_local_selection
+            and not mineru_succeeded
+        ):
+            receipt = self._finish_mineru_trace(
+                status="remote_failed",
+                error=remote_error,
+            )
             return {
                 "markdown_text": "",
                 "plain_text": "",
@@ -517,6 +2441,7 @@ class PreprocessManager:
                 "mineru_token_present": mineru_token_present,
                 "mineru_remote_requested": remote_requested,
                 "mineru_remote_enabled": remote_enabled,
+                "mineru_receipt": receipt,
             }
 
         local_result = self._extract_with_local_fallbacks(
@@ -527,6 +2452,8 @@ class PreprocessManager:
             baseline_page_index=baseline_page_index,
         )
         if not local_result:
+            if mineru_attempted:
+                self._finish_mineru_trace(status="remote_failed", error=remote_error)
             return None
 
         local_result["mineru_attempted"] = mineru_attempted
@@ -534,6 +2461,24 @@ class PreprocessManager:
         local_result["mineru_token_present"] = mineru_token_present
         local_result["mineru_remote_requested"] = remote_requested
         local_result["mineru_remote_enabled"] = remote_enabled
+        if mineru_attempted:
+            local_result["mineru_receipt"] = self._finish_mineru_trace(
+                status="remote_failed_fallback_local",
+                response_identity={
+                    "local_result": self._mineru_response_identity(local_result),
+                    "remote_error_hash": (
+                        _stable_hash(
+                            {
+                                "type": type(remote_error).__name__,
+                                "message": str(remote_error),
+                            }
+                        )
+                        if remote_error is not None
+                        else ""
+                    ),
+                },
+                error=remote_error,
+            )
         return local_result
 
     def _should_try_remote_in_hybrid(
@@ -616,16 +2561,6 @@ class PreprocessManager:
         if local_result:
             return local_result
 
-        legacy_result = self._extract_with_legacy_pdf_extractor(
-            pdf_path=pdf_path,
-            baseline_plain_text=baseline_plain_text,
-            baseline_page_diagnostics=baseline_page_diagnostics,
-            baseline_page_blocks=baseline_page_blocks,
-            baseline_page_index=baseline_page_index,
-        )
-        if legacy_result:
-            return legacy_result
-
         return None
 
     def _extract_with_mineru_remote(
@@ -635,102 +2570,348 @@ class PreprocessManager:
         baseline_page_blocks: List[Dict[str, Any]],
         baseline_page_index: List[Dict[str, Any]],
     ) -> Optional[Dict[str, Any]]:
-        self.preflight_mineru()
-        upload_url = self._join_base_url(self.mineru_upload_endpoint)
-        payload = {
-            "files": [
-                {
-                    "name": os.path.basename(pdf_path),
-                    "data_id": self._pdf_cache_key(pdf_path),
-                }
-            ],
-            "model_version": self.mineru_model_version,
-        }
+        frozen_path = ""
+        try:
+            frozen_path, source_identity = self._freeze_mineru_source(pdf_path)
+            source_pdf_size = int(source_identity["size"])
+            self.preflight_mineru()
+            upload_url = self._join_base_url(self.mineru_upload_endpoint)
+            payload = {
+                "files": [
+                    {
+                        "name": os.path.basename(pdf_path),
+                        "data_id": self._pdf_cache_key(pdf_path, source_identity),
+                    }
+                ],
+                "model_version": self.mineru_model_version,
+            }
 
-        upload_response = self._request_json("post", upload_url, json=payload)
-        if not upload_response:
-            return None
+            # The task-create endpoint is non-idempotent. Reserve its one
+            # allowed attempt before the POST and recover a durable pending
+            # submission when this process is a resume.
+            self._begin_mineru_trace(pdf_path=frozen_path, request_payload=payload)
+            upload_response = self._resumed_mineru_payload
+            if upload_response is None:
+                upload_response = self._request_json("post", upload_url, json=payload)
+            if not upload_response:
+                raise MineruSubmissionUncertainError(
+                    "MinerU task-create response was empty; task state cannot be verified"
+                )
 
-        batch_id = str(self._find_first_value(upload_response, {"batch_id", "task_id", "id"}) or "").strip()
-        upload_targets = self._normalize_upload_targets(
-            self._find_first_value(upload_response, {"file_urls", "upload_urls", "urls"})
-        )
-        if not upload_targets:
-            raise RuntimeError("MinerU upload response did not include presigned upload URLs.")
-
-        with open(pdf_path, "rb") as handle:
-            pdf_bytes = handle.read()
-
-        for target in upload_targets:
-            self.mineru_circuit_breaker.ensure_closed()
-            response = requests.put(
-                self._validate_mineru_url(target, purpose="upload URL"),
-                data=pdf_bytes,
-                timeout=120,
-                allow_redirects=False,
+            batch_id = str(
+                self._find_first_value(upload_response, {"batch_id", "task_id", "id"}) or ""
+            ).strip()
+            if not batch_id:
+                raise MineruSubmissionUncertainError(
+                    "MinerU task-create response omitted a task identifier"
+                )
+            self._set_mineru_task_id(batch_id)
+            upload_targets = self._normalize_upload_targets(
+                self._find_first_value(upload_response, {"file_urls", "upload_urls", "urls"})
             )
-            if response.status_code in {401, 403}:
-                self.mineru_circuit_breaker.open(
-                    reason="upload_authorization_rejected",
-                    status_code=int(response.status_code),
+            if not upload_targets:
+                raise MineruSubmissionUncertainError(
+                    "MinerU task-create response omitted presigned upload URLs"
                 )
-                raise ProviderCircuitOpen(
-                    f"MinerU upload authorization rejected with HTTP {response.status_code}",
-                    snapshot=self.mineru_circuit_breaker.snapshot,
+            self._remember_mineru_create_response(upload_response, upload_targets)
+
+            # Read the job-owned frozen object once.  Subsequent source-path
+            # replacement or in-place edits cannot change the bytes sent to a
+            # presigned URL or the amount reserved in the budget.
+            frozen_bytes = Path(frozen_path).read_bytes()
+            frozen_check = self._source_identity(frozen_path)
+            if (
+                int(frozen_check["size"]) != source_pdf_size
+                or str(frozen_check["sha256"]) != str(source_identity["sha256"])
+            ):
+                raise MineruArtifactError("frozen source PDF changed before upload")
+
+            self._last_mineru_upload_bytes = int(
+                (self._active_mineru_private or {}).get("completed_upload_bytes") or 0
+            )
+            completed_targets = {
+                str(item)
+                for item in (self._active_mineru_private or {}).get(
+                    "uploaded_target_hashes", []
                 )
-            response.raise_for_status()
+                if str(item)
+            }
+            for target in upload_targets:
+                self.mineru_circuit_breaker.ensure_closed()
+                safe_target = self._validate_mineru_url(target, purpose="upload URL")
+                target_hash = hashlib.sha256(safe_target.encode("utf-8")).hexdigest()
+                if target_hash in completed_targets:
+                    continue
+                self._reserve_mineru_transport(
+                    kind="upload_put",
+                    url=safe_target,
+                    upload_bytes=len(frozen_bytes),
+                )
+                try:
+                    response = requests.put(
+                        safe_target,
+                        data=frozen_bytes,
+                        timeout=self.mineru_upload_timeout_seconds,
+                        allow_redirects=False,
+                    )
+                except Exception:
+                    self._record_mineru_transport_result()
+                    raise
+                try:
+                    self._record_mineru_transport_result(
+                        status_code=getattr(response, "status_code", None)
+                    )
+                    status_code = int(getattr(response, "status_code", 200))
+                    if status_code in {401, 403}:
+                        self.mineru_circuit_breaker.open(
+                            reason="upload_authorization_rejected",
+                            status_code=status_code,
+                        )
+                        raise ProviderCircuitOpen(
+                            f"MinerU upload authorization rejected with HTTP {status_code}",
+                            snapshot=self.mineru_circuit_breaker.snapshot,
+                        )
+                    response.raise_for_status()
+                    self._last_mineru_upload_bytes += len(frozen_bytes)
+                    if self._active_mineru_private is not None:
+                        completed_targets.add(target_hash)
+                        self._active_mineru_private["uploaded_target_hashes"] = sorted(
+                            completed_targets
+                        )
+                        self._active_mineru_private["completed_upload_bytes"] = (
+                            self._last_mineru_upload_bytes
+                        )
+                        self._persist_mineru_trace()
+                finally:
+                    close = getattr(response, "close", None)
+                    if callable(close):
+                        close()
 
-        poll_payload = self._poll_mineru_result(batch_id=batch_id, seed_payload=upload_response)
-        if not poll_payload:
-            return None
+            poll_payload = self._poll_mineru_result(
+                batch_id=batch_id, seed_payload=upload_response
+            )
+            if not poll_payload:
+                return None
 
-        normalized = self._normalize_mineru_payload(
-            payload=poll_payload,
-            baseline_page_diagnostics=baseline_page_diagnostics,
-            baseline_page_blocks=baseline_page_blocks,
-            baseline_page_index=baseline_page_index,
+            normalized = self._normalize_mineru_payload(
+                payload=poll_payload,
+                baseline_page_diagnostics=baseline_page_diagnostics,
+                baseline_page_blocks=baseline_page_blocks,
+                baseline_page_index=baseline_page_index,
+            )
+            if not normalized or (
+                not normalized.get("markdown_text") and not normalized.get("plain_text")
+            ):
+                return None
+
+            normalized["extractor_used"] = "mineru"
+            normalized["layout_fidelity"] = "layout_aware"
+            normalized["conversion_used"] = "native_pdf"
+            normalized["used_ocr"] = False
+            normalized["mineru_upload_bytes"] = self._last_mineru_upload_bytes
+            return normalized
+        finally:
+            if frozen_path and self._active_mineru_trace is None:
+                self._clear_mineru_source_copy(
+                    {"source_pdf_path": frozen_path}
+                )
+
+    def _freeze_mineru_source(self, pdf_path: str) -> tuple[str, Dict[str, Any]]:
+        """Create one immutable, job-owned byte source for remote upload."""
+
+        lexical_source = Path(pdf_path).expanduser()
+        if is_reparse_path(lexical_source):
+            raise MineruArtifactError("source PDF is a symlink or reparse point")
+        try:
+            source_identity = self._source_identity(str(lexical_source))
+        except OSError as exc:
+            raise MineruArtifactError(f"cannot stat source PDF before upload: {exc}") from exc
+        source_pdf_size = int(source_identity["size"])
+        if source_pdf_size > self.source_pdf_max_bytes:
+            raise MineruArtifactLimitError(
+                "source PDF exceeds the configured upload byte limit "
+                f"({source_pdf_size} > {self.source_pdf_max_bytes})"
+            )
+        freeze_root = Path(self.cache_root).expanduser().resolve()
+        freeze_root.mkdir(parents=True, exist_ok=True)
+        freeze_dir = Path(tempfile.mkdtemp(prefix=".mineru-source-", dir=str(freeze_root)))
+        temp_path = freeze_dir / ".source.pdf.tmp"
+        frozen_path = freeze_dir / "source.pdf"
+        try:
+            with lexical_source.open("rb") as source_handle, temp_path.open("wb") as target:
+                shutil.copyfileobj(source_handle, target, length=1024 * 1024)
+                target.flush()
+                os.fsync(target.fileno())
+            os.replace(str(temp_path), str(frozen_path))
+            frozen_identity = self._source_identity(str(frozen_path))
+            source_after = self._source_identity(str(lexical_source))
+            if (
+                str(frozen_identity["sha256"]) != str(source_identity["sha256"])
+                or int(frozen_identity["size"]) != source_pdf_size
+                or str(source_after["sha256"]) != str(source_identity["sha256"])
+                or str(source_after["file_id"]) != str(source_identity["file_id"])
+            ):
+                raise MineruArtifactError(
+                    "source PDF changed while creating the remote-upload freeze"
+                )
+            return str(frozen_path), dict(source_identity)
+        except BaseException:
+            try:
+                shutil.rmtree(freeze_dir)
+            except OSError:
+                pass
+            raise
+
+    def _read_bounded_json_response(self, response: Any) -> bytes:
+        """Read decompressed response bytes under a streaming deadline/limit."""
+
+        limit = min(
+            max(1, int(self.mineru_response_max_bytes)),
+            max(1, int(self.mineru_json_max_bytes)),
         )
-        if not normalized or (not normalized.get("markdown_text") and not normalized.get("plain_text")):
-            return None
+        headers = getattr(response, "headers", {})
+        content_length = headers.get("Content-Length") if hasattr(headers, "get") else None
+        try:
+            advertised_bytes = int(content_length) if content_length else 0
+        except (TypeError, ValueError):
+            advertised_bytes = 0
+        if advertised_bytes > limit:
+            raise MineruArtifactLimitError(
+                "MinerU JSON response exceeds the configured byte limit "
+                f"({advertised_bytes} > {limit})"
+            )
 
-        normalized["extractor_used"] = "mineru"
-        normalized["layout_fidelity"] = "layout_aware"
-        normalized["conversion_used"] = "native_pdf"
-        normalized["used_ocr"] = False
-        return normalized
+        deadline = time.monotonic() + float(self.mineru_request_timeout_seconds)
+        chunks: list[bytes] = []
+        total_bytes = 0
+        iterator = cast(
+            Callable[..., Iterable[Any]] | None,
+            getattr(response, "iter_content", None),
+        )
+        if callable(iterator):
+            for chunk in iterator(chunk_size=64 * 1024):
+                if callable(self.cancellation_checker):
+                    self.cancellation_checker()
+                if time.monotonic() > deadline:
+                    raise TimeoutError("MinerU JSON response deadline exceeded")
+                if not chunk:
+                    continue
+                chunk_bytes = bytes(chunk)
+                total_bytes += len(chunk_bytes)
+                if total_bytes > limit:
+                    raise MineruArtifactLimitError(
+                        "MinerU JSON response exceeded the configured byte limit "
+                        f"({total_bytes} > {limit})"
+                    )
+                chunks.append(chunk_bytes)
+            return b"".join(chunks)
+
+        # This branch exists only for small test doubles and non-requests
+        # adapters.  Production requests always use stream=True and expose
+        # iter_content, so a real response is never eagerly buffered here.
+        content = getattr(response, "content", b"") or b""
+        if not content:
+            json_method = getattr(response, "json", None)
+            if callable(json_method):
+                try:
+                    content = json.dumps(
+                        json_method(), ensure_ascii=False, separators=(",", ":")
+                    ).encode("utf-8")
+                except (TypeError, ValueError) as exc:
+                    raise MineruArtifactFormatError(
+                        "MinerU JSON response is not serializable"
+                    ) from exc
+        response_bytes = content.encode("utf-8") if isinstance(content, str) else bytes(content)
+        if len(response_bytes) > limit:
+            raise MineruArtifactLimitError(
+                "MinerU JSON response exceeds the configured byte limit "
+                f"({len(response_bytes)} > {limit})"
+            )
+        return response_bytes
 
     def _request_json(self, method: str, url: str, **kwargs: Any) -> Optional[Dict[str, Any]]:
-        safe_url = self._validate_mineru_url(url, purpose="JSON request URL", require_mineru_origin=True)
+        safe_url = self._validate_mineru_url(
+            url, purpose="JSON request URL", require_mineru_origin=True
+        )
+        normalized_method = str(method or "").strip().upper()
+        if normalized_method not in {"GET", "POST"}:
+            raise MineruConfigurationError(
+                f"unsupported MinerU JSON method: {normalized_method or '<empty>'}"
+            )
         last_exception: Optional[Exception] = None
-        for attempt in range(self.mineru_request_max_retries + 1):
+        # MinerU task creation is non-idempotent. Without a provider-supported
+        # idempotency contract a lost POST response is an unknown charged task,
+        # so one transport attempt is the only safe behavior.
+        total_attempts = (
+            1 if normalized_method == "POST" else self.mineru_request_max_retries + 1
+        )
+        for attempt in range(total_attempts):
+            response: Any = None
+            transport_recorded = False
             try:
+                if callable(self.cancellation_checker):
+                    self.cancellation_checker()
                 self.mineru_circuit_breaker.ensure_closed()
+                self._reserve_mineru_transport(
+                    kind=f"json_{normalized_method.lower()}", url=safe_url
+                )
+                request_kwargs = dict(kwargs)
+                request_kwargs["stream"] = True
                 response = requests.request(
-                    method=method.upper(),
+                    method=normalized_method,
                     url=safe_url,
                     headers=self._mineru_headers(),
-                    timeout=60,
+                    timeout=self.mineru_request_timeout_seconds,
                     allow_redirects=False,
-                    **kwargs,
+                    **request_kwargs,
                 )
-                if response.status_code in {401, 403}:
+                status_code = int(getattr(response, "status_code", 200))
+                self._record_mineru_transport_result(status_code=status_code)
+                transport_recorded = True
+                if status_code in {401, 403}:
                     self.mineru_circuit_breaker.open(
                         reason="authorization_rejected",
-                        status_code=int(response.status_code),
+                        status_code=status_code,
                     )
                     raise ProviderCircuitOpen(
-                        f"MinerU authorization rejected with HTTP {response.status_code}",
+                        f"MinerU authorization rejected with HTTP {status_code}",
                         snapshot=self.mineru_circuit_breaker.snapshot,
                     )
                 response.raise_for_status()
-                return response.json()
-            except ProviderCircuitOpen:
+                response_content = self._read_bounded_json_response(response)
+                try:
+                    payload = json.loads(response_content.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise MineruArtifactFormatError("MinerU JSON response is invalid JSON") from exc
+                if not isinstance(payload, dict):
+                    raise MineruArtifactFormatError("MinerU JSON response must be an object")
+                return payload
+            except ProviderCircuitOpen as exc:
+                if normalized_method == "POST":
+                    raise MineruSubmissionUncertainError(
+                        "MinerU task-create request was rejected or interrupted; "
+                        "refusing fallback after a non-idempotent submission boundary"
+                    ) from exc
+                raise
+            except MineruArtifactError:
                 raise
             except Exception as exc:  # pragma: no cover - transport path.
+                if not transport_recorded:
+                    self._record_mineru_transport_result()
+                if normalized_method == "POST":
+                    raise MineruSubmissionUncertainError(
+                        "MinerU task-create request outcome is unknown; refusing retry or local fallback"
+                    ) from exc
                 last_exception = exc
-                if attempt >= self.mineru_request_max_retries:
+                if attempt >= total_attempts - 1:
                     break
+                if callable(self.cancellation_checker):
+                    self.cancellation_checker()
                 time.sleep(self.mineru_retry_backoff_seconds * (attempt + 1))
+            finally:
+                close = getattr(response, "close", None)
+                if callable(close):
+                    close()
         if last_exception:
             raise last_exception
         return None
@@ -746,13 +2927,24 @@ class PreprocessManager:
         session.trust_env = False
         try:
             for attempt in range(self.mineru_request_max_retries + 1):
+                response: Any = None
+                transport_recorded = False
                 try:
                     is_mineru_origin = self._is_mineru_origin_url(safe_url)
                     if is_mineru_origin:
                         self.mineru_circuit_breaker.ensure_closed()
                     headers = self._mineru_headers() if is_mineru_origin else {}
-                    response = session.get(safe_url, headers=headers, timeout=120, allow_redirects=False)
+                    self._reserve_mineru_transport(kind="binary_get", url=safe_url)
+                    response = session.get(
+                        safe_url,
+                        headers=headers,
+                        timeout=self.mineru_download_timeout_seconds,
+                        allow_redirects=False,
+                        stream=True,
+                    )
                     status_code = int(getattr(response, "status_code", 200))
+                    self._record_mineru_transport_result(status_code=status_code)
+                    transport_recorded = True
                     if status_code in {401, 403}:
                         self.mineru_circuit_breaker.open(
                             reason="artifact_authorization_rejected",
@@ -763,14 +2955,57 @@ class PreprocessManager:
                             snapshot=self.mineru_circuit_breaker.snapshot,
                         )
                     response.raise_for_status()
-                    return response.content
+                    content_length = getattr(response, "headers", {}).get("Content-Length")
+                    try:
+                        advertised_bytes = int(content_length) if content_length else 0
+                    except (TypeError, ValueError):
+                        advertised_bytes = 0
+                    if advertised_bytes > self.mineru_response_max_bytes:
+                        raise MineruArtifactLimitError(
+                            "MinerU response exceeds the configured byte limit "
+                            f"({advertised_bytes} > {self.mineru_response_max_bytes})"
+                        )
+                    chunks: list[bytes] = []
+                    total_bytes = 0
+                    iterator = cast(
+                        Callable[..., Iterable[Any]] | None,
+                        getattr(response, "iter_content", None),
+                    )
+                    if callable(iterator):
+                        for chunk in iterator(chunk_size=1024 * 1024):
+                            if not chunk:
+                                continue
+                            chunk_bytes = bytes(chunk)
+                            total_bytes += len(chunk_bytes)
+                            if total_bytes > self.mineru_response_max_bytes:
+                                raise MineruArtifactLimitError(
+                                    "MinerU response exceeded the configured byte limit "
+                                    f"({total_bytes} > {self.mineru_response_max_bytes})"
+                                )
+                            chunks.append(chunk_bytes)
+                        return b"".join(chunks)
+                    content = bytes(getattr(response, "content", b"") or b"")
+                    if len(content) > self.mineru_response_max_bytes:
+                        raise MineruArtifactLimitError(
+                            "MinerU response exceeds the configured byte limit "
+                            f"({len(content)} > {self.mineru_response_max_bytes})"
+                        )
+                    return content
                 except ProviderCircuitOpen:
                     raise
+                except MineruArtifactError:
+                    raise
                 except Exception as exc:  # pragma: no cover - transport path.
+                    if not transport_recorded:
+                        self._record_mineru_transport_result()
                     last_exception = exc
                     if attempt >= self.mineru_request_max_retries:
                         break
                     time.sleep(self.mineru_retry_backoff_seconds * (attempt + 1))
+                finally:
+                    close = getattr(response, "close", None)
+                    if callable(close):
+                        close()
         finally:
             session.close()
         if last_exception:
@@ -888,6 +3123,8 @@ class PreprocessManager:
         if isinstance(zip_url, str) and zip_url.strip():
             try:
                 zip_artifacts = self._artifacts_from_zip_bytes(self._request_binary(self._join_base_url(zip_url)))
+            except MineruArtifactError:
+                raise
             except Exception as exc:  # pragma: no cover - transport path.
                 self._log(f"MinerU result zip download failed: {exc}", level="warning")
                 zip_artifacts = {}
@@ -938,7 +3175,39 @@ class PreprocessManager:
         artifacts: Dict[str, Any] = {}
         if not raw_bytes:
             return artifacts
-        with zipfile.ZipFile(io.BytesIO(raw_bytes)) as archive:
+        if len(raw_bytes) > self.mineru_response_max_bytes:
+            raise MineruArtifactLimitError(
+                "MinerU archive response exceeds the configured byte limit "
+                f"({len(raw_bytes)} > {self.mineru_response_max_bytes})"
+            )
+        try:
+            archive_context = zipfile.ZipFile(io.BytesIO(raw_bytes))
+        except (OSError, zipfile.BadZipFile) as exc:
+            raise MineruArtifactFormatError("MinerU result is not a valid ZIP archive") from exc
+        with archive_context as archive:
+            infos = archive.infolist()
+            if len(infos) > self.mineru_zip_max_entries:
+                raise MineruArtifactLimitError(
+                    "MinerU archive contains too many entries "
+                    f"({len(infos)} > {self.mineru_zip_max_entries})"
+                )
+            total_uncompressed = 0
+            for info in infos:
+                entry_bytes = int(info.file_size or 0)
+                compressed_bytes = int(info.compress_size or 0)
+                total_uncompressed += entry_bytes
+                if entry_bytes > self.mineru_zip_max_entry_bytes:
+                    raise MineruArtifactLimitError(
+                        f"MinerU archive entry is too large: {info.filename!r}"
+                    )
+                if total_uncompressed > self.mineru_zip_max_uncompressed_bytes:
+                    raise MineruArtifactLimitError(
+                        "MinerU archive exceeds the total uncompressed byte limit"
+                    )
+                if compressed_bytes > 0 and entry_bytes / compressed_bytes > self.mineru_zip_max_compression_ratio:
+                    raise MineruArtifactLimitError(
+                        f"MinerU archive entry has an excessive compression ratio: {info.filename!r}"
+                    )
             markdown_candidate = None
             structured_candidate = None
             page_index_candidate = None
@@ -954,20 +3223,50 @@ class PreprocessManager:
                 elif lowered.endswith("plain_text.txt"):
                     plain_text_candidate = name
             if markdown_candidate:
-                artifacts["markdown_text"] = archive.read(markdown_candidate).decode("utf-8", errors="ignore")
+                markdown_bytes = archive.read(markdown_candidate)
+                if len(markdown_bytes) > self.mineru_text_max_bytes:
+                    raise MineruArtifactLimitError(
+                        f"MinerU markdown member exceeds {self.mineru_text_max_bytes} bytes"
+                    )
+                artifacts["markdown_text"] = markdown_bytes.decode("utf-8", errors="ignore")
             if plain_text_candidate:
-                artifacts["plain_text"] = archive.read(plain_text_candidate).decode("utf-8", errors="ignore")
+                plain_text_bytes = archive.read(plain_text_candidate)
+                if len(plain_text_bytes) > self.mineru_text_max_bytes:
+                    raise MineruArtifactLimitError(
+                        f"MinerU plain-text member exceeds {self.mineru_text_max_bytes} bytes"
+                    )
+                artifacts["plain_text"] = plain_text_bytes.decode("utf-8", errors="ignore")
             if structured_candidate:
-                artifacts["structured_payload"] = json.loads(
-                    archive.read(structured_candidate).decode("utf-8", errors="ignore")
-                )
+                structured_bytes = archive.read(structured_candidate)
+                if len(structured_bytes) > self.mineru_json_max_bytes:
+                    raise MineruArtifactLimitError(
+                        f"MinerU structured JSON exceeds {self.mineru_json_max_bytes} bytes"
+                    )
+                try:
+                    artifacts["structured_payload"] = json.loads(
+                        structured_bytes.decode("utf-8", errors="ignore")
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise MineruArtifactFormatError(
+                        f"MinerU structured JSON is invalid: {structured_candidate!r}"
+                    ) from exc
                 content_list = self._find_first_value(artifacts["structured_payload"], {"content_list", "contentList"})
                 if isinstance(content_list, list):
                     artifacts["content_list"] = content_list
             if page_index_candidate:
-                artifacts["page_index"] = json.loads(
-                    archive.read(page_index_candidate).decode("utf-8", errors="ignore")
-                )
+                page_index_bytes = archive.read(page_index_candidate)
+                if len(page_index_bytes) > self.mineru_json_max_bytes:
+                    raise MineruArtifactLimitError(
+                        f"MinerU page-index JSON exceeds {self.mineru_json_max_bytes} bytes"
+                    )
+                try:
+                    artifacts["page_index"] = json.loads(
+                        page_index_bytes.decode("utf-8", errors="ignore")
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise MineruArtifactFormatError(
+                        f"MinerU page-index JSON is invalid: {page_index_candidate!r}"
+                    ) from exc
         return artifacts
 
     def _extract_with_docling(
@@ -1077,6 +3376,7 @@ class PreprocessManager:
             "layout_fidelity": "page_markdown" if extractor_used == "pymupdf4llm" else "page_text",
             "conversion_used": "native_pdf",
             "used_ocr": any(item.used_ocr for item in page_diagnostics),
+            "ocr_engine": self._ocr_engine_label(),
         }
 
     def _extract_local_page_data(
@@ -1086,6 +3386,7 @@ class PreprocessManager:
     ) -> tuple[str, List[PageDiagnostics], List[Dict[str, Any]]]:
         import warnings
         parser_warnings: List[str] = []
+        self._ocr_engines_used.clear()
         warning_markers = (
             "No common ancestor in structure tree",
             "OCR on page.number=",
@@ -1198,61 +3499,6 @@ class PreprocessManager:
 
 
 
-    def _extract_with_legacy_pdf_extractor(
-        self,
-        pdf_path: str,
-        baseline_plain_text: str,
-        baseline_page_diagnostics: List[PageDiagnostics],
-        baseline_page_blocks: List[Dict[str, Any]],
-        baseline_page_index: List[Dict[str, Any]],
-    ) -> Optional[Dict[str, Any]]:
-        try:
-            from pdf_extractor import extract_text_from_pdf  # type: ignore
-        except Exception:
-            return None
-
-        try:
-            plain_text = str(extract_text_from_pdf(pdf_path) or "").strip()
-        except Exception as exc:
-            self._log(f"Legacy pdf_extractor fallback failed: {exc}", level="warning")
-            return None
-
-        if not plain_text:
-            plain_text = baseline_plain_text
-        if not plain_text:
-            return None
-
-        page_index = baseline_page_index
-        if not page_index:
-            page_index = [
-                {
-                    "page_number": 1,
-                    "text": plain_text,
-                    "text_length": len(plain_text),
-                    "image_count": 0,
-                    "block_count": 0,
-                    "scanned_candidate": False,
-                    "used_ocr": False,
-                    "low_quality": len(plain_text) < 80,
-                }
-            ]
-
-        return {
-            "markdown_text": self._fallback_markdown_from_text(plain_text),
-            "plain_text": plain_text,
-            "page_index": page_index,
-            "page_diagnostics": baseline_page_diagnostics,
-            "page_blocks": baseline_page_blocks,
-            "structured_payload": {
-                "pages": baseline_page_blocks,
-                "page_index": page_index,
-            },
-            "extractor_used": "legacy_pdf_extractor",
-            "layout_fidelity": "plain_text_only",
-            "conversion_used": "native_pdf",
-            "used_ocr": any(item.used_ocr for item in baseline_page_diagnostics),
-        }
-
     def _should_try_docling_fallback(
         self,
         plain_text: str,
@@ -1337,10 +3583,13 @@ class PreprocessManager:
         require_mineru_origin: bool = False,
     ) -> str:
         url = self._join_base_url(value)
-        parsed = urlparse(url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise RuntimeError(f"MinerU {purpose} must be an absolute HTTP(S) URL.")
+        try:
+            parsed = parse_mineru_http_url(url)
+        except ValueError as exc:
+            raise RuntimeError(f"MinerU {purpose} is unsafe: {exc}") from exc
         if require_mineru_origin:
+            if parsed.scheme.casefold() != "https":
+                raise RuntimeError(f"MinerU {purpose} must use HTTPS")
             if not self._is_mineru_origin_url(url):
                 raise RuntimeError(f"MinerU {purpose} must use the configured MinerU service origin.")
             return url
@@ -1351,26 +3600,31 @@ class PreprocessManager:
         return url
 
     def _is_mineru_origin_url(self, value: str) -> bool:
-        parsed = urlparse(value)
-        base = urlparse(self.mineru_base_url)
-        return parsed.scheme == base.scheme and parsed.netloc.lower() == base.netloc.lower()
+        try:
+            parsed = parse_mineru_http_url(value)
+            base = parse_mineru_http_url(self.mineru_base_url)
+        except ValueError:
+            return False
+        return (
+            parsed.scheme.casefold() == base.scheme.casefold()
+            and str(parsed.hostname or "").casefold() == str(base.hostname or "").casefold()
+            and (parsed.port or (443 if parsed.scheme.casefold() == "https" else 80))
+            == (base.port or (443 if base.scheme.casefold() == "https" else 80))
+        )
 
     def _is_allowed_mineru_host(self, value: str) -> bool:
-        parsed = urlparse(value)
-        hostname = (parsed.hostname or "").lower()
-        return bool(parsed.scheme == "https" and hostname and hostname in self.mineru_allowed_url_hosts)
+        try:
+            parsed = parse_mineru_http_url(value, require_https=True)
+        except ValueError:
+            return False
+        if parsed.port not in {None, 443}:
+            return False
+        hostname = str(parsed.hostname or "").casefold()
+        return bool(hostname and hostname in self.mineru_allowed_url_hosts)
 
     @staticmethod
     def _is_safe_exact_mineru_host(value: str) -> bool:
-        host = str(value or "").strip().lower()
-        if not host or "*" in host or "/" in host or ":" in host or "@" in host:
-            return False
-        if host.startswith(".") or host.endswith(".") or ".." in host:
-            return False
-        return all(
-            part and all(char.isalnum() or char == "-" for char in part)
-            for part in host.split(".")
-        )
+        return bool(normalize_exact_mineru_host(value))
 
     def _mineru_headers(self) -> Dict[str, str]:
         return {
@@ -1523,12 +3777,36 @@ class PreprocessManager:
         plain_text: str,
         page_index: List[Dict[str, Any]],
         allow_reprocess: bool = True,
+        text_layer_complete: bool | None = None,
     ) -> Stage1InputSelection:
+        if text_layer_complete is None:
+            text_layer_complete = self._has_complete_native_text_layer(page_index)
         return select_stage1_input(
             markdown_text=markdown_text,
             plain_text=plain_text,
             page_index=page_index,
             allow_reprocess=allow_reprocess,
+            text_layer_complete=bool(text_layer_complete),
+        )
+
+    @staticmethod
+    def _has_complete_native_text_layer(page_index: List[Dict[str, Any]]) -> bool:
+        """Recognize a fully populated native text layer as explicit lineage.
+
+        This is only true when every indexed page has substantive extracted
+        text and none is classified as scanned/low-quality. It does not make
+        an arbitrary short string safe; the page diagnostics must prove the
+        source was covered end to end.
+        """
+
+        pages = [item for item in page_index if isinstance(item, Mapping)]
+        if not pages:
+            return False
+        return all(
+            int(item.get("text_length") or len(str(item.get("text") or "").strip())) >= 80
+            and not bool(item.get("scanned_candidate"))
+            and not bool(item.get("low_quality"))
+            for item in pages
         )
 
     def _write_stage1_selection_artifacts(
@@ -1588,6 +3866,7 @@ class PreprocessManager:
         artifact_paths: Dict[str, str],
         diagnostics: Dict[str, Any],
         manifest: Dict[str, Any],
+        allow_rebuild: bool = True,
     ) -> tuple[str, str, str, List[str], List[Dict[str, Any]]]:
         stage1_paths = [
             artifact_paths["stage1_input_path"],
@@ -1605,6 +3884,8 @@ class PreprocessManager:
                 page_index=page_index,
             )
             if self._stage1_cache_needs_refresh(stage1_manifest, stage1_input_text, current_selection):
+                if not allow_rebuild:
+                    raise RuntimeError("cached Stage 1 selection is inconsistent with its generation")
                 chunks = self._write_stage1_selection_artifacts(
                     selection=current_selection,
                     artifact_paths=artifact_paths,
@@ -1628,10 +3909,26 @@ class PreprocessManager:
                 with open(artifact_paths["chunks_path"], "r", encoding="utf-8") as handle:
                     chunks = json.load(handle)
             except Exception:
+                if not allow_rebuild:
+                    raise RuntimeError("cached chunks artifact cannot be read")
                 chunks = self._build_chunks(stage1_input_text, page_index)
                 with open(artifact_paths["chunks_path"], "w", encoding="utf-8") as handle:
                     json.dump(chunks, handle, ensure_ascii=False, indent=2)
+            if (
+                not self._chunks_use_selected_stage1(chunks)
+                and not str(stage1_input_text or "").strip()
+                and not str(current_selection.selected_text or "").strip()
+            ):
+                return (
+                    stage1_input_text,
+                    str(stage1_manifest.get("selected_text_source") or ""),
+                    str(stage1_manifest.get("stage1_quality_level") or ""),
+                    list(stage1_manifest.get("stage1_quality_reasons") or []),
+                    chunks if isinstance(chunks, list) else [],
+                )
             if not self._chunks_use_selected_stage1(chunks):
+                if not allow_rebuild:
+                    raise RuntimeError("cached chunks artifact is not bound to selected Stage 1 input")
                 chunks = self._build_chunks(stage1_input_text, page_index)
                 with open(artifact_paths["chunks_path"], "w", encoding="utf-8") as handle:
                     json.dump(chunks, handle, ensure_ascii=False, indent=2)
@@ -1822,16 +4119,19 @@ class PreprocessManager:
         self,
         pdf_path: str,
         cache_dir: str,
+        generation_dir: str,
         markdown_path: str,
         plain_text_path: str,
         page_index_path: str,
         chunks_path: str,
         diagnostics_path: str,
+        ocr_diagnostics_path: str,
+        ocr_artifact_path: str,
         structured_json_path: str,
         manifest_path: str,
     ) -> Optional[PreprocessResult]:
         try:
-            artifact_paths = self._artifact_paths(cache_dir)
+            artifact_paths = self._artifact_paths(generation_dir)
             with open(markdown_path, "r", encoding="utf-8") as handle:
                 markdown_text = handle.read()
             with open(plain_text_path, "r", encoding="utf-8") as handle:
@@ -1857,6 +4157,7 @@ class PreprocessManager:
                 artifact_paths=artifact_paths,
                 diagnostics=diagnostics,
                 manifest=manifest,
+                allow_rebuild=False,
             )
             return PreprocessResult(
                 pdf_path=pdf_path,
@@ -1866,6 +4167,8 @@ class PreprocessManager:
                 page_index_path=page_index_path,
                 chunks_path=chunks_path,
                 diagnostics_path=diagnostics_path,
+                ocr_diagnostics_path=ocr_diagnostics_path,
+                ocr_artifact_path=ocr_artifact_path,
                 structured_json_path=structured_json_path,
                 manifest_path=manifest_path,
                 stage1_input_path=artifact_paths["stage1_input_path"],
@@ -1894,33 +4197,85 @@ class PreprocessManager:
                 mineru_base_url=str(manifest.get("mineru_base_url", self.mineru_base_url)),
                 selected_text_source=selected_text_source,
                 stage1_quality_level=stage1_quality_level,
+                stage1_quality_reasons=list(stage1_quality_reasons),
+                mineru_receipt=dict(manifest.get("mineru_receipt") or {}),
             )
         except Exception as exc:
             self._log(f"Failed to load preprocess cache for {pdf_path}: {exc}", level="warning")
             return None
 
     def _cache_is_fresh(self, pdf_path: str, manifest_path: str, *required_files: str) -> bool:
-        if not os.path.exists(manifest_path):
+        if not os.path.isfile(manifest_path) or os.path.islink(manifest_path):
             return False
-        if not all(os.path.exists(path) for path in required_files):
+        if not all(os.path.isfile(path) and not os.path.islink(path) for path in required_files):
             return False
         try:
             with open(manifest_path, "r", encoding="utf-8") as handle:
                 manifest = json.load(handle)
-            return (
-                manifest.get("file_size") == os.path.getsize(pdf_path)
-                and abs(float(manifest.get("modified_time", 0.0)) - os.path.getmtime(pdf_path)) < 0.001
-            )
-        except Exception:
+            if (
+                manifest.get("schema_version") != PREPROCESS_MANIFEST_SCHEMA_VERSION
+                or manifest.get("implementation_version") != PREPROCESS_IMPLEMENTATION_VERSION
+            ):
+                return False
+            generation_id = str(manifest.get("generation_id") or "")
+            if generation_id != os.path.basename(os.path.dirname(manifest_path)):
+                return False
+            source = self._source_identity(pdf_path)
+            if (
+                str(manifest.get("canonical_source_path") or "") != source["canonical_path"]
+                or str(manifest.get("source_pdf_sha256") or "") != source["sha256"]
+                or int(manifest.get("source_pdf_size") or -1) != source["size"]
+                or int(manifest.get("source_pdf_mtime_ns") or -1) != source["mtime_ns"]
+                or str(manifest.get("source_pdf_file_id") or "") != source["file_id"]
+                or str(manifest.get("processing_fingerprint") or "") != self.processing_fingerprint
+            ):
+                return False
+            artifact_hashes = manifest.get("artifact_hashes")
+            if not isinstance(artifact_hashes, dict):
+                return False
+            for path in required_files:
+                entry = artifact_hashes.get(os.path.basename(path))
+                if not isinstance(entry, dict):
+                    return False
+                if str(entry.get("relative_path") or "") != os.path.basename(path):
+                    return False
+                if str(entry.get("schema_version") or "") != PREPROCESS_MANIFEST_SCHEMA_VERSION:
+                    return False
+                raw_size = entry.get("size")
+                if raw_size is None or int(raw_size) != os.path.getsize(path):
+                    return False
+                if str(entry.get("sha256") or "") != self._file_sha256(path):
+                    return False
+            return True
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return False
 
-    def _pdf_cache_key(self, pdf_path: str) -> str:
-        stat = os.stat(pdf_path)
-        payload = f"{os.path.abspath(pdf_path)}::{stat.st_size}::{stat.st_mtime}".encode("utf-8")
-        return hashlib.md5(payload).hexdigest()
+    def _pdf_cache_key(
+        self,
+        pdf_path: str,
+        source_identity: Dict[str, Any] | None = None,
+    ) -> str:
+        source = source_identity or self._source_identity(pdf_path)
+        payload = (
+            f"{source['canonical_path']}::{source['size']}::{source['sha256']}"
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
 
     def _ocr_available(self) -> bool:
-        return shutil.which("tesseract") is not None
+        if shutil.which("tesseract") is not None:
+            return True
+        return any(
+            importlib.util.find_spec(module_name) is not None
+            for module_name in ("rapidocr_onnxruntime", "rapidocr")
+        )
+
+    def _ocr_engine_label(self) -> str:
+        engines = sorted(self._ocr_engines_used)
+        if not engines:
+            return "none"
+        if len(engines) == 1:
+            return engines[0]
+        return "mixed"
 
     def _should_try_ocr(self, scanned_candidate: bool) -> bool:
         if self.ocr_mode == "off":
@@ -1966,6 +4321,9 @@ class PreprocessManager:
                     level="warning",
                 )
                 return ""
+            engine = str(payload.get("engine") or "").strip().lower()
+            if engine:
+                self._ocr_engines_used.add(engine)
             return str(payload.get("text") or "")
         except subprocess.TimeoutExpired:
             self._log(f"OCR timed out on page {page.number + 1}", level="warning")
@@ -1987,7 +4345,14 @@ class PreprocessManager:
             return value
         return str(value)
 
-    def _maybe_build_local_rag(self, collection_name: str, chunks: List[Dict[str, Any]]) -> bool:
+    def _maybe_build_local_rag(
+        self,
+        collection_name: str,
+        chunks: List[Dict[str, Any]],
+        *,
+        source_pdf_sha256: str = "",
+        processing_fingerprint: str = "",
+    ) -> bool:
         if not self.enable_local_rag or not chunks:
             return False
         if self.rag_backend != "chroma":
@@ -1997,7 +4362,14 @@ class PreprocessManager:
             from rag.local_rag import LocalRAGIndex
 
             index = LocalRAGIndex(persist_dir=self.rag_persist_dir, logger=self.logger)
-            built = index.build_from_chunks(collection_name=collection_name, chunks=chunks)
+            built = index.build_from_chunks(
+                collection_name=collection_name,
+                chunks=chunks,
+                source_pdf_sha256=source_pdf_sha256,
+                processing_fingerprint=processing_fingerprint,
+                allow_model_download=self.local_rag_allow_model_download,
+                retain_recent_identities=self.local_rag_retain_recent_identities,
+            )
             if not built:
                 self._log("Local RAG skipped because dependencies are unavailable or chunks are empty.", level="info")
             return built

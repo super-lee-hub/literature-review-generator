@@ -8,7 +8,7 @@ import pytest
 import os
 import tempfile
 import json
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -213,7 +213,7 @@ def test_parse_result_v1_joins_wrapped_standard_fields(tmp_path: Path) -> None:
     assert result.status == "ok"
     assert result.parser_route == "standard"
     assert result.report_hash
-    assert result.parser_version == "zotero-parser-v1"
+    assert result.parser_version == "zotero-parser-v1.1"
     assert result.stats.wrapped_fields_joined == 4
     assert result.papers[0]["title"] == "A Long Study of Consumer Fairness"
     assert result.papers[0]["abstract"] == "First abstract line continued abstract line"
@@ -257,3 +257,75 @@ def test_parse_result_v1_failure_preserves_legacy_empty_projection(tmp_path: Pat
     assert result.status == "failed"
     assert result.diagnostics[0].code == "source_missing"
     assert parser.parse_zotero_report(str(missing)) == []
+
+
+def test_parse_result_v1_preserves_localized_zotero_fields_and_unknowns(tmp_path: Path) -> None:
+    report_path = tmp_path / "localized-zotero.txt"
+    report_path.write_text(
+        "\n".join(
+            [
+                "*",
+                "标题\tA Deal Fairness Study",
+                "作者\tAlice Smith",
+                "页码\t369-389",
+                "出版物\tJournal of Consumer Research",
+                "DOI\t10.1093/jcr/ucaf066<http://doi.org/10.1093/jcr/ucaf066>",
+                "网址\thttps://academic.example/article<https://academic.example/article>",
+                "引用关键词yiPromotionArchitectureDeal2026",
+                "刊名简称\tJCR",
+                "未支持字段\tkeep this raw",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    parser = __import__("zotero_parser", fromlist=["parse_zotero_report_result"])
+    result = parser.parse_zotero_report_result(str(report_path))
+    paper = result.papers[0]
+
+    assert result.status == "partial"
+    assert paper["journal"] == "Journal of Consumer Research"
+    assert paper["pages"] == "369-389"
+    assert paper["doi"] == "10.1093/jcr/ucaf066"
+    assert paper["doi_raw"].endswith("ucaf066>")
+    assert paper["url"] == "https://academic.example/article"
+    assert paper["citation_key"] == "yiPromotionArchitectureDeal2026"
+    assert paper["journal_abbreviation"] == "JCR"
+    assert paper["unknown_fields"] == [
+        {
+            "key": "未支持字段",
+            "raw_value": "keep this raw",
+            "line_start": 10,
+            "line_end": 10,
+        }
+    ]
+    assert any(item.code == "unknown_field" and item.line_start == 10 for item in result.diagnostics)
+
+    serialized = result.to_dict()
+    assert parser.ZoteroParseResultV1.from_dict(serialized).to_dict() == serialized
+
+
+def test_parse_result_v1_keeps_colon_in_unlabeled_title(tmp_path: Path) -> None:
+    report_path = tmp_path / "colon-title.txt"
+    report_path.write_text(
+        "\n".join(
+            [
+                "*",
+                "Painful Prices: The Moral Harm Model of Price Fairness",
+                "条目类型\t期刊文章",
+                "作者\tMargaret C Campbell",
+                "出版物\tJournal of Consumer Research",
+                "DOI\t10.1093/jcr/ucaf045",
+                "引用关键词\tcampbellPainfulPricesMoral2025",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    parser = __import__("zotero_parser", fromlist=["parse_zotero_report_result"])
+    result = parser.parse_zotero_report_result(str(report_path))
+
+    assert result.status == "ok"
+    assert result.papers[0]["title"] == "Painful Prices: The Moral Harm Model of Price Fairness"
+    assert result.papers[0]["journal"] == "Journal of Consumer Research"
+    assert not result.diagnostics

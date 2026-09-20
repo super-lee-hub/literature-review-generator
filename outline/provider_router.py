@@ -27,7 +27,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import urlsplit, urlunsplit
 
 from runtime.provider_context import ProviderContextProfile
@@ -340,6 +340,7 @@ def build_outline_provider_router(
     settings: Any,
     config: Mapping[str, Any],
     route_resolver: Callable[[str, str], OutlineRoleRoute | None],
+    enabled_roles: Iterable[str] | None = None,
 ) -> OutlineProviderRouter:
     """Build the router from ``[OutlineModels]`` via an injected resolver.
 
@@ -355,7 +356,14 @@ def build_outline_provider_router(
     routes: dict[str, OutlineRoleRoute] = {}
     missing: list[str] = []
 
+    enabled = (
+        {str(item).strip() for item in enabled_roles if str(item).strip()}
+        if enabled_roles is not None
+        else set(ROLE_SETTING_KEYS)
+    )
     for role, setting_key in ROLE_SETTING_KEYS.items():
+        if role not in enabled:
+            continue
         accessor = SETTING_ACCESSORS.get(setting_key, setting_key)
         getter = getattr(settings, accessor, None)
         section_name = str(getter() if callable(getter) else "").strip()

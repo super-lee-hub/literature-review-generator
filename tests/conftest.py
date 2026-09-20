@@ -22,10 +22,18 @@ from offline_guard import (  # noqa: E402
     install_offline_guard,
     live_api_skip_reason,
 )
+from runtime.test_dependencies import (  # noqa: E402
+    RuntimeTestDependencies,
+    install_runtime_test_dependencies,
+)
 
 
 configure_offline_environment()
 install_offline_guard()
+# This is an explicit Python dependency injection for the in-process pytest
+# lane.  Production run/resume/GUI processes never use the ordinary offline
+# environment variable as an authorization bypass.
+install_runtime_test_dependencies(RuntimeTestDependencies())
 
 
 _OPTIONAL_MARKERS = {"live_api", "playwright", "heavy_ocr", "optional"}
@@ -269,8 +277,12 @@ def pytest_terminal_summary(terminalreporter):
 
 
 def pytest_sessionfinish(session, exitstatus):
-    if (
-        _UNEXPECTED_SKIPS
-        and os.environ.get("AUTO_GENERATE_FAIL_ON_UNEXPECTED_SKIP", "1") == "1"
-    ):
+    if _UNEXPECTED_SKIPS:
+        terminalreporter = session.config.pluginmanager.get_plugin("terminalreporter")
+        if terminalreporter is not None:
+            terminalreporter.write_line(
+                "unexpected required-test skips: "
+                + ", ".join(sorted(set(_UNEXPECTED_SKIPS)))
+            )
+    if _UNEXPECTED_SKIPS and os.environ.get("AUTO_GENERATE_FAIL_ON_UNEXPECTED_SKIP", "1") == "1":
         session.exitstatus = pytest.ExitCode.TESTS_FAILED

@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import json
+import threading
 
 import ai_interface
+import pytest
 from runtime.provider_context import ProviderContextProfile
 from runtime.provider_runtime import (
+    ProviderAggregateBudgetV1,
+    ProviderBudgetController,
     ProviderBudgetExceeded,
     ProviderBudgetV1,
+    ProviderRuntimeContractError,
     ProviderRuntime,
     ProviderRuntimeLedger,
     canonical_provider_request_payload,
@@ -68,11 +73,272 @@ def test_provider_runtime_enforces_budget_and_emits_redacted_append_only_receipt
         raise AssertionError("second admission should be rejected by max_calls")
 
 
-def test_provider_runtime_budget_mapping_is_fail_closed_for_invalid_limits() -> None:
-    budget = ProviderBudgetV1.from_mapping(
-        {"max_calls": "not-a-number", "max_total_tokens": "-4", "max_elapsed_seconds": "bad"}
+def test_provider_runtime_complete_is_exactly_once_for_concurrent_duplicate_completion(tmp_path):
+    aggregate = ProviderBudgetController(
+        ProviderAggregateBudgetV1(max_provider_calls_total=1, max_output_tokens_total=10)
     )
-    assert budget == ProviderBudgetV1()
+    ledger = ProviderRuntimeLedger(tmp_path / "receipts.jsonl")
+    runtime = ProviderRuntime(
+        aggregate_budget=aggregate,
+        ledger=ledger,
+        test_only=True,
+    )
+    admission = runtime.admit(requested_output_tokens=10)
+    barrier = threading.Barrier(3)
+    results = []
+    errors = []
+
+    def complete_duplicate():
+        barrier.wait()
+        try:
+            results.append(
+                runtime.complete(
+                    admission=admission,
+                    prompt="prompt",
+                    input_payload={"input": "value"},
+                    api_config={
+                        "api_key": "secret",
+                        "model": "test-model",
+                        "api_base": "https://provider.example/v1",
+                    },
+                    result={"status": "success", "content": {"ok": True}},
+                )
+            )
+        except BaseException as exc:  # collect worker failures for a useful assertion
+            errors.append(exc)
+
+    workers = [threading.Thread(target=complete_duplicate) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    barrier.wait()
+    for worker in workers:
+        worker.join(timeout=5)
+
+    assert errors == []
+    assert len(results) == 2
+    assert results[0].receipt_id == results[1].receipt_id
+    assert len(ledger.list_receipts()) == 1
+    assert aggregate.snapshot()["calls_used"] == 1
+
+
+def test_zero_retry_budget_blocks_compatibility_retry_before_transport(monkeypatch):
+    calls = 0
+
+    class Response:
+        status_code = 400
+
+        def raise_for_status(self):
+            raise ai_interface.requests.exceptions.HTTPError("HTTP 400")
+
+        def json(self):
+            return {"error": {"message": "temperature is unsupported"}}
+
+    def post(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return Response()
+
+    monkeypatch.setattr(ai_interface, "_post_with_proxy_mode", post)
+    runtime = ProviderRuntime(budget=ProviderBudgetV1(max_retries_per_call=0), test_only=True)
+    result = ai_interface._call_ai_api_detailed(
+        "prompt",
+        {"api_key": "secret", "model": "test-model", "api_base": "https://provider.example/v1"},
+        "system",
+        retry_attempts=1,
+        provider_runtime=runtime,
+    )
+
+    assert calls == 1
+    assert result["status"] == "failed"
+    assert result["attempts"] == 1
+
+
+def test_json_retry_accumulates_usage(monkeypatch):
+    class Response:
+        status_code = 200
+
+        def __init__(self, body):
+            self.body = body
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.body
+
+    responses = iter([
+        Response({"usage": {"completion_tokens": 8}, "choices": [{"message": {"content": "not-json"}}]}),
+        Response({"usage": {"completion_tokens": 8}, "choices": [{"message": {"content": '{\"ok\":true}'}}]}),
+    ])
+    monkeypatch.setattr(ai_interface, "_post_with_proxy_mode", lambda *a, **k: next(responses))
+    runtime = ProviderRuntime(budget=ProviderBudgetV1(max_retries_per_call=2), test_only=True)
+    result = ai_interface._call_ai_api_detailed(
+        "prompt",
+        {"api_key": "secret", "model": "test-model", "api_base": "https://provider.example/v1"},
+        "system",
+        max_tokens=10,
+        retry_attempts=2,
+        provider_runtime=runtime,
+    )
+
+    assert result["status"] == "success"
+    assert result["output_tokens"] == 16
+    assert result["provider_receipt"]["output_tokens"] == 16
+
+
+def test_aggregate_output_budget_accounts_for_all_funded_retries(monkeypatch):
+    class Response:
+        status_code = 200
+
+        def __init__(self, content):
+            self.content = content
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "usage": {"completion_tokens": 8},
+                "choices": [{"message": {"content": self.content}}],
+            }
+
+    responses = iter([Response("not-json"), Response('{"ok":true}')])
+    calls = 0
+
+    def post(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return next(responses)
+
+    monkeypatch.setattr(ai_interface, "_post_with_proxy_mode", post)
+    aggregate = ProviderBudgetController(
+        ProviderAggregateBudgetV1(
+            max_provider_calls_total=2,
+            max_output_tokens_total=20,
+        )
+    )
+    runtime = ProviderRuntime(
+        aggregate_budget=aggregate,
+        test_only=True,
+    )
+    result = ai_interface._call_ai_api_detailed(
+        "prompt",
+        {"api_key": "secret", "model": "test-model", "api_base": "https://provider.example/v1"},
+        "system",
+        max_tokens=10,
+        retry_attempts=2,
+        provider_runtime=runtime,
+    )
+
+    assert calls == 2
+    assert result["status"] == "success"
+    assert aggregate.snapshot()["output_tokens_used"] == 16
+
+
+def test_provider_runtime_budget_mapping_is_fail_closed_for_invalid_limits() -> None:
+    import pytest
+
+    with pytest.raises(ValueError):
+        ProviderBudgetV1.from_mapping(
+            {"max_calls": "not-a-number", "max_total_tokens": "-4", "max_elapsed_seconds": "bad"}
+        )
+
+    with pytest.raises(ValueError):
+        ProviderBudgetV1.from_mapping({"max_total_tokens": True})
+
+
+def test_local_total_token_budget_is_cumulative_and_survives_restart(tmp_path) -> None:
+    ledger = ProviderRuntimeLedger(tmp_path / "receipts.jsonl")
+    budget = ProviderBudgetV1(max_total_tokens=100)
+    runtime = ProviderRuntime(budget=budget, ledger=ledger, test_only=True)
+
+    admission = runtime.admit(requested_output_tokens=80)
+    runtime.complete(
+        admission=admission,
+        prompt="prompt",
+        input_payload={"input": "value"},
+        api_config={"api_key": "secret", "model": "model", "api_base": "https://provider.example/v1"},
+        result={"status": "success", "content": {"ok": True}, "total_tokens": 80},
+    )
+
+    assert runtime.consumed_tokens == 80
+    with pytest.raises(ProviderBudgetExceeded):
+        runtime.admit(requested_output_tokens=80)
+
+    restarted = ProviderRuntime(budget=budget, ledger=ledger, test_only=True)
+    assert restarted.consumed_tokens == 80
+    with pytest.raises(ProviderBudgetExceeded):
+        restarted.admit(requested_output_tokens=21)
+
+
+def test_unknown_usage_remains_exposed_against_local_total_budget(tmp_path) -> None:
+    runtime = ProviderRuntime(
+        budget=ProviderBudgetV1(max_total_tokens=100),
+        ledger=ProviderRuntimeLedger(tmp_path / "receipts.jsonl"),
+        test_only=True,
+    )
+    admission = runtime.admit(requested_output_tokens=80)
+    runtime.complete(
+        admission=admission,
+        prompt="prompt",
+        input_payload={"input": "value"},
+        api_config={"api_key": "secret", "model": "model", "api_base": "https://provider.example/v1"},
+        result={"status": "success", "content": {"ok": True}},
+    )
+
+    assert runtime.unknown_exposure_tokens == 80
+    with pytest.raises(ProviderBudgetExceeded):
+        runtime.admit(requested_output_tokens=21)
+
+
+def test_response_is_durable_when_aggregate_accounting_fails_and_retries_close_it(
+    tmp_path, monkeypatch
+) -> None:
+    aggregate = ProviderBudgetController(
+        ProviderAggregateBudgetV1(max_provider_calls_total=1, max_output_tokens_total=10)
+    )
+    ledger = ProviderRuntimeLedger(tmp_path / "receipts.jsonl")
+    runtime = ProviderRuntime(aggregate_budget=aggregate, ledger=ledger, test_only=True)
+    admission = runtime.admit(requested_output_tokens=8)
+    original_complete = aggregate.complete
+    failed_once = True
+
+    def fail_once(reservation, result):
+        nonlocal failed_once
+        if failed_once:
+            failed_once = False
+            raise ProviderRuntimeContractError("injected accounting failure")
+        return original_complete(reservation, result)
+
+    monkeypatch.setattr(aggregate, "complete", fail_once)
+    result = {
+        "status": "success",
+        "content": {"ok": True},
+        "total_tokens": 8,
+    }
+    with pytest.raises(ProviderRuntimeContractError):
+        runtime.complete(
+            admission=admission,
+            prompt="prompt",
+            input_payload={"input": "value"},
+            api_config={"api_key": "secret", "model": "model", "api_base": "https://provider.example/v1"},
+            result=result,
+        )
+
+    persisted = ledger.list_receipts()
+    assert len(persisted) == 1
+    assert persisted[0].metadata["accounting_status"] == "pending"
+
+    receipt = runtime.complete(
+        admission=admission,
+        prompt="prompt",
+        input_payload={"input": "value"},
+        api_config={"api_key": "secret", "model": "model", "api_base": "https://provider.example/v1"},
+        result=result,
+    )
+    assert receipt.receipt_id == persisted[0].receipt_id
+    assert len(ledger.list_receipts()) == 1
+    assert aggregate.snapshot()["calls_used"] == 1
 
 
 def test_ai_detailed_call_attaches_durable_provider_receipt(monkeypatch, tmp_path) -> None:

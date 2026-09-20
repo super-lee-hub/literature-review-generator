@@ -1274,9 +1274,11 @@ def _request_variant_matches_receipt(
             continue
         input_hash = str(raw_variant.get("input_hash") or "")
         config_hash = str(raw_variant.get("config_hash") or "")
+        prompt_hash = str(raw_variant.get("prompt_hash") or "")
         if (
             input_hash
             and config_hash
+            and (not prompt_hash or str(receipt_row.get("prompt_hash") or "") == prompt_hash)
             and str(receipt_row.get("input_hash") or "") == input_hash
             and str(receipt_row.get("config_hash") or "") == config_hash
         ):
@@ -1301,7 +1303,7 @@ def _receipt_matches_expected_binding(
         "schema_hash",
     ):
         if (
-            field_name in {"input_hash", "config_hash"}
+            field_name in {"input_hash", "config_hash", "prompt_hash"}
             and variant_match
         ):
             continue
@@ -2128,7 +2130,7 @@ def _provider_closure_entry(
             "config_hash",
             "schema_hash",
         ):
-            if field_name in {"input_hash", "config_hash"} and variant_match:
+            if field_name in {"input_hash", "config_hash", "prompt_hash"} and variant_match:
                 continue
             expected_value = str(expected_row.get(field_name) or "")
             if not expected_value or str(row.get(field_name) or "") != expected_value:

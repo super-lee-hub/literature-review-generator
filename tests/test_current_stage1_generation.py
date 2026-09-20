@@ -9,6 +9,7 @@ from typing import Any, Mapping
 import fitz  # type: ignore
 import pytest
 
+from preprocess.service import PreprocessManager
 import preprocess.visual_artifacts as visual_artifacts
 from preprocess.visual_artifacts import Stage1VisualArtifactBuilder
 from runtime.provider_runtime import ProviderRuntimeLedger
@@ -18,6 +19,7 @@ from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry
 from services.job_workspace import JobWorkspace
 from services.settings import ApplicationSettings
 from services.stage1_analysis_service import Stage1AnalysisService
+from runtime.reconcile import validate_canonical_ai_summary
 from validation.closure import resolve_current_stage_closure_map
 from summary_schema import normalize_ai_summary
 
@@ -292,6 +294,165 @@ def test_current_stage1_generates_canonical_summary_and_receipt(tmp_path: Path) 
     assert closure_payload["expected_provider_transport_count"] == 1
     assert closure_payload["payload"]["complete"] is True
     assert any(item.artifact_type == "evidence_manifest" for item in service.registry.list_records())
+
+
+def test_stage1_force_rebuild_reuses_predeclared_preprocess_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pdf_path = tmp_path / "paper.pdf"
+    _write_pdf(pdf_path)
+    extract_calls = 0
+    original_extract = PreprocessManager._extract_preferred_content
+
+    def count_extract(self: PreprocessManager, source_pdf: str):
+        nonlocal extract_calls
+        extract_calls += 1
+        return original_extract(self, source_pdf)
+
+    monkeypatch.setattr(
+        PreprocessManager,
+        "_extract_preferred_content",
+        count_extract,
+    )
+    service, bundle = _service(
+        tmp_path,
+        pdf_path,
+        lambda **_kwargs: {"status": "success", "content": _canonical_summary()},
+        config_overrides={"Preprocess": {"force_rebuild": "true"}},
+    )
+
+    result = service.run(bundle)
+
+    assert result.generated_count == 1
+    assert extract_calls == 1
+
+
+def test_stage1_preserves_resolved_preprocess_environment_after_config_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pdf_path = tmp_path / "paper.pdf"
+    _write_pdf(pdf_path)
+    observed_tokens: list[str] = []
+    original_extract = PreprocessManager._extract_preferred_content
+
+    def capture_token(self: PreprocessManager, source_pdf: str):
+        observed_tokens.append(self.mineru_api_token)
+        return original_extract(self, source_pdf)
+
+    monkeypatch.setenv("MINERU_API_TOKEN", "ambient-process-token")
+    monkeypatch.setattr(PreprocessManager, "_extract_preferred_content", capture_token)
+    service, bundle = _service(
+        tmp_path,
+        pdf_path,
+        lambda **_kwargs: {"status": "success", "content": _canonical_summary()},
+        config_overrides={
+            "Preprocess": {
+                "mineru_api_token": "resolved-config-token",
+                "parser_mode": "local",
+                "primary_parser": "local",
+                "fallback_parser": "none",
+            }
+        },
+    )
+    service._preprocess_environment_resolved = True
+
+    service.run(bundle)
+
+    assert observed_tokens == ["resolved-config-token"]
+
+
+def test_stage1_records_single_remote_parser_transport_under_force_rebuild(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pdf_path = tmp_path / "paper.pdf"
+    _write_pdf(pdf_path)
+    request_methods: list[str] = []
+    extract_calls = 0
+    original_extract = PreprocessManager._extract_preferred_content
+
+    class Response:
+        def __init__(self, status_code: int, payload: Mapping[str, Any]) -> None:
+            self.status_code = status_code
+            self._payload = dict(payload)
+            self.content = b""
+            self.headers: dict[str, str] = {}
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                raise RuntimeError(f"HTTP {self.status_code}")
+
+        def json(self) -> Mapping[str, Any]:
+            return self._payload
+
+    def fake_request(**kwargs: Any) -> Response:
+        method = str(kwargs["method"])
+        request_methods.append(method)
+        if method == "POST":
+            return Response(
+                200,
+                {
+                    "batch_id": "task-opaque-id",
+                    "upload_urls": ["https://storage.example.test/upload"],
+                },
+            )
+        return Response(
+            200,
+            {
+                "status": "success",
+                "markdown_text": "# MinerU\n\n" + ("remote complete text. " * 200),
+                "plain_text": "remote complete text. " * 200,
+            },
+        )
+
+    def fake_put(*_args: Any, **_kwargs: Any) -> Response:
+        request_methods.append("PUT")
+        return Response(200, {})
+
+    def count_extract(self: PreprocessManager, source_pdf: str):
+        nonlocal extract_calls
+        extract_calls += 1
+        return original_extract(self, source_pdf)
+
+    monkeypatch.setattr("preprocess.service.requests.request", fake_request)
+    monkeypatch.setattr("preprocess.service.requests.put", fake_put)
+    monkeypatch.setattr(PreprocessManager, "_extract_preferred_content", count_extract)
+    service, bundle = _service(
+        tmp_path,
+        pdf_path,
+        lambda **_kwargs: {"status": "success", "content": _canonical_summary()},
+        config_overrides={
+            "Preprocess": {
+                "force_rebuild": "true",
+                "parser_mode": "remote_first",
+                "primary_parser": "mineru_remote",
+                "fallback_parser": "none",
+                "mineru_api_token": "configured-token",
+                "mineru_base_url": "https://mineru.example.test/api",
+                "mineru_allowed_url_hosts": "storage.example.test",
+                "mineru_max_remote_tasks": "1",
+                "mineru_max_remote_http_calls": "3",
+                "mineru_max_remote_upload_bytes": "1048576",
+            }
+        },
+    )
+
+    result = service.run(bundle)
+    closure = service.finalize_provider_receipt_closure()
+    closure_payload = json.loads(Path(closure.path).read_text(encoding="utf-8"))
+
+    assert extract_calls == 1
+    assert request_methods == ["POST", "PUT", "GET"]
+    assert result.expected_provider_transport_count == 2
+    assert result.actual_provider_transport_count == 2
+    assert closure_payload["payload"]["complete"] is True
+    assert any(
+        record.artifact_type == "mineru_remote_receipt"
+        for record in service.registry.list_records()
+    )
+    assert result.summaries[0]["preprocess"]["mineru_receipt_artifact_id"]
 
 
 def test_current_stage1_malformed_existing_closure_is_rebuilt(tmp_path: Path) -> None:
@@ -645,6 +806,11 @@ def test_current_stage1_supported_preprocess_setting_change_is_stale_and_regener
     assert calls == [1]
 
     changed_preprocess = {**baseline_preprocess, setting_name: changed_value}
+    if setting_name == "primary_parser":
+        # A remote primary is only valid under the hybrid/remote parser
+        # policy.  Keep this reuse-invalidation case valid while the parser
+        # state machine rejects contradictory local/remote combinations.
+        changed_preprocess["parser_mode"] = "hybrid"
     changed, changed_bundle = _service(
         tmp_path / "changed",
         pdf_path,
@@ -1456,3 +1622,34 @@ def test_current_stage1_rejects_placeholder_provider_output(tmp_path: Path) -> N
         assert "placeholder" in str(exc)
     else:
         raise AssertionError("placeholder Stage 1 output was accepted")
+
+
+def test_current_stage1_publishes_normalized_routing_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pdf_path = tmp_path / "missing-derived-routing-field.pdf"
+    _write_pdf(pdf_path)
+    raw_summary = _canonical_summary()
+    raw_summary["routing"]["paper_subtype_raw"] = "quantitative"
+    raw_summary["routing"]["paper_subtype_normalized"] = None
+
+    def reader(**_kwargs: Any) -> Mapping[str, Any]:
+        return {"status": "success", "content": raw_summary}
+
+    # Exercise the publication boundary with the raw-but-substantive provider
+    # shape observed in the F1-07 live Stage 1 artifact.
+    monkeypatch.setattr(
+        Stage1AnalysisService,
+        "_canonical_substantive_summary",
+        staticmethod(lambda _provider_result: raw_summary),
+    )
+    service, bundle = _service(tmp_path, pdf_path, reader)
+    result = service.run(bundle)
+    assert result.generated_count == 1
+    summary_record = next(
+        record for record in service.registry.list_records() if record.artifact_type == "summary_file"
+    )
+    persisted = json.loads(Path(summary_record.path).read_text(encoding="utf-8"))[0]
+    assert persisted["ai_summary"]["routing"]["paper_subtype_normalized"] == "quantitative"
+    validate_canonical_ai_summary(persisted["ai_summary"], label="published ai_summary")

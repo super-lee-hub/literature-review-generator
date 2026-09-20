@@ -17,6 +17,24 @@
 - `[Multimodal]` 只为一次迁移兼容读取并发出 warning，不再写入，也不再作为第二个
   API key authority。
 
+## MinerU 配置准入
+
+MinerU 路由设置只会从 process environment、相邻 `.env` 与 `[Preprocess]`
+统一解析一次。两个或更多有效来源同时存在时，值必须一致。不同的
+`MINERU_API_TOKEN`、`MINERU_BASE_URL`、上传路由、资源上限或回退策略会在上传
+PDF 前 fail-closed；诊断只说明字段和来源，不输出任何值。
+
+当前 parser 枚举是严格的：
+
+- `parser_mode = local|hybrid|remote_first|remote`
+- `primary_parser = local|mineru_remote`
+- `fallback_parser = none|local|mineru_remote`
+
+`reviewctl doctor` 与 `reviewctl preflight` 仍是零网络检查。当前 parser 请求
+MinerU 时，它们会报告是否请求远程解析、token 是否存在，以及是否会采用允许的
+本地回退。远程路由缺失或无效且禁止回退时为失败；显式允许本地回退时为 warning，
+不会伪装成完整的远程可用状态。
+
 ## Stage 1 输入
 
 `[Stage1_Input]` 关键默认值：

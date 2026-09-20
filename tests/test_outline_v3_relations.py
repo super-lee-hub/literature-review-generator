@@ -90,3 +90,28 @@ def test_candidate_plans_share_global_inputs_but_use_distinct_axes_and_provider_
     assert all(candidate.shared_artifact_hashes == plans.shared_artifact_hashes for candidate in plans.candidates)
     assert all("global_corpus_ledger" in candidate.required_node_ids for candidate in plans.candidates)
     assert all("organizing_axes" in candidate.required_node_ids for candidate in plans.candidates)
+
+
+def test_relation_pair_cap_limits_actual_pairs_not_input_paper_count():
+    summaries = [
+        _relation_summary(f"10.1000/{letter}", letter, "online retail", "survey", "supports")
+        for letter in ("a", "b", "c", "d")
+    ]
+    evidence = build_outline_evidence_views(summaries)
+    ledger = build_global_corpus_ledger(evidence)
+    matrix = build_multi_view_matrix(evidence)
+    relation_map = build_global_relation_map(
+        evidence,
+        matrix,
+        ledger,
+        max_pairs_per_label=2,
+    )
+
+    capped = [
+        item for item in relation_map.blocking_diagnostics
+        if item.get("code") == "relation_label_pair_cap"
+    ]
+    assert capped
+    assert all(item["generated_pair_count"] == 2 for item in capped)
+    assert all(item["possible_pair_count"] == 6 for item in capped)
+    assert all(item["omitted_pair_count"] == 4 for item in capped)

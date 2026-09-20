@@ -1,0 +1,53 @@
+{
+  "artifact_type": "f1_aihubmix_outline_retry_summary",
+  "artifact_version": "v1",
+  "checked_at_utc": "2026-09-19T10:32:35Z",
+  "final_executable_sha": "b61e0917346d86d67015cc1ea7bab818ce922f4e",
+  "scope": "Outline-only Gate F child; existing canonical Stage1 summaries reused; no Stage1 rerun",
+  "f1_manifest_sha256": "f741776ea2eda6b5937f4fc13e40569216eb3173ff597fb80eeea2e46dab3e90",
+  "canonical_stage1_summary": {
+    "path": "D:/auto-generate/.acceptance_runs/f1_q_local_r3/f1_acceptance_Q_local_parser__f1-acceptance-Q-20260919-local-r3/artifacts/outline_v3/inputs/stage1_summaries_bcb217a040cc20989dbe5071__23cd9861ed9e63a84c70f283.json",
+    "sha256": "23cd9861ed9e63a84c70f283b35411089958902aed275e10f1c1d50b47bd0e87",
+    "paper_count": 15,
+    "stage1_provider_calls_in_this_retry": 0
+  },
+  "route_mismatch": {
+    "prior_failed_node": "candidate_1_provider_generation",
+    "prior_host": "api.yhlxj.ai",
+    "prior_node_route_fingerprint": "43a238be2ee491a28d8ee59cb145d89ec8cc0eb8ea2bd91b26f16e135933763c",
+    "new_gateway": "aihubmix.com",
+    "new_outline_route_fingerprint": "2550d1a10fac4fcd4bb2890859435800d3c8e0908d5b2eb75a0adc0c82954d34",
+    "new_outline_external_host_policy_fingerprint": "6b0e8045e1dc36009667cf6574f64e905c9416fa1727d3c3eceb0dfbfe72b5c4"
+  },
+  "minimal_route_probes": {
+    "physical_routes": 4,
+    "successful_calls": 4,
+    "retry_attempts": 0,
+    "timeouts": 0,
+    "models": ["claude-opus-5", "claude-fable-5-1", "gpt-5.6-sol", "deepseek-flash"]
+  },
+  "outline_retry": {
+    "acceptance_run_id": "f1-acceptance-F-outline-aihubmix-r8",
+    "job_id": "f1-acceptance-F-outline-aihubmix-r8",
+    "status": "NOT_VERIFIED",
+    "provider_receipts_persisted": 1,
+    "successful_node": "relation_adjudication",
+    "successful_node_http_status": 200,
+    "successful_node_output_tokens": 6986,
+    "failed_node": "candidate_1_provider_generation",
+    "failed_error_kind": "transient_network",
+    "failed_transport_observation": "ProxyError: RemoteDisconnected; connection closed by aihubmix.com during the large chat/completions request",
+    "terminal_reason": "provider transport attempts exceeded the pre-admitted aggregate reservation",
+    "complete_outline_closure": false,
+    "original_pdf_transport": "never",
+    "provider_gateway": "aihubmix.com"
+  },
+  "evidence": {
+    "provider_receipt_ledger": {
+      "path": "D:/auto-generate/.acceptance_runs/f1_q_outline_aihubmix_20260919/f1_q_outline_retry_aihubmix__f1-acceptance-F-outline-aihubmix-r8/artifacts/outline_v3_provider_receipts__ee36b3a804556d3af381b6fb.jsonl",
+      "sha256": "ee36b3a804556d3af381b6fb51e098a565d29f0e952fbac1a3cb97ec036dcfb1"
+    },
+    "parent_acceptance_result_sha256": "066ee4b62f03dc3aa720a317ea6d67861c0adfcb03209a40459eec4060a73a26",
+    "scenario_receipt_sha256": "e44e34c96868d8a5255693f85063a2ae7be5db3db2cd7e271abef0e1a1996d15"
+  }
+}

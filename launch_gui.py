@@ -6,12 +6,15 @@
 from __future__ import annotations
 
 import argparse
+import os
 import socket
+import ssl
 import sys
 import threading
 import time
 import urllib.request
 import webbrowser
+from typing import Any
 
 from services.environment_service import (
     detect_runtime_environment,
@@ -30,18 +33,45 @@ def _can_bind(host: str, port: int) -> bool:
     return True
 
 
-def _pick_available_port(preferred_port: int, host: str = '127.0.0.1', attempts: int = 30) -> int:
-    if _can_bind(host, preferred_port):
+# Chromium blocks a known set of service ports (for example 6566), which
+# otherwise makes a healthy local NiceGUI server appear unreachable to browser
+# automation. Keep launcher fallback selection away from those ports.
+_BROWSER_UNSAFE_PORTS = frozenset({
+    1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53,
+    67, 68, 69, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 99, 100,
+    101, 102, 103, 104, 109, 110, 111, 113, 119, 135, 139, 143, 179, 389,
+    427, 465, 512, 513, 514, 515, 548, 554, 587, 631, 636, 989, 990, 993,
+    995, 2049, 3659, 4045, 5060, 6000, 6566, 6665, 6666, 6667, 6668, 6669,
+    6697, 10080,
+})
+
+
+def _pick_available_port(
+    preferred_port: int,
+    host: str = '127.0.0.1',
+    attempts: int = 30,
+    *,
+    strict: bool = False,
+) -> int:
+    if preferred_port not in _BROWSER_UNSAFE_PORTS and _can_bind(host, preferred_port):
         return preferred_port
+
+    if strict:
+        raise RuntimeError(
+            f"requested GUI port {preferred_port} is unavailable or browser-unsafe"
+        )
 
     for offset in range(1, attempts + 1):
         candidate = preferred_port + offset
-        if _can_bind(host, candidate):
+        if candidate not in _BROWSER_UNSAFE_PORTS and _can_bind(host, candidate):
             return candidate
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind((host, 0))
-        return int(sock.getsockname()[1])
+        candidate = int(sock.getsockname()[1])
+        if candidate in _BROWSER_UNSAFE_PORTS:
+            return _pick_available_port(12000, host=host, attempts=attempts, strict=strict)
+        return candidate
 
 
 def _open_browser_when_ready(url: str, timeout: float = 25.0) -> None:
@@ -66,14 +96,46 @@ def _print_environment_notice() -> None:
         print(f'  {recommended_conda_activate_command()}', file=sys.stderr)
 
 
+def _configure_certifi_ssl_fallback() -> None:
+    """Opt into a CA-bundle fallback for broken Windows certificate stores."""
+
+    if os.environ.get("AUTO_GENERATE_GUI_CERTIFI_FALLBACK") != "1":
+        return
+    try:
+        ssl.create_default_context()
+        return
+    except ssl.SSLError:
+        pass
+    try:
+        import certifi  # type: ignore[import-not-found]
+    except ImportError:
+        return
+    original_create_default_context = ssl.create_default_context
+
+    def create_default_context(*args: Any, **kwargs: Any) -> ssl.SSLContext:
+        kwargs.setdefault("cafile", certifi.where())
+        return original_create_default_context(*args, **kwargs)
+
+    setattr(ssl, "create_default_context", create_default_context)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description='Launch the local GUI for auto-generate.')
     parser.add_argument('--config', type=str, default='config.ini', help='Path to config.ini')
     parser.add_argument('--port', type=int, default=8098, help='Local GUI port')
     parser.add_argument('--reload', action='store_true', help='Enable NiceGUI auto reload for development')
     parser.add_argument('--no-show', action='store_true', help='Do not auto-open the browser')
+    parser.add_argument(
+        '--strict-port',
+        action='store_true',
+        help='Fail if the requested port cannot be used exactly',
+    )
     args = parser.parse_args()
-    selected_port = _pick_available_port(args.port)
+    try:
+        selected_port = _pick_available_port(args.port, strict=args.strict_port)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(2) from exc
     launch_token = int(time.time())
     launch_url = f'http://127.0.0.1:{selected_port}/?launch={launch_token}'
     _print_environment_notice()
@@ -87,7 +149,12 @@ def main() -> None:
     try:
         if not args.no_show and not args.reload:
             threading.Thread(target=_open_browser_when_ready, args=(launch_url,), daemon=True).start()
-        launch_gui(config_path=args.config, port=selected_port, reload=args.reload, show=False)
+        launch_gui(
+            config_path=args.config,
+            port=selected_port,
+            reload=args.reload,
+            show=False,
+        )
     except Exception as exc:
         print("GUI launch failed.", file=sys.stderr)
         print(str(exc), file=sys.stderr)
@@ -106,6 +173,7 @@ def launch_gui(
     reload: bool = False,
     show: bool = True,
 ) -> None:
+    _configure_certifi_ssl_fallback()
     from gui.app import BUILD_STAMP, launch_gui as _launch_gui
 
     print(f'GUI build: {BUILD_STAMP}', file=sys.stderr)

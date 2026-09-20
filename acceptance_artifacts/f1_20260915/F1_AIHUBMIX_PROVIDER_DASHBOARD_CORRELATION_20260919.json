@@ -1,0 +1,57 @@
+{
+  "artifact_type": "f1_aihubmix_provider_dashboard_correlation",
+  "artifact_version": "v1",
+  "observed_at_utc": "2026-09-19T14:15:27Z",
+  "source": "user-provided AihubMix usage/dashboard export",
+  "gateway": "aihubmix.com",
+  "correlation": {
+    "relation_r14": {
+      "local_acceptance_run": "f1-acceptance-F-outline-aihubmix-r14",
+      "local_input_tokens": 68080,
+      "local_output_tokens": 6536,
+      "dashboard_model": "AWS/claude-fable-5-1",
+      "dashboard_input_tokens": 68080,
+      "dashboard_output_tokens": 6536,
+      "dashboard_status": "success",
+      "dashboard_request_id": "2026091913584085190249550163857",
+      "correlation_strength": "exact_token_count_match"
+    },
+    "relation_r15": {
+      "local_acceptance_run": "f1-acceptance-F-outline-aihubmix-r15",
+      "local_input_tokens": 68080,
+      "local_output_tokens": 7972,
+      "dashboard_model": "AWS/claude-fable-5-1",
+      "dashboard_input_tokens": 68080,
+      "dashboard_output_tokens": 7972,
+      "dashboard_status": "success",
+      "dashboard_request_id": "202609191406409233836233036727",
+      "correlation_strength": "exact_token_count_match"
+    },
+    "candidate_upstream_observations": [
+      {
+        "dashboard_model": "AWS/claude-opus-5",
+        "dashboard_input_tokens": 56835,
+        "dashboard_output_tokens": 18474,
+        "dashboard_status": "success",
+        "duration_seconds": 309.172,
+        "dashboard_request_id": "2026091914083058209367051712364",
+        "correlation_strength": "model-and-sequence-consistent_but_no_local_receipt"
+      },
+      {
+        "dashboard_model": "AWS/claude-opus-5",
+        "dashboard_input_tokens": 56835,
+        "dashboard_output_tokens": 18964,
+        "dashboard_status": "success",
+        "duration_seconds": 291.233,
+        "dashboard_request_id": "2026091914103613156241741542034",
+        "correlation_strength": "model-and-sequence-consistent_but_no_local_receipt"
+      }
+    ]
+  },
+  "interpretation": {
+    "provider_side": "The exact relation calls were processed and billed with reported output. The two Claude Opus rows are consistent with candidate generation completing upstream.",
+    "local_runtime_side": "The candidate response was not received by the local transport, so no provider receipt, content hash, schema validation, Registry artifact, or closure evidence exists for candidate generation.",
+    "acceptance_effect": "NOT_VERIFIED; provider dashboard success is corroborating transport evidence, not a substitute for local response and receipt closure.",
+    "billing_is_not_local_pass": true
+  }
+}

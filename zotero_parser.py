@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 import hashlib
 import logging
-import os
 from pathlib import Path
 import re
 from typing import Any, Dict, Iterable, List, Literal, Mapping, Optional, Sequence, Tuple, cast
@@ -15,7 +14,7 @@ from services.text_io import read_text_file_with_fallbacks
 
 
 logger = logging.getLogger(__name__)
-PARSER_VERSION = "zotero-parser-v1"
+PARSER_VERSION = "zotero-parser-v1.1"
 
 
 @dataclass(frozen=True)
@@ -237,10 +236,19 @@ _FIELD_ALIASES: Dict[str, str] = {
     "页码": "pages",
     "publication": "publication_title",
     "publication title": "publication_title",
+    "出版物": "publication_title",
     "journal": "journal",
     "期刊": "journal",
     "刊名": "publication_title",
+    "journal abbreviation": "journal_abbreviation",
+    "journal abbr": "journal_abbreviation",
+    "刊名简称": "journal_abbreviation",
     "doi": "doi",
+    "doi url": "doi",
+    "引用关键词": "citation_key",
+    "citation key": "citation_key",
+    "citation key (zotero)": "citation_key",
+    "引用键": "citation_key",
     "issue": "issue",
     "期号": "issue",
     "issn": "issn",
@@ -291,10 +299,39 @@ def _split_authors(value: str) -> List[str]:
     return comma_parts
 
 
+def _canonicalize_doi(value: str) -> str:
+    """Return the first DOI-shaped value without destroying the raw export."""
+
+    match = re.search(r"10\.\d{4,9}/[^\s<>]+", value, flags=re.IGNORECASE)
+    if not match:
+        return re.sub(r"\s+", "", value).strip("<>.,;。；")
+    return match.group(0).rstrip(".,;。；)")
+
+
+def _canonicalize_url(value: str) -> str:
+    """Separate Zotero display text/angle-bracket links from the URL value."""
+
+    angle_match = re.search(r"<\s*(https?://[^>\s]+)\s*>", value, flags=re.IGNORECASE)
+    if angle_match:
+        return angle_match.group(1).rstrip(".,;。；)")
+    url_match = re.search(r"https?://[^\s<>]+", value, flags=re.IGNORECASE)
+    if url_match:
+        return url_match.group(0).rstrip(".,;。；)")
+    return re.sub(r"\s+", "", value).strip("<>.,;。；")
+
+
+def _canonicalize_citation_key(value: str) -> str:
+    return re.sub(r"\s+", "", value).strip("<>.,;。；")
+
+
 def _normalize_field_value(field_name: str, parts: Sequence[str]) -> str:
     value = " ".join(part.strip() for part in parts if part.strip()).strip()
-    if field_name in {"doi", "url"}:
-        return re.sub(r"\s+", "", value)
+    if field_name == "doi":
+        return _canonicalize_doi(re.sub(r"\s+", "", value))
+    if field_name == "url":
+        return _canonicalize_url(re.sub(r"\s+", "", value))
+    if field_name == "citation_key":
+        return _canonicalize_citation_key(re.sub(r"\s+", "", value))
     return re.sub(r"\s+", " ", value)
 
 
@@ -310,6 +347,42 @@ def _parse_known_field(line: str) -> Optional[Tuple[str, str, str]]:
         mapped = _FIELD_ALIASES.get(_normalized_key(key))
         if mapped:
             return mapped, key, match.group(2).strip()
+    # Some localized exports lose the tab/colon separator when a field value
+    # starts immediately after the label (for example ``引用关键词key``).
+    # Only accept exact known labels, longest first, so ordinary prose is not
+    # reclassified as metadata.
+    stripped = line.strip()
+    for alias in sorted(_FIELD_ALIASES, key=len, reverse=True):
+        if not alias or not any(ord(char) > 127 for char in alias):
+            continue
+        if not stripped.casefold().startswith(alias.casefold()):
+            continue
+        remainder = stripped[len(alias) :]
+        if (
+            not remainder
+            or remainder[0].isspace()
+            or remainder[0] in ":：\t"
+            or (all(ord(char) > 127 for char in alias) and remainder[0].isalnum())
+        ):
+            mapped = _FIELD_ALIASES[alias]
+            return mapped, alias, remainder.lstrip(" \t:：")
+    return None
+
+
+def _parse_labeled_field(line: str) -> Optional[Tuple[str, str]]:
+    """Parse an unknown standard-export label without misreading prose titles.
+
+    Standard Zotero reports use a tab between a field label and its value.
+    Colon-delimited text is intentionally excluded here: article titles and
+    abstract prose commonly contain colons and must remain title/continuation
+    content.  Known colon-delimited fields are still handled by
+    :func:`_parse_known_field` above.
+    """
+
+    if "\t" in line:
+        key, value = line.split("\t", 1)
+        if key.strip():
+            return key.strip(), value.strip()
     return None
 
 
@@ -342,7 +415,13 @@ def _parse_entry_lines(
     entry_index: int,
     parser_route: str,
 ) -> Tuple[Optional[ZoteroRecordV1], List[ZoteroParseDiagnosticV1], int]:
-    paper: Dict[str, Any] = {"authors": [], "editors": [], "tags": [], "attachments": []}
+    paper: Dict[str, Any] = {
+        "authors": [],
+        "editors": [],
+        "tags": [],
+        "attachments": [],
+        "unknown_fields": [],
+    }
     sources: Dict[str, List[ZoteroFieldSourceV1]] = {}
     diagnostics: List[ZoteroParseDiagnosticV1] = []
     wrapped_fields_joined = 0
@@ -381,6 +460,15 @@ def _parse_entry_lines(
             paper.setdefault(field_name, []).append(value)
             section_last_field = field_name
         else:
+            if field_name == "doi":
+                paper.setdefault("doi_raw", " ".join(part.strip() for part in parts if part.strip()))
+            elif field_name == "url":
+                paper.setdefault("url_raw", " ".join(part.strip() for part in parts if part.strip()))
+            elif field_name == "citation_key":
+                paper.setdefault(
+                    "citation_key_raw",
+                    " ".join(part.strip() for part in parts if part.strip()),
+                )
             if paper.get(field_name):
                 diagnostics.append(
                     ZoteroParseDiagnosticV1(
@@ -428,11 +516,13 @@ def _parse_entry_lines(
             section = "tags"
             saw_field = True
             continue
-        if normalized_line in {"附件", "attachments"} and not _parse_known_field(raw_line):
-            flush_current()
-            section = "attachments"
-            saw_field = True
-            continue
+        if normalized_line in {"附件", "attachments"}:
+            attachment_field = _parse_known_field(raw_line)
+            if attachment_field is None or not attachment_field[2]:
+                flush_current()
+                section = "attachments"
+                saw_field = True
+                continue
 
         field_match = _parse_known_field(raw_line)
         if field_match:
@@ -445,6 +535,32 @@ def _parse_entry_lines(
             current_parts = [value] if value else []
             section = ""
             section_last_field = ""
+            saw_field = True
+            continue
+
+        unknown_match = _parse_labeled_field(raw_line)
+        if unknown_match:
+            flush_current()
+            unknown_key, unknown_value = unknown_match
+            paper.setdefault("unknown_fields", []).append(
+                {
+                    "key": unknown_key,
+                    "raw_value": unknown_value,
+                    "line_start": line_number,
+                    "line_end": line_number,
+                }
+            )
+            diagnostics.append(
+                ZoteroParseDiagnosticV1(
+                    code="unknown_field",
+                    severity="warning",
+                    message=f"Unknown Zotero field preserved without attaching it to the previous field: {unknown_key}",
+                    entry_index=entry_index,
+                    field=unknown_key,
+                    line_start=line_number,
+                    line_end=line_number,
+                )
+            )
             saw_field = True
             continue
 

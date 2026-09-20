@@ -1,0 +1,36 @@
+{
+  "artifact_type": "f1_stage1_machine_content_integrity_projection",
+  "artifact_version": "v1",
+  "execution_sha": "420663e4eea4e9e2a1ffdee1d5d16193d7e5d08e",
+  "recheck_sha": "c49bf58675746ad647a9ecd104e514d8b4cc21db",
+  "run_id": "f1-stage1-full-20260917-r14",
+  "summary_file_registry_hash": "70c44250cfd061ccd02157f536358eeceb9f5aaccb1bf4f6977d58b507dc22a2",
+  "counts": {
+    "summaries": 15,
+    "unique_paper_keys": 15,
+    "canonical_invalid": 0,
+    "empty_core_fields": 0,
+    "placeholder_hits": 0,
+    "source_hash_mismatches": 0,
+    "missing_receipt_bindings": 0
+  },
+  "machine_integrity_pass": true,
+  "human_semantic_ground_truth": "NOT_REVIEWED_BY_HUMAN",
+  "per_paper": [
+    {"paper_key":"f101_unknown_author","route":"Primary_Reader_API","receipt_count":1,"core_lengths":{"summary":787,"methodology":1527,"findings":1796,"conclusions":1183}},
+    {"paper_key":"f102_unknown_author","route":"Backup_Reader_API","receipt_count":3,"core_lengths":{"summary":712,"methodology":448,"findings":598,"conclusions":418}},
+    {"paper_key":"f103_unknown_author","route":"Primary_Reader_API","receipt_count":1,"core_lengths":{"summary":629,"methodology":1356,"findings":1595,"conclusions":856}},
+    {"paper_key":"f104_unknown_author","route":"Primary_Reader_API","receipt_count":1,"core_lengths":{"summary":82,"methodology":941,"findings":1407,"conclusions":890}},
+    {"paper_key":"f105_unknown_author","route":"Primary_Reader_API","receipt_count":1,"core_lengths":{"summary":1026,"methodology":1832,"findings":1703,"conclusions":809}},
+    {"paper_key":"f106_unknown_author","route":"Primary_Reader_API","receipt_count":1,"core_lengths":{"summary":927,"methodology":1391,"findings":2477,"conclusions":841}},
+    {"paper_key":"f107_unknown_author","route":"Primary_Reader_API","receipt_count":1,"core_lengths":{"summary":1037,"methodology":364,"findings":1252,"conclusions":1208}},
+    {"paper_key":"f108_unknown_author","route":"Primary_Reader_API","receipt_count":2,"core_lengths":{"summary":1256,"methodology":2186,"findings":3510,"conclusions":806}},
+    {"paper_key":"f109_unknown_author","route":"Primary_Reader_API","receipt_count":2,"core_lengths":{"summary":676,"methodology":1443,"findings":2115,"conclusions":861}},
+    {"paper_key":"f110_unknown_author","route":"Primary_Reader_API","receipt_count":4,"core_lengths":{"summary":870,"methodology":608,"findings":2134,"conclusions":1609}},
+    {"paper_key":"f111_unknown_author","route":"Primary_Reader_API","receipt_count":1,"core_lengths":{"summary":213,"methodology":655,"findings":652,"conclusions":135}},
+    {"paper_key":"f112_unknown_author","route":"Primary_Reader_API","receipt_count":1,"core_lengths":{"summary":871,"methodology":1425,"findings":2238,"conclusions":1025}},
+    {"paper_key":"f113_unknown_author","route":"Primary_Reader_API","receipt_count":1,"core_lengths":{"summary":1230,"methodology":1098,"findings":2933,"conclusions":1038}},
+    {"paper_key":"f114_unknown_author","route":"Primary_Reader_API","receipt_count":1,"core_lengths":{"summary":270,"methodology":440,"findings":775,"conclusions":220}},
+    {"paper_key":"f115_unknown_author","route":"Primary_Reader_API","receipt_count":1,"core_lengths":{"summary":714,"methodology":689,"findings":5694,"conclusions":636}}
+  ]
+}

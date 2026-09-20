@@ -233,7 +233,6 @@ def migrate_config_text(
     # default. A config already on the current schema has been touched by a
     # current revision, so its model choice is treated as deliberate.
     declared_schema = _declared_schema(sections, lines)
-    is_legacy_schema = declared_schema < CONFIG_SCHEMA_VERSION
     promote_vision_primary = promote_vision_primary and _legacy_primary_default_is_unambiguous(
         sections,
         lines,

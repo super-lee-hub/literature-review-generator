@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping
 
 import pytest
 
 from outline.v3_executor import OutlineV3Executor
-from runtime.provider_runtime import ProviderRuntimeLedger
+from outline.v3_evidence import (
+    build_global_corpus_ledger,
+    build_multi_view_matrix,
+    build_outline_evidence_views,
+)
+from outline.v3_relations import build_global_relation_map
+from runtime.provider_runtime import ProviderRuntimeLedger, hash_json
 from services.artifact_registry import ArtifactRegistry
 from services.job_workspace import JobWorkspace
 from summary_schema import normalize_ai_summary
@@ -112,6 +119,7 @@ def _executor(
     max_estimated_total_tokens: int | None = 5_000_000,
     pricing_source: str | None = "tests:explicit-rates-v1",
     candidate_count: int = 2,
+    technical_shard_target_tokens: int = 0,
 ) -> OutlineV3Executor:
     workspace = JobWorkspace.create(str(tmp_path), "outline", job_id="outline-job")
     registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
@@ -133,6 +141,7 @@ def _executor(
         input_cost_per_1k_tokens=0.0,
         output_cost_per_1k_tokens=0.001,
         reasoning_cost_per_1k_tokens=0.001,
+        technical_shard_target_tokens=technical_shard_target_tokens,
         cache_read_cost_per_1k_tokens=0.0,
         cache_write_cost_per_1k_tokens=0.0,
     )
@@ -157,6 +166,20 @@ def test_outline_v3_fixture_executes_evidence_bound_adoption(tmp_path: Path) -> 
 
     ledger = ProviderRuntimeLedger(result.artifacts["provider_receipts"])
     assert ledger.list_receipts()
+
+    audit_path = Path(result.artifacts["request_payload_audit"])
+    audit_rows = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert audit_rows
+    assert all(row["schema_version"] == "outline_request_payload_audit/v1" for row in audit_rows)
+    assert all(row["serialized_bytes"] > 0 for row in audit_rows)
+    assert all(row["mock_live"] == "mock" for row in audit_rows)
+    assert {"paper-a", "paper-b"}.issubset({key for row in audit_rows for key in row["paper_keys"]})
+
+    graph = json.loads(Path(result.artifacts["hierarchical_call_graph"]).read_text(encoding="utf-8"))
+    assert graph["schema_version"] == "outline_hierarchical_call_graph/v1"
+    assert graph["provider_calls"]
+    assert graph["edges"]
+    assert {"paper-a", "paper-b"}.issubset(set(graph["coverage"]["paper_keys"]))
 
 
 def test_outline_v3_without_explicit_adoption_stops_at_ready_for_adoption(tmp_path: Path) -> None:
@@ -294,6 +317,184 @@ def test_outline_v3_explicit_pricing_estimate_changes_with_input_volume(tmp_path
     assert long_estimate > short_estimate
 
 
+def test_relation_shard_plan_is_lossless_and_estimate_is_bounded(tmp_path: Path) -> None:
+    executor = _executor(
+        tmp_path,
+        stability_mode="off",
+        technical_shard_target_tokens=1,
+    )
+    evidence = build_outline_evidence_views(executor.summaries, executor.job_id)
+    plan = executor._build_relation_shard_plan(evidence.views, [])
+
+    assert plan["shard_count"] == len(evidence.views)
+    assert plan["coverage"]["input_view_count"] == len(evidence.views)
+    assert plan["coverage"]["planned_view_count"] == len(evidence.views)
+    assert plan["coverage"]["missing_view_hashes"] == []
+    assert all(item["estimated_input_tokens"] >= 1 for item in plan["shards"])
+
+
+def test_shard_target_changes_real_relation_subrequest_membership(tmp_path: Path) -> None:
+    def run_with_target(target_tokens: int) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        calls: list[dict[str, Any]] = []
+
+        def provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
+            calls.append({"node_id": node_id, "request": dict(request)})
+            ids = [
+                str(item.get("relation_id") or "")
+                for item in request.get("relation_candidates") or ()
+                if isinstance(item, Mapping) and str(item.get("relation_id") or "")
+            ]
+            rejected = [
+                {"relation_id": relation_id, "reason": "not confirmed in fixture"}
+                for relation_id in ids
+                if not relation_id.endswith("0")
+            ]
+            confirmed = [relation_id for relation_id in ids if relation_id not in {item["relation_id"] for item in rejected}]
+            return {
+                "status": "success",
+                "content": {
+                    "confirmed_relation_ids": confirmed,
+                    "rejected_relations": rejected,
+                },
+            }
+
+        executor = _executor(
+            tmp_path / str(target_tokens),
+            provider=provider,
+            stability_mode="off",
+            technical_shard_target_tokens=target_tokens,
+        )
+        evidence = build_outline_evidence_views(executor.summaries, executor.job_id)
+        ledger = build_global_corpus_ledger(evidence)
+        matrix = build_multi_view_matrix(evidence)
+        relation_map = build_global_relation_map(evidence, matrix, ledger)
+        relations = [item.to_dict() for item in relation_map.relations]
+        plan = executor._build_relation_shard_plan(evidence.views, relations)
+        executor._run_hierarchical_relation_adjudication(
+            evidence_views=evidence.views,
+            relation_candidates=relations,
+            shard_plan=plan,
+            relation_contract={
+                "must_return_confirmed_relation_ids": True,
+                "must_reject_without_recorded_evidence": True,
+                "allowed_relation_ids": [item["relation_id"] for item in relations],
+            },
+            relation_dependencies={"evidence": hash_json(evidence.to_dict())},
+        )
+        return plan, calls
+
+    small_plan, small_calls = run_with_target(500)
+    large_plan, large_calls = run_with_target(5_000)
+
+    assert small_plan["shard_count"] > large_plan["shard_count"]
+    assert len(small_calls) > len(large_calls)
+    assert {
+        str((request.get("hierarchy") or {}).get("shard_id") or "")
+        for item in small_calls
+        for request in [item["request"]]
+    } != {
+        str((request.get("hierarchy") or {}).get("shard_id") or "")
+        for item in large_calls
+        for request in [item["request"]]
+    }
+    assert all(
+        (request.get("hierarchy") or {}).get("target_tokens") in {500, 5_000}
+        for item in [*small_calls, *large_calls]
+        for request in [item["request"]]
+    )
+
+
+def test_evidence_projection_preserves_tail_and_chunks_long_view(tmp_path: Path) -> None:
+    executor = _executor(
+        tmp_path,
+        stability_mode="off",
+        technical_shard_target_tokens=1,
+    )
+    evidence = build_outline_evidence_views(executor.summaries, executor.job_id)
+    view = replace(
+        evidence.views[0],
+        findings=[f"finding-{index}" for index in range(1, 12)],
+        theories=["theory-tail-" + ("x" * 1400)],
+    )
+
+    projected = executor._prompt_evidence_views([view])[0]
+    assert len(projected["findings"]) == 11
+    assert projected["findings"][-1] == "finding-11"
+    chunks = executor._prompt_evidence_chunks(view)
+    assert len(chunks) > 1
+    assert any("theory-tail-" in value for chunk in chunks for value in chunk["theories"])
+    assert any("finding-11" in value for chunk in chunks for value in chunk["findings"])
+
+    plan = executor._build_relation_shard_plan(
+        [view],
+        [{"relation_id": "r-long", "paper_keys": [view.paper_key]}],
+    )
+    assert plan["coverage"]["missing_chunk_ids"] == []
+    assert plan["coverage"]["input_chunk_count"] == len(chunks)
+
+
+def test_outline_preflight_counts_hierarchical_relation_calls(tmp_path: Path) -> None:
+    executor = _executor(
+        tmp_path,
+        stability_mode="off",
+        technical_shard_target_tokens=1,
+    )
+    executor._preflight_stability_budget()
+
+    assert executor.stability_preflight["hierarchical_relation_shard_calls"] > 0
+    assert executor.stability_preflight["estimated_provider_calls"] > len(
+        executor._provider_node_ids()
+    )
+
+
+def test_hierarchical_relation_adjudication_emits_local_and_cross_shard_calls(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+
+    def provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        calls.append(node_id)
+        relation_ids = [
+            str(item.get("relation_id") or "")
+            for item in request.get("relation_candidates") or ()
+            if isinstance(item, Mapping)
+        ]
+        return {
+            "status": "success",
+            "content": {
+                "confirmed_relation_ids": relation_ids,
+                "rejected_relations": [],
+            },
+        }
+
+    executor = _executor(
+        tmp_path,
+        provider=provider,
+        stability_mode="off",
+        technical_shard_target_tokens=1,
+    )
+    evidence = build_outline_evidence_views(executor.summaries, executor.job_id)
+    relations = [
+        {"relation_id": "r_local_a", "paper_keys": ["paper-a"]},
+        {"relation_id": "r_local_b", "paper_keys": ["paper-b"]},
+        {"relation_id": "r_cross", "paper_keys": ["paper-a", "paper-b"]},
+    ]
+    plan = executor._build_relation_shard_plan(evidence.views, relations)
+    content, digests = executor._run_hierarchical_relation_adjudication(
+        evidence_views=evidence.views,
+        relation_candidates=relations,
+        shard_plan=plan,
+        relation_contract={"output_fields": {}, "allowed_relation_ids": []},
+        relation_dependencies={"evidence": "evidence-hash", "plan": "plan-hash"},
+    )
+
+    assert len(plan["shards"]) == 2
+    assert len(calls) == 3
+    assert sorted(content["confirmed_relation_ids"]) == ["r_cross", "r_local_a", "r_local_b"]
+    assert len(digests) == 3
+    assert {item["level"] for item in digests} == {"local_shard", "cross_shard"}
+
+
 @pytest.mark.parametrize(
     ("candidate_count", "stability_mode", "expected_transport_calls"),
     [
@@ -360,6 +561,66 @@ def test_outline_v3_transport_trace_matches_call_plan(
     assert stability["preflight"]["estimated_provider_calls"] == expected_transport_calls
     assert stability["provider_call_count_total"] == expected_transport_calls
     assert stability["transport_call_count_after_stability"] == expected_transport_calls
+
+
+def test_stability_dynamic_candidate_and_critique_shards_are_registry_bound(
+    tmp_path: Path,
+) -> None:
+    executor = _executor(
+        tmp_path,
+        stability_mode="off",
+        technical_shard_target_tokens=1,
+    )
+    evidence = build_outline_evidence_views(executor.summaries, executor.job_id)
+    ledger = build_global_corpus_ledger(evidence)
+    matrix = build_multi_view_matrix(evidence)
+    relation_map = build_global_relation_map(evidence, matrix, ledger)
+    relations = [item.to_dict() for item in relation_map.relations]
+    paper_keys = [view.paper_key for view in evidence.views]
+    relation_ids = [item["relation_id"] for item in relations]
+    candidate_request = {
+        "candidate_id": "candidate_1",
+        "organizing_logic": "evidence",
+        "paper_keys": paper_keys,
+        "relation_ids": relation_ids,
+        "relations": relations,
+        "evidence": executor._prompt_evidence_views(evidence.views),
+    }
+    candidate = executor._run_hierarchical_candidate_generation(
+        candidate_id="candidate_1",
+        generation_node_id="candidate_1_provider_generation",
+        provider_request=candidate_request,
+        evidence_views=evidence.views,
+        relation_candidates=relations,
+        allowed_paper_keys=paper_keys,
+        allowed_relation_ids=relation_ids,
+        generation_deps={"candidate": "candidate-hash"},
+        alias_map=None,
+        node_prefix="stability:test-candidate",
+    )
+    critique = executor._run_hierarchical_critique(
+        node_id="coverage_critique",
+        request={
+            "node_id": "coverage_critique",
+            "candidate_contents": {"candidate_1": candidate},
+            "candidate_hashes": {"candidate_1": hash_json(candidate)},
+            "corpus_ledger": ledger.to_dict(),
+            "relations": relations,
+        },
+        dependency_hashes={"candidate": hash_json(candidate)},
+        node_prefix="stability:test-critique",
+    )
+
+    assert candidate["sections"]
+    assert critique["passed"] is True
+    assert any(
+        node_id.startswith("stability:test-candidate:candidate_1_provider_generation:local:")
+        for node_id in executor.artifact_records
+    )
+    assert any(
+        node_id.startswith("stability:test-critique:coverage_critique:local:")
+        for node_id in executor.artifact_records
+    )
 
 
 def test_outline_v3_actual_usage_and_cost_are_reported_without_billing_claim(tmp_path: Path) -> None:

@@ -99,6 +99,31 @@ def test_non_adjacent_tokens_stay_separate() -> None:
     assert "(Chen, 2024)" in out and "(Chen, 2026)" in out
 
 
+def test_adjacent_tokens_preserve_each_occurrence_mode_and_locator() -> None:
+    manifest = _manifest()
+    manifest["occurrences"] = [
+        {"ref_id": "R006", "paper_id": "10.1/a", "mode": "narrative", "locator": "p. 7"},
+        {"ref_id": "R009", "paper_id": "10.1/b", "mode": "parenthetical", "locator": "pp. 8-9"},
+    ]
+    rendered, unresolved = render_structured_citations(
+        "Claim[[cite_ref:R006]][[cite_ref:R009]].", None, manifest
+    )
+    assert unresolved == []
+    assert "Chen (2024, p. 7); (Chen, 2026, pp. 8-9)" in rendered
+
+
+def test_render_structured_citations_selects_occurrence_by_section() -> None:
+    manifest = _manifest()
+    manifest["occurrences"] = [
+        {"ref_id": "R006", "paper_id": "10.1/a", "section_number": 1, "locator": "p. 1"},
+        {"ref_id": "R006", "paper_id": "10.1/a", "section_number": 2, "locator": "p. 99"},
+    ]
+    first, _ = render_structured_citations("A[[cite_ref:R006]].", None, manifest, section_number=1)
+    second, _ = render_structured_citations("B[[cite_ref:R006]].", None, manifest, section_number=2)
+    assert "p. 1" in first
+    assert "p. 99" in second
+
+
 def test_json_and_docx_bibliography_match() -> None:
     """references_from_catalog_payload and format_in_text_citation share one catalog."""
 

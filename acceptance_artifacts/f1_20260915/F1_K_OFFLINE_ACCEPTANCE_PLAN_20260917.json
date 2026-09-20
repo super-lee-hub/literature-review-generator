@@ -1,0 +1,29 @@
+{
+  "schema_version": "release-acceptance-plan-v2",
+  "parent_run_id": "f1-k-offline-acceptance-20260917",
+  "final_executable_sha": "",
+  "state_path": "F1_K_OFFLINE_ACCEPTANCE_PLAN_STATE_20260917.json",
+  "budget": {
+    "max_provider_calls_total": 4,
+    "max_output_tokens_total": 1000,
+    "max_retry_attempts_total": 1,
+    "max_wall_seconds": 300
+  },
+  "third_party_acknowledged": false,
+  "third_party_hosts": [],
+  "external_host_acknowledgement": null,
+  "scenarios": {
+    "K": {
+      "scenario_id": "K",
+      "gate": "K",
+      "runtime_spec": "",
+      "workspace": "acceptance_artifacts/f1_20260915/k_offline_workspace",
+      "input_manifest": "",
+      "f1_source_ids": [],
+      "execution_mode": "offline-k",
+      "budget_domain": "offline-k",
+      "prerequisites": [],
+      "job_id": ""
+    }
+  }
+}

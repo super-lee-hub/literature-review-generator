@@ -248,20 +248,30 @@ def build_global_relation_map(
     pair_dimensions: Dict[Tuple[str, str], Dict[str, Set[str]]] = defaultdict(lambda: defaultdict(set))
     for (dimension, label), paper_keys in sorted(index.items()):
         keys = sorted(set(paper_keys))
-        if len(keys) > max_pairs_per_label:
+        pair_cap = max(0, int(max_pairs_per_label))
+        possible_pairs = len(keys) * max(0, len(keys) - 1) // 2
+        if possible_pairs > pair_cap:
             blocking.append({
                 "code": "relation_label_pair_cap",
                 "severity": "blocking",
                 "dimension": dimension,
                 "label": label,
                 "paper_count": len(keys),
-                "max_pairs_per_label": max_pairs_per_label,
+                "possible_pair_count": possible_pairs,
+                "generated_pair_count": pair_cap,
+                "omitted_pair_count": possible_pairs - pair_cap,
+                "max_pairs_per_label": pair_cap,
                 "message": "Relation candidates were capped for a high-frequency label.",
             })
-            keys = keys[:max_pairs_per_label]
+        generated_pairs = 0
         for left_index, left_key in enumerate(keys):
             for right_key in keys[left_index + 1:]:
+                if generated_pairs >= pair_cap:
+                    break
                 pair_dimensions[(left_key, right_key)][dimension].add(label)
+                generated_pairs += 1
+            if generated_pairs >= pair_cap:
+                break
 
     relations: Dict[str, RelationCandidate] = {}
     for (left_key, right_key), dimension_map in sorted(pair_dimensions.items()):

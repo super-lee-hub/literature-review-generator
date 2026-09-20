@@ -1,0 +1,29 @@
+{
+  "project_name": "f1_acceptance_J",
+  "job_id": "f1-acceptance-J-20260916-r5",
+  "config": "auxiliary_ocr_scan_20260916/J_ACCEPTANCE_CONFIG_20260916.ini",
+  "action": "analyze",
+  "workspace_path": "runs/f1_acceptance_J__f1-acceptance-J-20260916-r5",
+  "source": {
+    "mode": "direct",
+    "pdf_folder": "auxiliary_ocr_scan_20260916/source_corpus"
+  },
+  "metadata": {
+    "requested_stages": ["source_intake", "analyze"],
+    "validation_required": false,
+    "require_clean_validation": false,
+    "allow_unvalidated_when_validation_optional": true,
+    "audit_actor": "Codex",
+    "audit_reason": "F1 Gate J explicitly labelled auxiliary scan OCR acceptance; not part of the authoritative Q corpus",
+    "audit_scope": {
+      "field": "F1",
+      "gate": "J",
+      "corpus_id": "field-f1-20260915",
+      "auxiliary_scan": true,
+      "source_label": "F1-AUX-SCAN-01",
+      "provider_calls_allowed": true,
+      "allowed_provider": "https://api.deepseek.com",
+      "allowed_role": "Primary Reader only"
+    }
+  }
+}

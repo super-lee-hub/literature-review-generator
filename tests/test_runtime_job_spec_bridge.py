@@ -6,7 +6,9 @@ from pathlib import Path
 import pytest
 
 from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
+from runtime.orchestrator import AgentRuntimeBridge
 from services.review_batch import SummarySelectionError
+from tests.test_runtime_bridge_helpers import current_config
 
 
 def test_runtime_job_spec_compiles_direct_source_into_canonical_job_request() -> None:
@@ -59,6 +61,19 @@ def test_runtime_job_spec_defaults_stage1_reuse_for_stage1_actions() -> None:
     request = spec.to_job_request()
 
     assert request.reuse_stage1 is True
+
+
+def test_runtime_job_spec_passes_partial_source_quarantine_policy() -> None:
+    spec = RuntimeJobSpec(
+        project_name="partial-corpus",
+        source=RuntimeSourceSpec(mode="direct", pdf_folder="D:/papers"),
+        action="run_all",
+        metadata={"allow_partial_source_quarantine": True},
+    )
+
+    request = spec.to_job_request()
+
+    assert request.allow_partial_source_quarantine is True
 
 
 def test_runtime_job_spec_preserves_stage1_reuse_opt_out() -> None:
@@ -183,6 +198,33 @@ def test_runtime_job_spec_from_mapping_preserves_workspace_path(tmp_path: Path) 
 
     assert spec.workspace_path == str(workspace)
     assert spec.to_job_request().workspace_path == str(workspace)
+
+
+def test_runtime_bridge_honors_explicit_workspace_path(tmp_path: Path) -> None:
+    pdf_dir = tmp_path / "papers"
+    pdf_dir.mkdir()
+    (pdf_dir / "alpha.pdf").write_bytes(b"%PDF-1.4\n%alpha\n")
+    workspace = tmp_path / "planned-output" / "demo__workspace-job"
+    spec = RuntimeJobSpec(
+        project_name="demo",
+        source=RuntimeSourceSpec(mode="direct", pdf_folder=str(pdf_dir)),
+        action="analyze",
+        config=str(current_config(tmp_path)),
+        job_id="workspace-job",
+        queue_file=str(tmp_path / "queue.json"),
+        workspace_path=str(workspace),
+    )
+
+    session = AgentRuntimeBridge(spec).bootstrap(
+        claim_latest_pointer=False,
+        publish_running_state=False,
+    )
+
+    assert Path(session.context.workspace.root_dir).resolve() == workspace.resolve()
+    assert (
+        Path(session.stage_host.config["Paths"]["output_path"]).resolve()
+        == workspace.parent.resolve()
+    )
 
 
 def test_runtime_job_spec_paths_are_resolved_from_spec_not_cwd(tmp_path: Path, monkeypatch) -> None:

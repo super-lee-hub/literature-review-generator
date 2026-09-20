@@ -172,6 +172,32 @@ class TestAIIinterface:
         assert result["error_kind"] == "transient_network"
 
     @patch('ai_interface.requests.post')
+    def test_aihubmix_disconnect_is_unknown_and_not_retried_without_recovery(self, mock_post):
+        """AihubMix POST disconnects are not safe to regenerate automatically."""
+        mock_post.side_effect = ConnectionError("remote end closed connection")
+
+        config = {
+            "api_key": "test_key",
+            "model": "claude-fable-5-1",
+            "api_base": "https://aihubmix.com/v1",
+            "provider_family": "aihubmix_claude",
+            "transport_retries": "4",
+            "aihubmix_recovery_enabled": "false",
+        }
+        with patch('ai_interface.load_config', return_value=_runtime_config(retries="4")), patch(
+            'ai_interface.time.sleep', return_value=None
+        ):
+            result = self.ai_interface._call_ai_api_detailed(
+                "test prompt",
+                config,
+                "system prompt",
+            )
+
+        assert result["status"] == "failed"
+        assert result["error_kind"] == "outcome_unknown"
+        assert mock_post.call_count == 1
+
+    @patch('ai_interface.requests.post')
     def test_call_ai_api_detailed_classifies_retryable_http(self, mock_post):
         mock_response = Mock()
         mock_response.status_code = 503
@@ -239,6 +265,57 @@ class TestAIIinterface:
 
         assert result is None
         assert mock_post.call_count == 3
+
+    @patch('ai_interface.requests.post')
+    def test_explicit_zero_transport_retries_allows_initial_request_only(self, mock_post):
+        mock_post.side_effect = ConnectionError("Network error")
+
+        with patch('ai_interface.load_config', return_value=_runtime_config(retries="0")), patch(
+            'ai_interface.time.sleep', return_value=None
+        ):
+            result = self.ai_interface._call_ai_api(
+                "test prompt",
+                {"api_key": "test_key", "model": "test_model", "transport_retries": "0"},
+                "system prompt",
+            )
+
+        assert result is None
+        assert mock_post.call_count == 1
+
+    def test_http_error_response_does_not_leak_into_following_connection_error(self, monkeypatch):
+        class Response:
+            def __init__(self, status_code: int):
+                self.status_code = status_code
+
+            def raise_for_status(self):
+                error = HTTPError(f"HTTP {self.status_code}")
+                error.response = self  # type: ignore[attr-defined]
+                raise error
+
+            def json(self):
+                return {"error": {"message": "temporary"}}
+
+        responses = iter([Response(429), ConnectionError("socket closed")])
+
+        def post(*_args, **_kwargs):
+            item = next(responses)
+            if isinstance(item, BaseException):
+                raise item
+            return item
+
+        monkeypatch.setattr(ai_interface, "_post_with_proxy_mode", post)
+        monkeypatch.setattr(ai_interface.time, "sleep", lambda _seconds: None)
+
+        result = ai_interface._call_ai_api_detailed(
+            "prompt",
+            {"api_key": "secret", "model": "test-model", "api_base": "https://provider.example/v1"},
+            "system",
+            retry_attempts=2,
+            provider_runtime=ProviderRuntime(test_only=True),
+        )
+
+        assert result["error_kind"] == "transient_network"
+        assert result["http_status"] is None
 
     @patch('ai_interface.requests.post')
     def test_call_ai_api_retries_without_deprecated_temperature(self, mock_post):

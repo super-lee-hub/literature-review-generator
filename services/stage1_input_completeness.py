@@ -26,6 +26,9 @@ def build_completeness_metrics(
     candidate_lengths: Optional[Mapping[str, int]] = None,
     selected_text_length: Optional[int] = None,
     chunk_count: Optional[int] = None,
+    visual_coverage_complete: bool = False,
+    scanned_primary: bool = False,
+    text_layer_complete: bool = False,
 ) -> Dict[str, Any]:
     candidate = str(text or "")
     length = int(selected_text_length) if selected_text_length is not None else len(candidate)
@@ -44,7 +47,17 @@ def build_completeness_metrics(
     min_length_for_pages = None
     if safe_page_count >= 5:
         min_length_for_pages = min(6000, safe_page_count * 750)
-        if length < min_length_for_pages:
+        # A sparse extraction is incomplete unless an explicit upstream
+        # authority proves that every page is covered by visual evidence or
+        # that this source is a scanned-primary document. Page count alone
+        # must never turn a truncated 13/20/50-page input into a warning-only
+        # result.
+        if (
+            length < min_length_for_pages
+            and not visual_coverage_complete
+            and not scanned_primary
+            and not text_layer_complete
+        ):
             blocking_reasons.append("incomplete_by_page_count")
 
         thin_length_threshold = min(9000, safe_page_count * 1200)
@@ -71,6 +84,9 @@ def build_completeness_metrics(
         "alternative_length_ratio": alternative_ratio,
         "estimated_chunk_count": estimated_chunk_count,
         "has_late_structure_signal": has_late_structure_signal,
+        "visual_coverage_complete": bool(visual_coverage_complete),
+        "scanned_primary": bool(scanned_primary),
+        "text_layer_complete": bool(text_layer_complete),
         "blocking_reasons": blocking_reasons,
         "warning_reasons": warning_reasons,
         "reasons": sorted(set(blocking_reasons + warning_reasons)),

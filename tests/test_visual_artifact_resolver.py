@@ -13,7 +13,7 @@ def test_resolve_visual_manifest_from_paper_artifact(tmp_path):
     # Create registry
     registry_path = tmp_path / "artifact_registry.json"
     registry = ArtifactRegistry(str(registry_path), "job-123")
-    
+
     # Create visual manifest
     manifest_path = tmp_path / "visual_manifest.json"
     manifest = {
@@ -127,7 +127,6 @@ def test_resolve_visual_manifest_from_registry(tmp_path):
     # Create registry
     registry_path = tmp_path / "artifact_registry.json"
     registry = ArtifactRegistry(str(registry_path), "job-123")
-    
     # Create a current-authority visual manifest
     manifest_path = tmp_path / "visual_manifest.json"
     manifest = _current_authority_manifest(tmp_path)

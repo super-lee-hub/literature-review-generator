@@ -1,0 +1,39 @@
+{
+  "artifact_type": "pr24_current_head_offline_regression",
+  "artifact_version": "v1",
+  "checked_at_utc": "2026-09-18T15:41:36.4067700Z",
+  "executable_sha": "b6fa86b7b75fbd35888f871066e0e00aae70eac0",
+  "python_executable": "D:\\Anaconda\\python.exe",
+  "targeted_pr24": {
+    "command": "D:\\Anaconda\\python.exe -m pytest -q tests/test_pr24_final_fixes.py",
+    "passed": 30,
+    "failed": 0,
+    "skipped": 0,
+    "duration_seconds": 6.46,
+    "status": "PASS"
+  },
+  "full_suite": {
+    "command": "D:\\Anaconda\\python.exe -m pytest -q -p no:cacheprovider",
+    "passed": 1700,
+    "failed": 0,
+    "skipped": 28,
+    "duration_seconds": 2434.50,
+    "status": "PASS_WITH_EXPLICIT_SKIPS",
+    "cache_provider_disabled_reason": "avoid local pytest cache ACL warning; this does not disable test collection or execution"
+  },
+  "additional_checks": {
+    "pip_check": "PASS: No broken requirements found.",
+    "compileall": "PASS",
+    "ruff_select_E9_F": "PASS",
+    "pyright_changed_modules": "PASS: 0 errors, 0 warnings, 0 informations"
+  },
+  "evidence_boundary": {
+    "offline_only": true,
+    "real_provider_calls": false,
+    "real_mineru_calls": false,
+    "f1_q_started": false,
+    "f1_d_status": "FAIL_MODALITY",
+    "human_semantic_ground_truth": "PENDING_HUMAN_REVIEW",
+    "final_release_status": "NOT_READY_TO_MERGE"
+  }
+}

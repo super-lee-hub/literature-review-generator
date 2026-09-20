@@ -1,0 +1,38 @@
+{
+  "artifact_type": "auxiliary_ocr_fixture",
+  "artifact_version": "v1",
+  "schema_version": "auxiliary-ocr-fixture-v1",
+  "fixture_id": "zotero-WFX3F52Q",
+  "source_origin": "zotero_local_library",
+  "source_pdf_sha256": "14eb5a88d318cbddeb0971b397b5e6b71d2aed9feb9724ae07887bcbad9bb349",
+  "source_pdf_size_bytes": 108395214,
+  "source_pdf_title": "The Persuasion Knowledge Model: How People Cope with Persuasion Attempts",
+  "source_pdf_doi": "10.1086/209380",
+  "zotero_attachment_key": "WFX3F52Q",
+  "f1_corpus_member": false,
+  "auxiliary_only": true,
+  "derived_modality": "ocr_scanned",
+  "page_count": 62,
+  "scanned_candidate_pages": 62,
+  "scanned_candidate_ratio": 1.0,
+  "actual_ocr_pages": 3,
+  "ocr_engine": "rapidocr",
+  "ocr_sample_pages": [2, 32, 62],
+  "visual_render_pages": [2, 3, 6, 32, 62],
+  "source_pdf_transmitted": false,
+  "production_lineage": {
+    "diagnostics_path": "acceptance_artifacts/f1_20260915/zotero_auxiliary_scan_20260918/production/diagnostics.json",
+    "ocr_sample_artifacts": [
+      "acceptance_artifacts/f1_20260915/zotero_auxiliary_scan_20260918/ocr-worker-page-002.json",
+      "acceptance_artifacts/f1_20260915/zotero_auxiliary_scan_20260918/ocr-samples/page-032.json",
+      "acceptance_artifacts/f1_20260915/zotero_auxiliary_scan_20260918/ocr-samples/page-062.json"
+    ],
+    "audit_sha256": "c355350f16ba9d55089eddd7dcbcd5df0fac2fe51f4788a18dac58cef17d51c9"
+  },
+  "policy_boundary": {
+    "policy_id": "f1-two-in-corpus-plus-auxiliary-ocr-v1",
+    "f1_manifest_unchanged": true,
+    "q_corpus_unchanged": true,
+    "human_semantic_ground_truth": "not_provided"
+  }
+}

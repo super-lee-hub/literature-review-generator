@@ -11,6 +11,7 @@ import types
 from pathlib import Path
 
 import pytest
+from services.configuration_service import ConfigurationPersistenceError
 from services.queue_service import QueueJobSpec
 
 
@@ -368,12 +369,12 @@ def test_build_queue_job_spec_can_use_explicit_input_mode(gui_app_module) -> Non
         work_mode="normal",
     )
 
-    assert spec.parameters["pdf_folder"] is None
-    assert spec.parameters["zotero_report"] == "D:/zotero/report.md"
-    assert spec.parameters["library_path"] == "D:/ZoteroLibrary"
-    assert spec.parameters["source_mode"] == "zotero"
-    assert spec.parameters["free_mode_profile"] is None
-    assert spec.parameters["free_mode_idea"] is None
+    assert spec.parameters["source"]["pdf_folder"] == ""
+    assert spec.parameters["source"]["zotero_report"] == str(Path("D:/zotero/report.md").resolve())
+    assert spec.parameters["source"]["library_path"] == str(Path("D:/ZoteroLibrary").resolve())
+    assert spec.parameters["source"]["mode"] == "zotero"
+    assert spec.parameters["free_mode_profile"] == ""
+    assert spec.parameters["free_mode_idea"] == ""
 
 
 def test_stage1_reuse_defaults_to_analyze_only_actions(gui_app_module) -> None:
@@ -387,7 +388,9 @@ def test_stage1_reuse_defaults_to_analyze_only_actions(gui_app_module) -> None:
         "analyze",
     )
     assert analyze_spec.parameters["reuse_stage1"] is True
-    assert analyze_spec.parameters["reuse_summary_files"] == ["D:/reuse/a.json"]
+    assert analyze_spec.parameters["reuse_summary_files"] == [
+        str(Path("D:/reuse/a.json").resolve())
+    ]
 
     outline_spec = controller._build_queue_job_spec(
         "demo",
@@ -395,11 +398,12 @@ def test_stage1_reuse_defaults_to_analyze_only_actions(gui_app_module) -> None:
         "",
         "outline",
     )
+    assert outline_spec.parameters["action"] == "generate_outline"
     assert outline_spec.parameters["reuse_stage1"] is False
     assert outline_spec.parameters["reuse_summary_files"] == []
 
 
-def test_build_queue_job_spec_captures_immutable_source_snapshot(gui_app_module) -> None:
+def test_build_queue_job_spec_captures_immutable_source_snapshot(gui_app_module, tmp_path: Path) -> None:
     controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
     controller.state["workflow"].update(
         {
@@ -414,7 +418,9 @@ def test_build_queue_job_spec_captures_immutable_source_snapshot(gui_app_module)
         }
     )
     controller.state["paths"]["library_path"] = "D:/Library"
-    controller.free_mode_profile_path = "D:/profiles/original.json"
+    original_profile = tmp_path / "original-profile.json"
+    original_profile.write_text("{}", encoding="utf-8")
+    controller.free_mode_profile_path = str(original_profile)
 
     spec = controller._build_queue_job_spec(
         "original-project",
@@ -433,7 +439,7 @@ def test_build_queue_job_spec_captures_immutable_source_snapshot(gui_app_module)
             "section_number": "9",
         }
     )
-    controller.free_mode_profile_path = "D:/profiles/edited.json"
+    controller.free_mode_profile_path = str(tmp_path / "edited-profile.json")
 
     assert spec.source_snapshot == {
         "project_name": "original-project",
@@ -443,16 +449,19 @@ def test_build_queue_job_spec_captures_immutable_source_snapshot(gui_app_module)
         "pdf_folder": "D:/papers/original",
         "zotero_report": None,
         "library_path": None,
-        "summary_file": "D:/summaries/a.json",
+        "summary_file": str(Path("D:/summaries/a.json").resolve()),
         "summary_sources": ["D:/summaries/b.json", "D:/summaries/c.json"],
         "reuse_stage1": False,
         "reuse_summary_files": [],
         "concept": None,
-        "free_mode_profile": "D:/profiles/original.json",
+        "free_mode_profile": str(original_profile),
         "free_mode_idea": None,
         "generate_section": 3,
     }
-    assert spec.parameters["summary_sources"] == ["D:/summaries/b.json", "D:/summaries/c.json"]
+    assert spec.parameters["summary_sources"] == [
+        str(Path("D:/summaries/b.json").resolve()),
+        str(Path("D:/summaries/c.json").resolve()),
+    ]
     assert spec.parameters["reuse_summary_files"] == []
 
 
@@ -579,7 +588,7 @@ def test_validation_policy_is_derived_once_across_direct_cli_gui_and_queue_entri
     queue_round_trip = QueueJobSpec.from_dict(
         json.loads(json.dumps(gui_spec.to_dict(), ensure_ascii=False))
     )
-    gui_request = build_job_request_from_mapping(queue_round_trip.parameters)
+    gui_request = RuntimeJobSpec.from_dict(queue_round_trip.parameters).to_job_request()
     captured_requests = []
 
     class _CapturingRunner:
@@ -652,6 +661,80 @@ def test_persist_config_keeps_active_queue_service(gui_app_module, monkeypatch, 
     controller.persist_config(notify_user=False)
 
     assert controller._queue_service is original_service
+
+
+def test_persist_config_rejects_output_root_change_while_queue_has_pending_work(
+    gui_app_module,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.ini"
+    config_path.write_text((REPO_ROOT / "config.ini.example").read_text(encoding="utf-8"), encoding="utf-8")
+    parser = configparser.ConfigParser()
+    parser.read(config_path, encoding="utf-8")
+    original_output = tmp_path / "output"
+    parser["Paths"]["output_path"] = str(original_output)
+    with config_path.open("w", encoding="utf-8") as handle:
+        parser.write(handle)
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    monkeypatch.setenv("AUTO_GENERATE_ENV_PATH", str(env_path))
+
+    controller = gui_app_module.WorkspaceController(str(config_path))
+    controller._queue_service.add_job(  # type: ignore[union-attr]
+        QueueJobSpec(job_id="pending", job_type="test", project_name="pending")
+    )
+    controller.state["paths"]["output_path"] = str(tmp_path / "other-output")
+
+    with pytest.raises(ConfigurationPersistenceError, match="output_path"):
+        controller.persist_config(notify_user=False)
+    assert controller.state["paths"]["output_path"] == str(original_output.resolve())
+    persisted = configparser.ConfigParser()
+    persisted.read(config_path, encoding="utf-8")
+    assert persisted["Paths"]["output_path"] == str(original_output)
+
+
+def test_gui_retry_increments_count_and_schedules_processor(gui_app_module, monkeypatch, tmp_path: Path) -> None:
+    service = gui_app_module.PersistentQueueService(tmp_path / "queue.json")
+    service.add_job(QueueJobSpec(job_id="failed", job_type="test", project_name="failed"))
+    assert service.update_job_state("failed", gui_app_module.QueueState.RUNNING)
+    assert service.update_job_state("failed", gui_app_module.QueueState.FAILED)
+    controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
+    controller._queue_service = service
+    notifications: list[str] = []
+    schedule_calls: list[bool] = []
+    monkeypatch.setattr(gui_app_module.ui, "notify", lambda message, **_kwargs: notifications.append(message))
+    monkeypatch.setattr(controller, "_schedule_queue_processor", lambda: schedule_calls.append(True) or True)
+
+    controller.retry_job("failed")
+
+    runtime = service.get_job_runtime("failed")
+    assert runtime is not None
+    assert runtime.state is gui_app_module.QueueState.PENDING
+    assert runtime.retry_count == 1
+    assert schedule_calls == [True]
+    assert any("failed" in message for message in notifications)
+
+
+def test_save_config_from_ui_cleans_up_controls_after_persistence_error(gui_app_module, monkeypatch) -> None:
+    controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
+    button = _FakeElement()
+    controller.bindings.action_buttons = [button]
+    controller.set_workflow_running(True)
+    notifications: list[str] = []
+    monkeypatch.setattr(
+        controller,
+        "persist_config",
+        lambda **_kwargs: (_ for _ in ()).throw(ConfigurationPersistenceError("disk blocked")),
+    )
+    monkeypatch.setattr(controller, "notify", lambda message, **_kwargs: notifications.append(message))
+
+    controller.save_config_from_ui()
+
+    assert controller.workflow_running is False
+    assert button.disabled is False
+    assert "保存配置失败" in controller.status_message
+    assert notifications and "disk blocked" in notifications[-1]
 
 
 def test_clear_completed_jobs_keeps_failed_and_cancelled(gui_app_module, tmp_path) -> None:
@@ -947,7 +1030,138 @@ def test_persist_config_writes_and_applies_mineru_settings(gui_app_module, monke
     assert "ALLOW_LOCAL_PARSE_FALLBACK=false" in env_content
 
     assert controller.env_values["MINERU_API_TOKEN"] == "token-123"
-    assert os.environ["MINERU_API_TOKEN"] == "token-123"
+    # GUI persistence reads the selected dotenv file without mutating the
+    # caller's process environment. Runtime loading applies the same file
+    # explicitly, so unrelated tasks cannot inherit this token.
+    assert os.environ["MINERU_API_TOKEN"] == ""
+
+
+def test_gui_external_config_uses_adjacent_dotenv_and_process_credentials(
+    gui_app_module, monkeypatch, tmp_path
+) -> None:
+    config_path = tmp_path / "config.ini"
+    config_path.write_text(
+        (REPO_ROOT / "config.ini.example").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (tmp_path / ".env").write_text(
+        "LLM_FREE_MODE_API=process-free-key\nMINERU_API_TOKEN=dotenv-mineru-token\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("AUTO_GENERATE_ENV_PATH", raising=False)
+    monkeypatch.setenv("LLM_FREE_MODE_API", "process-free-key")
+    monkeypatch.delenv("MINERU_API_TOKEN", raising=False)
+
+    controller = gui_app_module.WorkspaceController(str(config_path))
+
+    assert Path(controller.env_path) == tmp_path / ".env"
+    assert controller.api_cards["Free_Mode_API"]["api_key"] == "process-free-key"
+    assert controller.state["mineru"]["api_token"] == "dotenv-mineru-token"
+
+
+def test_gui_resolves_relative_paths_from_config_origin_not_process_cwd(
+    gui_app_module, monkeypatch, tmp_path
+) -> None:
+    config_dir = tmp_path / "config-root"
+    config_dir.mkdir()
+    config_path = config_dir / "config.ini"
+    config_path.write_text(
+        (REPO_ROOT / "config.ini.example").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    parser = configparser.ConfigParser()
+    parser.read(config_path, encoding="utf-8")
+    parser["Paths"]["output_path"] = "./relative-output"
+    parser["Paths"]["zotero_report"] = "./references.txt"
+    parser["Paths"]["library_path"] = "./library"
+    with config_path.open("w", encoding="utf-8") as handle:
+        parser.write(handle)
+    other_cwd = tmp_path / "other-cwd"
+    other_cwd.mkdir()
+    monkeypatch.chdir(other_cwd)
+
+    controller = gui_app_module.WorkspaceController(str(config_path))
+
+    assert controller.state["paths"]["output_path"] == str((config_dir / "relative-output").resolve())
+    assert controller.state["paths"]["zotero_report"] == str((config_dir / "references.txt").resolve())
+    assert controller.state["paths"]["library_path"] == str((config_dir / "library").resolve())
+    assert controller._queue_file_path() == (config_dir / "relative-output" / "_queue" / "queue.json").resolve()
+
+
+def test_gui_save_preserves_unedited_mineru_env_values(
+    gui_app_module, monkeypatch, tmp_path
+) -> None:
+    config_path = tmp_path / "config.ini"
+    config_path.write_text(
+        (REPO_ROOT / "config.ini.example").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "MINERU_UPLOAD_ENDPOINT=/custom/upload\n"
+        "MINERU_POLL_INTERVAL_SECONDS=9\n"
+        "MINERU_ZIP_MAX_ENTRIES=77\n"
+        "CUSTOM_EXISTING=value\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AUTO_GENERATE_ENV_PATH", str(env_path))
+
+    controller = gui_app_module.WorkspaceController(str(config_path))
+    controller.persist_config(notify_user=False)
+
+    saved = env_path.read_text(encoding="utf-8")
+    assert "MINERU_UPLOAD_ENDPOINT=/custom/upload" in saved
+    assert "MINERU_POLL_INTERVAL_SECONDS=9" in saved
+    assert "MINERU_ZIP_MAX_ENTRIES=77" in saved
+    assert "CUSTOM_EXISTING=value" in saved
+
+
+def test_gui_save_does_not_persist_process_only_mineru_token(
+    gui_app_module, monkeypatch, tmp_path
+) -> None:
+    config_path = tmp_path / "config.ini"
+    config_path.write_text(
+        (REPO_ROOT / "config.ini.example").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    env_path = tmp_path / ".env"
+    env_path.write_text("MINERU_API_TOKEN=dotenv-token\n", encoding="utf-8")
+    monkeypatch.setenv("AUTO_GENERATE_ENV_PATH", str(env_path))
+    monkeypatch.setenv("MINERU_API_TOKEN", "process-only-token")
+
+    controller = gui_app_module.WorkspaceController(str(config_path))
+    assert controller.state["mineru"]["api_token"] == "dotenv-token"
+    assert "MINERU_API_TOKEN" in controller.credential_error
+    assert "dotenv-token" not in controller.credential_error
+    assert "process-only-token" not in controller.credential_error
+    with pytest.raises(ConfigurationPersistenceError, match="source conflict"):
+        controller.persist_config(notify_user=False)
+
+    saved = env_path.read_text(encoding="utf-8")
+    assert "MINERU_API_TOKEN=dotenv-token" in saved
+    assert "process-only-token" not in saved
+
+
+def test_gui_runtime_config_keeps_process_only_secret_without_persisting_it(
+    gui_app_module, monkeypatch, tmp_path
+) -> None:
+    config_path = tmp_path / "config.ini"
+    config_path.write_text(
+        (REPO_ROOT / "config.ini.example").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    monkeypatch.setenv("AUTO_GENERATE_ENV_PATH", str(env_path))
+    monkeypatch.setenv("LLM_FREE_MODE_API", "process-only-free-key")
+
+    controller = gui_app_module.WorkspaceController(str(config_path))
+
+    runtime_config = controller.build_runtime_config()
+
+    assert runtime_config["Free_Mode_API"]["api_key"] == "process-only-free-key"
+    controller.persist_config(notify_user=False)
+    assert "process-only-free-key" not in env_path.read_text(encoding="utf-8")
 
 
 def test_persist_config_writes_none_fallback(gui_app_module, monkeypatch, tmp_path) -> None:
@@ -967,3 +1181,28 @@ def test_persist_config_writes_none_fallback(gui_app_module, monkeypatch, tmp_pa
     parser = configparser.ConfigParser()
     parser.read(config_path, encoding="utf-8")
     assert parser["Preprocess"]["fallback_parser"] == "none"
+
+
+def test_free_mode_handlers_clear_busy_after_runtime_error(gui_app_module, monkeypatch) -> None:
+    controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
+    controller.test_mode = False
+    controller.free_mode_chat_input = "a bounded test idea"
+    controller.update_free_mode_widgets = lambda: None
+    controller.notify = lambda *_args, **_kwargs: None
+    monkeypatch.setattr(
+        gui_app_module,
+        "plan_free_mode_chat_turn",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("transport failed")),
+    )
+
+    asyncio.run(controller.send_free_mode_message())
+
+    assert controller.free_mode_busy is False
+
+
+def test_canonical_lifecycle_states_tolerate_blocked_string_status(gui_app_module) -> None:
+    states = gui_app_module.WorkspaceController._canonical_lifecycle_states(
+        {"status": "blocked", "artifacts": []},
+        {"status": "blocked"},
+    )
+    assert "validation_not_run" in states

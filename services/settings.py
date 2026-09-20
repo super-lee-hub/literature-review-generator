@@ -8,7 +8,7 @@ from one current schema.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Mapping, MutableMapping
+from typing import Any, Dict, Iterable, Mapping, MutableMapping
 
 from services.config_values import normalize_stage1_config_sections
 from services.model_capabilities import resolve_model_capability
@@ -16,6 +16,116 @@ from services.repair_policy import DEFAULT_REPAIR_POLICY, parse_repair_policy
 
 
 CONFIG_SCHEMA_VERSION = 4
+
+PREPROCESS_PARSER_MODES = frozenset({"local", "hybrid", "remote_first", "remote"})
+PREPROCESS_PRIMARY_PARSERS = frozenset({"local", "mineru_remote"})
+PREPROCESS_FALLBACK_PARSERS = frozenset({"none", *PREPROCESS_PRIMARY_PARSERS})
+
+
+@dataclass(frozen=True)
+class PreprocessParserPolicy:
+    """One validated parser route, shared by admission and execution.
+
+    ``fallback_parser`` used to be only an accepted configuration value while
+    the runtime consulted a separate boolean.  Keeping the resolved route in
+    one small value object prevents a configuration from claiming a parser
+    behavior that the execution path cannot actually provide.
+    """
+
+    parser_mode: str
+    primary_parser: str
+    fallback_parser: str
+    local_fallback_allowed: bool
+
+    @property
+    def remote_requested(self) -> bool:
+        return self.primary_parser == "mineru_remote"
+
+    @property
+    def hybrid(self) -> bool:
+        return self.parser_mode == "hybrid"
+
+
+def _optional_preprocess_bool(value: object) -> bool | None:
+    if value is None or not str(value).strip():
+        return None
+    normalized = str(value).strip().casefold()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError("[Preprocess] allow_local_parse_fallback must be a boolean")
+
+
+def resolve_preprocess_parser_policy(
+    parser_mode: object,
+    primary_parser: object,
+    fallback_parser: object,
+    *,
+    allow_local_parse_fallback: object | None = None,
+) -> PreprocessParserPolicy:
+    """Validate and resolve the only supported parser/fallback state machine.
+
+    MinerU can be the primary parser for ``hybrid``/``remote`` modes.  A local
+    fallback is then explicit.  A MinerU *fallback* is intentionally rejected:
+    the public trust-admission path has no safe way to acknowledge a remote
+    route that is hidden behind a local primary.  Rejecting it is preferable to
+    silently never using it or sending content to an unadmitted host.
+    """
+
+    mode = str(parser_mode or "local").strip().casefold() or "local"
+    primary = str(primary_parser or "local").strip().casefold() or "local"
+    fallback = str(fallback_parser or "local").strip().casefold() or "local"
+    if mode not in PREPROCESS_PARSER_MODES:
+        raise ValueError(f"[Preprocess] parser_mode is unsupported: {mode}")
+    if primary not in PREPROCESS_PRIMARY_PARSERS:
+        raise ValueError(f"[Preprocess] primary_parser is unsupported: {primary}")
+    if fallback not in PREPROCESS_FALLBACK_PARSERS:
+        raise ValueError(f"[Preprocess] fallback_parser is unsupported: {fallback}")
+    if fallback == "mineru_remote":
+        raise ValueError(
+            "[Preprocess] fallback_parser=mineru_remote is unsupported; "
+            "select mineru_remote as primary_parser with an admitted remote mode"
+        )
+    if mode == "local" and primary != "local":
+        raise ValueError("[Preprocess] parser_mode=local requires primary_parser=local")
+    if mode in {"remote", "remote_first"} and primary != "mineru_remote":
+        raise ValueError(
+            f"[Preprocess] parser_mode={mode} requires primary_parser=mineru_remote"
+        )
+
+    configured_local_fallback = _optional_preprocess_bool(
+        allow_local_parse_fallback
+    )
+    local_fallback_allowed = fallback == "local"
+    if local_fallback_allowed and configured_local_fallback is False:
+        raise ValueError(
+            "[Preprocess] fallback_parser=local conflicts with "
+            "allow_local_parse_fallback=false"
+        )
+    return PreprocessParserPolicy(
+        parser_mode=mode,
+        primary_parser=primary,
+        fallback_parser=fallback,
+        local_fallback_allowed=local_fallback_allowed,
+    )
+
+
+def mineru_remote_requested(parser_mode: object, primary_parser: object) -> bool:
+    """Return whether the selected primary parser requires MinerU.
+
+    This compatibility helper is used by trust admission, where a fallback
+    route is deliberately not accepted.  Runtime execution resolves the full
+    three-field policy above.
+    """
+
+    mode = str(parser_mode or "local").strip().casefold() or "local"
+    primary = str(primary_parser or "local").strip().casefold() or "local"
+    if mode not in PREPROCESS_PARSER_MODES or primary not in PREPROCESS_PRIMARY_PARSERS:
+        raise ValueError("invalid preprocess parser policy")
+    return mode in {"remote", "remote_first"} or (
+        mode == "hybrid" and primary == "mineru_remote"
+    )
 
 # Kept in the accepted schema only so older config files can be read and
 # normalized.  This field is not a current parser-routing control.
@@ -33,6 +143,7 @@ _MIGRATION_ONLY_STAGE1_KEYS = frozenset(
 # keys are rejected instead of being silently ignored.
 STAGE1_CONFIG_OWNERSHIP: Dict[str, Dict[str, str]] = {
     "Stage1_Input": {
+        "primary_reader_only": "ACTIVE",
         "mode": "INVARIANT",
         "send_extracted_text": "ACTIVE",
         "send_selected_visuals": "ACTIVE",
@@ -239,12 +350,24 @@ CONFIG_KEYS: Dict[str, frozenset[str]] = {
             "retain_diagnostics",
             "enable_local_rag",
             "rag_backend",
+            "local_rag_allow_model_download",
+            "local_rag_retain_recent_identities",
+            "source_pdf_max_bytes",
+            "mineru_base_url", "mineru_api_token", "mineru_model_version", "mineru_upload_endpoint",
+            "mineru_poll_endpoint_templates", "mineru_poll_interval_seconds", "mineru_poll_timeout_seconds",
+            "mineru_request_timeout_seconds", "mineru_upload_timeout_seconds", "mineru_download_timeout_seconds",
+            "mineru_request_max_retries", "mineru_retry_backoff_seconds", "mineru_max_remote_tasks",
+            "mineru_max_remote_http_calls", "mineru_max_remote_upload_bytes", "mineru_response_max_bytes",
+            "mineru_zip_max_entries", "mineru_zip_max_uncompressed_bytes", "mineru_zip_max_entry_bytes",
+            "mineru_zip_max_compression_ratio", "mineru_json_max_bytes", "mineru_text_max_bytes",
+            "mineru_allowed_url_hosts", "allow_local_parse_fallback", "docling_timeout_seconds", "ocr_timeout_seconds",
         }
     ),
     "Styling": frozenset({"font_name", "font_size_body", "font_size_heading1", "font_size_heading2"}),
     "GUI": frozenset({"language"}),
     "Stage1_Input": frozenset(
         {
+            "primary_reader_only",
             "mode",
             "send_extracted_text",
             "send_selected_visuals",
@@ -658,7 +781,11 @@ class ApplicationSettings:
             "arbitrator_model": self.arbitrator_model(),
         }
 
-    def validate_outline_config(self) -> list[str]:
+    def validate_outline_config(
+        self,
+        *,
+        enabled_role_keys: Iterable[str] | None = None,
+    ) -> list[str]:
         """Errors only. Non-fatal routing observations come from
         :meth:`outline_routing_diagnostics` so a deliberate single-model setup
         stays legal while still being reported.
@@ -671,7 +798,14 @@ class ApplicationSettings:
         if count > 12:
             errors.append("Outline.candidate_count must not exceed 12")
 
+        enabled = (
+            set(str(item) for item in enabled_role_keys)
+            if enabled_role_keys is not None
+            else set(self.outline_role_sections())
+        )
         for role_key, section_name in self.outline_role_sections().items():
+            if role_key not in enabled:
+                continue
             if not section_name:
                 errors.append(f"OutlineModels.{role_key} is not configured")
                 continue
@@ -691,7 +825,11 @@ class ApplicationSettings:
                 )
         return errors
 
-    def outline_routing_diagnostics(self) -> list[str]:
+    def outline_routing_diagnostics(
+        self,
+        *,
+        enabled_role_keys: Iterable[str] | None = None,
+    ) -> list[str]:
         """Report review relationships that carry no independent judgement."""
 
         roles = self.outline_role_sections()
@@ -702,7 +840,14 @@ class ApplicationSettings:
             return diagnostics
 
         generator_identity = _route_identity(generator)
+        enabled = (
+            set(str(item) for item in enabled_role_keys)
+            if enabled_role_keys is not None
+            else set(self.outline_role_sections())
+        )
         for role_key in ("structure_critic_model", "coverage_critic_model", "evidence_critic_model"):
+            if role_key not in enabled:
+                continue
             section_name = roles.get(role_key) or ""
             section = self.sections.get(section_name)
             if section is None or not section_name:

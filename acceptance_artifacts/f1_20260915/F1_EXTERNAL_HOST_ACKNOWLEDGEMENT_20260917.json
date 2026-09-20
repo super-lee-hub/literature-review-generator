@@ -1,0 +1,9 @@
+{
+  "schema_version": "external-host-acknowledgement-v2",
+  "version": 2,
+  "acknowledged": true,
+  "hosts": ["ai.saigou.work", "chat.178266.xyz"],
+  "route_fingerprint": "8c5443705306d6a1df9b726579faef434297215ac3b1dbf95a4ce5ba0f608309",
+  "issued_at": "2026-09-17T06:20:07.290471Z",
+  "expires_at": "2026-09-18T06:20:07.290471Z"
+}

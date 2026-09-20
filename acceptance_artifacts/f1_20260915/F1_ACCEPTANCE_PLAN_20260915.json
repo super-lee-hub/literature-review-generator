@@ -1,0 +1,65 @@
+{
+  "schema_version": "release-acceptance-plan-v2",
+  "parent_run_id": "f1-acceptance-20260916-r3",
+  "final_executable_sha": "",
+  "state_path": "F1_ACCEPTANCE_PLAN_STATE_20260915.json",
+  "budget": {
+    "max_provider_calls_total": 4,
+    "max_output_tokens_total": 128000,
+    "max_retry_attempts_total": 4,
+    "max_wall_seconds": 7200
+  },
+  "third_party_acknowledged": true,
+  "third_party_hosts": ["ai.saigou.work", "chat.178266.xyz"],
+  "external_host_acknowledgement": {
+    "schema_version": "external-host-acknowledgement-v2",
+    "version": 2,
+    "acknowledged": true,
+    "hosts": ["ai.saigou.work", "chat.178266.xyz"],
+    "route_fingerprint": "344765ad52227adc74d73030a8c0942f527bc84bf136babf0c873144c30392a9",
+    "issued_at": "2026-09-16T11:51:39.155227Z",
+    "expires_at": "2026-09-17T11:51:39.155227Z"
+  },
+  "scenarios": {
+    "C": {
+      "scenario_id": "C",
+      "gate": "C",
+      "runtime_spec": "C_RUNTIME_SPEC_20260915.json",
+      "workspace": "runs/f1_acceptance_C__f1-acceptance-C-20260916-r3",
+      "input_manifest": "F1_CORPUS_MANIFEST_20260915.json",
+      "f1_source_ids": ["F1-01"],
+      "execution_mode": "runtime",
+      "budget_domain": "live",
+      "prerequisites": [],
+      "job_id": "f1-acceptance-C-20260916-r3"
+    },
+    "D": {
+      "scenario_id": "D",
+      "gate": "D",
+      "runtime_spec": "D_RUNTIME_SPEC_20260915.json",
+      "workspace": "runs/f1_acceptance_D__f1-acceptance-D-20260916-r3",
+      "input_manifest": "F1_CORPUS_MANIFEST_20260915.json",
+      "f1_source_ids": ["F1-01", "F1-03", "F1-14"],
+      "execution_mode": "runtime",
+      "budget_domain": "live",
+      "prerequisites": ["C"],
+      "job_id": "f1-acceptance-D-20260916-r3"
+    },
+    "Q": {
+      "scenario_id": "Q",
+      "gate": "Q",
+      "runtime_spec": "Q_RUNTIME_SPEC_20260915.json",
+      "workspace": "runs/f1_acceptance_Q__f1-acceptance-Q-20260916-r3",
+      "input_manifest": "F1_CORPUS_MANIFEST_20260915.json",
+      "f1_source_ids": [
+        "F1-01", "F1-02", "F1-03", "F1-04", "F1-05",
+        "F1-06", "F1-07", "F1-08", "F1-09", "F1-10",
+        "F1-11", "F1-12", "F1-13", "F1-14", "F1-15"
+      ],
+      "execution_mode": "runtime",
+      "budget_domain": "live",
+      "prerequisites": ["D"],
+      "job_id": "f1-acceptance-Q-20260916-r3"
+    }
+  }
+}

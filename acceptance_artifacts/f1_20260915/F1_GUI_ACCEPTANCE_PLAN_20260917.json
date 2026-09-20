@@ -1,0 +1,29 @@
+{
+  "schema_version": "release-acceptance-plan-v2",
+  "parent_run_id": "f1-gui-acceptance-20260917",
+  "final_executable_sha": "",
+  "state_path": "F1_GUI_ACCEPTANCE_PLAN_STATE_20260917.json",
+  "budget": {
+    "max_provider_calls_total": 2,
+    "max_output_tokens_total": 64000,
+    "max_retry_attempts_total": 2,
+    "max_wall_seconds": 1800
+  },
+  "third_party_acknowledged": false,
+  "third_party_hosts": [],
+  "external_host_acknowledgement": null,
+  "scenarios": {
+    "I": {
+      "scenario_id": "I",
+      "gate": "I",
+      "runtime_spec": "",
+      "workspace": "gui_production_20260917/plan_workspace",
+      "input_manifest": "F1_GUI_INPUT_20260917.json",
+      "f1_source_ids": [],
+      "execution_mode": "playwright",
+      "budget_domain": "live",
+      "prerequisites": [],
+      "job_id": ""
+    }
+  }
+}

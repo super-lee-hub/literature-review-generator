@@ -4,10 +4,13 @@ import hashlib
 import json
 import mimetypes
 import os
+from pathlib import Path
+import tempfile
 import time
 import re
 import requests  # type: ignore
-from typing import Union, Dict, Optional, Any, List, Tuple, Callable, Set, Mapping
+from typing import Dict, Optional, Any, List, Tuple, Callable, Set, Mapping, Iterable, cast
+from urllib.parse import urlparse
 
 from models import APIConfig
 from config_loader import load_config
@@ -23,16 +26,17 @@ from services.model_capabilities import (
     resolve_model_capability,
 )
 from services.proxy_policy import should_bypass_environment_proxy
+from services.credential_provenance import is_template_credential
 from services.prompt_registry import default_prompt_registry
 from runtime.provider_context import ProviderContextProfile
 from runtime.provider_runtime import (
     ProviderBudgetExceeded,
     ProviderRuntime,
+    ProviderRuntimeLedger,
     canonical_provider_request_payload,
 )
 from summary_schema import (
     default_ai_summary,
-    get_ai_summary,
     normalize_ai_summary,
 )
 from services.multimodal_capability import detect_multimodal_capability
@@ -45,6 +49,7 @@ from services.stage1_visual_scan import (
 _DEFAULT_TIMEOUT_SECONDS = 600
 _DEFAULT_API_RETRY_ATTEMPTS = 3
 _MAX_LOCAL_IMAGE_INPUT_BYTES = DEFAULT_MAX_SINGLE_IMAGE_BYTES
+_MAX_PROVIDER_RESPONSE_BYTES = 64 * 1024 * 1024
 _NON_RETRIABLE_HTTP_STATUSES = {400, 401, 402, 403, 404, 422}
 _QUOTA_ERROR_MARKERS = (
     "insufficient_user_quota",
@@ -84,6 +89,33 @@ _PAYLOAD_PARAMETER_ERROR_MARKERS = (
 )
 
 
+class ProviderResponseReadError(RuntimeError):
+    """A response began but its body was not received to completion."""
+
+    def __init__(
+        self,
+        *,
+        partial_body: bytes,
+        content_type: str,
+        cause: BaseException,
+        spool_path: str = "",
+    ) -> None:
+        super().__init__(str(cause) or "provider response body read failed")
+        self.partial_body = partial_body
+        self.content_type = content_type
+        self.cause = cause
+        self.spool_path = spool_path
+
+
+class ProviderResponseLimitError(ValueError):
+    """A provider response exceeded the configured bounded-read limit."""
+
+    def __init__(self, message: str, *, partial_body: bytes = b"", spool_path: str = "") -> None:
+        super().__init__(message)
+        self.partial_body = partial_body
+        self.spool_path = spool_path
+
+
 def _load_stage1_system_prompt(logger: Any = None) -> str:
     """Load the canonical Stage 1 system prompt through prompt authority."""
 
@@ -115,7 +147,24 @@ def _api_result(
     }
 
 
-def _extract_provider_error(response: Any) -> Dict[str, Any]:
+def _redact_provider_text(value: Any, secret: str = "") -> str:
+    text = str(value or "")
+    if secret:
+        text = text.replace(secret, "[REDACTED]")
+    text = re.sub(
+        r"(?i)(authorization['\"]?\s*[:=]\s*['\"]?(?:bearer\s+)?)[^,\s}\"']+",
+        r"\1[REDACTED]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)(x-api-key|api[_-]?key|token|secret)['\"]?\s*[:=]\s*['\"]?[^,\s}\"']+",
+        r"\1=[REDACTED]",
+        text,
+    )
+    return text[:2000]
+
+
+def _extract_provider_error(response: Any, *, secret: str = "") -> Dict[str, Any]:
     status_code = getattr(response, "status_code", None)
     provider_code = None
     message = ""
@@ -142,12 +191,12 @@ def _extract_provider_error(response: Any) -> Dict[str, Any]:
                 or error_payload.get("type")
                 or error_payload.get("error_code")
             )
-            message = str(error_payload.get("message") or error_payload.get("error") or "")
+            message = _redact_provider_text(error_payload.get("message") or error_payload.get("error") or "", secret)
         elif error_payload is not None:
-            message = str(error_payload)
-        raw_text = str(payload)
+            message = _redact_provider_text(error_payload, secret)
+        raw_text = _redact_provider_text(payload, secret)
     else:
-        raw_text = str(getattr(response, "text", "") or "")
+        raw_text = _redact_provider_text(getattr(response, "text", "") or "", secret)
         message = raw_text
 
     return {
@@ -163,8 +212,8 @@ def _looks_like_quota_error(*parts: Any) -> bool:
     return any(marker.casefold() in text for marker in _QUOTA_ERROR_MARKERS)
 
 
-def _classify_http_error(response: Any) -> Tuple[str, Optional[int], Optional[str], str]:
-    details = _extract_provider_error(response)
+def _classify_http_error(response: Any, *, secret: str = "") -> Tuple[str, Optional[int], Optional[str], str]:
+    details = _extract_provider_error(response, secret=secret)
     status_code = details.get("http_status")
     provider_code = str(details.get("provider_code") or "")
     message = str(details.get("message") or details.get("raw_text") or "")
@@ -195,6 +244,300 @@ def _classify_exception(exc: BaseException) -> Tuple[str, str]:
     if any(marker in message_folded for marker in _TRANSIENT_NETWORK_MARKERS):
         return "transient_network", message
     return "invalid_response", message
+
+
+def _aihubmix_recovery_enabled(api_config: Mapping[str, Any]) -> bool:
+    """Return whether opt-in recovery of a disconnected AihubMix LLM call is enabled."""
+
+    api_base = str(api_config.get("api_base") or "").casefold()
+    if "aihubmix.com" not in api_base:
+        return False
+    configured = api_config.get("aihubmix_recovery_enabled")
+    if configured is None:
+        configured = os.getenv("AUTO_GENERATE_AIHUBMIX_RECOVERY", "0")
+    return str(configured or "").strip().casefold() in {"1", "true", "yes", "on"}
+
+
+def _epoch_seconds(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _aihubmix_recover_disconnected_call(
+    *,
+    api_config: APIConfig,
+    model: str,
+    request_started_epoch: float,
+    response_parser: Callable[[Dict[str, Any]], Tuple[str, str]],
+    response_format: str,
+    request_fingerprint: str = "",
+    logger: Any = None,
+) -> Dict[str, Any] | None:
+    """Recover one uniquely matched AihubMix task after a client disconnect.
+
+    AihubMix creates an LLM recovery task only when the account feature is
+    enabled and the client disconnects after the platform accepted the call.
+    The public task list has no request-hash filter, so ambiguity is a hard
+    failure: this helper never selects the newest task merely because it is
+    convenient.
+    """
+
+    if not _aihubmix_recovery_enabled(api_config):
+        return None
+    api_base = str(api_config.get("api_base") or "").strip()
+    parsed_base = urlparse(api_base)
+    if not parsed_base.scheme or not parsed_base.netloc:
+        return None
+    recovery_base = f"{parsed_base.scheme}://{parsed_base.netloc}"
+    api_key = str(api_config.get("api_key") or "").strip()
+    if not api_key or is_template_credential(api_key):
+        return None
+    proof = api_config.get("aihubmix_recovery_proof")
+    if not isinstance(proof, Mapping):
+        if logger:
+            logger.warning("AihubMix recovery refused: no operator-bound identity proof was supplied")
+        return None
+    proof_task_id = str(proof.get("task_id") or "").strip()
+    proof_fingerprint = str(proof.get("request_fingerprint") or "").strip()
+    proof_operator = str(proof.get("operator") or "").strip()
+    operation_id = str(api_config.get("operation_id") or "").strip()
+    attempt_id = str(api_config.get("attempt_id") or "").strip()
+    proof_operation_id = str(proof.get("operation_id") or "").strip()
+    proof_attempt_id = str(proof.get("attempt_id") or "").strip()
+    if (
+        not proof_task_id
+        or not proof_fingerprint
+        or not proof_operator
+        or not operation_id
+        or not attempt_id
+        or proof_operation_id != operation_id
+        or proof_attempt_id != attempt_id
+        or not request_fingerprint
+        or proof_fingerprint != request_fingerprint
+    ):
+        if logger:
+            logger.warning("AihubMix recovery refused: identity proof does not bind this request")
+        return None
+    headers = {"Authorization": f"Bearer {api_key}"}
+    timeout_seconds = min(
+        30,
+        _coerce_positive_int(api_config.get("recovery_request_timeout_seconds"), 30),
+    )
+    max_polls = min(
+        10,
+        _coerce_positive_int(api_config.get("recovery_max_polls"), 3),
+    )
+    poll_interval_seconds = min(
+        10,
+        _coerce_nonnegative_int(api_config.get("recovery_poll_interval_seconds"), 2),
+    )
+    recovery_deadline = time.monotonic() + min(
+        120,
+        _coerce_positive_int(api_config.get("recovery_deadline_seconds"), 90),
+    )
+
+    def get_json(url: str, **kwargs: Any) -> Any:
+        if should_bypass_environment_proxy(api_config):
+            session = requests.Session()
+            session.trust_env = False
+            try:
+                response = session.get(url, **kwargs)
+            except BaseException:
+                session.close()
+                raise
+            setattr(response, "_codex_owned_session", session)
+            return response
+        return requests.get(url, **kwargs)
+
+    def task_row_from_payload(payload: Any) -> Mapping[str, Any] | None:
+        if isinstance(payload, Mapping):
+            data = payload.get("data")
+            if isinstance(data, Mapping):
+                return data
+            if str(payload.get("id") or "").strip():
+                return payload
+        return None
+
+    def task_is_usable(row: Mapping[str, Any]) -> bool:
+        if str(row.get("id") or "").strip() != proof_task_id:
+            return False
+        if str(row.get("model") or "").strip() != model:
+            return False
+        created_at = _epoch_seconds(row.get("created_at"))
+        if created_at is None or created_at < request_started_epoch - 15:
+            return False
+        output_items = row.get("output")
+        return isinstance(output_items, list) and bool(output_items) and not any(
+            bool(item.get("truncated"))
+            for item in output_items
+            if isinstance(item, Mapping)
+        )
+
+    def fetch_task_detail(
+        url: str,
+        remaining: float,
+    ) -> tuple[int, Mapping[str, Any] | None]:
+        response = get_json(
+            url,
+            headers=headers,
+            timeout=min(timeout_seconds, max(1, int(remaining))),
+        )
+        try:
+            if response.status_code != 200:
+                return int(response.status_code), None
+            return int(response.status_code), task_row_from_payload(response.json())
+        finally:
+            _close_provider_response(response)
+
+    def recover_content(response: Any) -> Dict[str, Any] | None:
+        """Decode JSON or SSE recovery content through the bounded reader."""
+
+        raw_body = b""
+        content_type = _response_header(response, "content-type")
+        recovery_spool_path = ""
+        try:
+            recovery_root = str(
+                api_config.get("raw_response_dir")
+                or api_config.get("provider_raw_response_dir")
+                or ""
+            ).strip()
+            if recovery_root:
+                recovery_dir = Path(recovery_root).expanduser().resolve()
+                recovery_dir.mkdir(parents=True, exist_ok=True)
+                recovery_spool_path = str(
+                    recovery_dir / f"recovery-{proof_task_id}.spool"
+                )
+            raw_body, content_type = _read_bounded_response(
+                response,
+                max_bytes=_coerce_positive_int(
+                    api_config.get("max_response_bytes"),
+                    _MAX_PROVIDER_RESPONSE_BYTES,
+                ),
+                total_deadline=recovery_deadline,
+                spool_path=recovery_spool_path,
+            )
+            payload, response_complete = _decode_sse_response(
+                raw_body,
+                content_type=content_type,
+                endpoint_type=resolve_model_capability(api_config).endpoint_type,
+                model=model,
+            )
+            content, finish_reason = response_parser(payload)
+            formatted = _format_success_result(
+                content,
+                response_format,
+                response,
+                finish_reason,
+                logger=logger,
+            )
+            formatted["response_complete"] = bool(response_complete)
+            formatted["response_protocol"] = (
+                "sse"
+                if "text/event-stream" in content_type.casefold()
+                or any(
+                    line.lstrip().startswith("data:")
+                    for line in raw_body.decode("utf-8", errors="replace").splitlines()
+                )
+                else "json"
+            )
+            formatted["response_bytes"] = len(raw_body)
+            formatted["raw_response_sha256"] = (
+                hashlib.sha256(raw_body).hexdigest() if raw_body else ""
+            )
+            formatted["raw_response_path"] = _persist_raw_response(
+                raw_body,
+                api_config=api_config,
+            )
+            if recovery_spool_path:
+                Path(recovery_spool_path).unlink(missing_ok=True)
+            return formatted
+        except (ProviderResponseReadError, ProviderResponseLimitError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            return None
+
+    try:
+        task = None
+        detail_url = f"{recovery_base}/ai/v1/tasks/{proof_task_id}"
+        detail_supported = True
+        for poll_index in range(max_polls):
+            remaining = recovery_deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            if detail_supported:
+                detail_status, task = fetch_task_detail(detail_url, remaining)
+                # Older gateways may not expose the detail route. Only then
+                # fall back to the bounded list path; a successful detail
+                # response remains the authoritative task identity.
+                if detail_status in {404, 405}:
+                    detail_supported = False
+                elif detail_status != 200:
+                    return None
+                if task is not None and task_is_usable(task):
+                    break
+            if not detail_supported:
+                listing = get_json(
+                    f"{recovery_base}/ai/v1/tasks",
+                    params={"object": "llm", "model": model, "limit": 20, "order": "desc"},
+                    headers=headers,
+                    timeout=min(timeout_seconds, max(1, int(remaining))),
+                )
+                try:
+                    if listing.status_code != 200:
+                        return None
+                    payload = listing.json()
+                    rows = payload.get("data") if isinstance(payload, Mapping) else None
+                    if not isinstance(rows, list):
+                        return None
+                    candidates = [
+                        row for row in rows
+                        if isinstance(row, Mapping) and task_is_usable(row)
+                    ]
+                    if len(candidates) > 1:
+                        return None
+                    task = candidates[0] if candidates else None
+                finally:
+                    _close_provider_response(listing)
+                if task is not None:
+                    break
+            if poll_index + 1 < max_polls and poll_interval_seconds:
+                time.sleep(min(poll_interval_seconds, max(0, recovery_deadline - time.monotonic())))
+        if task is None:
+            return None
+        task_id = str(task.get("id") or "").strip()
+        if not task_id:
+            return None
+        content_response = get_json(
+            f"{recovery_base}/ai/v1/tasks/{task_id}/content",
+            headers=headers,
+            timeout=min(max(timeout_seconds, 60), max(1, int(recovery_deadline - time.monotonic()))),
+        )
+        if content_response.status_code != 200:
+            _close_provider_response(content_response)
+            return None
+        formatted = recover_content(content_response)
+        if formatted is None:
+            return None
+        if formatted.get("status") != "success":
+            return None
+        formatted.update(
+            {
+                "http_status": 200,
+                "recovered_from_aihubmix_task": True,
+                "aihubmix_recovery_task_id": task_id,
+                "aihubmix_recovery_content_sha256": str(
+                    formatted.get("raw_response_sha256") or ""
+                ),
+                "aihubmix_recovery_operator": proof_operator,
+                "aihubmix_recovery_request_fingerprint": request_fingerprint,
+            }
+        )
+        return formatted
+    except (OSError, ValueError, TypeError, KeyError, requests.RequestException, json.JSONDecodeError) as exc:
+        if logger:
+            logger.warning("AihubMix recovery lookup failed closed: %s", _redact_provider_text(exc, api_key))
+        return None
 
 
 def _is_payload_parameter_error(parameter_name: str, *parts: Any) -> bool:
@@ -516,6 +859,8 @@ def build_anthropic_messages_payload(
                 effort,
                 token_limit,
             )
+    if _config_bool(api_config.get("provider_stream")):
+        payload["stream"] = True
     return payload
 
 
@@ -626,6 +971,8 @@ def build_chat_completions_payload(
     }
     if response_format == "json":
         payload["response_format"] = {"type": "json_object"}
+    if _config_bool(api_config.get("provider_stream")):
+        payload["stream"] = True
     apply_reasoning_policy(payload, api_config, capability, logger=logger)
     return payload
 
@@ -671,6 +1018,8 @@ def build_responses_payload(
         payload["temperature"] = temperature
     if response_format == "json":
         payload["text"] = {"format": {"type": "json_object"}}
+    if _config_bool(api_config.get("provider_stream")):
+        payload["stream"] = True
     apply_reasoning_policy(payload, api_config, capability, logger=logger)
     return payload
 
@@ -756,10 +1105,448 @@ def _format_success_result(content: Any, response_format: str, response: Any, fi
 
 def _post_with_proxy_mode(api_url: str, *, api_config: APIConfig, **kwargs: Any) -> Any:
     if should_bypass_environment_proxy(api_config):
-        with requests.Session() as session:
-            session.trust_env = False
-            return session.post(api_url, **kwargs)
+        session = requests.Session()
+        session.trust_env = False
+        try:
+            response = session.post(api_url, **kwargs)
+        except BaseException:
+            session.close()
+            raise
+        setattr(response, "_codex_owned_session", session)
+        return response
     return requests.post(api_url, **kwargs)
+
+
+def build_provider_transport_preflight(
+    api_config: Mapping[str, Any],
+    *,
+    credential_source: str = "unknown",
+    prompt: str = "preflight",
+    system_prompt: str = "preflight",
+) -> Dict[str, Any]:
+    """Build the exact route/payload shape used by the formal AI transport.
+
+    This is intentionally no-network: it exercises capability resolution,
+    endpoint construction, proxy policy, payload builders, and the canonical
+    request identity without exposing or hashing the credential.
+    """
+
+    api_key = str(api_config.get("api_key") or "").strip()
+    if not api_key or is_template_credential(api_key):
+        raise ValueError("provider preflight requires a non-template runtime credential")
+    model = str(api_config.get("model") or "").strip()
+    if not model:
+        raise ValueError("provider preflight requires a model")
+    api_base = str(api_config.get("api_base") or "").strip()
+    if not api_base:
+        raise ValueError("provider preflight requires an api_base")
+
+    typed_config = cast(APIConfig, api_config)
+    capability = resolve_model_capability(typed_config)
+    if capability.endpoint_type == "anthropic":
+        route, _headers = anthropic_request_target(api_base, typed_config, api_key)
+        payload = build_anthropic_messages_payload(
+            prompt,
+            api_config,  # type: ignore[arg-type]
+            system_prompt,
+            max_tokens=1,
+            temperature=0.0,
+            response_format="json",
+            user_content=None,
+            capability=capability,
+        )
+    elif capability.endpoint_type == "responses":
+        route = f"{api_base.rstrip('/')}/responses"
+        payload = build_responses_payload(
+            prompt,
+            api_config,  # type: ignore[arg-type]
+            system_prompt,
+            max_tokens=1,
+            temperature=0.0,
+            response_format="json",
+            user_content=None,
+            capability=capability,
+        )
+    else:
+        route = f"{api_base.rstrip('/')}/chat/completions"
+        payload = build_chat_completions_payload(
+            prompt,
+            api_config,  # type: ignore[arg-type]
+            system_prompt,
+            max_tokens=1,
+            temperature=0.0,
+            response_format="json",
+            user_content=None,
+            capability=capability,
+        )
+    input_identity = canonical_provider_request_payload(
+        prompt=prompt,
+        system_prompt=system_prompt,
+        user_content=None,
+        response_format="json",
+        max_output_tokens=1,
+        temperature=0.0,
+    )
+    payload_bytes = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    input_bytes = json.dumps(
+        input_identity,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    timeout_seconds, retry_attempts = _load_api_runtime_settings(api_config)
+    bypass_proxy = should_bypass_environment_proxy(api_config)
+    endpoint_classification = classify_provider_endpoint(
+        api_base,
+        capability.provider_family,
+    )
+    return {
+        "provider_family": capability.provider_family,
+        "endpoint_type": capability.endpoint_type,
+        "api_base": api_base,
+        "model": model,
+        "proxy_mode": str(api_config.get("proxy_mode") or "environment"),
+        "trust_env": not bypass_proxy,
+        "credential_source": str(credential_source or "unknown"),
+        "endpoint_classification": endpoint_classification,
+        "request_method": "POST",
+        "request_route": route,
+        "payload_sha256": hashlib.sha256(payload_bytes).hexdigest(),
+        "input_sha256": hashlib.sha256(input_bytes).hexdigest(),
+        "request_byte_estimate": len(payload_bytes),
+        "timeout_seconds": timeout_seconds,
+        "transport_retries": retry_attempts,
+    }
+
+
+def _response_header(response: Any, name: str) -> str:
+    headers = getattr(response, "headers", None)
+    if not isinstance(headers, Mapping):
+        return ""
+    target = name.casefold()
+    for key, value in headers.items():
+        if str(key).casefold() == target:
+            return str(value or "").strip()
+    return ""
+
+
+def _close_provider_response(response: Any) -> None:
+    close = getattr(response, "close", None)
+    if callable(close):
+        close()
+    session = getattr(response, "_codex_owned_session", None)
+    if session is not None:
+        session_close = getattr(session, "close", None)
+        if callable(session_close):
+            session_close()
+
+
+def _read_bounded_response(
+    response: Any,
+    *,
+    max_bytes: int,
+    spool_path: str = "",
+    total_deadline: float | None = None,
+    cancelled: Callable[[], bool] | None = None,
+) -> Tuple[bytes, str]:
+    """Read one body with bounded chunks, durable attempt spooling and deadlines."""
+
+    chunks: List[bytes] = []
+    total = 0
+    content_type = _response_header(response, "content-type")
+    spool_handle = None
+    normalized_spool_path = str(spool_path or "").strip()
+    try:
+        if normalized_spool_path:
+            spool_target = Path(normalized_spool_path).expanduser().resolve()
+            spool_target.parent.mkdir(parents=True, exist_ok=True)
+            spool_handle = spool_target.open("wb")
+
+        def check_deadline() -> None:
+            if cancelled is not None and cancelled():
+                raise TimeoutError("provider response read cancelled")
+            if total_deadline is not None and time.monotonic() >= total_deadline:
+                raise TimeoutError("provider response total deadline exceeded")
+
+        def record_chunk(chunk: bytes) -> None:
+            nonlocal total
+            check_deadline()
+            remaining = max_bytes - total
+            if len(chunk) > remaining:
+                accepted = chunk[: max(0, remaining)]
+                if accepted:
+                    chunks.append(accepted)
+                    total += len(accepted)
+                    if spool_handle is not None:
+                        spool_handle.write(accepted)
+                        spool_handle.flush()
+                        os.fsync(spool_handle.fileno())
+                raise ProviderResponseLimitError(
+                    f"provider response exceeds {max_bytes} bytes",
+                    partial_body=b"".join(chunks),
+                    spool_path=normalized_spool_path,
+                )
+            chunks.append(chunk)
+            total += len(chunk)
+            if spool_handle is not None:
+                spool_handle.write(chunk)
+                spool_handle.flush()
+                os.fsync(spool_handle.fileno())
+
+        iterator = None
+        iter_content = getattr(response, "iter_content", None)
+        if callable(iter_content):
+            try:
+                iterator = iter(cast(Iterable[Any], iter_content(chunk_size=8192)))
+            except (AttributeError, TypeError):
+                iterator = None
+        if iterator is not None:
+            for raw_chunk in iterator:
+                check_deadline()
+                if not raw_chunk:
+                    continue
+                chunk = raw_chunk.encode("utf-8") if isinstance(raw_chunk, str) else bytes(raw_chunk)
+                record_chunk(chunk)
+        else:
+            check_deadline()
+            raw_body = getattr(response, "content", b"")
+            if not isinstance(raw_body, (bytes, bytearray)) or not raw_body:
+                try:
+                    raw_body = json.dumps(response.json(), ensure_ascii=False).encode("utf-8")
+                except Exception:
+                    raw_body = str(getattr(response, "text", "") or "").encode("utf-8")
+            record_chunk(bytes(raw_body))
+        return b"".join(chunks), content_type
+    except ProviderResponseLimitError:
+        raise
+    except Exception as exc:
+        raise ProviderResponseReadError(
+            partial_body=b"".join(chunks),
+            content_type=content_type,
+            cause=exc,
+            spool_path=normalized_spool_path,
+        ) from exc
+    finally:
+        if spool_handle is not None:
+            try:
+                spool_handle.flush()
+                os.fsync(spool_handle.fileno())
+            except OSError:
+                pass
+            spool_handle.close()
+        _close_provider_response(response)
+
+
+def _persist_raw_response(body: bytes, *, api_config: Mapping[str, Any]) -> str:
+    """Optionally persist bounded raw bytes under an operator-owned evidence root."""
+
+    if not body:
+        return ""
+    raw_root = str(
+        api_config.get("raw_response_dir")
+        or api_config.get("provider_raw_response_dir")
+        or ""
+    ).strip()
+    if not raw_root:
+        return ""
+    root = Path(raw_root).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(body).hexdigest()
+    target = root / f"response-{digest}.bin"
+    if target.exists():
+        existing = target.read_bytes()
+        if hashlib.sha256(existing).hexdigest() != digest:
+            raise ValueError(f"raw response hash collision at {target}")
+        return str(target)
+    fd, temporary_name = tempfile.mkstemp(prefix=".provider-response-", suffix=".tmp", dir=str(root))
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return str(target)
+
+
+def _decode_sse_response(
+    body: bytes,
+    *,
+    content_type: str,
+    endpoint_type: str,
+    model: str,
+) -> Tuple[Dict[str, Any], bool]:
+    """Decode provider SSE events into the same response shape as JSON."""
+
+    text = body.decode("utf-8", errors="replace")
+    looks_like_sse = "text/event-stream" in content_type.casefold() or any(
+        line.lstrip().startswith("data:") for line in text.splitlines()
+    )
+    if not looks_like_sse:
+        payload = json.loads(text)
+        if not isinstance(payload, dict):
+            raise ValueError("provider JSON response must be an object")
+        return payload, True
+
+    events: List[Dict[str, Any]] = []
+    data_lines: List[str] = []
+    saw_done = False
+
+    def flush_event() -> None:
+        nonlocal data_lines, saw_done
+        if not data_lines:
+            return
+        raw = "\n".join(data_lines).strip()
+        data_lines = []
+        if raw == "[DONE]":
+            saw_done = True
+            return
+        if not raw:
+            return
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            events.append(parsed)
+
+    for line in text.splitlines():
+        stripped = line.strip("\r")
+        if not stripped:
+            flush_event()
+        elif stripped.startswith(":"):
+            continue
+        elif stripped.startswith("data:"):
+            data_lines.append(stripped[5:].lstrip())
+    flush_event()
+    if not events or not saw_done and not any(
+        str(event.get("type") or "").casefold() in {"response.completed", "message_stop"}
+        or str(event.get("finish_reason") or "").strip()
+        for event in events
+    ):
+        raise ValueError("SSE response ended without a terminal completion event")
+
+    # Prefer a complete provider event when available; otherwise synthesize a
+    # normal response from deltas so the existing schema/finish validation is
+    # shared by streamed and non-streamed calls.
+    for event in reversed(events):
+        if isinstance(event.get("response"), Mapping):
+            return dict(event["response"]), True
+        if "choices" in event and any(
+            isinstance(choice, Mapping) and isinstance(choice.get("message"), Mapping)
+            for choice in (event.get("choices") or [])
+        ):
+            return event, True
+        if "output" in event:
+            return event, True
+
+    text_parts: List[str] = []
+    finish_reason = ""
+    usage: Mapping[str, Any] | None = None
+    for event in events:
+        event_type = str(event.get("type") or "").casefold()
+        if isinstance(event.get("usage"), Mapping):
+            usage = event["usage"]
+        if endpoint_type == "anthropic" or "message" in event_type:
+            delta = event.get("delta")
+            if isinstance(delta, Mapping) and delta.get("text"):
+                text_parts.append(str(delta["text"]))
+            finish_reason = str(
+                (delta or {}).get("stop_reason") if isinstance(delta, Mapping) else ""
+            ) or finish_reason
+        elif endpoint_type == "responses" or "response." in event_type:
+            if event.get("delta"):
+                text_parts.append(str(event.get("delta")))
+            raw_details = event.get("response")
+            details: Mapping[str, Any] = (
+                cast(Mapping[str, Any], raw_details)
+                if isinstance(raw_details, Mapping)
+                else event
+            )
+            status = str(details.get("status") or "").casefold()
+            if status == "completed":
+                finish_reason = "stop"
+            elif status:
+                incomplete_details = details.get("incomplete_details")
+                reason = (
+                    incomplete_details.get("reason")
+                    if isinstance(incomplete_details, Mapping)
+                    else ""
+                )
+                finish_reason = str(reason or status)
+        else:
+            choices = event.get("choices") or []
+            for choice in choices:
+                if not isinstance(choice, Mapping):
+                    continue
+                delta = choice.get("delta")
+                if isinstance(delta, Mapping) and delta.get("content"):
+                    value = delta["content"]
+                    if isinstance(value, list):
+                        text_parts.extend(
+                            str(item.get("text") or "")
+                            for item in value
+                            if isinstance(item, Mapping)
+                        )
+                    else:
+                        text_parts.append(str(value))
+                finish_reason = str(choice.get("finish_reason") or finish_reason)
+
+    if not text_parts:
+        raise ValueError("SSE response contained no usable content")
+    if endpoint_type == "anthropic":
+        payload: Dict[str, Any] = {
+            "model": model,
+            "content": [{"type": "text", "text": "".join(text_parts)}],
+            "stop_reason": {"stop": "end_turn", "length": "max_tokens"}.get(finish_reason, finish_reason),
+        }
+    elif endpoint_type == "responses":
+        payload = {
+            "model": model,
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "".join(text_parts)}]}],
+            "status": "completed" if finish_reason in {"", "stop"} else "incomplete",
+        }
+    else:
+        payload = {
+            "model": model,
+            "choices": [{"message": {"content": "".join(text_parts)}, "finish_reason": finish_reason or "stop"}],
+        }
+    if usage is not None:
+        payload["usage"] = dict(usage)
+    return payload, True
+
+
+def classify_provider_endpoint(api_base: str, provider_family: str = "") -> dict[str, Any]:
+    """Classify a provider host without contacting it or reading credentials."""
+
+    raw_base = str(api_base or "").strip()
+    host = str(urlparse(raw_base).hostname or "").casefold()
+    family = str(provider_family or "").strip().casefold().replace("-", "_")
+    official_hosts = {
+        "deepseek": {"api.deepseek.com"},
+        "anthropic": {"api.anthropic.com"},
+        "openai_responses": {"api.openai.com"},
+        "openai": {"api.openai.com"},
+    }
+    local_hosts = {"localhost", "127.0.0.1", "::1"}
+    if host in local_hosts:
+        classification = "custom_local_endpoint"
+        warning = "requests stay on a local/custom endpoint"
+    elif host in official_hosts.get(family, set()):
+        classification = "official_provider_host"
+        warning = "host matches the configured official provider family"
+    else:
+        classification = "third_party_gateway"
+        warning = "prompts, document content, and endpoint credentials are sent to a non-official/custom gateway"
+    return {
+        "host": host,
+        "classification": classification,
+        "warning": warning,
+    }
 
 
 def _default_core_variables() -> Dict[str, List[str]]:
@@ -776,17 +1563,31 @@ def _coerce_positive_int(value: Any, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
-def _response_error_details(response: Any, limit: int = 500) -> str:
+def _coerce_nonnegative_int(value: Any, default: int) -> int:
+    """Parse an integer while preserving an explicit zero configuration."""
+
+    if value is None or str(value).strip() == "":
+        return default
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
+def _response_error_details(response: Any, limit: int = 500, *, secret: str = "") -> str:
     if response is None:
         return "HTTP错误 ?"
 
     details = f"HTTP错误 {getattr(response, 'status_code', '?')}"
     try:
         error_response = response.json()
-        details += f"，响应: {str(error_response)[:limit]}"
+        details += f"，响应: {_redact_provider_text(error_response, secret)[:limit]}"
     except Exception:
         response_text = getattr(response, "text", "") or "无响应内容"
-        details += f"，响应文本: {response_text[:limit]}"
+        details += f"，响应文本: {_redact_provider_text(response_text, secret)[:limit]}"
     return details
 
 
@@ -804,7 +1605,7 @@ def _load_api_runtime_settings(api_config: Optional[Mapping[str, Any]] = None) -
             api_config.get("read_timeout_seconds", api_config.get("total_timeout_seconds", timeout_seconds)),
             timeout_seconds,
         )
-        retry_attempts = _coerce_positive_int(
+        retry_attempts = _coerce_nonnegative_int(
             api_config.get("transport_retries", retry_attempts),
             retry_attempts,
         )
@@ -816,7 +1617,7 @@ def _load_api_runtime_settings(api_config: Optional[Mapping[str, Any]] = None) -
         return timeout_seconds, retry_attempts
 
     runtime = config.get("Runtime", {}) or {}
-    retry_attempts = _coerce_positive_int(
+    retry_attempts = _coerce_nonnegative_int(
         runtime.get("transport_retries", retry_attempts),
         retry_attempts,
     )
@@ -1565,11 +2366,14 @@ def _call_ai_api_detailed_uninstrumented(
     retry_attempts: Optional[int] = None,
     timeout_seconds: Optional[int] = None,
     max_retries_per_call: int = 0,
+    attempt_limit: Optional[int] = None,
     max_single_image_bytes: Optional[int] = None,
     max_request_image_bytes: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Call a configured AI API transport and retain failure details."""
     attempts_used = 0
+    usage_totals: Dict[str, int] = {}
+    usage_reported = False
     removed_compat_params: Set[Any] = set()
 
     def mutation_label(value: Any) -> str:
@@ -1596,10 +2400,11 @@ def _call_ai_api_detailed_uninstrumented(
         api_key = api_config.get('api_key') or ''
         model_name = api_config.get('model') or ''
         api_base = api_config.get('api_base', 'https://api.openai.com/v1') or 'https://api.openai.com/v1'
+        request_started_epoch = time.time()
         capability = resolve_model_capability(api_config)
 
-        if not api_key or not model_name:
-            message = "API config is missing api_key or model"
+        if not api_key or is_template_credential(api_key) or not model_name:
+            message = "API config is missing a real api_key or model"
             if logger:
                 logger.error(message)
             return finish(_api_result(status="failed", error_kind="fatal_config_or_auth", message=message))
@@ -1610,13 +2415,31 @@ def _call_ai_api_detailed_uninstrumented(
             if timeout_seconds is not None
             else configured_timeout_seconds
         )
+        connect_timeout_seconds = _coerce_positive_int(
+            api_config.get("connect_timeout_seconds"),
+            min(10, request_timeout_seconds),
+        )
+        read_timeout_seconds = _coerce_positive_int(
+            api_config.get("read_timeout_seconds"),
+            request_timeout_seconds,
+        )
+        total_timeout_seconds = _coerce_positive_int(
+            api_config.get("total_timeout_seconds"),
+            request_timeout_seconds,
+        )
+        total_deadline = time.monotonic() + total_timeout_seconds
         max_retries = (
-            _coerce_positive_int(retry_attempts, configured_retries)
+            _coerce_nonnegative_int(retry_attempts, configured_retries)
             if retry_attempts is not None
             else configured_retries
         )
         if max_retries_per_call:
             max_retries = min(max_retries, max(1, int(max_retries_per_call)) + 1)
+        if attempt_limit is not None:
+            max_retries = max(1, int(attempt_limit))
+        # ``transport_retries=0`` means no retry after the initial request,
+        # not zero total requests.
+        max_retries = max(1, max_retries)
         if capability.endpoint_type == "anthropic":
             api_url, headers = anthropic_request_target(api_base, api_config, api_key)
         else:
@@ -1674,48 +2497,199 @@ def _call_ai_api_detailed_uninstrumented(
             )
             response_parser = parse_chat_completions_response
 
-        response = None
         last_failure = _api_result(status="failed", error_kind="invalid_response", message="API call did not run")
         attempt = 0
-        strict_retry_budget = bool(max_retries_per_call)
+        strict_retry_budget = attempt_limit is not None or bool(max_retries_per_call)
 
         def can_start_attempt() -> bool:
             if strict_retry_budget:
                 return attempts_used < max_retries
             return attempt < max_retries
 
+        def sleep_before_retry(seconds: float) -> None:
+            remaining = total_deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(float(seconds), remaining))
+
+        def request_fingerprint() -> str:
+            identity = {
+                "identity_version": "aihubmix-request-fingerprint/v1",
+                "endpoint": api_url,
+                "model": str(model_name),
+                "response_format": response_format,
+                "payload": payload,
+                "operation_id": str(api_config.get("operation_id") or ""),
+                "attempt_id": str(api_config.get("attempt_id") or ""),
+                "logical_attempt_identity": str(api_config.get("logical_attempt_identity") or ""),
+                "provider_route": str(api_config.get("provider_route") or ""),
+                "source_manifest_sha256": str(api_config.get("source_manifest_sha256") or ""),
+            }
+            return hashlib.sha256(
+                json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+
+        def recover_final_transient_failure(failure: Dict[str, Any]) -> Dict[str, Any] | None:
+            if str(failure.get("error_kind") or "") not in {"transient_network", "outcome_unknown"}:
+                return None
+            return _aihubmix_recover_disconnected_call(
+                api_config=api_config,
+                model=str(model_name),
+                request_started_epoch=request_started_epoch,
+                response_parser=response_parser,
+                response_format=response_format,
+                request_fingerprint=request_fingerprint(),
+                logger=logger,
+            )
+
         while can_start_attempt():
+            if total_deadline <= time.monotonic():
+                return finish(
+                    _api_result(
+                        status="failed",
+                        error_kind="transient_network",
+                        message="provider total transport deadline exhausted before the next attempt",
+                    )
+                )
             attempt += 1
             attempts_used += 1
+            # Do not let a previous 429/503 leak into a new transport error.
+            response = None
+            transport_attempt_started = False
+            provider_request_id = ""
+            response_spool_path = ""
             try:
                 final_payload = copy.deepcopy(payload)
                 if 'aihubmix.com' in api_base.lower() and logger:
                     logger.info(f"调用AIHubMix API，模型: {final_payload['model']}")
 
+                # Once the POST hand-off begins, a disconnect/timeout cannot
+                # prove that the provider did not process the request.  Keep
+                # this boundary separate from retry configuration so an
+                # unknown outcome is never silently regenerated.
+                transport_attempt_started = True
                 response = _post_with_proxy_mode(
                     api_url,
                     api_config=api_config,
                     headers=headers,
                     json=final_payload,
-                    timeout=request_timeout_seconds,
+                    timeout=(
+                        min(connect_timeout_seconds, max(0.001, total_deadline - time.monotonic())),
+                        min(read_timeout_seconds, max(0.001, total_deadline - time.monotonic())),
+                    ),
+                    stream=True,
                 )
+                # Capture the remote identity before status/body handling can
+                # raise for an HTTP error or a truncated body.
+                provider_request_id = _response_header(response, "x-aihubmix-request-id")
                 response.raise_for_status()
 
+                raw_root = str(
+                    api_config.get("raw_response_dir")
+                    or api_config.get("provider_raw_response_dir")
+                    or ""
+                ).strip()
+                if raw_root:
+                    spool_root = Path(raw_root).expanduser().resolve()
+                    spool_root.mkdir(parents=True, exist_ok=True)
+                    response_spool_path = str(
+                        spool_root
+                        / f"attempt-{attempt}-{request_fingerprint()[:16]}.spool"
+                    )
+
+                response_data: Any = None
+                raw_response_body = b""
+                response_protocol = "json"
+                response_complete = False
+                raw_response_path = ""
+                response_retryable = True
                 try:
-                    response_data = response.json()
+                    max_response_bytes = _coerce_positive_int(
+                        api_config.get("max_response_bytes"),
+                        _MAX_PROVIDER_RESPONSE_BYTES,
+                    )
+                    raw_response_body, content_type = _read_bounded_response(
+                        response,
+                        max_bytes=max_response_bytes,
+                        spool_path=response_spool_path,
+                        total_deadline=total_deadline,
+                    )
+                    raw_response_path = _persist_raw_response(raw_response_body, api_config=api_config)
+                    if response_spool_path:
+                        Path(response_spool_path).unlink(missing_ok=True)
+                        response_spool_path = ""
+                    response_data, response_complete = _decode_sse_response(
+                        raw_response_body,
+                        content_type=content_type,
+                        endpoint_type=capability.endpoint_type,
+                        model=str(model_name),
+                    )
+                    response_protocol = (
+                        "sse"
+                        if "text/event-stream" in content_type.casefold()
+                        or any(line.lstrip().startswith("data:") for line in raw_response_body.decode("utf-8", errors="replace").splitlines())
+                        else "json"
+                    )
                     content, finish_reason = response_parser(response_data)
+                except ProviderResponseReadError as exc:
+                    raw_response_body = exc.partial_body
+                    raw_response_path = _persist_raw_response(
+                        raw_response_body,
+                        api_config=api_config,
+                    )
+                    response_spool_path = exc.spool_path or response_spool_path
+                    response_protocol = (
+                        "sse" if "text/event-stream" in exc.content_type.casefold() else "json"
+                    )
+                    response_retryable = False
+                    formatted = _api_result(
+                        status="failed",
+                        error_kind="outcome_unknown",
+                        http_status=getattr(response, "status_code", None),
+                        message=(
+                            "provider response body was incomplete after response headers; "
+                            "partial bytes were retained and the outcome is unknown"
+                            + (f": {exc}" if str(exc) else "")
+                        ),
+                    )
+                except ProviderResponseLimitError as exc:
+                    raw_response_body = exc.partial_body
+                    raw_response_path = _persist_raw_response(
+                        raw_response_body,
+                        api_config=api_config,
+                    )
+                    response_spool_path = exc.spool_path or response_spool_path
+                    response_retryable = False
+                    formatted = _api_result(
+                        status="failed",
+                        error_kind="invalid_response",
+                        http_status=getattr(response, "status_code", None),
+                        message=str(exc),
+                    )
                 except Exception as exc:
                     message = f"Malformed API response: {exc}"
                     if logger:
                         logger.error(message)
-                    return finish(_api_result(
+                    formatted = _api_result(
                         status="failed",
                         error_kind="invalid_response",
                         http_status=getattr(response, "status_code", None),
                         message=message,
-                    ))
+                    )
+                else:
+                    formatted = _format_success_result(content, response_format, response, finish_reason, logger=logger)
 
-                formatted = _format_success_result(content, response_format, response, finish_reason, logger=logger)
+                formatted["provider_request_id"] = provider_request_id
+                formatted["raw_response_sha256"] = (
+                    hashlib.sha256(raw_response_body).hexdigest()
+                    if raw_response_body
+                    else ""
+                )
+                formatted["response_bytes"] = len(raw_response_body)
+                formatted["response_protocol"] = response_protocol
+                formatted["response_complete"] = bool(response_complete)
+                formatted["raw_response_path"] = raw_response_path
+                formatted["raw_response_spool_path"] = response_spool_path
+
                 if isinstance(response_data, dict):
                     provider_model = str(response_data.get("model") or "").strip()
                     usage = response_data.get("usage")
@@ -1727,6 +2701,7 @@ def _call_ai_api_detailed_uninstrumented(
                             "output_tokens": ("completion_tokens", "output_tokens"),
                             "total_tokens": ("total_tokens",),
                         }
+                        attempt_usage = {}
                         for result_key, candidates in usage_keys.items():
                             for usage_key in candidates:
                                 raw_value = usage.get(usage_key)
@@ -1739,13 +2714,21 @@ def _call_ai_api_detailed_uninstrumented(
                                 except (TypeError, ValueError, OverflowError):
                                     continue
                                 if parsed_value >= 0:
-                                    formatted[result_key] = parsed_value
+                                    attempt_usage[result_key] = parsed_value
                                     break
-                        formatted["usage_status"] = "reported"
+                        if attempt_usage:
+                            usage_reported = True
+                            for result_key, parsed_value in attempt_usage.items():
+                                usage_totals[result_key] = usage_totals.get(result_key, 0) + parsed_value
+                            formatted.update(usage_totals)
+                            formatted["usage_status"] = "reported"
+                if usage_reported:
+                    formatted.update(usage_totals)
                 if (
                     formatted.get("status") == "failed"
                     and formatted.get("error_kind") == "invalid_response"
                     and response_format == "json"
+                    and response_retryable
                     and can_start_attempt()
                 ):
                     wait_time = 2 * (2 ** (attempt - 1))
@@ -1753,21 +2736,111 @@ def _call_ai_api_detailed_uninstrumented(
                         logger.warning(
                             f"API returned malformed JSON; retrying structured request in {wait_time:.1f}s..."
                         )
-                    time.sleep(wait_time)
+                    sleep_before_retry(wait_time)
                     last_failure = formatted
                     continue
 
+                if formatted.get("error_kind") == "outcome_unknown":
+                    recovered = recover_final_transient_failure(formatted)
+                    return finish(recovered or formatted)
+
                 return finish(formatted)
 
-            except requests.exceptions.HTTPError:
-                error_kind, http_status, provider_code, message = _classify_http_error(response)
+            except requests.exceptions.HTTPError as exc:
+                current_response = getattr(exc, "response", None) or response
+                error_kind, http_status, provider_code, message = _classify_http_error(
+                    current_response,
+                    secret=api_key,
+                )
+                error_body = b""
+                error_content_type = _response_header(current_response, "content-type")
+                error_response_path = ""
+                error_response_spool_path = ""
+                try:
+                    error_root = str(
+                        api_config.get("raw_response_dir")
+                        or api_config.get("provider_raw_response_dir")
+                        or ""
+                    ).strip()
+                    if error_root:
+                        error_spool_root = Path(error_root).expanduser().resolve()
+                        error_spool_root.mkdir(parents=True, exist_ok=True)
+                        error_response_spool_path = str(
+                            error_spool_root
+                            / f"attempt-{attempt}-{request_fingerprint()[:16]}.error.spool"
+                        )
+                    error_body, error_content_type = _read_bounded_response(
+                        current_response,
+                        max_bytes=_coerce_positive_int(
+                            api_config.get("max_response_bytes"),
+                            _MAX_PROVIDER_RESPONSE_BYTES,
+                        ),
+                        spool_path=error_response_spool_path,
+                        total_deadline=total_deadline,
+                    )
+                    error_response_path = _persist_raw_response(
+                        error_body,
+                        api_config=api_config,
+                    )
+                    if error_response_spool_path:
+                        Path(error_response_spool_path).unlink(missing_ok=True)
+                        error_response_spool_path = ""
+                except ProviderResponseReadError as read_error:
+                    error_body = read_error.partial_body
+                    error_response_spool_path = read_error.spool_path or error_response_spool_path
+                    try:
+                        error_response_path = _persist_raw_response(
+                            error_body,
+                            api_config=api_config,
+                        )
+                    except OSError:
+                        error_response_path = ""
+                except ProviderResponseLimitError as limit_error:
+                    error_body = limit_error.partial_body
+                    error_response_spool_path = limit_error.spool_path or error_response_spool_path
+                    try:
+                        error_response_path = _persist_raw_response(
+                            error_body,
+                            api_config=api_config,
+                        )
+                    except OSError:
+                        error_response_path = ""
+                except (OSError, ValueError):
+                    error_response_path = ""
+                error_trace_id = (
+                    provider_request_id
+                    or _response_header(current_response, "x-request-id")
+                    or _response_header(current_response, "x-aihubmix-request-id")
+                )
+                if not error_trace_id and error_body:
+                    trace_match = re.search(
+                        rb"(?:tid|trace_id|request_id)\"?\s*[:=]\s*\"?([A-Za-z0-9_.:-]+)",
+                        error_body,
+                    )
+                    if trace_match:
+                        error_trace_id = trace_match.group(1).decode("utf-8", errors="replace")
                 last_failure = _api_result(
                     status="failed",
                     error_kind=error_kind,
                     http_status=http_status,
                     provider_code=provider_code,
-                    message=message or _response_error_details(response, limit=500),
+                    message=message or _response_error_details(current_response, limit=500, secret=api_key),
                 )
+                last_failure["provider_request_id"] = (
+                    provider_request_id
+                    or _response_header(current_response, "x-aihubmix-request-id")
+                )
+                last_failure["provider_error_trace_id"] = error_trace_id
+                last_failure["error_response_sha256"] = (
+                    hashlib.sha256(error_body).hexdigest() if error_body else ""
+                )
+                last_failure["error_response_bytes"] = len(error_body)
+                last_failure["error_response_path"] = error_response_path
+                last_failure["error_response_spool_path"] = error_response_spool_path
+                last_failure["error_response_protocol"] = (
+                    "sse" if "text/event-stream" in error_content_type.casefold() else "json"
+                )
+                _close_provider_response(current_response)
                 if (
                     capability.reasoning_param_style == "chat_reasoning"
                     and ("reasoning", "display") not in removed_compat_params
@@ -1838,22 +2911,43 @@ def _call_ai_api_detailed_uninstrumented(
                 if can_start_attempt():
                     wait_time = 2 * (2 ** (attempt - 1))
                     if logger:
-                        logger.warning(f"{_response_error_details(response, limit=200)}，{wait_time:.1f}秒后重试...")
-                    time.sleep(wait_time)
+                        logger.warning(
+                            f"{_response_error_details(current_response, limit=200, secret=api_key)}，"
+                            f"{wait_time:.1f}秒后重试..."
+                        )
+                    sleep_before_retry(wait_time)
                     continue
 
                 if logger:
                     logger.error(f"API调用最终失败: {last_failure['message']}")
-                return finish(last_failure)
+                recovered = recover_final_transient_failure(last_failure)
+                return finish(recovered or last_failure)
 
             except Exception as exc:
-                response_status = getattr(response, "status_code", None)
+                current_response = response
+                response_status = getattr(current_response, "status_code", None)
                 if isinstance(response_status, int) and response_status >= 400:
-                    error_kind, http_status, provider_code, message = _classify_http_error(response)
+                    error_kind, http_status, provider_code, message = _classify_http_error(
+                        current_response,
+                        secret=api_key,
+                    )
                 else:
                     error_kind, message = _classify_exception(exc)
                     http_status = response_status
                     provider_code = None
+
+                if (
+                    transport_attempt_started
+                    and "aihubmix.com" in str(api_base).casefold()
+                    and error_kind == "transient_network"
+                ):
+                    error_kind = "outcome_unknown"
+                    message = (
+                        "AihubMix transport disconnected after the request boundary; "
+                        "the provider outcome is unknown and will not be regenerated automatically; "
+                        "recovery is attempted only when explicitly enabled and identity-bound"
+                        + (f": {message}" if message else "")
+                    )
 
                 last_failure = _api_result(
                     status="failed",
@@ -1862,23 +2956,30 @@ def _call_ai_api_detailed_uninstrumented(
                     provider_code=provider_code,
                     message=message,
                 )
+                _close_provider_response(current_response)
                 if error_kind in {"quota_exhausted", "fatal_config_or_auth", "invalid_response"}:
                     if logger:
                         logger.error(f"API调用不可重试失败 ({error_kind}): {message}")
                     return finish(last_failure)
 
+                if error_kind == "outcome_unknown":
+                    recovered = recover_final_transient_failure(last_failure)
+                    return finish(recovered or last_failure)
+
                 if can_start_attempt():
                     wait_time = 2 * (2 ** (attempt - 1))
                     if logger:
                         logger.warning(f"API调用失败 ({error_kind}): {message}，{wait_time:.1f}秒后重试...")
-                    time.sleep(wait_time)
+                    sleep_before_retry(wait_time)
                     continue
 
                 if logger:
                     logger.error(f"API调用最终失败 ({error_kind}): {message}")
-                return finish(last_failure)
+                recovered = recover_final_transient_failure(last_failure)
+                return finish(recovered or last_failure)
 
-        return finish(last_failure)
+        recovered = recover_final_transient_failure(last_failure)
+        return finish(recovered or last_failure)
 
     except Exception as exc:
         if logger:
@@ -1932,6 +3033,23 @@ def _call_ai_api_detailed(
         max_output_tokens=int(max_tokens),
         temperature=temperature,
     )
+    runtime_api_key = str(api_config.get("api_key") or "").strip()
+    runtime_model = str(api_config.get("model") or "").strip()
+    if not runtime_api_key or is_template_credential(runtime_api_key) or not runtime_model:
+        receipt = provider_runtime.blocked_receipt(
+            prompt=prompt,
+            input_payload=request_payload,
+            api_config=api_config,
+            message="provider runtime rejected an empty/template credential or model before transport",
+            route=provider_route,
+        )
+        blocked = _api_result(
+            status="failed",
+            error_kind="fatal_config_or_auth",
+            message="provider runtime rejected an empty/template credential or model before transport",
+        )
+        blocked["provider_receipt"] = receipt.to_dict()
+        return blocked
     capability = resolve_model_capability(api_config)
     profile = ProviderContextProfile.conservative(
         provider=str(api_config.get("provider_family") or capability.provider_family),
@@ -1967,8 +3085,15 @@ def _call_ai_api_detailed(
         return blocked
 
     estimated_tokens = int(budget["estimated_input_tokens"])
+    configured_attempts = _load_api_runtime_settings(api_config)[1]
+    requested_attempts = retry_attempts if retry_attempts is not None else configured_attempts
+    effective_attempts = provider_runtime.max_attempts_for_call(requested_attempts)
     try:
-        admission = provider_runtime.admit(estimated_tokens=estimated_tokens)
+        admission = provider_runtime.admit(
+            estimated_tokens=estimated_tokens,
+            requested_output_tokens=max(0, int(max_tokens)) * max(1, effective_attempts),
+            requested_retry_attempts=max(0, effective_attempts - 1),
+        )
     except ProviderBudgetExceeded as exc:
         receipt = provider_runtime.blocked_receipt(
             prompt=prompt,
@@ -1989,18 +3114,48 @@ def _call_ai_api_detailed(
         }
         return blocked
 
+    # The durable budget distinguishes a process that died before transport
+    # from one that may have sent a request but failed before writing a receipt.
+    # Mark this boundary immediately before entering the uninstrumented
+    # transport so resume can release only the former case.
+    provider_runtime.mark_transport_started(admission)
+    transport_api_config: dict[str, Any] = dict(api_config)
+    if not str(transport_api_config.get("operation_id") or "").strip():
+        transport_api_config["operation_id"] = (
+            f"{getattr(provider_runtime, 'job_id', '')}:{getattr(provider_runtime, 'call_id', '')}"
+        ).strip(":")
+    if not str(transport_api_config.get("attempt_id") or "").strip():
+        transport_api_config["attempt_id"] = str(getattr(provider_runtime, "attempt_id", "") or "")
+    if not str(transport_api_config.get("logical_attempt_identity") or "").strip():
+        transport_api_config["logical_attempt_identity"] = str(
+            getattr(provider_runtime, "logical_attempt_identity", "") or ""
+        )
+    if not str(transport_api_config.get("provider_route") or "").strip():
+        transport_api_config["provider_route"] = str(provider_route or "")
+    if not str(
+        transport_api_config.get("raw_response_dir")
+        or transport_api_config.get("provider_raw_response_dir")
+        or ""
+    ).strip():
+        runtime_ledger = getattr(provider_runtime, "ledger", None)
+        ledger_path = getattr(runtime_ledger, "path", None)
+        if ledger_path:
+            transport_api_config["raw_response_dir"] = str(
+                Path(str(ledger_path)).resolve().parent / "raw_responses"
+            )
     result = _call_ai_api_detailed_uninstrumented(
         prompt,
-        api_config,
+        cast(APIConfig, transport_api_config),
         system_prompt,
         max_tokens=max_tokens,
         temperature=temperature,
         response_format=response_format,
         logger=logger,
         user_content=admitted_user_content,
-        retry_attempts=retry_attempts,
+        retry_attempts=effective_attempts,
         timeout_seconds=timeout_seconds,
-        max_retries_per_call=provider_runtime.budget.max_retries_per_call,
+        max_retries_per_call=max(0, effective_attempts - 1),
+        attempt_limit=effective_attempts,
         max_single_image_bytes=max_single_image_bytes,
         max_request_image_bytes=max_request_image_bytes,
     )
@@ -2061,7 +3216,88 @@ def _call_ai_api_detailed(
         "transport_metadata": {
             **transport_report,
             "successful_input_mode": "multimodal" if transport_report.get("images_actually_sent_count", 0) else "text_only",
+            **{
+                key: result[key]
+                for key in (
+                    "recovered_from_aihubmix_task",
+                    "aihubmix_recovery_task_id",
+                    "aihubmix_recovery_content_sha256",
+                    "aihubmix_recovery_operator",
+                    "aihubmix_recovery_request_fingerprint",
+                    "provider_request_id",
+                    "raw_response_sha256",
+                    "response_bytes",
+                    "response_protocol",
+                    "response_complete",
+                    "raw_response_path",
+                    "raw_response_spool_path",
+                    "provider_error_trace_id",
+                    "error_response_sha256",
+                    "error_response_bytes",
+                    "error_response_path",
+                    "error_response_spool_path",
+                )
+                if key in result
+            },
         },
+    }
+    if capability.endpoint_type == "anthropic":
+        request_route = anthropic_request_target(
+            str(api_config.get("api_base") or ""),
+            cast(APIConfig, api_config),
+            str(api_config.get("api_key") or ""),
+        )[0]
+    else:
+        request_route = (
+            f"{str(api_config.get('api_base') or '').rstrip('/')}/"
+            f"{'responses' if capability.endpoint_type == 'responses' else 'chat/completions'}"
+        )
+    configured_timeout, configured_transport_retries = _load_api_runtime_settings(api_config)
+    effective_timeout = (
+        _coerce_positive_int(timeout_seconds, configured_timeout)
+        if timeout_seconds is not None
+        else configured_timeout
+    )
+    effective_transport_retries = (
+        _coerce_nonnegative_int(retry_attempts, configured_transport_retries)
+        if retry_attempts is not None
+        else configured_transport_retries
+    )
+    transport_config = {
+        "provider_family": capability.provider_family,
+        "endpoint_type": capability.endpoint_type,
+        "api_base": str(api_config.get("api_base") or ""),
+        "model": str(api_config.get("model") or ""),
+        "proxy_mode": str(api_config.get("proxy_mode") or "environment"),
+        "trust_env": not should_bypass_environment_proxy(api_config),
+        "request_route": request_route,
+        "request_byte_estimate": len(
+            json.dumps(
+                request_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ),
+        "timeout_seconds": effective_timeout,
+        "connect_timeout_seconds": _coerce_positive_int(
+            api_config.get("connect_timeout_seconds"),
+            min(10, effective_timeout),
+        ),
+        "read_timeout_seconds": _coerce_positive_int(
+            api_config.get("read_timeout_seconds"),
+            effective_timeout,
+        ),
+        "total_timeout_seconds": _coerce_positive_int(
+            api_config.get("total_timeout_seconds"),
+            effective_timeout,
+        ),
+        "provider_stream": _config_bool(api_config.get("provider_stream")),
+        "max_response_bytes": _coerce_positive_int(
+            api_config.get("max_response_bytes"),
+            _MAX_PROVIDER_RESPONSE_BYTES,
+        ),
+        "transport_retries": effective_transport_retries,
     }
     receipt = provider_runtime.complete(
         admission=admission,
@@ -2072,6 +3308,10 @@ def _call_ai_api_detailed(
         metadata={
             "request_budget": budget,
             "requested_output_tokens": int(max_tokens),
+            "transport_config": transport_config,
+            "config_section": str(provider_runtime.route or "")
+            if str(provider_runtime.route or "").endswith("_API")
+            else "",
             **dict(result.get("transport_metadata") or {}),
         },
         route=provider_route,
@@ -2079,6 +3319,49 @@ def _call_ai_api_detailed(
     enriched = dict(result)
     enriched["provider_receipt"] = receipt.to_dict()
     return enriched
+
+
+def probe_provider_connection(
+    api_config: Mapping[str, Any],
+    *,
+    logger: Any = None,
+) -> Dict[str, Any]:
+    """Run the canonical one-token provider probe through the real transport."""
+
+    descriptor, ledger_path = tempfile.mkstemp(
+        prefix="auto-generate-provider-probe-",
+        suffix=".jsonl",
+    )
+    os.close(descriptor)
+    target = Path(ledger_path)
+    try:
+        capability = resolve_model_capability(cast(APIConfig, dict(api_config)))
+        runtime = ProviderRuntime(
+            ledger=ProviderRuntimeLedger(target),
+            job_id="configuration-provider-probe",
+            attempt_id=f"probe-{os.getpid()}",
+            stage_name="configuration_probe",
+            route="configuration_probe",
+            node_id="configuration_probe",
+            call_id=f"configuration_probe:{os.getpid()}",
+            endpoint_type=capability.endpoint_type,
+        )
+        return _call_ai_api_detailed(
+            "ping",
+            cast(APIConfig, dict(api_config)),
+            "Return one short token.",
+            max_tokens=1,
+            temperature=0.0,
+            response_format="text",
+            logger=logger,
+            provider_runtime=runtime,
+        )
+    finally:
+        try:
+            target.unlink(missing_ok=True)
+            target.with_name(target.name + ".lock").unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _call_ai_api(prompt: str, api_config: APIConfig, system_prompt: str, max_tokens: int = 4000,
