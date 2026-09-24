@@ -26,7 +26,7 @@ from runtime.architecture_gates import ArchitectureGateScope, collect_scannable_
 from runtime.lifecycle import BootstrappedRuntimeContext, bootstrap_job_runtime, finalize_job_runtime
 from runtime.job_spec import RuntimeJobSpec
 from runtime.provider_context import ProviderContextProfile
-from runtime.provider_runtime import hash_json
+from runtime.provider_runtime import bind_pause_state_path, hash_json
 from runtime.reconcile import ReconcileValidationError, validate_canonical_ai_summary
 from runtime.source_intake import build_source_bundle_for_request
 from runtime.stage_contracts import SourceBundle, StageArtifactRef, StageResult
@@ -245,6 +245,7 @@ class _RuntimeStageHost:
         resume_state_report: Any | None = None,
     ) -> None:
         self.job_workspace = workspace
+        bind_pause_state_path(workspace.artifact_path(f"pause_state/{workspace.job_id}.json"))
         self.workspace = workspace
         self.artifact_registry = artifact_registry
         self.settings = settings
@@ -807,8 +808,33 @@ class InternalStageExecutorRegistry:
                 source_sha = file_sha256(source_file)
             except (OSError, UnicodeError):
                 source_sha = ""
+        # A resume can expose both the imported Stage1 source and the local
+        # summary_file artifact.  They are allowed to point to the same paper,
+        # but the provider-facing pack must contain exactly one canonical
+        # entry per paper.  Identical duplicates are a read-side merge; a
+        # conflicting duplicate stays fail-closed.
+        deduplicated: list[Mapping[str, Any]] = []
+        seen_entries: dict[str, str] = {}
+        for summary in summaries:
+            paper_info = summary.get("paper_info") if isinstance(summary, Mapping) else None
+            paper_key = str(
+                (paper_info.get("canonical_paper_key") if isinstance(paper_info, Mapping) else "")
+                or (paper_info.get("doi") if isinstance(paper_info, Mapping) else "")
+                or (paper_info.get("title") if isinstance(paper_info, Mapping) else "")
+                or ""
+            ).strip()
+            summary_hash = hash_json(summary)
+            if paper_key and paper_key in seen_entries:
+                if seen_entries[paper_key] != summary_hash:
+                    raise ValueError(
+                        f"outline evidence pack has conflicting duplicate paper identity: {paper_key}"
+                    )
+                continue
+            if paper_key:
+                seen_entries[paper_key] = summary_hash
+            deduplicated.append(summary)
         pack = build_pack(
-            summaries,
+            deduplicated,
             source_ref=source_ref,
             source_ref_sha256=source_sha,
             job_id=session.context.workspace.job_id,
@@ -1043,6 +1069,14 @@ class InternalStageExecutorRegistry:
         capability = resolve_model_capability(api_config)
         model_context_limit = self._positive_int(api_config.get("max_context_tokens"), 128_000)
         max_output_tokens = self._positive_int(api_config.get("max_output_tokens"), 4_096)
+        # Evidence critique receives the largest request in the current v3
+        # graph because it sees all candidate outputs.  Keep the generator
+        # budget at the configured 32k, but cap this critique role at 16k:
+        # observed evidence critiques are only a few thousand tokens, while
+        # the lower reserve materially reduces gateway pre-charge and timeout
+        # risk without changing the evidence input or contract.
+        if role == "evidence_critique":
+            max_output_tokens = min(max_output_tokens, 16_000)
         profile = ProviderContextProfile.conservative(
             provider=capability.provider_family,
             model=model,
@@ -1211,7 +1245,7 @@ class InternalStageExecutorRegistry:
         if not isinstance(final_payload, Mapping):
             raise RuntimeError("Outline v3 final outline payload is missing")
         artifact_refs: list[StageArtifactRef] = []
-        for node_id in ("final_outline", "coverage_audit", "stability_audit", "provider_receipt_closure", "stage_health"):
+        for node_id in ("outline_content_layers", "semantic_chunk_plan", "final_outline", "coverage_audit", "stability_audit", "provider_receipt_closure", "stage_health"):
             record = session.context.registry.get(f"outline-v3:{node_id}")
             if record is not None and record.status == "ready":
                 artifact_refs.append(self.bridge._artifact_ref_from_record(record))

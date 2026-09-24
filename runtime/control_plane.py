@@ -71,10 +71,14 @@ from preprocess.service import DEFAULT_MINERU_ALLOWED_URL_HOSTS, PreprocessManag
 from services.job_workspace import JobWorkspace, atomic_write_json, is_reparse_path
 from services.durable_io import atomic_replace_with_retry, interprocess_file_lock
 from runtime.cancellation import CancellationRequestStore
+from runtime.pause_state import PauseStateStore
 from runtime.export_bundle import ExportBundleService, ExportBundleSpecV1, ForensicAttestationService
 from outline.adoption_transaction import OutlineAdoptionTransaction
 from validation.closure import ValidationClosureService
 from validation.repair_transaction import RepairTransactionService
+from outline.semantic_chunking import ReuseInventoryItem, build_paper_content_layers, build_semantic_chunk_plan
+from outline.v3_evidence import build_outline_evidence_views, build_global_corpus_ledger, build_multi_view_matrix
+from outline.v3_relations import build_global_relation_map
 
 
 CONTROL_PLANE_VERSION = "reviewctl-v1"
@@ -437,8 +441,13 @@ class ReviewControlPlane:
         if artifacts_dir.is_dir():
             candidates.extend(artifacts_dir.glob("provider_receipts*.jsonl"))
             candidates.extend(artifacts_dir.glob("**/provider_receipts*.jsonl"))
+        staging_dir = Path(workspace.root_dir) / ".publication-staging" / "provider-receipts"
+        if staging_dir.is_dir():
+            candidates.extend(staging_dir.glob("**/provider_receipts/*.jsonl"))
         unique = tuple(dict.fromkeys(path.resolve() for path in candidates if path.is_file()))
-        entries: list[dict[str, Any]] = []
+        entries_by_id: dict[str, dict[str, Any]] = {}
+        entry_hashes: dict[str, str] = {}
+        conflicts: list[str] = []
         malformed: list[str] = []
         for path in unique:
             try:
@@ -455,15 +464,29 @@ class ReviewControlPlane:
                     malformed.append(f"{path}:{line_number}: invalid JSON")
                     continue
                 if isinstance(payload, Mapping):
-                    entries.append(dict(payload))
+                    item = dict(payload)
+                    receipt_id = str(item.get("receipt_id") or item.get("call_id") or "").strip()
+                    if not receipt_id:
+                        malformed.append(f"{path}:{line_number}: receipt identity is missing")
+                        continue
+                    item_hash = _canonical_hash(item)
+                    previous_hash = entry_hashes.get(receipt_id)
+                    if previous_hash is not None and previous_hash != item_hash:
+                        conflicts.append(receipt_id)
+                        entries_by_id.pop(receipt_id, None)
+                        continue
+                    entry_hashes[receipt_id] = item_hash
+                    entries_by_id[receipt_id] = item
                 else:
                     malformed.append(f"{path}:{line_number}: receipt must be an object")
+        entries = list(entries_by_id.values())
         return {
             "paths": [str(path) for path in unique],
             "count": len(entries),
             "entries": entries,
             "malformed": malformed,
-            "complete": bool(unique) and not malformed,
+            "conflicts": sorted(set(conflicts)),
+            "complete": bool(unique) and not malformed and not conflicts,
         }
 
     def next_action(self, *, job_id: str | None = None, workspace: str | Path | None = None) -> dict[str, Any]:
@@ -549,6 +572,88 @@ class ReviewControlPlane:
             "plan_hash": _canonical_hash(spec.to_dict()),
             "read_only": True,
         }
+        return payload
+
+    def chunk_plan(
+        self,
+        summary_files: Sequence[str | Path],
+        *,
+        job_id: str = "chunk-plan",
+        candidate_count: int = 3,
+        physical_call_limit: int = 24,
+        output_path: str | Path | None = None,
+    ) -> dict[str, Any]:
+        """Build the semantic plan from canonical summaries without provider calls."""
+
+        if not summary_files:
+            raise ControlPlaneError("chunk-plan requires at least one --summary-file")
+        summaries: list[dict[str, Any]] = []
+        source_paths: list[str] = []
+        for raw_path in summary_files:
+            path = Path(raw_path).expanduser().resolve()
+            if not path.is_file():
+                raise ControlPlaneError(f"summary file does not exist: {path}")
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            rows = payload.get("summaries") if isinstance(payload, Mapping) else payload
+            if isinstance(rows, Mapping):
+                rows = [rows]
+            if not isinstance(rows, list) or not all(isinstance(item, Mapping) for item in rows):
+                raise ControlPlaneError(f"summary file must contain a JSON array or summaries array: {path}")
+            summaries.extend(dict(item) for item in rows)
+            source_paths.append(str(path))
+        evidence = build_outline_evidence_views(summaries, str(job_id))
+        ledger = build_global_corpus_ledger(evidence)
+        matrix = build_multi_view_matrix(evidence)
+        relation_map = build_global_relation_map(evidence, matrix, ledger)
+        content_layers = build_paper_content_layers(summaries, evidence, job_id=str(job_id))
+        reuse_inventory = [
+            ReuseInventoryItem(
+                source_path=path,
+                content_hash=content_layers.content_hash,
+                source_node="stage1_canonical_summaries",
+                content_status="read_only_input",
+                evidence_completeness="complete" if not content_layers.blocking_diagnostics else "partial",
+                new_node_usage="outline_content_layers -> semantic_chunk_plan",
+                disposition="direct_reuse",
+                reason="canonical Stage 1 summaries are projected locally; provider calls are not emitted",
+            )
+            for path in source_paths
+        ]
+        semantic_plan = build_semantic_chunk_plan(
+            content_layers,
+            relation_map,
+            candidate_count=int(candidate_count),
+            physical_call_limit=min(24, max(0, int(physical_call_limit))),
+            reuse_inventory=reuse_inventory,
+        )
+        payload: dict[str, Any] = {
+            "control_plane_version": CONTROL_PLANE_VERSION,
+            "status": "planned" if semantic_plan.status == "ready" else "blocked",
+            "command": "chunk-plan",
+            "job_id": str(job_id),
+            "source_files": source_paths,
+            "source_summary_count": len(summaries),
+            "content_layers": {
+                "content_hash": content_layers.content_hash,
+                "status": content_layers.status,
+                "index_card_count": len(content_layers.index_cards),
+                "dossier_count": len(content_layers.dossiers),
+                "blocking_diagnostics": list(content_layers.blocking_diagnostics),
+            },
+            "semantic_chunk_plan": semantic_plan.to_dict(),
+            "relation_map": {
+                "content_hash": relation_map.content_hash,
+                "candidate_count": len(relation_map.relations),
+                "blocking_diagnostics": list(relation_map.blocking_diagnostics),
+            },
+            "provider_posts_emitted": 0,
+            "read_only": True,
+        }
+        if output_path:
+            target = Path(output_path).expanduser().resolve()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            payload["output_path"] = str(target)
         return payload
 
     def _run_spec(
@@ -4642,6 +4747,40 @@ class ReviewControlPlane:
             "status": "requested",
             "job_id": inspection["job_id"],
             "request": request.to_dict(),
+            "mutation_performed": True,
+            "read_only": False,
+        }
+
+    def pause(
+        self,
+        *,
+        job_id: str | None = None,
+        workspace: str | Path | None = None,
+        requested_by: str = "reviewctl",
+        reason: str = "user_requested",
+    ) -> dict[str, Any]:
+        inspection = self.inspect(job_id=job_id, workspace=workspace)
+        current_status = str((inspection.get("status") or {}).get("job_status") or "")
+        if current_status in {"completed", "failed", "cancelled"}:
+            return {
+                "status": "blocked",
+                "job_id": inspection["job_id"],
+                "reason": f"job is already terminal: {current_status}",
+                "mutation_performed": False,
+                "read_only": True,
+            }
+        workspace_obj, registry = AgentRuntimeRunner._open_workspace(inspection["workspace_path"])
+        try:
+            state = PauseStateStore(workspace_obj, registry).request(
+                requested_by=requested_by,
+                reason=reason,
+            )
+        except (OSError, RegistryError, ValueError, TypeError) as exc:
+            raise ControlPlaneError(f"cannot persist pause state: {exc}") from exc
+        return {
+            "status": "paused",
+            "job_id": inspection["job_id"],
+            "pause_state": state.to_dict(),
             "mutation_performed": True,
             "read_only": False,
         }

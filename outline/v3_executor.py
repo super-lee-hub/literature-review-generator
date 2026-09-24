@@ -11,7 +11,9 @@ from dataclasses import asdict, dataclass, field, replace
 import hashlib
 import json
 import math
+import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -43,8 +45,14 @@ from outline.v3_evidence import (
 )
 from outline.v3_models import GlobalRelationMap, OutlineQualityGate, compute_v3_hash
 from outline.v3_relations import build_global_relation_map, build_organizing_axes, build_outline_candidate_plans
+from outline.semantic_chunking import (
+    build_paper_content_layers,
+    build_semantic_chunk_plan,
+    build_topic_synthesis_plan,
+)
 from outline.evidence_alias import alias_structural, canonicalize_structural
 from runtime.outline_v3_dag import OutlineNodeDAG, OutlineNodeStore
+from runtime.pause_state import PauseRequestedError, PauseStateStore
 from runtime.provider_completion import ProviderCompletionEvaluator
 from runtime.provider_context import ProviderContextProfile
 from runtime.provider_receipt_closure import ExpectedProviderCall, ProviderReceiptClosure
@@ -70,6 +78,7 @@ from services.artifact_registry import (
     file_sha256,
 )
 from services.job_workspace import publish_bytes_artifact, publish_json_artifact
+from services.durable_io import atomic_replace_with_retry, fsync_file
 from services.queue_service import LocalPublicationContext
 from services.prompt_registry import PromptRegistry
 
@@ -458,15 +467,57 @@ class OutlineV3Executor:
             and str(record.metadata.get("stage_name") or "") == "outline_v3"
             and str(record.metadata.get("closure_epoch_id") or "") == self.closure_epoch_id
         ]
-        existing_ledger = max(
-            epoch_ledgers,
-            key=lambda record: (record.created_at, record.artifact_id),
-            default=None,
+        stable_ledgers = [
+            record for record in epoch_ledgers
+            if record.artifact_id == "outline_v3_provider_receipts"
+        ]
+        existing_ledger = (
+            stable_ledgers[0]
+            if stable_ledgers
+            else max(
+                epoch_ledgers,
+                key=lambda record: (record.created_at, record.artifact_id),
+                default=None,
+            )
         )
         if existing_ledger is not None and existing_ledger.status == "ready":
             try:
                 self._receipt_ledger.path.parent.mkdir(parents=True, exist_ok=True)
-                self._receipt_ledger.path.write_bytes(Path(existing_ledger.path).read_bytes())
+                published_ledger = ProviderRuntimeLedger(existing_ledger.path)
+                published_receipts = list(published_ledger.list_receipts())
+                staging_receipts = list(self._receipt_ledger.list_receipts())
+                published_ids = {receipt.receipt_id for receipt in published_receipts}
+                snapshot_time = str(existing_ledger.created_at or "")
+                fresh_receipts = [
+                    receipt
+                    for receipt in staging_receipts
+                    if receipt.receipt_id not in published_ids
+                    and str(receipt.finished_at or "") > snapshot_time
+                ]
+                merged_by_id = {
+                    receipt.receipt_id: receipt
+                    for receipt in [*published_receipts, *fresh_receipts]
+                }
+                merged = [merged_by_id[key] for key in sorted(merged_by_id)]
+                if [receipt.receipt_id for receipt in staging_receipts] != [receipt.receipt_id for receipt in merged]:
+                    payload = "".join(
+                        json.dumps(receipt.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+                        for receipt in merged
+                    ).encode("utf-8")
+                    fd, temp_name = tempfile.mkstemp(
+                        prefix="outline-receipts-reconcile-",
+                        suffix=".jsonl",
+                        dir=str(self._receipt_ledger.path.parent),
+                    )
+                    os.close(fd)
+                    try:
+                        fsync_file(temp_name, payload)
+                        atomic_replace_with_retry(temp_name, self._receipt_ledger.path)
+                    finally:
+                        try:
+                            Path(temp_name).unlink(missing_ok=True)
+                        except OSError:
+                            pass
             except OSError:
                 pass
         self._replay_store = ModelCallReplayStore(self.workspace)
@@ -478,6 +529,7 @@ class OutlineV3Executor:
         self._replay_receipt_index_cache: dict[str, Any] | None = None
         self._verified_reuse_records: dict[str, ArtifactRecord] = {}
         self._verified_reuse_source_receipt_ids: dict[str, str] = {}
+        self._pause_state = PauseStateStore(self.workspace, self.registry)
         self._node_store = OutlineNodeStore(self.workspace, self.registry)
         self._dag = self._node_store.ensure(self.job_id, candidate_count=self.candidate_count)
         self._hydrate_expected_provider_calls()
@@ -926,7 +978,7 @@ class OutlineV3Executor:
         ``api_base_host``.
         """
 
-        return {
+        identity = {
             "provider_family": route.provider_name,
             "model": route.model,
             "api_base": route.api_base_host,
@@ -934,6 +986,8 @@ class OutlineV3Executor:
             "config_section": route.config_section,
             "route_fingerprint": route.safe_config_fingerprint(),
         }
+        identity["transport_retries"] = str(route.config_identity.get("transport_retries") or "0")
+        return identity
 
     def _provider_configured(self) -> bool:
         """Return whether the configured execution surface can transport calls."""
@@ -1545,6 +1599,8 @@ class OutlineV3Executor:
     def _build_provider_call_plans(self) -> tuple[OutlineProviderCallPlan, ...]:
         plans: list[OutlineProviderCallPlan] = []
         for variant_name, variant_summaries, transport_expected in self._provider_call_plan_variants():
+            variant_evidence = build_outline_evidence_views(variant_summaries, self.job_id)
+            variant_layers = build_paper_content_layers(variant_summaries, variant_evidence, job_id=self.job_id)
             for node_id in self._provider_node_ids():
                 route = self._role_route(node_id)
                 profile = route.profile
@@ -1573,19 +1629,35 @@ class OutlineV3Executor:
                         self._role_route("candidate_1_provider_generation").profile,
                         variant_name=variant_name,
                     )
+                common_estimation = {
+                    "navigation_cards": [item.to_dict() for item in variant_layers.index_cards],
+                    "content_layers_hash": variant_layers.content_hash,
+                    "source_summary_hashes": list(variant_layers.source_summary_hashes),
+                    "source_summary_size_tokens": [
+                        max(1, len(json.dumps(item, ensure_ascii=False, sort_keys=True)) // 4)
+                        for item in variant_summaries
+                    ],
+                    "source_summary_size_marker": "x" * min(
+                        2000,
+                        max(1, sum(len(json.dumps(item, ensure_ascii=False)) for item in variant_summaries) // 1000),
+                    ),
+                    "candidate_count": self.candidate_count,
+                    "evidence_bound": True,
+                    "full_dossiers_are_local_retrieval_only": True,
+                }
                 if hierarchical_relation_input is not None:
                     representative_request = {
+                        **common_estimation,
                         "job_id": self.job_id,
                         "stage_name": "outline_v3",
                         "variant_name": variant_name,
                         "node_id": node_id,
                         "hierarchical_relation_request": True,
                         "estimated_shard_input_tokens": hierarchical_relation_input,
-                        "candidate_count": self.candidate_count,
-                        "evidence_bound": True,
                     }
                 elif node_id in {"structure_critique", "coverage_critique", "evidence_critique", "arbitration"}:
                     representative_request = {
+                        **common_estimation,
                         "job_id": self.job_id,
                         "stage_name": "outline_v3",
                         "variant_name": variant_name,
@@ -1594,23 +1666,18 @@ class OutlineV3Executor:
                         * max(1, candidate_shard_multiplier)
                         * int(self._role_route("candidate_1_provider_generation").profile.max_output_tokens),
                         "paper_count": len(variant_summaries),
-                        "source_summary_hash_count": len(variant_summaries),
-                        "evidence_bound": True,
                     }
                 else:
                     representative_request = {
+                        **common_estimation,
                         "job_id": self.job_id,
                         "stage_name": "outline_v3",
                         "variant_name": variant_name,
                         "node_id": node_id,
-                        "evidence_views": self._prompt_evidence_views(
-                            build_outline_evidence_views(variant_summaries, self.job_id).views
-                        ),
+                        "evidence_views": self._prompt_evidence_views(variant_evidence.views),
                         "source_summary_excerpts_for_estimation": self._estimate_source_summary_excerpts(
                             variant_summaries
                         ),
-                        "candidate_count": self.candidate_count,
-                        "evidence_bound": True,
                     }
                 budget = profile.estimate_request(representative_request)
                 estimated_input = max(
@@ -2067,11 +2134,14 @@ class OutlineV3Executor:
         if node_id.endswith("_provider_generation"):
             return "outline_candidate"
         return {
+            "outline_content_layers": "outline_content_layers",
+            "semantic_chunk_plan": "semantic_chunk_plan",
             "structure_critique": "structure_critique",
             "coverage_critique": "coverage_critique",
             "evidence_critique": "evidence_critique",
             "arbitration": "arbitration_decision",
             "selected_candidate": "selected_outline_candidate",
+            "selected_candidate_revision": "selected_candidate_revision",
             "section_evidence_packets": "section_evidence_packet_set",
             "final_outline": "final_outline",
             "coverage_audit": "coverage_audit",
@@ -2180,6 +2250,11 @@ class OutlineV3Executor:
             "endpoint_type": bind_endpoint,
             "api_base_host": resolved_route.api_base_host if provider_node and resolved_route is not None else "",
             "route_fingerprint": resolved_route.safe_config_fingerprint() if provider_node and resolved_route is not None else "",
+            "transport_retries": (
+                str(resolved_route.config_identity.get("transport_retries") or "0")
+                if provider_node and resolved_route is not None
+                else "0"
+            ),
             "prompt_template_hash": prompt_template_hash,
             "prompt_payload_hash": prompt_payload_hash,
             "prompt_hash": hash_text(json.dumps(prompt, sort_keys=True, ensure_ascii=False)) if prompt is not None else "",
@@ -2302,17 +2377,13 @@ class OutlineV3Executor:
                 same_record = self._receipt_record_hash(previous) == self._receipt_record_hash(receipt)
                 previous_epoch = str(getattr(previous, "closure_epoch_id", "") or "")
                 previous_source = sources.get(receipt_id)
-                duplicate_registry_source = (
-                    same_record
-                    and previous_epoch == source_epoch
-                    and previous_source is not None
-                    and source_record is not None
-                    and previous_source.artifact_id != source_record.artifact_id
-                )
-                if same_record and previous_epoch == source_epoch and not duplicate_registry_source:
-                    # The local staging copy and its immutable Registry copy
-                    # describe the same call. Prefer the Registry record as
-                    # the source authority when it is available.
+                if same_record and previous_epoch == source_epoch:
+                    # A resumed run publishes a content-addressed cumulative
+                    # ledger. Its immutable Registry snapshots legitimately
+                    # share the same receipt prefix, so an identical receipt
+                    # from two ready ledger records is not a conflict. Keep a
+                    # Registry record as the source authority when the first
+                    # occurrence came from the local staging copy.
                     if source_record is not None and previous_source is None:
                         sources[receipt_id] = source_record
                     continue
@@ -2339,6 +2410,14 @@ class OutlineV3Executor:
         except Exception as exc:
             registry_records = []
             reject("provider receipt Registry", type(exc).__name__)
+        stable_registry_ids = {
+            str(getattr(record, "artifact_id", "") or "")
+            for record in registry_records
+            if str(getattr(record, "artifact_type", "") or "") == "provider_receipt_ledger"
+            and str(getattr(record, "status", "") or "") == "ready"
+            and str(getattr(record, "job_id", "") or "") == self.job_id
+            and str(getattr(record, "artifact_id", "") or "") == "outline_v3_provider_receipts"
+        }
         for record in registry_records:
             if str(getattr(record, "artifact_type", "") or "") != "provider_receipt_ledger":
                 continue
@@ -2352,6 +2431,12 @@ class OutlineV3Executor:
                 reject(str(getattr(record, "artifact_id", "") or "<unknown>"), "metadata is not an object")
                 continue
             if str(metadata.get("stage_name") or "") != "outline_v3":
+                continue
+            if stable_registry_ids and str(getattr(record, "artifact_id", "") or "") not in stable_registry_ids:
+                # Content-addressed historical snapshots are forensic inputs;
+                # the stable current ledger is the only replay authority. A
+                # missing record in that authority must trigger a fresh call,
+                # not be resurrected from an older snapshot.
                 continue
             source_epoch = str(metadata.get("closure_epoch_id") or "")
             if not source_epoch:
@@ -2823,7 +2908,7 @@ class OutlineV3Executor:
             input_hash=str(binding.get("prompt_payload_hash") or ""),
             config_hash=str(binding.get("provider_config_hash") or ""),
             schema_hash=str(binding.get("schema_hash") or _hash_payload({"node_id": semantic_node_id, "expect_json": True})),
-            max_attempts=1,
+            max_attempts=max(1, int(binding.get("transport_retries") or 0) + 1),
             provider=str(binding.get("provider_family") or ""),
             model=str(binding.get("model_name") or ""),
             endpoint=str(binding.get("api_base_host") or ""),
@@ -2861,7 +2946,7 @@ class OutlineV3Executor:
                 endpoint=route.api_base_host if route is not None else "",
                 endpoint_type=route.endpoint_type if route is not None else self.profile.endpoint_type,
                 config_hash=hash_json(route_identity) if route_identity else "",
-                max_attempts=1,
+                max_attempts=max(1, int((route.config_identity if route is not None else {}).get("transport_retries") or 0) + 1),
                 usage_required=(route.endpoint_type if route is not None else self.profile.endpoint_type)
                 not in {"internal", "fixture"},
             )
@@ -2893,7 +2978,7 @@ class OutlineV3Executor:
             input_hash=hash_json(request),
             config_hash=hash_json(api_config),
             schema_hash=_hash_payload({"node_id": semantic_node_id, "expect_json": expect_json}),
-            max_attempts=1,
+            max_attempts=max(1, int(api_config.get("transport_retries") or 0) + 1),
             provider=str(api_config.get("provider_family") or ""),
             model=str(api_config.get("model") or ""),
             endpoint=str(api_config.get("api_base") or ""),
@@ -2905,6 +2990,11 @@ class OutlineV3Executor:
     def _check(self, node_id: str, *, phase: str = "before") -> None:
         if self.cancellation_checker is not None:
             self.cancellation_checker()
+        # Pause is an explicit durable admission gate, separate from
+        # cancellation.  It is checked immediately before local/provider node
+        # work so a stale UI interruption cannot silently start another call.
+        if phase == "before":
+            self._pause_state.assert_runnable(node_id=node_id)
         if self.fault_injector is not None:
             self.fault_injector(
                 node_id,
@@ -3061,7 +3151,12 @@ class OutlineV3Executor:
                 else f"outline-v3:{node_id}"
             )
         path = str(record.path) if record is not None else self._node_path(node_id)
-        if node.status != "succeeded" or not Path(path).is_file():
+        recoverable_failed_provider = (
+            node.status == "failed" and node_id in self._provider_node_ids()
+        )
+        if node.status != "succeeded" and not recoverable_failed_provider:
+            return None
+        if not Path(path).is_file():
             return None
         if node.execution_binding != binding:
             if node.status == "succeeded":
@@ -3071,17 +3166,31 @@ class OutlineV3Executor:
             value = json.loads(Path(path).read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
             return None
-        if not isinstance(value, Mapping) or str(value.get("content_hash") or "") != str(node.output_hash or ""):
+        envelope_content_hash = str(value.get("content_hash") or "") if isinstance(value, Mapping) else ""
+        if (
+            not isinstance(value, Mapping)
+            or not envelope_content_hash
+            or (
+                node.status == "succeeded"
+                and envelope_content_hash != str(node.output_hash or "")
+            )
+        ):
             return None
         payload = value.get("payload")
         if not isinstance(payload, Mapping):
             return None
+        artifact_output_hash = (
+            envelope_content_hash
+            if recoverable_failed_provider
+            else str(node.output_hash or "")
+        )
         if record is None or record.status != "ready":
             return None
         try:
             self.registry.verify_ready_artifact_closure(record)
         except Exception:
             return None
+        replay: Any | None = None
         if node_id in self._provider_node_ids():
             replay_key = ModelCallReplayKey(
                 node_id=node_id,
@@ -3133,12 +3242,12 @@ class OutlineV3Executor:
                     output_hash=normalized_hash,
                     normalized_output_hash=normalized_hash,
                     artifact_payload_hash=hash_json(payload),
-                    artifact_content_hash=node.output_hash,
+                    artifact_content_hash=artifact_output_hash,
                     registry_file_hash=record.content_hash,
                     artifact_path=record.path,
-                    registered_artifact_hash=node.output_hash,
+                    registered_artifact_hash=artifact_output_hash,
                     replay_output_hash=replay.record.output_hash,
-                    node_output_hash=node.output_hash,
+                    node_output_hash=artifact_output_hash,
                     verified_reuse=True,
                     reuse_evidence_artifact_id=reuse_evidence.artifact_id,
                     reuse_evidence_artifact_hash=reuse_evidence.content_hash,
@@ -3156,12 +3265,12 @@ class OutlineV3Executor:
                     output_hash=normalized_hash,
                     normalized_output_hash=normalized_hash,
                     artifact_payload_hash=hash_json(payload),
-                    artifact_content_hash=node.output_hash,
+                        artifact_content_hash=artifact_output_hash,
                     registry_file_hash=record.content_hash,
                     artifact_path=record.path,
-                    registered_artifact_hash=node.output_hash,
+                        registered_artifact_hash=artifact_output_hash,
                     replay_output_hash=replay.record.output_hash,
-                    node_output_hash=node.output_hash,
+                        node_output_hash=artifact_output_hash,
                 )
             self._replay_evidence.append({
                 "node_id": node_id,
@@ -3184,6 +3293,25 @@ class OutlineV3Executor:
         self.artifact_paths[node_id] = record.path
         self.artifact_records[node_id] = record
         self._payloads[node_id] = dict(payload)
+        if recoverable_failed_provider and replay is not None and replay.record is not None:
+            self._dag = self._node_store.record_node(
+                node_id,
+                status="succeeded",
+                input_hash=_hash_payload(dict(binding.get("dependency_hashes") or {})),
+                output_hash=envelope_content_hash,
+                output_artifact_ids=(record.artifact_id,),
+                model_route=str(binding.get("provider_route") or ""),
+                model_name=str(binding.get("model_name") or ""),
+                provider=str(binding.get("provider_family") or ""),
+                config_snapshot={"candidate_count": self.candidate_count},
+                budget_snapshot={"input_budget": self.profile.input_budget},
+                receipt_ids=tuple(
+                    str(receipt_id)
+                    for receipt_id in replay.record.receipt_ids
+                    if str(receipt_id)
+                ),
+                execution_binding=binding,
+            )
         return dict(payload)
 
     def _fixture_response(self, node_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -3932,6 +4060,15 @@ class OutlineV3Executor:
         route = self._node_route(node_id, transport_node_id)
         profile = route.profile
         budget = profile.estimate_request(request)
+        configured_cap = int(self.max_source_prompt_tokens or 32000)
+        route_cap = int(profile.input_budget or configured_cap)
+        effective_cap = max(1, min(32000, configured_cap, route_cap))
+        estimated_input = int(budget.get("estimated_input_tokens") or profile.estimate_tokens(request))
+        if estimated_input > effective_cap:
+            raise OutlineV3ExecutionError(
+                f"BLOCKED_BUDGET: {node_id} serialized input estimate {estimated_input} "
+                f"exceeds effective input cap {effective_cap}; split by evidence unit before transport"
+            )
         api_config = self._route_transport_identity(route)
         # Keep the ordinary node path compatible with callers that decorate
         # ``_provider_binding`` for replay tests or local instrumentation.  A
@@ -4097,6 +4234,9 @@ class OutlineV3Executor:
             self.replay_diagnostics.append(
                 f"replay stale for {node_id}: {','.join(replay_lookup.stale_reasons)}"
             )
+        # Re-check after replay lookup: replay is local and may be usable while
+        # a paused job must still refuse any new provider admission.
+        self._pause_state.assert_runnable(node_id=node_id)
         runtime = ProviderRuntime(
             budget=ProviderBudgetV1(
                 max_calls=1,
@@ -4127,7 +4267,8 @@ class OutlineV3Executor:
                 receipt_ids=[receipt.receipt_id],
             )
             raise OutlineV3ExecutionError(f"provider budget blocked node {node_id}")
-        requested_attempts = max(1, int(api_config.get("transport_retries") or 1))
+        configured_retries = max(0, int(api_config.get("transport_retries") or 0))
+        requested_attempts = configured_retries + 1
         effective_attempts = runtime.max_attempts_for_call(requested_attempts)
         admission = runtime.admit(
             estimated_tokens=int(budget["estimated_input_tokens"]),
@@ -4380,7 +4521,7 @@ class OutlineV3Executor:
             try:
                 self._dag = self._node_store.record_node(
                     node_id,
-                    status="failed",
+                    status="blocked" if isinstance(exc, PauseRequestedError) else "failed",
                     input_hash=_hash_payload(dict(binding.get("dependency_hashes") or {})),
                     output_hash="",
                     output_artifact_ids=(),
@@ -4813,6 +4954,10 @@ class OutlineV3Executor:
             raise OutlineV3ExecutionError(f"{candidate_id} provider output has no sections")
         allowed_papers = {str(item) for item in allowed_paper_keys}
         allowed_relations = {str(item) for item in allowed_relation_ids}
+        from outline.evidence_alias import build_alias_map
+
+        paper_alias_map = build_alias_map(list(allowed_paper_keys), list(allowed_relation_ids))
+        paper_alias_reverse = dict(paper_alias_map.get("papers_reverse") or {})
         seen_sections: set[str] = set()
         for section in sections:
             if not isinstance(section, Mapping):
@@ -4830,6 +4975,31 @@ class OutlineV3Executor:
             claims = [str(item).strip() for item in section.get("claims") or () if str(item).strip()]
             if not claims:
                 raise OutlineV3ExecutionError(f"{candidate_id} provider output contains a section without planned claims")
+            for claim in claims:
+                aliases = {
+                    str(match.group(0)).upper()
+                    for match in re.finditer(r"\bP\d{3}\b", claim, flags=re.IGNORECASE)
+                }
+                referenced_papers = {
+                    paper_alias_reverse.get(alias, alias)
+                    for alias in aliases
+                }
+                if not referenced_papers.issubset(paper_keys):
+                    raise OutlineV3ExecutionError(
+                        f"{candidate_id} claim references paper aliases outside its section evidence: "
+                        f"{sorted(referenced_papers - paper_keys)}"
+                    )
+                if (
+                    len(paper_keys) > 1
+                    and not aliases
+                    and re.search(
+                        r"(作者自陈|局限|缺口|不足).*(共同|一致|四篇|三类|领域共识)|(共同指向|共同.*缺口|领域共识)",
+                        claim,
+                    )
+                ):
+                    raise OutlineV3ExecutionError(
+                        f"{candidate_id} claim makes an unsupported cross-paper limitation aggregation"
+                    )
 
     @property
     def _alias_enabled(self) -> bool:
@@ -4928,6 +5098,11 @@ class OutlineV3Executor:
                 "Do not invent citation identities; do not attribute evidence to any work outside the provided evidence corpus.",
                 "If a section has no in-corpus evidence left after removal, delete the section or rewrite it using only the remaining in-corpus evidence.",
                 "Do not add sections beyond those in original_provider_output and do not increase the total number of planned claims.",
+                "Return exactly the same number of sections in exactly the same order as original_provider_output.",
+                "Copy every original section_id verbatim; never create, delete, duplicate, or rename a section_id.",
+                "Every claim that names a paper alias must be supported by a paper_key in that same section; remove the claim if its paper is not assigned there.",
+                "Do not write cross-paper limitation or gap aggregations unless each named paper explicitly supports the same limitation; prefer separate paper-specific claims or remove the aggregation.",
+                "Ensure each section goal accurately covers every remaining claim; rewrite a goal to a neutral evidence-bound purpose when the original goal is narrower than the claims.",
                 "Keep candidate_id unchanged and return the same top-level shape.",
             ],
             "output_schema": {
@@ -4976,17 +5151,25 @@ class OutlineV3Executor:
             if alias_map is not None
             else dict(raw_repaired)
         )
-        # Bounded structural guards: no new section identities, no claim inflation.
+        # Bounded structural guards: a format repair cannot change section
+        # count, order, or identity. Any semantic split/merge/delete must be a
+        # separate versioned candidate revision with explicit lineage.
         repaired_sections = [
             section
             for section in (repaired_content.get("sections") or [])
             if isinstance(section, Mapping)
         ]
-        original_ids = {str(s.get("section_id") or "") for s in original_sections}
-        repaired_ids = {str(s.get("section_id") or "") for s in repaired_sections}
-        if not repaired_sections or not repaired_ids.issubset(original_ids):
+        original_ids = [str(s.get("section_id") or "") for s in original_sections]
+        repaired_ids = [str(s.get("section_id") or "") for s in repaired_sections]
+        if (
+            not repaired_sections
+            or len(repaired_sections) != len(original_sections)
+            or len(set(repaired_ids)) != len(repaired_ids)
+            or repaired_ids != original_ids
+        ):
             failure = OutlineV3ExecutionError(
-                f"{candidate_id} semantic repair changed the section identity set"
+                f"{candidate_id} format repair changed section count/order/identity: "
+                f"before={original_ids}, after={repaired_ids}"
             )
             self._publish_repair_failure(candidate_id, failure)
             raise failure
@@ -5145,6 +5328,27 @@ class OutlineV3Executor:
             except (OSError, UnicodeError, json.JSONDecodeError):
                 return record.content_hash
             if isinstance(payload, Mapping) and str(payload.get("content_hash") or ""):
+                if node_id == "provider_receipt_closure":
+                    body = payload.get("payload")
+                    if isinstance(body, Mapping):
+                        decision_fields = (
+                            "closure_epoch_id",
+                            "expected_call_ids",
+                            "duplicate_expected_call_ids",
+                            "observed_call_ids",
+                            "missing_call_ids",
+                            "stale_call_ids",
+                            "failed_call_ids",
+                            "incomplete_call_ids",
+                            "hash_mismatches",
+                            "unexpected_receipts",
+                            "out_of_epoch_receipts",
+                            "retry_exceeded_call_ids",
+                            "usage_incomplete_call_ids",
+                            "verified_reuse_call_ids",
+                            "complete",
+                        )
+                        return hash_json({key: body.get(key) for key in decision_fields})
                 return str(payload["content_hash"])
             return record.content_hash
 
@@ -5349,10 +5553,166 @@ class OutlineV3Executor:
                 self._artifact(OutlineArtifact, matrix_model.to_dict(), {"outline_evidence_views": _hash_payload(evidence), "global_corpus_ledger": _hash_payload(ledger)}),
                 ("outline_evidence_views", "global_corpus_ledger"), "deterministic", "local",
             ))
+            content_layers_model = build_paper_content_layers(
+                self.summaries,
+                evidence_model,
+                job_id=self.job_id,
+            )
+            content_layers = self._run_node("outline_content_layers", lambda: (
+                self._artifact(
+                    OutlineArtifact,
+                    content_layers_model.to_dict(),
+                    {"outline_evidence_views": _hash_payload(evidence)},
+                ),
+                ("outline_evidence_views",),
+                "deterministic",
+                "local",
+            ))
             candidate_map_model = build_global_relation_map(evidence_model, matrix_model, ledger_model)
             candidate_map = self._run_node("relation_candidates", lambda: (
                 self._artifact(OutlineArtifact, candidate_map_model.to_dict(), {"multi_view_matrix": _hash_payload(matrix)}),
                 ("multi_view_matrix",), "deterministic", "local",
+            ))
+
+            semantic_chunk_plan_model = build_semantic_chunk_plan(
+                content_layers_model,
+                candidate_map_model,
+                candidate_count=self.candidate_count,
+                physical_call_limit=min(24, max(0, int(self.max_provider_calls or 24))),
+            )
+            semantic_chunk_plan = self._run_node("semantic_chunk_plan", lambda: (
+                self._artifact(
+                    OutlineArtifact,
+                    semantic_chunk_plan_model.to_dict(),
+                    {
+                        "outline_content_layers": _hash_payload(content_layers),
+                        "relation_candidates": _hash_payload(candidate_map),
+                        "global_corpus_ledger": _hash_payload(ledger),
+                        "multi_view_matrix": _hash_payload(matrix),
+                    },
+                ),
+                ("outline_content_layers", "relation_candidates", "global_corpus_ledger", "multi_view_matrix"),
+                "deterministic",
+                "local",
+            ))
+
+            # The semantic plan is executable only when its planned work is
+            # materialized into durable stage nodes.  These local nodes do not
+            # claim model-level synthesis: they preserve the complete evidence
+            # IDs, topic routing, comparison questions, and shared hashes so a
+            # later provider call can be directed and bounded without rereading
+            # the corpus or pretending that a plan file is a result.
+            topic_plan = build_topic_synthesis_plan(semantic_chunk_plan_model)
+            navigation_payload = {
+                "schema_version": "outline-global-navigation/v1",
+                "execution_mode": "deterministic_local_routing",
+                "status": "completed",
+                "content_layers_hash": content_layers_model.content_hash,
+                "semantic_chunk_plan_hash": semantic_chunk_plan_model.content_hash,
+                "topic_ids": [item.topic_id for item in semantic_chunk_plan_model.topics],
+                "paper_ids": [card.paper_id for card in content_layers_model.index_cards],
+                "outlier_policy": "preserve_explicit_outlier_topic",
+            }
+            global_navigation = self._run_node("global_navigation", lambda: (
+                self._artifact(
+                    OutlineArtifact,
+                    navigation_payload,
+                    {
+                        "outline_content_layers": _hash_payload(content_layers),
+                        "semantic_chunk_plan": _hash_payload(semantic_chunk_plan),
+                    },
+                ),
+                ("outline_content_layers", "semantic_chunk_plan"),
+                "deterministic",
+                "local",
+            ))
+            topic_payloads: list[dict[str, Any]] = []
+            for item in topic_plan:
+                topic_payload = item.to_dict()
+                topic_payload.update({
+                    "status": "completed_local_deterministic",
+                    "execution_mode": "local_evidence_projection",
+                    "provider_calls": 0,
+                    "diagnostics": [
+                        "This node materializes routing and complete evidence references locally; it is not a provider-generated synthesis."
+                    ],
+                })
+                topic_payloads.append(topic_payload)
+            topic_synthesis = self._run_node("topic_synthesis", lambda: (
+                self._artifact(
+                    OutlineArtifact,
+                    {
+                        "schema_version": "outline-topic-synthesis/v1",
+                        "execution_mode": "local_evidence_projection",
+                        "status": "completed",
+                        "shared_semantic_chunk_plan_hash": semantic_chunk_plan_model.content_hash,
+                        "topics": topic_payloads,
+                    },
+                    {
+                        "global_navigation": _hash_payload(global_navigation),
+                        "semantic_chunk_plan": _hash_payload(semantic_chunk_plan),
+                    },
+                ),
+                ("global_navigation", "semantic_chunk_plan"),
+                "deterministic",
+                "local",
+            ))
+            cross_group = self._run_node("cross_group_comparison", lambda: (
+                self._artifact(
+                    OutlineArtifact,
+                    {
+                        "schema_version": "outline-cross-group-comparison/v1",
+                        "execution_mode": "local_question_projection",
+                        "status": "completed",
+                        "shared_semantic_chunk_plan_hash": semantic_chunk_plan_model.content_hash,
+                        "questions": list(semantic_chunk_plan_model.cross_group_questions),
+                        "relation_bundle_ids": [item.relation_id for item in semantic_chunk_plan_model.relation_bundles],
+                        "deferred_relation_ids": [
+                            item.relation_id
+                            for item in semantic_chunk_plan_model.relation_bundles
+                            if item.relation_id not in set(semantic_chunk_plan_model.coverage.get("selected_relation_ids") or ())
+                        ],
+                    },
+                    {
+                        "topic_synthesis": _hash_payload(topic_synthesis),
+                        "semantic_chunk_plan": _hash_payload(semantic_chunk_plan),
+                    },
+                ),
+                ("topic_synthesis", "semantic_chunk_plan"),
+                "deterministic",
+                "local",
+            ))
+            global_synthesis = self._run_node("global_synthesis", lambda: (
+                self._artifact(
+                    OutlineArtifact,
+                    {
+                        "schema_version": "outline-global-synthesis/v1",
+                        "execution_mode": "local_shared_synthesis_base",
+                        "status": "completed",
+                        "shared_semantic_chunk_plan_hash": semantic_chunk_plan_model.content_hash,
+                        "topic_synthesis_hash": _hash_payload(topic_synthesis),
+                        "cross_group_comparison_hash": _hash_payload(cross_group),
+                        "topic_ids": [item.topic_id for item in semantic_chunk_plan_model.topics],
+                        "relation_ids": [item.relation_id for item in semantic_chunk_plan_model.relation_bundles],
+                        "supporting_evidence_ids": sorted({
+                            evidence_id
+                            for item in topic_plan
+                            for evidence_id in item.supporting_evidence_ids
+                        }),
+                        "conclusions": [
+                            "Shared global synthesis base materialized from topic routes and evidence references; provider narrative generation remains bounded to the candidate stage."
+                        ],
+                        "unresolved_questions": list(semantic_chunk_plan_model.cross_group_questions),
+                    },
+                    {
+                        "cross_group_comparison": _hash_payload(cross_group),
+                        "relation_candidates": _hash_payload(candidate_map),
+                        "semantic_chunk_plan": _hash_payload(semantic_chunk_plan),
+                    },
+                ),
+                ("cross_group_comparison", "relation_candidates", "semantic_chunk_plan"),
+                "deterministic",
+                "local",
             ))
 
             relation_candidates = [relation.to_dict() for relation in candidate_map_model.relations]
@@ -5373,14 +5733,47 @@ class OutlineV3Executor:
                 "deterministic",
                 "local",
             ))
+            all_candidate_by_id = {
+                str(item["relation_id"]): item for item in relation_candidates
+            }
+            selected_relation_ids = {
+                str(item)
+                for item in (semantic_chunk_plan_model.coverage.get("selected_relation_ids") or all_candidate_by_id)
+                if str(item)
+            }
+            selected_relation_candidates = [
+                item for item in relation_candidates
+                if str(item.get("relation_id") or "") in selected_relation_ids
+            ]
+            excluded_relation_ids = sorted(
+                set(all_candidate_by_id) - {
+                    str(item.get("relation_id") or "") for item in selected_relation_candidates
+                }
+            )
             relation_request = {
-                "relation_candidates": relation_candidates,
+                "relation_candidates": selected_relation_candidates,
                 "evidence_views": self._prompt_evidence_views(evidence_model.views),
                 "relation_shard_plan": relation_shard_plan_payload,
+                # The provider sees a bounded navigation layer and the
+                # evidence-complete relation bundles selected for adjudication;
+                # full dossiers remain Registry artifacts addressed by ids.
+                "navigation_cards": [card.to_dict() for card in content_layers_model.index_cards],
+                "content_layer_refs": {
+                    "artifact_type": "outline_content_layers",
+                    "artifact_hash": content_layers_model.content_hash,
+                    "dossier_ids": [dossier.dossier_id for dossier in content_layers_model.dossiers],
+                },
+                "relation_evidence_bundles": [
+                    item.to_dict()
+                    for item in semantic_chunk_plan_model.relation_bundles
+                    if item.relation_id in selected_relation_ids
+                ],
+                "excluded_relation_ids": excluded_relation_ids,
+                "semantic_chunk_plan_hash": semantic_chunk_plan_model.content_hash,
                 "relation_adjudication_contract": {
                     "must_return_confirmed_relation_ids": True,
                     "must_reject_without_recorded_evidence": True,
-                    "allowed_relation_ids": [item["relation_id"] for item in relation_candidates],
+                    "allowed_relation_ids": [item["relation_id"] for item in selected_relation_candidates],
                     # Explicit output envelope: the JSON response must include
                     # BOTH keys even when one of the lists is empty.  Providers
                     # that omit an empty rejected_relations array otherwise
@@ -5403,6 +5796,7 @@ class OutlineV3Executor:
                 "relation_candidates": _hash_payload(candidate_map),
                 "outline_evidence_views": _hash_payload(evidence),
                 "relation_shard_plan": _hash_payload(relation_shard_plan),
+                "semantic_chunk_plan": _hash_payload(semantic_chunk_plan),
             }
             use_hierarchical_relations = (
                 self.technical_shard_target_tokens > 0
@@ -5418,7 +5812,7 @@ class OutlineV3Executor:
                 hierarchical_content, relation_shard_digests = (
                     self._run_hierarchical_relation_adjudication(
                         evidence_views=evidence_model.views,
-                        relation_candidates=relation_candidates,
+                        relation_candidates=selected_relation_candidates,
                         shard_plan=relation_shard_plan_payload,
                         relation_contract=relation_request["relation_adjudication_contract"],
                         relation_dependencies=relation_deps,
@@ -5504,31 +5898,46 @@ class OutlineV3Executor:
                     self._provider_call_id("relation_adjudication"),
                     None,
                 )
-            candidate_by_id = {str(item["relation_id"]): item for item in relation_candidates}
             if not isinstance(adjudication.get("confirmed_relation_ids"), list) or not isinstance(adjudication.get("rejected_relations"), list):
                 raise OutlineV3ExecutionError("relation adjudication must return explicit confirmed and rejected lists")
-            if len(candidate_by_id) != len(relation_candidates):
+            if len(all_candidate_by_id) != len(relation_candidates):
                 raise OutlineV3ExecutionError("relation candidates contain duplicate relation ids")
             confirmed_ids = [str(item).strip() for item in adjudication["confirmed_relation_ids"] if str(item).strip()]
             rejected_payload = [item for item in adjudication["rejected_relations"] if isinstance(item, Mapping)]
             rejected_ids = [str(raw.get("relation_id") or "").strip() for raw in rejected_payload]
+            deferred_relation_ids = list(excluded_relation_ids)
+            selected_id_set = set(selected_relation_ids)
+            bundle_by_id = {
+                item.relation_id: item
+                for item in semantic_chunk_plan_model.relation_bundles
+            }
+            incomplete_confirmed = sorted(
+                relation_id
+                for relation_id in confirmed_ids
+                if relation_id in bundle_by_id and not bundle_by_id[relation_id].is_complete
+            )
+            if incomplete_confirmed:
+                raise OutlineV3ExecutionError(
+                    "relation adjudication confirmed relations with incomplete "
+                    f"evidence bundles: {incomplete_confirmed}"
+                )
             if len(confirmed_ids) != len(set(confirmed_ids)):
                 raise OutlineV3ExecutionError("relation adjudication confirmed a relation more than once")
             if len(rejected_ids) != len(set(rejected_ids)):
                 raise OutlineV3ExecutionError("relation adjudication rejected a relation more than once")
-            if any(item not in candidate_by_id for item in confirmed_ids):
+            if any(item not in selected_id_set for item in confirmed_ids):
                 raise OutlineV3ExecutionError("relation adjudication confirmed an unknown relation")
-            if any(item not in candidate_by_id for item in rejected_ids):
+            if any(item not in selected_id_set for item in rejected_ids):
                 raise OutlineV3ExecutionError("relation adjudication rejected an unknown relation")
             if set(confirmed_ids) & set(rejected_ids):
                 raise OutlineV3ExecutionError("relation adjudication both confirmed and rejected a relation")
-            if set(confirmed_ids) | set(rejected_ids) != set(candidate_by_id):
-                raise OutlineV3ExecutionError("relation adjudication did not classify every relation candidate")
-            confirmed = [candidate_by_id[item] for item in confirmed_ids]
-            rejected = [candidate_by_id[item] for item in rejected_ids]
+            if set(confirmed_ids) | set(rejected_ids) != selected_id_set:
+                raise OutlineV3ExecutionError("relation adjudication did not classify every selected relation")
+            confirmed = [all_candidate_by_id[item] for item in confirmed_ids]
+            rejected = [all_candidate_by_id[item] for item in rejected_ids]
             confirmed_map = self._run_node("global_relation_map", lambda: (
-                self._artifact(ConfirmedGlobalRelationMap, {"relations": confirmed, "rejected_relations": rejected, "confirmed_relation_ids": confirmed_ids, "rejected_relation_ids": rejected_ids, "paper_keys": sorted({key for item in confirmed for key in item.get("paper_keys", [])}), "source_artifact_hashes": {"relation_candidates": _hash_payload(candidate_map)}, "blocking_diagnostics": []}, {"relation_adjudication": _hash_payload(adjudication)}),
-                ("relation_adjudication", "relation_candidates"), self.profile.model, self.profile.provider,
+                self._artifact(ConfirmedGlobalRelationMap, {"relations": confirmed, "rejected_relations": rejected, "deferred_relations": [{"relation_id": item, "reason": "deferred_for_directed_evidence_retrieval"} for item in deferred_relation_ids], "confirmed_relation_ids": confirmed_ids, "rejected_relation_ids": rejected_ids, "deferred_relation_ids": deferred_relation_ids, "paper_keys": sorted({key for item in confirmed for key in item.get("paper_keys", [])}), "source_artifact_hashes": {"relation_candidates": _hash_payload(candidate_map), "semantic_chunk_plan": _hash_payload(semantic_chunk_plan)}, "blocking_diagnostics": []}, {"relation_adjudication": _hash_payload(adjudication), "semantic_chunk_plan": _hash_payload(semantic_chunk_plan)}),
+                ("relation_adjudication", "relation_candidates", "semantic_chunk_plan"), self.profile.model, self.profile.provider,
             ))
 
             intent_model = build_review_intent(self.review_intent_input)
@@ -5547,11 +5956,19 @@ class OutlineV3Executor:
                 paper_keys=sorted({key for item in confirmed for key in item.get("paper_keys", [])}),
                 source_artifact_hashes={"relation_candidates": _hash_payload(candidate_map)},
             )
-            plans_model = build_outline_candidate_plans(ledger_model, matrix_model, confirmed_map_model, intent_model, contract_model, candidate_count=self.candidate_count)
-            axes_payload = {"axes": [item.to_dict() for item in axes], "candidates": [item.to_dict() for item in plans_model.candidates], "bridge_pass": [{"type": "cross_stream_bridge", "paper_keys": sorted(item.paper_keys)} for item in confirmed_map_model.relations if item.relation_type == "bridge_between_topics"]}
+            plans_model = build_outline_candidate_plans(
+                ledger_model,
+                matrix_model,
+                confirmed_map_model,
+                intent_model,
+                contract_model,
+                candidate_count=self.candidate_count,
+                semantic_chunk_plan_hash=semantic_chunk_plan_model.content_hash,
+            )
+            axes_payload = {"axes": [item.to_dict() for item in axes], "candidates": [item.to_dict() for item in plans_model.candidates], "semantic_chunk_plan_hash": semantic_chunk_plan_model.content_hash, "global_synthesis_hash": _hash_payload(global_synthesis), "topic_routes": [item.to_dict() for item in semantic_chunk_plan_model.topics], "bridge_pass": [{"type": "cross_stream_bridge", "paper_keys": sorted(item.paper_keys)} for item in confirmed_map_model.relations if item.relation_type == "bridge_between_topics"]}
             axes_out = self._run_node("organizing_axes", lambda: (
-                self._artifact(OutlineArtifact, axes_payload, {"global_corpus_ledger": _hash_payload(ledger), "multi_view_matrix": _hash_payload(matrix), "global_relation_map": _hash_payload(confirmed_map), "review_intent": _hash_payload(intent), "coverage_contract": _hash_payload(contract)}),
-                ("global_corpus_ledger", "multi_view_matrix", "global_relation_map", "review_intent", "coverage_contract"), "deterministic", "local",
+                self._artifact(OutlineArtifact, axes_payload, {"global_corpus_ledger": _hash_payload(ledger), "multi_view_matrix": _hash_payload(matrix), "global_relation_map": _hash_payload(confirmed_map), "semantic_chunk_plan": _hash_payload(semantic_chunk_plan), "global_synthesis": _hash_payload(global_synthesis), "review_intent": _hash_payload(intent), "coverage_contract": _hash_payload(contract)}),
+                ("global_corpus_ledger", "multi_view_matrix", "global_relation_map", "semantic_chunk_plan", "global_synthesis", "review_intent", "coverage_contract"), "deterministic", "local",
             ))
 
             candidate_ids: list[str] = []
@@ -5560,8 +5977,8 @@ class OutlineV3Executor:
                 candidate_ids.append(candidate_id)
                 plan_payload = plan.to_dict()
                 self._run_node(candidate_id, lambda payload=plan_payload: (
-                    self._artifact(OutlineCandidate, payload, {"organizing_axes": _hash_payload(axes_out), "global_relation_map": _hash_payload(confirmed_map), "coverage_contract": _hash_payload(contract)}),
-                    ("organizing_axes", "global_relation_map", "coverage_contract"), "deterministic", "local",
+                    self._artifact(OutlineCandidate, payload, {"organizing_axes": _hash_payload(axes_out), "global_relation_map": _hash_payload(confirmed_map), "global_synthesis": _hash_payload(global_synthesis), "coverage_contract": _hash_payload(contract)}),
+                    ("organizing_axes", "global_relation_map", "global_synthesis", "coverage_contract"), "deterministic", "local",
                 ))
                 paper_keys = [item.paper_key for item in ledger_model.entries]
                 allowed_relation_ids = [item.relation_id for item in confirmed_map_model.relations]
@@ -5580,8 +5997,49 @@ class OutlineV3Executor:
                     "relation_ids": allowed_relation_ids,
                     "relations": candidate_relations,
                     "evidence": candidate_evidence,
+                    "semantic_chunk_plan": {
+                        "content_layers_hash": semantic_chunk_plan_model.content_layers_hash,
+                        "topic_routes": [
+                            {
+                                "topic_id": item.topic_id,
+                                "question": item.question,
+                                "paper_ids": item.paper_ids,
+                                "bridge_paper_ids": item.bridge_paper_ids,
+                                "dimensions": item.dimensions,
+                                "required_evidence_count": len(item.required_evidence_ids),
+                                "status": item.status,
+                            }
+                            for item in semantic_chunk_plan_model.topics
+                        ],
+                        "relation_summaries": [
+                            {
+                                "relation_id": item.relation_id,
+                                "relation_type": item.relation_type,
+                                "paper_ids": item.paper_ids,
+                                "evidence_completeness": item.evidence_completeness,
+                                "decision": item.decision,
+                                "missing_evidence_count": len(item.missing_evidence_ids),
+                            }
+                            for item in semantic_chunk_plan_model.relation_bundles
+                            if item.relation_id in set(
+                                str(value)
+                                for value in (semantic_chunk_plan_model.coverage.get("selected_relation_ids") or ())
+                            )
+                        ],
+                        "deferred_relation_count": semantic_chunk_plan_model.coverage.get("unselected_relation_count", 0),
+                        "deferred_relation_policy": "directed_evidence_retrieval",
+                        "cross_group_questions": list(semantic_chunk_plan_model.cross_group_questions),
+                    },
+                    "content_layer_refs": {
+                        "artifact_type": "outline_content_layers",
+                        "artifact_hash": content_layers_model.content_hash,
+                        "dossier_ids": [
+                            f"dossier:{paper_key}" for paper_key in paper_keys
+                        ],
+                    },
                     "source_summary_hashes": sorted(evidence_model.source_summary_hashes),
                     "shared_hashes": plan.shared_artifact_hashes,
+                    "global_synthesis_hash": _hash_payload(global_synthesis),
                     "output_contract": {
                         "output_fields": {
                             "candidate_id": (
@@ -5625,16 +6083,11 @@ class OutlineV3Executor:
                         "section_paper_keys_must_be_subset_of_evidence": True,
                         "section_relation_ids_must_be_subset_of_relation_ids": True,
                         "planned_claims_must_be_non_empty": True,
-                        "paper_keys_must_be_unique_across_sections": (
-                            "Assign every paper_key you use at most ONCE across the "
-                            "whole candidate: never repeat the same paper key in two "
-                            "different sections.  If one paper genuinely informs two "
-                            "sections, put the paper in the section where it is "
-                            "strongest and phrase the other section's claim so that "
-                            "the paper's evidence is described without repeating the "
-                            "paper key.  A candidate that reuses papers to inflate "
-                            "coverage will be rejected by the structure and coverage "
-                            "critics."
+                        "paper_keys_may_repeat_with_distinct_roles": (
+                            "A paper may support more than one section when each "
+                            "occurrence carries a non-empty paper_roles mapping and "
+                            "the role/claim is materially distinct.  Do not repeat a "
+                            "paper merely to inflate coverage or copy the same claim."
                         ),
                         "claim_must_be_supported_by_section_evidence": (
                             "Every planned claim inside a section must be directly "
@@ -5662,12 +6115,20 @@ class OutlineV3Executor:
                     "candidate": _hash_payload(provider_request),
                     "global_relation_map": _hash_payload(confirmed_map),
                     "coverage_contract": _hash_payload(contract),
+                    "semantic_chunk_plan": _hash_payload(semantic_chunk_plan),
+                    "outline_content_layers": _hash_payload(content_layers),
                 }
                 generation_node_id = f"{candidate_id}_provider_generation"
                 generation_binding = self._provider_binding(
                     generation_node_id, provider_request, expect_json=True,
                     input_artifact_hashes=tuple(generation_deps.values()),
                 )
+                loaded_generation = self._load_node(
+                    generation_node_id,
+                    generation_binding,
+                )
+                if loaded_generation is not None:
+                    continue
                 generation_route = self._node_route(generation_node_id)
                 generation_budget = generation_route.profile.estimate_request(provider_request)
                 sharded_generation = bool(
@@ -5788,7 +6249,18 @@ class OutlineV3Executor:
                     "candidate_id": candidate_id,
                     "organizing_logic": str(self._payloads.get(candidate_id, {}).get("organizing_logic") or ""),
                     "sections": list(self._payloads.get(f"{candidate_id}_provider_generation", {}).get("sections") or []),
-                    "planned_claims": list(self._payloads.get(f"{candidate_id}_provider_generation", {}).get("claims") or []),
+                    "planned_claims": list(
+                        self._payloads.get(f"{candidate_id}_provider_generation", {}).get("claims")
+                        or [
+                            claim
+                            for section in self._payloads.get(
+                                f"{candidate_id}_provider_generation", {}
+                            ).get("sections", [])
+                            if isinstance(section, Mapping)
+                            for claim in section.get("claims") or ()
+                            if str(claim).strip()
+                        ]
+                    ),
                     "paper_assignments": [
                         {
                             "section_id": str(section.get("section_id") or ""),
@@ -5801,11 +6273,41 @@ class OutlineV3Executor:
                 for candidate_id in candidate_ids
             }
             critiques: dict[str, dict[str, Any]] = {}
+            from outline.evidence_alias import build_alias_map
+
+            critique_alias_map = getattr(self, "_alias_map", None)
+            if not isinstance(critique_alias_map, Mapping):
+                critique_alias_map = build_alias_map(
+                    list(contract_model.corpus_paper_keys),
+                    [relation.relation_id for relation in confirmed_map_model.relations],
+                )
+            paper_alias_reverse = dict(critique_alias_map.get("papers_reverse") or {})
+            for candidate_content in candidate_contents.values():
+                normalized_sections: list[dict[str, Any]] = []
+                for raw_section in candidate_content.get("sections") or ():
+                    if not isinstance(raw_section, Mapping):
+                        continue
+                    section = dict(raw_section)
+                    raw_roles = section.get("paper_roles")
+                    if isinstance(raw_roles, Mapping):
+                        section["paper_roles"] = {
+                            paper_alias_reverse.get(str(key), str(key)): value
+                            for key, value in raw_roles.items()
+                        }
+                    normalized_sections.append(section)
+                candidate_content["sections"] = normalized_sections
             critique_requests = {
                 "structure_critique": {
                     "node_id": "structure_critique",
                     "candidate_contents": candidate_contents,
                     "candidate_hashes": generation_hashes,
+                    "paper_key_aliases": critique_alias_map,
+                    "paper_reuse_policy": (
+                        "A paper may be used in multiple sections when each occurrence "
+                        "has a distinct paper role and materially distinct function. "
+                        "Count unique canonical paper keys for coverage; flag only "
+                        "mechanical duplication without distinct evidence function."
+                    ),
                     "review_intent": intent_model.to_dict(),
                     "checks": ["section_progression", "duplicate_assignments", "goal_claim_alignment", "placeholder_sections", "empty_research_streams"],
                 },
@@ -5813,6 +6315,11 @@ class OutlineV3Executor:
                     "node_id": "coverage_critique",
                     "candidate_contents": candidate_contents,
                     "candidate_hashes": generation_hashes,
+                    "paper_key_aliases": critique_alias_map,
+                    "paper_reuse_policy": (
+                        "Repeated use is allowed when roles/functions differ; repeated "
+                        "occurrences do not create new unique-paper coverage."
+                    ),
                     "coverage_contract": contract_model.to_dict(),
                     "corpus_ledger": ledger_model.to_dict(),
                     "must_use_paper_keys": list(contract_model.must_use_paper_keys),
@@ -5826,6 +6333,11 @@ class OutlineV3Executor:
                     "node_id": "evidence_critique",
                     "candidate_contents": candidate_contents,
                     "candidate_hashes": generation_hashes,
+                    "paper_key_aliases": critique_alias_map,
+                    "paper_reuse_policy": (
+                        "Repeated use is allowed when each section claim has a distinct "
+                        "evidence function; evaluate traceability through paper_key_aliases."
+                    ),
                     "candidate_claims": {key: value.get("planned_claims", []) for key, value in candidate_contents.items()},
                     "section_evidence": {key: value.get("sections", []) for key, value in candidate_contents.items()},
                     "paper_keys": sorted(contract_model.corpus_paper_keys),
@@ -5975,9 +6487,103 @@ class OutlineV3Executor:
             ))
 
             selected_payload = self._payloads.get(f"{selected_id}_provider_generation", {})
-            sections = list(selected_payload.get("sections") or [])
-            packets = []
+            selected_projection = candidate_contents.get(selected_id, {})
+            original_sections = list(
+                selected_projection.get("sections")
+                or selected_payload.get("sections")
+                or []
+            )
+            accepted_recommendations = [
+                str(item).strip()
+                for item in (arbitration.get("accepted_recommendations") or ())
+                if str(item).strip()
+            ]
             view_by_key = {view.paper_key: view for view in evidence_model.views}
+            revised_sections = [dict(item) for item in original_sections if isinstance(item, Mapping)]
+            revision_records: list[dict[str, Any]] = []
+            unresolved_revisions: list[str] = []
+            for recommendation in accepted_recommendations:
+                target_ids = {
+                    match.group(0)
+                    for match in re.finditer(r"\bS\d+\b", recommendation, flags=re.IGNORECASE)
+                }
+                changed = False
+                for section in revised_sections:
+                    section_id = str(section.get("section_id") or "")
+                    if target_ids and section_id.upper() not in {item.upper() for item in target_ids}:
+                        continue
+                    claims = [str(item) for item in section.get("claims") or () if str(item).strip()]
+                    aggregate_claims = [
+                        claim
+                        for claim in claims
+                        if any(marker in claim for marker in ("共同指向", "共同说明", "aggregate", "概括性"))
+                    ]
+                    if not aggregate_claims:
+                        continue
+                    per_paper_claims: list[str] = []
+                    for paper_key in section.get("paper_keys") or ():
+                        view = view_by_key.get(str(paper_key))
+                        if view is None:
+                            continue
+                        evidence = [
+                            *list(view.limitations),
+                            *list(view.research_gaps),
+                            *list(view.future_directions),
+                        ]
+                        if evidence:
+                            per_paper_claims.append(
+                                f"{paper_key} 的作者自陈边界：" + "；".join(evidence)
+                            )
+                    if per_paper_claims:
+                        section["claims"] = [claim for claim in claims if claim not in aggregate_claims] + per_paper_claims
+                        section["revision_lineage"] = {
+                            "parent_candidate_hash": generation_hashes[selected_id],
+                            "recommendation": recommendation,
+                            "replaced_claim_count": len(aggregate_claims),
+                            "evidence_paper_keys": list(section.get("paper_keys") or ()),
+                        }
+                        changed = True
+                        revision_records.append({
+                            "recommendation": recommendation,
+                            "section_id": section_id,
+                            "operation": "replace_aggregate_claim_with_per_paper_boundaries",
+                            "evidence_paper_keys": list(section.get("paper_keys") or ()),
+                        })
+                if not changed:
+                    unresolved_revisions.append(recommendation)
+            if unresolved_revisions:
+                raise OutlineV3ExecutionError(
+                    "accepted outline recommendations could not be applied to the selected candidate: "
+                    + "; ".join(unresolved_revisions)
+                )
+            revision_deps = {
+                "selected_candidate": _hash_payload(selected),
+                f"{selected_id}_provider_generation": generation_hashes[selected_id],
+            }
+            selected_revision = self._run_node("selected_candidate_revision", lambda: (
+                self._artifact(
+                    OutlineArtifact,
+                    {
+                        "schema_version": "selected-candidate-revision/v1",
+                        "candidate_id": selected_id,
+                        "parent_candidate_hash": generation_hashes[selected_id],
+                        "parent_selected_hash": _hash_payload(selected),
+                        "revised_content_hash": _hash_payload({"sections": revised_sections}),
+                        "sections": revised_sections,
+                        "accepted_recommendations": accepted_recommendations,
+                        "revision_records": revision_records,
+                        "revision_round": 1,
+                        "max_revision_rounds": 2,
+                        "status": "completed" if not unresolved_revisions else "blocked",
+                    },
+                    revision_deps,
+                ),
+                ("selected_candidate", f"{selected_id}_provider_generation"),
+                "deterministic",
+                "local",
+            ))
+            sections = revised_sections
+            packets = []
             relation_by_id = {relation.relation_id: relation for relation in confirmed_map_model.relations}
             for section in sections:
                 section_id = str(section.get("section_id") or "").strip()
@@ -6043,8 +6649,8 @@ class OutlineV3Executor:
                     "token_budget": {"strategy": self.profile.tokenizer_strategy, "input_budget": self.profile.input_budget},
                 })
             packet_set = self._run_node("section_evidence_packets", lambda: (
-                self._artifact(SectionEvidencePacketSet, {"packets": packets, "coverage_ledger": {"paper_coverage": sorted(set(item for packet in packets for item in packet["paper_keys"])), "must_use_coverage": sorted(set(contract_model.must_use_paper_keys) & set(item for packet in packets for item in packet["paper_keys"])), "claim_coverage": [claim for packet in packets for claim in packet["planned_claims"]]}}, {"selected_candidate": _hash_payload(selected), "global_corpus_ledger": _hash_payload(ledger), "global_relation_map": _hash_payload(confirmed_map)}),
-                ("selected_candidate", "global_corpus_ledger", "global_relation_map"), "deterministic", "local",
+                self._artifact(SectionEvidencePacketSet, {"packets": packets, "coverage_ledger": {"paper_coverage": sorted(set(item for packet in packets for item in packet["paper_keys"])), "must_use_coverage": sorted(set(contract_model.must_use_paper_keys) & set(item for packet in packets for item in packet["paper_keys"])), "claim_coverage": [claim for packet in packets for claim in packet["planned_claims"]]}, "semantic_chunk_plan_hash": semantic_chunk_plan_model.content_hash, "selected_candidate_revision_hash": _hash_payload(selected_revision)}, {"selected_candidate_revision": _hash_payload(selected_revision), "global_corpus_ledger": _hash_payload(ledger), "global_relation_map": _hash_payload(confirmed_map), "semantic_chunk_plan": _hash_payload(semantic_chunk_plan)}),
+                ("selected_candidate_revision", "global_corpus_ledger", "global_relation_map", "semantic_chunk_plan"), "deterministic", "local",
             ))
             final_payload = {"title": intent_model.review_question or "Evidence-led literature review outline", "sections": sections, "candidate_id": selected_id, "paper_keys": sorted(set(item for packet in packets for item in packet["paper_keys"])), "relation_ids": [item.relation_id for item in confirmed_map_model.relations], "source_hashes": sorted(evidence_model.source_summary_hashes)}
             final = self._run_node("final_outline", lambda: (
@@ -6081,6 +6687,27 @@ class OutlineV3Executor:
                 for paper_key, count in sorted(assignment_counts.items())
                 if count > 1
             }
+            duplicate_role_violations: list[str] = []
+            role_values_by_paper: dict[str, set[str]] = {}
+            for section in sections:
+                raw_roles = section.get("paper_roles")
+                roles = raw_roles if isinstance(raw_roles, Mapping) else {}
+                for paper_key in section.get("paper_keys") or ():
+                    paper = str(paper_key)
+                    role = str(roles.get(paper) or "").strip()
+                    if assignment_counts.get(paper, 0) <= 1:
+                        continue
+                    if not role:
+                        duplicate_role_violations.append(
+                            f"{paper}: section {section.get('section_id') or ''} has no distinct paper role"
+                        )
+                        continue
+                    role_values_by_paper.setdefault(paper, set()).add(role.casefold())
+            for paper_key, count in duplicate_assignments.items():
+                if len(role_values_by_paper.get(paper_key, set())) < count + 1:
+                    duplicate_role_violations.append(
+                        f"{paper_key}: repeated paper roles are not distinct across sections"
+                    )
             placeholder_sections = [
                 str(section.get("section_id") or "")
                 for section in sections
@@ -6150,7 +6777,10 @@ class OutlineV3Executor:
                 "local_threshold": local_coverage >= self.quality_gate.min_canonical_coverage_local,
                 "selected_threshold": (canonical_coverage if self.quality_gate.coverage_scope == "full" else local_coverage) >= threshold,
                 "min_effective_sections": len(effective_sections) >= self.quality_gate.min_effective_sections,
-                "max_duplicate_assignments": sum(duplicate_assignments.values()) <= self.quality_gate.max_duplicate_assignments,
+                "max_duplicate_assignments": (
+                    len(duplicate_role_violations)
+                    <= self.quality_gate.max_duplicate_assignments
+                ),
                 "placeholder_sections": not placeholder_sections if self.quality_gate.block_placeholder_sections else True,
                 "empty_research_streams": not empty_research_streams if self.quality_gate.block_empty_research_streams else True,
                 "unsupported_planned_claims": not unsupported_planned_claims,
@@ -6176,7 +6806,7 @@ class OutlineV3Executor:
                 "claim_coverage": {"count": len(claims), "claims": claims, "unsupported_planned_claims": unsupported_planned_claims},
                 "relation_coverage": {"planned": len(confirmed_map_model.relations), "used": len(used_relations), "unused": sorted(set(item.relation_id for item in confirmed_map_model.relations) - used_relations)},
                 "must_use_coverage": {"required": sorted(must_use), "covered": sorted(must_use & covered)},
-                "section_coverage": {"sections": section_count, "effective_section_count": len(effective_sections), "empty_sections": empty_sections, "packet_papers": len(packet_papers), "duplicate_paper_assignments": duplicate_assignments, "placeholder_sections": placeholder_sections},
+                "section_coverage": {"sections": section_count, "effective_section_count": len(effective_sections), "empty_sections": empty_sections, "packet_papers": len(packet_papers), "duplicate_paper_assignments": duplicate_assignments, "duplicate_role_violations": duplicate_role_violations, "placeholder_sections": placeholder_sections},
                 "research_streams": {"empty": empty_research_streams, "values": stream_values},
                 "method_coverage": method_coverage,
                 "context_coverage": context_coverage,
@@ -6823,10 +7453,12 @@ class OutlineV3Executor:
             # fresh exact-replay executor runs the canonical decision chain
             # with stability disabled, so prior stability receipts are
             # historical/out-of-scope rather than unexpected canonical calls.
+            current_receipt_ids = {str(receipt_id) for receipt_id in self.receipts if str(receipt_id)}
             current_receipts = [
                 receipt
                 for receipt in job_receipts
                 if not str(receipt.call_id or "").startswith("outline:stability:")
+                and str(receipt.receipt_id or "") in current_receipt_ids
             ]
             canonical_expected = [
                 expected

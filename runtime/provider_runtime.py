@@ -57,6 +57,21 @@ _ERROR_KINDS = frozenset(
     }
 )
 _CALL_STATUSES = frozenset({"success", "failed", "blocked"})
+
+_ACTIVE_PAUSE_STATE_PATH: ContextVar[str] = ContextVar(
+    "auto_generate_pause_state_path",
+    default="",
+)
+
+
+def bind_pause_state_path(path: str | Path) -> None:
+    """Bind the current runtime context to its durable pause marker."""
+
+    _ACTIVE_PAUSE_STATE_PATH.set(str(Path(path).expanduser().resolve()))
+
+
+def current_pause_state_path() -> str:
+    return str(_ACTIVE_PAUSE_STATE_PATH.get() or "").strip()
 _SECRET_KEY_MARKERS = frozenset(
     {"api_key", "apikey", "authorization", "password", "secret", "token", "credential"}
 )
@@ -2343,6 +2358,30 @@ class ProviderRuntime:
             )
         return receipt
 
+    @staticmethod
+    def _assert_pause_state_before_admission() -> None:
+        marker_path = current_pause_state_path()
+        if not marker_path:
+            return
+        path = Path(marker_path)
+        if not path.exists():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ProviderRuntimeContractError(
+                "CONTROL_STATE_INVALID: pause marker cannot be read"
+            ) from exc
+        if not isinstance(payload, Mapping):
+            raise ProviderRuntimeContractError("CONTROL_STATE_INVALID: pause marker is not an object")
+        state = str(payload.get("state") or "")
+        if state == "PAUSED_BY_USER":
+            raise ProviderBudgetExceeded("PAUSED_BY_USER: provider admission is blocked")
+        if state != "RUNNABLE" or not str(payload.get("state_id") or "").strip():
+            raise ProviderRuntimeContractError("CONTROL_STATE_INVALID: pause marker identity or state is invalid")
+
     def _account_existing_receipt(self, receipt: ProviderCallReceiptV1, admission: ProviderCallAdmissionV1) -> None:
         if admission.sequence in self._accounted_sequences:
             return
@@ -2400,6 +2439,7 @@ class ProviderRuntime:
         requested_output_tokens: int = 0,
         requested_retry_attempts: int = 0,
     ) -> ProviderCallAdmissionV1:
+        self._assert_pause_state_before_admission()
         estimated = max(0, int(estimated_tokens))
         output = max(0, int(requested_output_tokens))
         retries = max(0, int(requested_retry_attempts))

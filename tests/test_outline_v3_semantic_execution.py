@@ -120,6 +120,7 @@ def _executor(
     pricing_source: str | None = "tests:explicit-rates-v1",
     candidate_count: int = 2,
     technical_shard_target_tokens: int = 0,
+    max_source_prompt_tokens: int | None = None,
 ) -> OutlineV3Executor:
     workspace = JobWorkspace.create(str(tmp_path), "outline", job_id="outline-job")
     registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
@@ -142,6 +143,7 @@ def _executor(
         output_cost_per_1k_tokens=0.001,
         reasoning_cost_per_1k_tokens=0.001,
         technical_shard_target_tokens=technical_shard_target_tokens,
+        max_source_prompt_tokens=max_source_prompt_tokens,
         cache_read_cost_per_1k_tokens=0.0,
         cache_write_cost_per_1k_tokens=0.0,
     )
@@ -214,6 +216,25 @@ def test_outline_v3_stability_provider_call_budget_rejects_before_transport(tmp_
     preflight = json.loads(preflight_paths[0].read_text(encoding="utf-8"))
     assert preflight["preflight_status"] == "rejected"
     assert preflight["rejection_reason"] == "max_provider_calls_exceeded"
+
+
+def test_outline_v3_actual_request_cap_blocks_before_provider_post(tmp_path: Path) -> None:
+    transport_calls: list[str] = []
+
+    def provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        transport_calls.append(node_id)
+        return _configured_test_provider(node_id, request)
+
+    result = _executor(
+        tmp_path,
+        provider=provider,
+        stability_mode="off",
+        max_source_prompt_tokens=1,
+    ).run()
+
+    assert result.ok is False
+    assert result.status == "blocked"
+    assert transport_calls == []
 
 
 def test_outline_v3_stability_cost_budget_rejects_before_transport(tmp_path: Path) -> None:

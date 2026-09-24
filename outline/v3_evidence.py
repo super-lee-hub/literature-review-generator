@@ -16,7 +16,6 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from services.paper_identity import (
     normalize_doi,
     normalized_title_key,
-    normalize_paper_identity,
     title_author_year_key_from_paper,
 )
 from summary_schema import get_ai_summary

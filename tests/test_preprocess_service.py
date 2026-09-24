@@ -33,6 +33,16 @@ def _make_text_pdf(path: Path) -> None:
     doc.close()
 
 
+def test_mineru_zip_prefers_exact_page_index_json_over_generic_json() -> None:
+    manager = PreprocessManager(config={"Preprocess": {"enabled": "true"}}, logger=None)
+    raw_zip = io.BytesIO()
+    with zipfile.ZipFile(raw_zip, "w") as archive:
+        archive.writestr("page_index.json", json.dumps([{"page_number": 1, "text": "remote page"}]))
+        archive.writestr("normalized.md", "# normalized")
+    artifacts = manager._artifacts_from_zip_bytes(raw_zip.getvalue())
+    assert artifacts["page_index"] == [{"page_number": 1, "text": "remote page"}]
+
+
 def test_ocr_worker_normalizes_rapidocr_results() -> None:
     from preprocess.ocr_worker import _extract_rapidocr_text
 
@@ -715,8 +725,9 @@ def test_preprocess_manager_sanitizes_bytes_before_writing_json(tmp_path: Path, 
         "Preprocess": {
             "enabled": "true",
             "cache_dir": str(cache_dir),
-            "parser_mode": "remote_first",
-            "primary_parser": "mineru_remote",
+            "parser_mode": "local",
+            "primary_parser": "local",
+            "fallback_parser": "local",
             "ocr_mode": "off",
             "force_rebuild": "true",
             "extractor_profile": "fitz",

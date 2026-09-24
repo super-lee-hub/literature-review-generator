@@ -99,6 +99,7 @@ _ROUTE_CONFIG_KEYS = frozenset(
         "safety_margin_tokens",
         "force_highest_reasoning",
         "omit_temperature_when_reasoning",
+        "transport_retries",
     }
 )
 

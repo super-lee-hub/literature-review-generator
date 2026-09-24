@@ -20,6 +20,23 @@ GLOBAL_CORPUS_LEDGER_ARTIFACT_TYPE = "global_corpus_ledger"
 MULTI_VIEW_MATRIX_ARTIFACT_TYPE = "multi_view_matrix"
 REVIEW_INTENT_ARTIFACT_TYPE = "review_intent"
 COVERAGE_CONTRACT_ARTIFACT_TYPE = "coverage_contract"
+CONTENT_LAYERS_ARTIFACT_TYPE = "outline_content_layers"
+RELATION_EVIDENCE_BUNDLES_ARTIFACT_TYPE = "relation_evidence_bundles"
+TOPIC_SYNTHESIS_ARTIFACT_TYPE = "topic_synthesis"
+GLOBAL_SYNTHESIS_ARTIFACT_TYPE = "global_synthesis"
+
+EVIDENCE_CLAIM_TYPES = (
+    "empirical_finding",
+    "author_interpretation",
+    "author_proposed_gap",
+    "reviewer_inference",
+)
+RELATION_DECISIONS = (
+    "supported",
+    "contradicted",
+    "insufficient_evidence",
+    "not_comparable",
+)
 
 
 def canonical_json(value: Any) -> str:
@@ -62,6 +79,18 @@ def _list_of_dicts(value: Any) -> List[Dict[str, Any]]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         return []
     return [dict(item) for item in value if isinstance(item, Mapping)]
+
+
+def _text_list(value: Any) -> List[str]:
+    """Normalize one scalar-or-sequence field without splitting strings."""
+
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes)):
+        return _stable_unique([value])
+    if isinstance(value, Sequence):
+        return _stable_unique(value)
+    return _stable_unique([value])
 
 
 @dataclass(frozen=True)
@@ -890,6 +919,602 @@ class OutlineCandidatePlans:
         )
 
 
+@dataclass(frozen=True)
+class EvidenceClaim:
+    """One source-linked claim in a paper evidence dossier.
+
+    The claim type is deliberately modal.  A finding reported by the paper,
+    the paper authors' interpretation, a gap proposed by the authors, and a
+    later reviewer inference are not interchangeable evidence.
+    """
+
+    claim_id: str
+    claim_type: str
+    text: str
+    study_id: str = ""
+    evidence_ids: List[str] = field(default_factory=list)
+    source_locator: str = ""
+    source_summary_hash: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.claim_id.strip():
+            raise ValueError("EvidenceClaim.claim_id is required")
+        if self.claim_type not in EVIDENCE_CLAIM_TYPES:
+            raise ValueError(f"unsupported evidence claim type: {self.claim_type!r}")
+        if not self.text.strip():
+            raise ValueError("EvidenceClaim.text is required")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "claim_id": self.claim_id,
+            "claim_type": self.claim_type,
+            "text": self.text,
+            "study_id": self.study_id,
+            "evidence_ids": _stable_unique(self.evidence_ids),
+            "source_locator": self.source_locator,
+            "source_summary_hash": self.source_summary_hash,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "EvidenceClaim":
+        return cls(
+            claim_id=str(data.get("claim_id") or ""),
+            claim_type=str(data.get("claim_type") or ""),
+            text=str(data.get("text") or ""),
+            study_id=str(data.get("study_id") or ""),
+            evidence_ids=_text_list(data.get("evidence_ids")),
+            source_locator=str(data.get("source_locator") or ""),
+            source_summary_hash=str(data.get("source_summary_hash") or ""),
+        )
+
+
+@dataclass(frozen=True)
+class ResearchUnit:
+    """A complete study/argument unit within one paper.
+
+    A unit is the smallest legal split point for a long or multi-study paper;
+    its findings, conditions, and claims travel together.
+    """
+
+    study_id: str
+    parent_paper_id: str
+    research_questions: List[str] = field(default_factory=list)
+    definitions_and_operationalizations: Dict[str, List[str]] = field(default_factory=dict)
+    theoretical_derivation: List[str] = field(default_factory=list)
+    method: List[str] = field(default_factory=list)
+    sample_or_context: List[str] = field(default_factory=list)
+    findings: List[str] = field(default_factory=list)
+    mechanisms: List[str] = field(default_factory=list)
+    moderators_or_boundaries: List[str] = field(default_factory=list)
+    zero_results: List[str] = field(default_factory=list)
+    limitations: List[str] = field(default_factory=list)
+    claims: List[EvidenceClaim] = field(default_factory=list)
+    source_locators: Dict[str, List[str]] = field(default_factory=dict)
+    evidence_ids: List[str] = field(default_factory=list)
+    source_summary_hash: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "study_id": self.study_id,
+            "parent_paper_id": self.parent_paper_id,
+            "research_questions": _stable_unique(self.research_questions),
+            "definitions_and_operationalizations": _stable_mapping({
+                key: _text_list(value)
+                for key, value in self.definitions_and_operationalizations.items()
+            }),
+            "theoretical_derivation": _stable_unique(self.theoretical_derivation),
+            "method": _stable_unique(self.method),
+            "sample_or_context": _stable_unique(self.sample_or_context),
+            "findings": _stable_unique(self.findings),
+            "mechanisms": _stable_unique(self.mechanisms),
+            "moderators_or_boundaries": _stable_unique(self.moderators_or_boundaries),
+            "zero_results": _stable_unique(self.zero_results),
+            "limitations": _stable_unique(self.limitations),
+            "claims": [claim.to_dict() for claim in sorted(self.claims, key=lambda item: item.claim_id)],
+            "source_locators": _stable_mapping({
+                key: _text_list(value)
+                for key, value in self.source_locators.items()
+            }),
+            "evidence_ids": _stable_unique(self.evidence_ids),
+            "source_summary_hash": self.source_summary_hash,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ResearchUnit":
+        return cls(
+            study_id=str(data.get("study_id") or ""),
+            parent_paper_id=str(data.get("parent_paper_id") or ""),
+            research_questions=_text_list(data.get("research_questions")),
+            definitions_and_operationalizations={
+                str(key): _text_list(value)
+                for key, value in _stable_mapping(data.get("definitions_and_operationalizations")).items()
+            },
+            theoretical_derivation=_text_list(data.get("theoretical_derivation")),
+            method=_text_list(data.get("method")),
+            sample_or_context=_text_list(data.get("sample_or_context")),
+            findings=_text_list(data.get("findings")),
+            mechanisms=_text_list(data.get("mechanisms")),
+            moderators_or_boundaries=_text_list(data.get("moderators_or_boundaries")),
+            zero_results=_text_list(data.get("zero_results")),
+            limitations=_text_list(data.get("limitations")),
+            claims=[EvidenceClaim.from_dict(item) for item in data.get("claims", []) if isinstance(item, Mapping)],
+            source_locators={
+                str(key): _text_list(value)
+                for key, value in _stable_mapping(data.get("source_locators")).items()
+            },
+            evidence_ids=_text_list(data.get("evidence_ids")),
+            source_summary_hash=str(data.get("source_summary_hash") or ""),
+        )
+
+
+@dataclass(frozen=True)
+class PaperIndexCard:
+    """Compact whole-paper navigation record; not a substitute for a dossier."""
+
+    paper_id: str
+    research_questions: List[str] = field(default_factory=list)
+    key_constructs: List[str] = field(default_factory=list)
+    core_findings: List[str] = field(default_factory=list)
+    key_boundaries: List[str] = field(default_factory=list)
+    method_category: str = ""
+    topic_tags: List[str] = field(default_factory=list)
+    evidence_package_id: str = ""
+    source_summary_hash: str = ""
+    source_locators: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "paper_id": self.paper_id,
+            "research_questions": _stable_unique(self.research_questions),
+            "key_constructs": _stable_unique(self.key_constructs),
+            "core_findings": _stable_unique(self.core_findings),
+            "key_boundaries": _stable_unique(self.key_boundaries),
+            "method_category": self.method_category,
+            "topic_tags": _stable_unique(self.topic_tags),
+            "evidence_package_id": self.evidence_package_id,
+            "source_summary_hash": self.source_summary_hash,
+            "source_locators": _stable_unique(self.source_locators),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "PaperIndexCard":
+        return cls(
+            paper_id=str(data.get("paper_id") or ""),
+            research_questions=_text_list(data.get("research_questions")),
+            key_constructs=_text_list(data.get("key_constructs")),
+            core_findings=_text_list(data.get("core_findings")),
+            key_boundaries=_text_list(data.get("key_boundaries")),
+            method_category=str(data.get("method_category") or ""),
+            topic_tags=_text_list(data.get("topic_tags")),
+            evidence_package_id=str(data.get("evidence_package_id") or ""),
+            source_summary_hash=str(data.get("source_summary_hash") or ""),
+            source_locators=_text_list(data.get("source_locators")),
+        )
+
+
+@dataclass(frozen=True)
+class PaperEvidenceDossier:
+    """Logical-complete paper/study evidence package.
+
+    Length is not a truncation contract.  When a source is incomplete, the
+    dossier records the missing field instead of treating omitted material as
+    a negative finding.
+    """
+
+    dossier_id: str
+    paper_id: str
+    source_summary_hash: str = ""
+    overall_context: List[str] = field(default_factory=list)
+    research_questions: List[str] = field(default_factory=list)
+    concept_definitions: List[str] = field(default_factory=list)
+    operationalizations: List[str] = field(default_factory=list)
+    theoretical_derivation: List[str] = field(default_factory=list)
+    findings: List[str] = field(default_factory=list)
+    research_units: List[ResearchUnit] = field(default_factory=list)
+    claims: List[EvidenceClaim] = field(default_factory=list)
+    mechanism_evidence: List[str] = field(default_factory=list)
+    moderators_boundaries: List[str] = field(default_factory=list)
+    zero_results: List[str] = field(default_factory=list)
+    limitations: List[str] = field(default_factory=list)
+    source_locators: Dict[str, List[str]] = field(default_factory=dict)
+    evidence_ids_by_field: Dict[str, List[str]] = field(default_factory=dict)
+    evidence_text_by_id: Dict[str, str] = field(default_factory=dict)
+    diagnostics: List[str] = field(default_factory=list)
+    status: str = "ready"
+
+    @property
+    def evidence_ids(self) -> List[str]:
+        return _stable_unique(
+            value
+            for values in self.evidence_ids_by_field.values()
+            for value in values
+        )
+
+    def canonical_payload(self) -> Dict[str, Any]:
+        return {
+            "dossier_id": self.dossier_id,
+            "paper_id": self.paper_id,
+            "source_summary_hash": self.source_summary_hash,
+            "overall_context": _stable_unique(self.overall_context),
+            "research_questions": _stable_unique(self.research_questions),
+            "concept_definitions": _stable_unique(self.concept_definitions),
+            "operationalizations": _stable_unique(self.operationalizations),
+            "theoretical_derivation": _stable_unique(self.theoretical_derivation),
+            "findings": _stable_unique(self.findings),
+            "research_units": [unit.to_dict() for unit in sorted(self.research_units, key=lambda item: item.study_id)],
+            "claims": [claim.to_dict() for claim in sorted(self.claims, key=lambda item: item.claim_id)],
+            "mechanism_evidence": _stable_unique(self.mechanism_evidence),
+            "moderators_boundaries": _stable_unique(self.moderators_boundaries),
+            "zero_results": _stable_unique(self.zero_results),
+            "limitations": _stable_unique(self.limitations),
+            "source_locators": _stable_mapping({
+                key: _text_list(value)
+                for key, value in self.source_locators.items()
+            }),
+            "evidence_ids_by_field": _stable_mapping({
+                key: _stable_unique(value)
+                for key, value in self.evidence_ids_by_field.items()
+            }),
+            "evidence_text_by_id": {
+                str(key): str(value)
+                for key, value in sorted(self.evidence_text_by_id.items(), key=lambda item: str(item[0]))
+            },
+            "diagnostics": _stable_unique(self.diagnostics),
+            "status": self.status,
+        }
+
+    @property
+    def content_hash(self) -> str:
+        return compute_v3_hash(self.canonical_payload())
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = self.canonical_payload()
+        payload["evidence_ids"] = self.evidence_ids
+        payload["content_hash"] = self.content_hash
+        return payload
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "PaperEvidenceDossier":
+        return cls(
+            dossier_id=str(data.get("dossier_id") or ""),
+            paper_id=str(data.get("paper_id") or ""),
+            source_summary_hash=str(data.get("source_summary_hash") or ""),
+            overall_context=_text_list(data.get("overall_context")),
+            research_questions=_text_list(data.get("research_questions")),
+            concept_definitions=_text_list(data.get("concept_definitions")),
+            operationalizations=_text_list(data.get("operationalizations")),
+            theoretical_derivation=_text_list(data.get("theoretical_derivation")),
+            findings=_text_list(data.get("findings")),
+            research_units=[ResearchUnit.from_dict(item) for item in data.get("research_units", []) if isinstance(item, Mapping)],
+            claims=[EvidenceClaim.from_dict(item) for item in data.get("claims", []) if isinstance(item, Mapping)],
+            mechanism_evidence=_text_list(data.get("mechanism_evidence")),
+            moderators_boundaries=_text_list(data.get("moderators_boundaries")),
+            zero_results=_text_list(data.get("zero_results")),
+            limitations=_text_list(data.get("limitations")),
+            source_locators={
+                str(key): _text_list(value)
+                for key, value in _stable_mapping(data.get("source_locators")).items()
+            },
+            evidence_ids_by_field={
+                str(key): _text_list(value)
+                for key, value in _stable_mapping(data.get("evidence_ids_by_field")).items()
+            },
+            evidence_text_by_id={
+                str(key): str(value)
+                for key, value in _stable_mapping(data.get("evidence_text_by_id")).items()
+            },
+            diagnostics=_text_list(data.get("diagnostics")),
+            status=str(data.get("status") or "ready"),
+        )
+
+
+@dataclass(frozen=True)
+class PaperContentLayers:
+    """Shared, content-addressed navigation cards and evidence dossiers."""
+
+    artifact_type: str = CONTENT_LAYERS_ARTIFACT_TYPE
+    artifact_version: str = OUTLINE_V3_VERSION
+    index_cards: List[PaperIndexCard] = field(default_factory=list)
+    dossiers: List[PaperEvidenceDossier] = field(default_factory=list)
+    source_summary_hashes: List[str] = field(default_factory=list)
+    blocking_diagnostics: List[Dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def dossier_by_paper(self) -> Dict[str, PaperEvidenceDossier]:
+        return {item.paper_id: item for item in self.dossiers}
+
+    def canonical_payload(self) -> Dict[str, Any]:
+        return {
+            "artifact_type": self.artifact_type,
+            "artifact_version": self.artifact_version,
+            "index_cards": [item.to_dict() for item in sorted(self.index_cards, key=lambda item: item.paper_id)],
+            "dossiers": [item.to_dict() for item in sorted(self.dossiers, key=lambda item: item.paper_id)],
+            "source_summary_hashes": _stable_unique(self.source_summary_hashes),
+            "blocking_diagnostics": _list_of_dicts(sorted(self.blocking_diagnostics, key=compute_v3_hash)),
+        }
+
+    @property
+    def content_hash(self) -> str:
+        return compute_v3_hash(self.canonical_payload())
+
+    @property
+    def status(self) -> str:
+        return "blocked" if self.blocking_diagnostics else "ready"
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = self.canonical_payload()
+        payload.update({"status": self.status, "content_hash": self.content_hash})
+        return payload
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "PaperContentLayers":
+        return cls(
+            artifact_type=str(data.get("artifact_type") or CONTENT_LAYERS_ARTIFACT_TYPE),
+            artifact_version=str(data.get("artifact_version") or OUTLINE_V3_VERSION),
+            index_cards=[PaperIndexCard.from_dict(item) for item in data.get("index_cards", []) if isinstance(item, Mapping)],
+            dossiers=[PaperEvidenceDossier.from_dict(item) for item in data.get("dossiers", []) if isinstance(item, Mapping)],
+            source_summary_hashes=_text_list(data.get("source_summary_hashes")),
+            blocking_diagnostics=_list_of_dicts(data.get("blocking_diagnostics")),
+        )
+
+
+@dataclass(frozen=True)
+class RelationEvidenceBundle:
+    """Evidence-complete input for one directional relation adjudication."""
+
+    relation_id: str
+    comparison_question: str = ""
+    relation_type: str = ""
+    paper_ids: List[str] = field(default_factory=list)
+    study_ids: List[str] = field(default_factory=list)
+    claim_ids_left: List[str] = field(default_factory=list)
+    claim_ids_right: List[str] = field(default_factory=list)
+    definitions_and_operationalizations: Dict[str, List[str]] = field(default_factory=dict)
+    findings_left: List[str] = field(default_factory=list)
+    findings_right: List[str] = field(default_factory=list)
+    contexts_and_boundaries: Dict[str, List[str]] = field(default_factory=dict)
+    source_locators: Dict[str, List[str]] = field(default_factory=dict)
+    required_evidence_ids: List[str] = field(default_factory=list)
+    provided_evidence_ids: List[str] = field(default_factory=list)
+    missing_evidence_ids: List[str] = field(default_factory=list)
+    evidence_completeness: str = "incomplete"
+    decision: str = "insufficient_evidence"
+    diagnostics: List[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not self.relation_id.strip():
+            raise ValueError("RelationEvidenceBundle.relation_id is required")
+        if self.decision not in RELATION_DECISIONS:
+            raise ValueError(f"unsupported relation decision: {self.decision!r}")
+        required = set(_stable_unique(self.required_evidence_ids))
+        provided = set(_stable_unique(self.provided_evidence_ids))
+        missing = sorted(required - provided)
+        object.__setattr__(self, "required_evidence_ids", _stable_unique(required))
+        object.__setattr__(self, "provided_evidence_ids", _stable_unique(provided))
+        object.__setattr__(self, "missing_evidence_ids", _stable_unique(missing))
+        if missing:
+            object.__setattr__(self, "evidence_completeness", "incomplete")
+            # A relation with missing finding/boundary evidence can never be
+            # promoted to a substantive positive or negative judgment.
+            if self.decision in {"supported", "contradicted"}:
+                object.__setattr__(self, "decision", "insufficient_evidence")
+        else:
+            object.__setattr__(self, "evidence_completeness", "complete")
+            if self.decision == "insufficient_evidence":
+                # Complete evidence can still be non-comparable; it is not a
+                # missing-evidence rejection.
+                object.__setattr__(self, "decision", "not_comparable")
+
+    @property
+    def is_complete(self) -> bool:
+        return not set(self.required_evidence_ids) - set(self.provided_evidence_ids)
+
+    @property
+    def completeness_ratio(self) -> float:
+        required = set(self.required_evidence_ids)
+        if not required:
+            return 1.0
+        return len(required & set(self.provided_evidence_ids)) / len(required)
+
+    def with_decision(self, decision: str, *, diagnostics: Sequence[str] = ()) -> "RelationEvidenceBundle":
+        next_decision = str(decision or "").strip()
+        if next_decision not in RELATION_DECISIONS:
+            raise ValueError(f"unsupported relation decision: {next_decision!r}")
+        if not self.is_complete and next_decision in {"supported", "contradicted"}:
+            next_decision = "insufficient_evidence"
+        return replace_dataclass(self, decision=next_decision, diagnostics=[*self.diagnostics, *diagnostics])
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "relation_id": self.relation_id,
+            "comparison_question": self.comparison_question,
+            "relation_type": self.relation_type,
+            "paper_ids": _stable_unique(self.paper_ids),
+            "study_ids": _stable_unique(self.study_ids),
+            "claim_ids_left": _stable_unique(self.claim_ids_left),
+            "claim_ids_right": _stable_unique(self.claim_ids_right),
+            "definitions_and_operationalizations": _stable_mapping({
+                key: _text_list(value)
+                for key, value in self.definitions_and_operationalizations.items()
+            }),
+            "findings_left": _stable_unique(self.findings_left),
+            "findings_right": _stable_unique(self.findings_right),
+            "contexts_and_boundaries": _stable_mapping({
+                key: _text_list(value)
+                for key, value in self.contexts_and_boundaries.items()
+            }),
+            "source_locators": _stable_mapping({
+                key: _text_list(value)
+                for key, value in self.source_locators.items()
+            }),
+            "required_evidence_ids": _stable_unique(self.required_evidence_ids),
+            "provided_evidence_ids": _stable_unique(self.provided_evidence_ids),
+            "missing_evidence_ids": _stable_unique(self.missing_evidence_ids),
+            "evidence_completeness": self.evidence_completeness,
+            "evidence_complete": self.is_complete,
+            "completeness_ratio": self.completeness_ratio,
+            "decision": self.decision,
+            "diagnostics": _stable_unique(self.diagnostics),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "RelationEvidenceBundle":
+        return cls(
+            relation_id=str(data.get("relation_id") or ""),
+            comparison_question=str(data.get("comparison_question") or ""),
+            relation_type=str(data.get("relation_type") or ""),
+            paper_ids=_text_list(data.get("paper_ids")),
+            study_ids=_text_list(data.get("study_ids")),
+            claim_ids_left=_text_list(data.get("claim_ids_left")),
+            claim_ids_right=_text_list(data.get("claim_ids_right")),
+            definitions_and_operationalizations={
+                str(key): _text_list(value)
+                for key, value in _stable_mapping(data.get("definitions_and_operationalizations")).items()
+            },
+            findings_left=_text_list(data.get("findings_left")),
+            findings_right=_text_list(data.get("findings_right")),
+            contexts_and_boundaries={
+                str(key): _text_list(value)
+                for key, value in _stable_mapping(data.get("contexts_and_boundaries")).items()
+            },
+            source_locators={
+                str(key): _text_list(value)
+                for key, value in _stable_mapping(data.get("source_locators")).items()
+            },
+            required_evidence_ids=_text_list(data.get("required_evidence_ids")),
+            provided_evidence_ids=_text_list(data.get("provided_evidence_ids")),
+            missing_evidence_ids=_text_list(data.get("missing_evidence_ids")),
+            evidence_completeness=str(data.get("evidence_completeness") or "incomplete"),
+            decision=str(data.get("decision") or "insufficient_evidence"),
+            diagnostics=_text_list(data.get("diagnostics")),
+        )
+
+
+def replace_dataclass(value: Any, **changes: Any) -> Any:
+    """Small local wrapper to keep model construction readable."""
+
+    from dataclasses import replace
+
+    return replace(value, **changes)
+
+
+@dataclass(frozen=True)
+class TopicSynthesis:
+    """Shared group-level synthesis or its explicit not-yet-run plan."""
+
+    topic_id: str
+    question: str = ""
+    paper_ids: List[str] = field(default_factory=list)
+    bridge_paper_ids: List[str] = field(default_factory=list)
+    relation_ids: List[str] = field(default_factory=list)
+    conclusions: List[str] = field(default_factory=list)
+    supporting_evidence_ids: List[str] = field(default_factory=list)
+    conflicts: List[str] = field(default_factory=list)
+    comparability_notes: List[str] = field(default_factory=list)
+    unresolved_questions: List[str] = field(default_factory=list)
+    status: str = "planned"
+    diagnostics: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "topic_id": self.topic_id,
+            "question": self.question,
+            "paper_ids": _stable_unique(self.paper_ids),
+            "bridge_paper_ids": _stable_unique(self.bridge_paper_ids),
+            "relation_ids": _stable_unique(self.relation_ids),
+            "conclusions": _stable_unique(self.conclusions),
+            "supporting_evidence_ids": _stable_unique(self.supporting_evidence_ids),
+            "conflicts": _stable_unique(self.conflicts),
+            "comparability_notes": _stable_unique(self.comparability_notes),
+            "unresolved_questions": _stable_unique(self.unresolved_questions),
+            "status": self.status,
+            "diagnostics": _stable_unique(self.diagnostics),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "TopicSynthesis":
+        return cls(
+            topic_id=str(data.get("topic_id") or ""),
+            question=str(data.get("question") or ""),
+            paper_ids=_text_list(data.get("paper_ids")),
+            bridge_paper_ids=_text_list(data.get("bridge_paper_ids")),
+            relation_ids=_text_list(data.get("relation_ids")),
+            conclusions=_text_list(data.get("conclusions")),
+            supporting_evidence_ids=_text_list(data.get("supporting_evidence_ids")),
+            conflicts=_text_list(data.get("conflicts")),
+            comparability_notes=_text_list(data.get("comparability_notes")),
+            unresolved_questions=_text_list(data.get("unresolved_questions")),
+            status=str(data.get("status") or "planned"),
+            diagnostics=_text_list(data.get("diagnostics")),
+        )
+
+
+@dataclass(frozen=True)
+class GlobalSynthesis:
+    """Cross-topic synthesis base shared by all outline candidates."""
+
+    artifact_type: str = GLOBAL_SYNTHESIS_ARTIFACT_TYPE
+    artifact_version: str = OUTLINE_V3_VERSION
+    topic_ids: List[str] = field(default_factory=list)
+    cross_group_comparison_questions: List[str] = field(default_factory=list)
+    relation_ids: List[str] = field(default_factory=list)
+    coverage_matrix: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    conclusions: List[str] = field(default_factory=list)
+    alternative_explanations: List[str] = field(default_factory=list)
+    unresolved_questions: List[str] = field(default_factory=list)
+    supporting_evidence_ids: List[str] = field(default_factory=list)
+    status: str = "planned"
+    blocking_diagnostics: List[Dict[str, Any]] = field(default_factory=list)
+
+    def canonical_payload(self) -> Dict[str, Any]:
+        return {
+            "artifact_type": self.artifact_type,
+            "artifact_version": self.artifact_version,
+            "topic_ids": _stable_unique(self.topic_ids),
+            "cross_group_comparison_questions": _stable_unique(self.cross_group_comparison_questions),
+            "relation_ids": _stable_unique(self.relation_ids),
+            "coverage_matrix": _stable_mapping({
+                str(key): dict(value) if isinstance(value, Mapping) else {}
+                for key, value in self.coverage_matrix.items()
+            }),
+            "conclusions": _stable_unique(self.conclusions),
+            "alternative_explanations": _stable_unique(self.alternative_explanations),
+            "unresolved_questions": _stable_unique(self.unresolved_questions),
+            "supporting_evidence_ids": _stable_unique(self.supporting_evidence_ids),
+            "status": self.status,
+            "blocking_diagnostics": _list_of_dicts(self.blocking_diagnostics),
+        }
+
+    @property
+    def content_hash(self) -> str:
+        return compute_v3_hash(self.canonical_payload())
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = self.canonical_payload()
+        payload["content_hash"] = self.content_hash
+        return payload
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "GlobalSynthesis":
+        return cls(
+            artifact_type=str(data.get("artifact_type") or GLOBAL_SYNTHESIS_ARTIFACT_TYPE),
+            artifact_version=str(data.get("artifact_version") or OUTLINE_V3_VERSION),
+            topic_ids=_text_list(data.get("topic_ids")),
+            cross_group_comparison_questions=_text_list(data.get("cross_group_comparison_questions")),
+            relation_ids=_text_list(data.get("relation_ids")),
+            coverage_matrix={
+                str(key): dict(value) if isinstance(value, Mapping) else {}
+                for key, value in _stable_mapping(data.get("coverage_matrix")).items()
+            },
+            conclusions=_text_list(data.get("conclusions")),
+            alternative_explanations=_text_list(data.get("alternative_explanations")),
+            unresolved_questions=_text_list(data.get("unresolved_questions")),
+            supporting_evidence_ids=_text_list(data.get("supporting_evidence_ids")),
+            status=str(data.get("status") or "planned"),
+            blocking_diagnostics=_list_of_dicts(data.get("blocking_diagnostics")),
+        )
+
+
 # Names without the explicit version suffix are the public v3 vocabulary.
 OutlineEvidenceViewV1 = OutlineEvidenceView
 OutlineEvidenceViewsV1 = OutlineEvidenceViews
@@ -903,6 +1528,14 @@ GlobalRelationMapV1 = GlobalRelationMap
 OrganizingAxisV1 = OrganizingAxis
 OutlineCandidatePlanV1 = OutlineCandidatePlan
 OutlineCandidatePlansV1 = OutlineCandidatePlans
+EvidenceClaimV1 = EvidenceClaim
+ResearchUnitV1 = ResearchUnit
+PaperIndexCardV1 = PaperIndexCard
+PaperEvidenceDossierV1 = PaperEvidenceDossier
+PaperContentLayersV1 = PaperContentLayers
+RelationEvidenceBundleV1 = RelationEvidenceBundle
+TopicSynthesisV1 = TopicSynthesis
+GlobalSynthesisV1 = GlobalSynthesis
 
 
 __all__ = [
@@ -912,6 +1545,12 @@ __all__ = [
     "MULTI_VIEW_MATRIX_ARTIFACT_TYPE",
     "REVIEW_INTENT_ARTIFACT_TYPE",
     "COVERAGE_CONTRACT_ARTIFACT_TYPE",
+    "CONTENT_LAYERS_ARTIFACT_TYPE",
+    "RELATION_EVIDENCE_BUNDLES_ARTIFACT_TYPE",
+    "TOPIC_SYNTHESIS_ARTIFACT_TYPE",
+    "GLOBAL_SYNTHESIS_ARTIFACT_TYPE",
+    "EVIDENCE_CLAIM_TYPES",
+    "RELATION_DECISIONS",
     "canonical_json",
     "compute_v3_hash",
     "OutlineEvidenceView",
@@ -940,4 +1579,20 @@ __all__ = [
     "OrganizingAxisV1",
     "OutlineCandidatePlanV1",
     "OutlineCandidatePlansV1",
+    "EvidenceClaim",
+    "ResearchUnit",
+    "PaperIndexCard",
+    "PaperEvidenceDossier",
+    "PaperContentLayers",
+    "RelationEvidenceBundle",
+    "TopicSynthesis",
+    "GlobalSynthesis",
+    "EvidenceClaimV1",
+    "ResearchUnitV1",
+    "PaperIndexCardV1",
+    "PaperEvidenceDossierV1",
+    "PaperContentLayersV1",
+    "RelationEvidenceBundleV1",
+    "TopicSynthesisV1",
+    "GlobalSynthesisV1",
 ]

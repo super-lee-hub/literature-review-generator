@@ -115,6 +115,37 @@ def test_fully_bound_receipt_closure_passes(tmp_path: Path) -> None:
     assert closure.hash_mismatches == {}
 
 
+def test_newer_success_wins_over_older_failed_internal_retry(tmp_path: Path) -> None:
+    receipt, expected = _bound_receipt(tmp_path, call_id="call-retried")
+    failed = replace(
+        receipt,
+        receipt_id="provider-receipt-old-failure",
+        status="failed",
+        error_kind="transient_network",
+        attempts=2,
+        input_tokens=None,
+        output_tokens=None,
+        total_tokens=None,
+        response_hash=None,
+        usage_status="unreported",
+        finished_at="2026-01-01T00:00:02Z",
+    )
+    succeeded = replace(
+        receipt,
+        receipt_id="provider-receipt-new-success",
+        sequence=2,
+        attempts=1,
+        finished_at="2026-01-01T00:00:03Z",
+    )
+
+    closure = ProviderReceiptClosure.evaluate([expected], [failed, succeeded])
+
+    assert closure.complete is True
+    assert closure.failed_call_ids == ()
+    assert closure.retry_exceeded_call_ids == ()
+    assert closure.usage_incomplete_call_ids == ()
+
+
 def test_historical_receipts_are_isolated_from_current_epoch(tmp_path: Path) -> None:
     receipt, expected = _bound_receipt(tmp_path, call_id="call-expected")
     historical, _ = _bound_receipt(tmp_path, call_id="call-historical", epoch="epoch-old")

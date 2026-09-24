@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from collections import defaultdict
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
@@ -345,18 +344,25 @@ def build_global_relation_map(
         right_support = _has_signal(right, "support")
         left_contradict = _has_signal(left, "contradict")
         right_contradict = _has_signal(right, "contradict")
-        relation_dimension = next((d for d in shared_dimensions if d in {"theory", "construct", "mechanism", "context"}), shared_dimensions[0])
-        shared_labels = sorted(dimension_map[relation_dimension])
+        # Positive/negative words are only a retrieval signal.  A substantive
+        # relation requires a shared theory, construct, mechanism, or finding
+        # dimension; year, author, template labels, and context alone cannot
+        # establish support or contradiction.
+        relation_dimension = next(
+            (d for d in shared_dimensions if d in {"theory", "construct", "mechanism", "finding"}),
+            "",
+        )
+        shared_labels = sorted(dimension_map[relation_dimension]) if relation_dimension else []
         evidence_fields = {
             left.paper_key: ["findings", "conclusions"],
             right.paper_key: ["findings", "conclusions"],
         }
-        if (left_support and right_support) and not (left_contradict or right_contradict):
+        if relation_dimension and (left_support and right_support) and not (left_contradict or right_contradict):
             _add_relation(relations, _relation(
                 "supports", left, right, dimension=relation_dimension,
                 labels=shared_labels, confidence="low", evidence_fields=evidence_fields,
             ))
-        if left_contradict or right_contradict:
+        if relation_dimension and (left_contradict or right_contradict):
             _add_relation(relations, _relation(
                 "contradicts", left, right, dimension=relation_dimension,
                 labels=shared_labels, confidence="low", evidence_fields=evidence_fields,
@@ -424,6 +430,7 @@ def build_outline_candidate_plans(
     coverage_contract: CoverageContract,
     *,
     candidate_count: int = 5,
+    semantic_chunk_plan_hash: str = "",
 ) -> OutlineCandidatePlans:
     """Create deterministic candidate plans with provider generation isolated."""
 
@@ -438,6 +445,8 @@ def build_outline_candidate_plans(
         "review_intent": intent.content_hash,
         "coverage_contract": coverage_contract.content_hash,
     }
+    if str(semantic_chunk_plan_hash or "").strip():
+        shared["semantic_chunk_plan"] = str(semantic_chunk_plan_hash).strip()
     inherited_blocking = [
         *ledger.blocking_diagnostics,
         *matrix.blocking_diagnostics,
@@ -457,6 +466,7 @@ def build_outline_candidate_plans(
                 "global_corpus_ledger",
                 "multi_view_matrix",
                 "relation_candidates",
+                *(["semantic_chunk_plan"] if str(semantic_chunk_plan_hash or "").strip() else []),
                 "global_relation_map",
                 "review_intent",
                 "coverage_contract",
