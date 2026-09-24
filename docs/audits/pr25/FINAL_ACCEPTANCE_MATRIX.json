@@ -11,6 +11,7 @@
   "identity": {
     "base_sha": "bf00852fb627ac0519d96287d2d27b36f17a99ea",
     "executable_sha": "be68e36768d478beb05ef22b63023aba49dc5fb4",
+    "current_branch_head_sha": "f932b3602129fb45bce76475d311ba85467e1a83",
     "remote_branch": "codex/r1-outline-final-repair",
     "remote_executable_sha_readback": "be68e36768d478beb05ef22b63023aba49dc5fb4",
     "pr": "https://github.com/super-lee-hub/literature-review-generator/pull/25",
