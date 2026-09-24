@@ -3,7 +3,7 @@
 This branch implements the repair plan against PR #24's hardening head
 `bf00852fb627ac0519d96287d2d27b36f17a99ea`.
 
-The current executable code commit is `f9fcf63f3c5f157e0856aadfbfe2618052f8c48a`.
+The current executable code commit is `be68e36768d478beb05ef22b63023aba49dc5fb4`.
 The remote branch is `codex/r1-outline-final-repair`; PR #25 is open and
 unmerged. PR #24 remains open and unmerged.
 
@@ -52,6 +52,17 @@ unmerged. PR #24 remains open and unmerged.
   over any input, and returns a non-zero exit for blocked plans. Coverage
   gates use the selected scope while retaining full/local coverage as
   diagnostics.
+- Typed `reuse_summary_files` now bypass source-bundle resolution and PDF
+  preprocessing. The imported manifest is verified against its source summary,
+  visual evidence, provider closure, and ledger before the zero-transport
+  Stage 1 path is accepted.
+- Production topic, relation, candidate, and critique requests now use
+  explicit Registry-bound evidence projections. Complete semantic fields stay
+  in content-layer artifacts; provider inputs carry the relevant complete
+  field values plus stable evidence-unit hashes and never silently truncate a
+  value. Topic units split only at paper boundaries when the effective input
+  cap requires it. Candidate and critique output caps are enforced at both
+  planning and transport.
 
 ## Verification
 
@@ -60,7 +71,7 @@ Fresh local checks on this code commit:
 - Python compileall: PASS.
 - Changed-file Ruff `E9,F`: PASS.
 - Changed-file Pyright: 0 errors, 0 warnings, 0 informations.
-- Semantic execution suite: 31 passed.
+- Semantic execution and full-stability suite: 33 passed.
 - Outline replay/invalidation suite: 9 passed.
 - Semantic chunking, relations, receipt closure, reviewctl: 31 passed.
 - Preprocess service: 35 passed.
@@ -69,6 +80,20 @@ Fresh local checks on this code commit:
 - Additional focused provider/outline tests: 52 passed.
 - Provider routing/replay and current production-chain regressions: 14 passed
   in the latest local run after semantic response replay/closure fixes.
+- Typed reuse admission regression: 1 passed; Stage 1 reuse regression group:
+  2 passed; changed-file Pyright/Ruff remained clean after the final compact
+  projection changes.
+
+The authorized R1 execution evidence is now concrete. The reuse-only run
+reused all 63 typed manifests with `STAGE1_AUTHORITY_READY=true` and made zero
+Stage 1/MinerU calls. The compact Outline preflight reached
+`estimated_provider_calls=21`, `semantic_synthesis_calls_reserved=14`, and
+the route's 32k input cap without a budget rejection. A local 63-paper fake
+provider reached the late Outline quality gate with 22 receipts before it
+blocked its deliberately empty semantic fixture. The real provider attempt
+then reached the first topic call but the configured `api.yhlxj.ai` gateway
+returned Cloudflare HTTP 524 after waiting; this is an external transport
+blocker, not a PASS for Writer/Validator/DOCX.
 
 The environment-wide `pip check` is now clean after installing `pypdf 6.19.0`
 for the active Python 3.13 environment. PDF/DOCX/export focused tests passed
@@ -76,18 +101,17 @@ for the active Python 3.13 environment. PDF/DOCX/export focused tests passed
 
 ## Remaining acceptance boundaries
 
-- R1's fixed 63-paper live provider run, Writer, Validator/repair, citation
-  verification, DOCX export, and GUI parity were not invoked in this coding
-  turn. They require owner-authorized credentials, budget, and the frozen R1
-  manifest. The machine-readable matrix marks them `BLOCKED_EXTERNAL` or
-  `NOT_VERIFIED`, never PASS.
+- The real R1 provider route is externally blocked by the gateway timeout
+  described above. Writer, Validator/repair, citation verification, DOCX
+  export, and GUI parity therefore remain `NOT_VERIFIED`; no artifact is
+  promoted to `canonical_ready`.
 - The historical R1 spec was machine-checked read-only: 63 typed
   `stage1_reusable_summary_manifest/v1` files exist and decode with 63 unique
-  paper keys. The user-authorized `D:\\auto-generate\\config.ini` is present,
-  but the current loader rejects its legacy `Outline_GPT_*` sections and all
-  nine API keys are classified as template credentials. Its historical
-  external-host acknowledgement expired on 2026-09-21, so a live run still
-  requires real credentials and a fresh acknowledgement.
+  paper keys. The original `D:\\auto-generate\\config.ini` still contains
+  legacy sections rejected by the current loader, so the live attempt used a
+  schema-normalized config outside the repository. Credentials were resolved
+  from the authorized `D:\\auto-generate\\.env`; values were not printed or
+  committed. A fresh external-host acknowledgement was used for the attempt.
 - F1 remains an independent regression corpus and is `UNACCEPTED`; no R1
   evidence is promoted to F1.
 - Full-repository Ruff still reports pre-existing unused-import and duplicate

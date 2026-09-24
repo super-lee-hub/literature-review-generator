@@ -10,53 +10,135 @@
   },
   "identity": {
     "base_sha": "bf00852fb627ac0519d96287d2d27b36f17a99ea",
-    "executable_sha": "f9fcf63f3c5f157e0856aadfbfe2618052f8c48a",
+    "executable_sha": "be68e36768d478beb05ef22b63023aba49dc5fb4",
     "remote_branch": "codex/r1-outline-final-repair",
-    "remote_executable_sha_readback": "f9fcf63f3c5f157e0856aadfbfe2618052f8c48a",
+    "remote_executable_sha_readback": "be68e36768d478beb05ef22b63023aba49dc5fb4",
     "pr": "https://github.com/super-lee-hub/literature-review-generator/pull/25",
     "existing_pr_24": "https://github.com/super-lee-hub/literature-review-generator/pull/24",
     "merge_status": "UNMERGED"
   },
   "checks": [
-    {"id": "compileall", "status": "PASS", "evidence": "python -m compileall -q outline runtime preprocess reviewctl.py ai_interface.py"},
-    {"id": "changed_ruff_e9_f", "status": "PASS", "evidence": "ruff check changed modules --select E9,F"},
-    {"id": "changed_pyright", "status": "PASS", "evidence": "0 errors, 0 warnings, 0 informations"},
-    {"id": "outline_semantic_execution", "status": "PASS", "count": 31},
-    {"id": "outline_replay_invalidation", "status": "PASS", "count": 9},
-    {"id": "preprocess_service", "status": "PASS", "count": 35},
-    {"id": "runtime_cli_validation", "status": "PASS", "count": 15},
-    {"id": "focused_outline_preprocess_receipt_export", "status": "PASS", "count": 52},
-    {"id": "hosted_ci_pr25", "status": "PASS", "run": "https://github.com/super-lee-hub/literature-review-generator/actions/runs/35956150052"},
-    {"id": "r1_live_provider_outline", "status": "BLOCKED_EXTERNAL", "reason": "No live provider execution was authorized or performed in this coding turn"},
-    {"id": "r1_writer_validator_repair", "status": "NOT_VERIFIED", "reason": "Depends on a successful current R1 outline"},
-    {"id": "r1_citation_docx_export_gui", "status": "NOT_VERIFIED", "reason": "Depends on Writer/Validator and live current artifact set"},
-    {"id": "f1_independent_regression", "status": "UNACCEPTED", "reason": "Separate 15-paper/OCR acceptance authority"}
+    {
+      "id": "compileall",
+      "status": "PASS",
+      "evidence": "python -m compileall -q outline runtime preprocess reviewctl.py ai_interface.py"
+    },
+    {
+      "id": "changed_ruff_e9_f",
+      "status": "PASS",
+      "evidence": "ruff check changed modules --select E9,F"
+    },
+    {
+      "id": "changed_pyright",
+      "status": "PASS",
+      "evidence": "0 errors, 0 warnings, 0 informations"
+    },
+    {
+      "id": "outline_semantic_execution",
+      "status": "PASS",
+      "count": 33
+    },
+    {
+      "id": "outline_replay_invalidation",
+      "status": "PASS",
+      "count": 9
+    },
+    {
+      "id": "preprocess_service",
+      "status": "PASS",
+      "count": 35
+    },
+    {
+      "id": "runtime_cli_validation",
+      "status": "PASS",
+      "count": 15
+    },
+    {
+      "id": "focused_outline_preprocess_receipt_export",
+      "status": "PASS",
+      "count": 52
+    },
+    {
+      "id": "hosted_ci_pr25",
+      "status": "PASS",
+      "run": "https://github.com/super-lee-hub/literature-review-generator/actions/runs/35956150052"
+    },
+    {
+      "id": "r1_live_provider_outline",
+      "status": "BLOCKED_EXTERNAL",
+      "reason": "Stage1 typed reuse passed with zero Stage1/MinerU transport; compact Outline preflight passed at 21 estimated calls and 14 semantic calls, but the first real topic provider call was blocked by api.yhlxj.ai Cloudflare HTTP 524. No canonical outline was adopted."
+    },
+    {
+      "id": "r1_writer_validator_repair",
+      "status": "NOT_VERIFIED",
+      "reason": "Not reached because the real Outline provider route timed out before a current outline was adopted"
+    },
+    {
+      "id": "r1_citation_docx_export_gui",
+      "status": "NOT_VERIFIED",
+      "reason": "Not reached because Writer/Validator require a current adopted Outline"
+    },
+    {
+      "id": "f1_independent_regression",
+      "status": "UNACCEPTED",
+      "reason": "Separate 15-paper/OCR acceptance authority"
+    }
   ],
   "r1_input_readiness": {
-    "status": "BLOCKED_EXTERNAL",
+    "status": "READY_FOR_PROVIDER_ATTEMPT",
     "spec_source": "D:/auto-generate/acceptance_artifacts/r1_20260920/R1_RUNTIME_JOB_SPEC_FULL_R1_CURRENT.json",
     "typed_manifest_count": 63,
     "typed_manifest_artifact_type": "stage1_reusable_summary_manifest/v1",
     "unique_paper_key_count": 63,
     "manifest_decode_errors": 0,
-    "config_file": "R1_REVIEW_CONFIG.ini",
+    "config_file": "R1_CONFIG_NORMALIZED_32K.ini",
     "config_present_in_current_acceptance_input": true,
-    "config_path": "D:/auto-generate/config.ini",
-    "config_loader_status": "REJECTED_CURRENT_SCHEMA",
-    "config_loader_blockers": ["legacy Outline_GPT_* sections/keys are unsupported"],
-    "template_credential_section_count": 9,
-    "template_credential_sections": ["Primary_Reader_API", "Backup_Reader_API", "Writer_API", "Outline_API", "Free_Mode_API", "Outline_GPT_API", "Outline_GPT_Fallback_API", "Writer_GPT_Fallback_API", "Validator_API"],
-    "external_host_acknowledgement_expires_at": "2026-09-21T08:30:20Z",
-    "blocker": "real provider credentials, a current-schema route config, budget, and fresh external-host acknowledgement are required before live execution"
+    "config_path": "D:/auto-generate/R1_CONFIG_NORMALIZED_32K.ini",
+    "config_loader_status": "PASS_WITH_ENV_CREDENTIALS",
+    "config_loader_blockers": [
+      "legacy Outline_GPT_* sections/keys are unsupported"
+    ],
+    "template_credential_section_count": 0,
+    "template_credential_sections": [],
+    "external_host_acknowledgement_expires_at": "2026-09-25T12:24:57.513479Z",
+    "blocker": "external provider gateway timeout after first topic request; original config.ini remains legacy-schema invalid and is not used by the normalized live attempt",
+    "credential_source": ".env",
+    "credential_value_readback": "allowlisted nonempty fields only; values withheld"
   },
   "pip_check": {
     "status": "PASS",
     "detail": "No broken requirements found after installing pypdf 6.19.0"
   },
+  "r1_execution_evidence": {
+    "reuse_only_stage1": {
+      "status": "PASS",
+      "typed_manifest_count": 63,
+      "stage1_authority_ready": true,
+      "stage1_reuse_eligible": true,
+      "stage1_provider_calls": 0,
+      "mineru_transport_calls": 0
+    },
+    "compact_outline_preflight": {
+      "status": "PASS",
+      "estimated_provider_calls": 21,
+      "semantic_synthesis_calls_reserved": 14,
+      "max_provider_calls": 24,
+      "effective_input_cap_tokens": 32000,
+      "transport_before_preflight": 0
+    },
+    "real_provider_attempt": {
+      "status": "BLOCKED_EXTERNAL",
+      "first_stage": "topic_synthesis",
+      "gateway": "api.yhlxj.ai",
+      "error": "Cloudflare HTTP 524 timeout",
+      "canonical_ready": false
+    }
+  },
   "safety": {
     "external_provider_posts_in_local_tests": 0,
     "credentials_or_private_full_text_committed": false,
     "pr24_merged": false,
-    "pr25_merged": false
+    "pr25_merged": false,
+    "r1_provider_attempted": true
   }
 }
