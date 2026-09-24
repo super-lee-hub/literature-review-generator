@@ -40,9 +40,14 @@
     "unique_paper_key_count": 63,
     "manifest_decode_errors": 0,
     "config_file": "R1_REVIEW_CONFIG.ini",
-    "config_present_in_current_acceptance_input": false,
+    "config_present_in_current_acceptance_input": true,
+    "config_path": "D:/auto-generate/config.ini",
+    "config_loader_status": "REJECTED_CURRENT_SCHEMA",
+    "config_loader_blockers": ["legacy Outline_GPT_* sections/keys are unsupported"],
+    "template_credential_section_count": 9,
+    "template_credential_sections": ["Primary_Reader_API", "Backup_Reader_API", "Writer_API", "Outline_API", "Free_Mode_API", "Outline_GPT_API", "Outline_GPT_Fallback_API", "Writer_GPT_Fallback_API", "Validator_API"],
     "external_host_acknowledgement_expires_at": "2026-09-21T08:30:20Z",
-    "blocker": "fresh owner-supplied provider config, credentials, budget, and external-host acknowledgement are required before live execution"
+    "blocker": "real provider credentials, a current-schema route config, budget, and fresh external-host acknowledgement are required before live execution"
   },
   "pip_check": {
     "status": "PASS",

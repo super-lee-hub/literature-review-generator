@@ -83,10 +83,11 @@ for the active Python 3.13 environment. PDF/DOCX/export focused tests passed
   `NOT_VERIFIED`, never PASS.
 - The historical R1 spec was machine-checked read-only: 63 typed
   `stage1_reusable_summary_manifest/v1` files exist and decode with 63 unique
-  paper keys. Its referenced `R1_REVIEW_CONFIG.ini` is absent from the current
-  acceptance input, and its external-host acknowledgement expired on
-  2026-09-21, so it cannot be promoted into a live run without a fresh owner
-  supplied config/acknowledgement.
+  paper keys. The user-authorized `D:\\auto-generate\\config.ini` is present,
+  but the current loader rejects its legacy `Outline_GPT_*` sections and all
+  nine API keys are classified as template credentials. Its historical
+  external-host acknowledgement expired on 2026-09-21, so a live run still
+  requires real credentials and a fresh acknowledgement.
 - F1 remains an independent regression corpus and is `UNACCEPTED`; no R1
   evidence is promoted to F1.
 - Full-repository Ruff still reports pre-existing unused-import and duplicate
