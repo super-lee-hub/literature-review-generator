@@ -33,8 +33,8 @@
     {"id": "f1_independent_regression", "status": "UNACCEPTED", "reason": "Separate 15-paper/OCR acceptance authority"}
   ],
   "pip_check": {
-    "status": "ENVIRONMENT_GAP",
-    "detail": "fusion-reviewer 0.2.0 requires pypdf, which is not installed"
+    "status": "PASS",
+    "detail": "No broken requirements found after installing pypdf 6.19.0"
   },
   "safety": {
     "external_provider_posts_in_local_tests": 0,

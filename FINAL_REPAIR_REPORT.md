@@ -56,9 +56,9 @@ Fresh local checks on this code commit:
 - Runtime/CLI/validation/review generation group: 15 passed.
 - Additional focused provider/outline tests: 52 passed.
 
-The environment-wide `pip check` is not clean because the installed
-`fusion-reviewer 0.2.0` package requires an absent `pypdf`; this is an
-environment dependency gap, not a failure in the changed modules.
+The environment-wide `pip check` is now clean after installing `pypdf 6.19.0`
+for the active Python 3.13 environment. PDF/DOCX/export focused tests passed
+20/20 after installation.
 
 ## Remaining acceptance boundaries
 
