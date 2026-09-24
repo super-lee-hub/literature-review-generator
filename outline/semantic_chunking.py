@@ -293,22 +293,27 @@ def _make_dossier(view: Any, summary: Mapping[str, Any]) -> PaperEvidenceDossier
             if ids:
                 claims.append(claim)
 
+    evidence_id_diagnostics: List[str] = []
     for field_name, claim_type, source_key in (
         ("author_proposed_gap", "author_proposed_gap", "research_gaps"),
         ("author_future_direction", "author_proposed_gap", "future_directions"),
     ):
         values = list(view.research_gaps if source_key == "research_gaps" else view.future_directions)
+        ids = add_field(source_key, values, f"stage1:ai_summary.{source_key}")
         for index, text in enumerate(_stable_unique(values)):
-            add_field(source_key, [text], f"stage1:ai_summary.{source_key}")
-            claim, _ = _claim(
+            claim, evidence_id = _claim(
                 paper_id=paper_id,
                 source_hash=source_hash,
                 claim_type=claim_type,
                 text=text,
-                field_name=field_name,
+                field_name=source_key,
                 index=index,
                 locator=f"stage1:ai_summary.{source_key}",
             )
+            if index >= len(ids) or ids[index] != evidence_id:
+                evidence_id_diagnostics.append(
+                    f"evidence_id_mismatch:{paper_id}:{source_key}:{index}"
+                )
             claims.append(claim)
 
     explicit_reviewer_inferences = _collect_paths(ai_summary, ("reviewer_inference", "reviewer_inferences"))
@@ -345,18 +350,27 @@ def _make_dossier(view: Any, summary: Mapping[str, Any]) -> PaperEvidenceDossier
                 ("boundaries", unit_boundaries, "author_interpretation"),
             ):
                 for claim_index, text in enumerate(values):
+                    field_key = f"{study_id}:{field_name}"
                     claim, evidence_id = _claim(
                         paper_id=paper_id,
                         source_hash=source_hash,
                         claim_type=claim_type,
                         text=text,
-                        field_name=f"{study_id}:{field_name}",
+                        field_name=field_key,
                         index=claim_index,
                         study_id=study_id,
                         locator=locator,
                     )
                     unit_claims.append(claim)
                     evidence_text_by_id[evidence_id] = text
+                    evidence_ids_by_field[field_key] = _stable_unique([
+                        *evidence_ids_by_field.get(field_key, []),
+                        evidence_id,
+                    ])
+                    source_locators[field_key] = _stable_unique([
+                        *source_locators.get(field_key, []),
+                        locator,
+                    ])
             units.append(ResearchUnit(
                 study_id=study_id,
                 parent_paper_id=paper_id,
@@ -404,6 +418,7 @@ def _make_dossier(view: Any, summary: Mapping[str, Any]) -> PaperEvidenceDossier
         ))
 
     diagnostics: List[str] = [str(item) for item in (getattr(view, "diagnostics", ()) or ())]
+    diagnostics.extend(evidence_id_diagnostics)
     if not claims:
         diagnostics.append("no_structured_claims_in_stage1_summary")
     status = "ready" if not diagnostics else "partial"
@@ -1167,6 +1182,17 @@ def build_semantic_chunk_plan(
         retry_fallback_reserve=retry_fallback_reserve,
     )
     diagnostics = list(content_layers.blocking_diagnostics)
+    incomplete_selected = [
+        item for item in selected_relation_bundles if not item.is_complete
+    ]
+    for bundle in incomplete_selected:
+        diagnostics.append({
+            "code": "relation_evidence_incomplete",
+            "severity": "blocking",
+            "relation_id": bundle.relation_id,
+            "missing_evidence_ids": list(bundle.missing_evidence_ids),
+            "message": "A selected relation has no complete dossier evidence; it must remain insufficient_evidence until the missing unit is materialized.",
+        })
     if not budgets["within_physical_call_limit"]:
         diagnostics.append({
             "code": "physical_call_budget_exceeded",

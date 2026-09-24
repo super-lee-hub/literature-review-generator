@@ -1288,7 +1288,8 @@ class RelationEvidenceBundle:
             raise ValueError(f"unsupported relation decision: {self.decision!r}")
         required = set(_stable_unique(self.required_evidence_ids))
         provided = set(_stable_unique(self.provided_evidence_ids))
-        missing = sorted(required - provided)
+        explicit_missing = set(_stable_unique(self.missing_evidence_ids))
+        missing = sorted((required - provided) | explicit_missing)
         object.__setattr__(self, "required_evidence_ids", _stable_unique(required))
         object.__setattr__(self, "provided_evidence_ids", _stable_unique(provided))
         object.__setattr__(self, "missing_evidence_ids", _stable_unique(missing))
@@ -1298,16 +1299,17 @@ class RelationEvidenceBundle:
             # promoted to a substantive positive or negative judgment.
             if self.decision in {"supported", "contradicted"}:
                 object.__setattr__(self, "decision", "insufficient_evidence")
+        elif self.diagnostics and any(
+            marker in " ".join(self.diagnostics).casefold()
+            for marker in ("missing", "not_inspected", "dossier")
+        ):
+            object.__setattr__(self, "evidence_completeness", "incomplete")
         else:
             object.__setattr__(self, "evidence_completeness", "complete")
-            if self.decision == "insufficient_evidence":
-                # Complete evidence can still be non-comparable; it is not a
-                # missing-evidence rejection.
-                object.__setattr__(self, "decision", "not_comparable")
 
     @property
     def is_complete(self) -> bool:
-        return not set(self.required_evidence_ids) - set(self.provided_evidence_ids)
+        return self.evidence_completeness == "complete" and not self.missing_evidence_ids
 
     @property
     def completeness_ratio(self) -> float:

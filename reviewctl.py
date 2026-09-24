@@ -368,11 +368,13 @@ def _exit_code(command: str, payload: dict[str, Any]) -> int:
         return 0 if bool(payload.get("ok")) else 1
     if command == "acceptance-run":
         return 0 if bool(payload.get("ok")) else 1
-    if command in {"status", "inspect", "next-action", "reconcile", "repair-plan", "validate", "validation-status", "attest", "export", "queue-list", "chunk-plan"}:
+    if command in {"status", "inspect", "next-action", "reconcile", "repair-plan", "validate", "validation-status", "attest", "export", "queue-list"}:
         return 0
+    if command == "chunk-plan":
+        return 0 if payload.get("status") in {"planned", "complete", "available"} else 1
     if command == "config-migrate":
         return 0 if payload.get("status") == "ok" else 1
-    if command in {"retry-node", "repair-apply", "repair-promote", "cancel", "adopt", "queue-add", "queue-run", "queue-retry", "queue-cancel", "queue-remove", "queue-export", "queue-import"}:
+    if command in {"retry-node", "repair-apply", "repair-promote", "cancel", "pause", "adopt", "queue-add", "queue-run", "queue-retry", "queue-cancel", "queue-remove", "queue-export", "queue-import"}:
         success_statuses = {"available", "complete", "succeeded", "already_adopted", "planned", "requested", "paused", "added", "removed", "exported", "imported", "promoted", "already_promoted"}
         if command == "queue-run":
             success_statuses.update({"completed", "idle"})

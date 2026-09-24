@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
-from services.artifact_registry import ArtifactRecord, ArtifactRegistry
+from services.artifact_registry import ArtifactRecord, ArtifactRegistry, file_sha256
 from services.job_workspace import JobWorkspace, atomic_write_json, utc_now_iso
 
 
@@ -89,6 +89,17 @@ class PauseStateStore:
             raise PauseRequestedError("CONTROL_STATE_INVALID: pause marker identity does not match the job")
         if state.state not in {RUNNABLE, PAUSED_BY_USER}:
             raise PauseRequestedError("CONTROL_STATE_INVALID: pause marker has an unsupported state")
+        if self.registry is not None:
+            record = self.registry.get(self.artifact_id)
+            if (
+                record is None
+                or record.status != "ready"
+                or str(record.path) != str(self.path)
+                or str(record.content_hash or "") != file_sha256(self.path)
+            ):
+                raise PauseRequestedError(
+                    "CONTROL_STATE_INVALID: pause marker is not backed by the current Registry record"
+                )
         return state
 
     def _persist(self, state: PauseStateV1, *, producer: str) -> ArtifactRecord | None:

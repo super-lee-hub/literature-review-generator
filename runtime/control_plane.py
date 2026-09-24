@@ -587,20 +587,82 @@ class ReviewControlPlane:
 
         if not summary_files:
             raise ControlPlaneError("chunk-plan requires at least one --summary-file")
+        output_resolved = (
+            Path(output_path).expanduser().resolve(strict=False)
+            if output_path
+            else None
+        )
         summaries: list[dict[str, Any]] = []
         source_paths: list[str] = []
         for raw_path in summary_files:
             path = Path(raw_path).expanduser().resolve()
             if not path.is_file():
                 raise ControlPlaneError(f"summary file does not exist: {path}")
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            if output_resolved is not None and path == output_resolved:
+                raise ControlPlaneError(
+                    "chunk-plan output must differ from every read-only summary input"
+                )
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise ControlPlaneError(f"unable to read summary file {path}: {exc}") from exc
+            # Accept the typed Stage 1 authority manifest without treating the
+            # manifest itself as a summary.  Its materialized payload is still
+            # verified and read through this same bounded path.
+            if isinstance(payload, Mapping) and str(payload.get("artifact_type") or "") in {
+                "stage1_reusable_summary_manifest",
+                "summary_source_manifest",
+            }:
+                referenced = (
+                    payload.get("materialized_summary_file")
+                    or payload.get("canonical_summary_file")
+                    or payload.get("summary_file")
+                )
+                if referenced:
+                    materialized = Path(str(referenced))
+                    if not materialized.is_absolute():
+                        materialized = path.parent / materialized
+                    materialized = materialized.expanduser().resolve()
+                    if output_resolved is not None and materialized == output_resolved:
+                        raise ControlPlaneError(
+                            "chunk-plan output must differ from the manifest materialized summary"
+                        )
+                    if not materialized.is_file():
+                        raise ControlPlaneError(
+                            f"typed summary manifest references a missing materialized summary: {materialized}"
+                        )
+                    expected_hash = str(
+                        payload.get("materialized_summary_file_hash")
+                        or payload.get("summary_file_hash")
+                        or ""
+                    ).strip().lower()
+                    if expected_hash and file_sha256(materialized) != expected_hash:
+                        raise ControlPlaneError(
+                            f"typed summary manifest hash mismatch for {materialized}"
+                        )
+                    try:
+                        payload = json.loads(materialized.read_text(encoding="utf-8"))
+                    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                        raise ControlPlaneError(
+                            f"unable to read materialized summary file {materialized}: {exc}"
+                        ) from exc
+                    source_paths.append(str(materialized))
+                else:
+                    embedded = payload.get("summary_payload")
+                    if isinstance(embedded, Mapping):
+                        payload = embedded
+                    else:
+                        raise ControlPlaneError(
+                            "typed summary manifest must provide materialized_summary_file or summary_payload"
+                        )
             rows = payload.get("summaries") if isinstance(payload, Mapping) else payload
             if isinstance(rows, Mapping):
                 rows = [rows]
             if not isinstance(rows, list) or not all(isinstance(item, Mapping) for item in rows):
                 raise ControlPlaneError(f"summary file must contain a JSON array or summaries array: {path}")
             summaries.extend(dict(item) for item in rows)
-            source_paths.append(str(path))
+            if str(path) not in source_paths:
+                source_paths.append(str(path))
         evidence = build_outline_evidence_views(summaries, str(job_id))
         ledger = build_global_corpus_ledger(evidence)
         matrix = build_multi_view_matrix(evidence)
@@ -651,6 +713,10 @@ class ReviewControlPlane:
         }
         if output_path:
             target = Path(output_path).expanduser().resolve()
+            if target in {Path(item).expanduser().resolve() for item in source_paths}:
+                raise ControlPlaneError(
+                    "chunk-plan output must differ from every resolved summary source"
+                )
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
             payload["output_path"] = str(target)
@@ -4278,6 +4344,13 @@ class ReviewControlPlane:
                 cancel_store.clear(cleared_by="reviewctl", reason="resume_requested")
         except (OSError, RegistryError, ValueError, TypeError) as exc:
             raise ControlPlaneError(f"resume cancellation state is invalid: {exc}") from exc
+        try:
+            pause_store = PauseStateStore(workspace_obj, registry)
+            pause_state = pause_store.read()
+            if pause_state is not None and pause_state.paused:
+                pause_store.clear(cleared_by="reviewctl", reason="explicit_resume")
+        except (OSError, RegistryError, ValueError, TypeError, RuntimeError) as exc:
+            raise ControlPlaneError(f"resume pause state is invalid: {exc}") from exc
         payload = self._run_spec(
             spec_path,
             resume=True,
