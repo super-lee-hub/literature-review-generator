@@ -537,6 +537,7 @@ class OutlineV3Executor:
                 pass
         self._replay_store = ModelCallReplayStore(self.workspace)
         self._expected_provider_calls: dict[str, ExpectedProviderCall] = {}
+        self._dynamic_provider_bindings: dict[str, dict[str, Any]] = {}
         self._pending_replays: dict[str, tuple[ModelCallReplayKey, str, str]] = {}
         self._replay_evidence: list[dict[str, Any]] = []
         self._replay_receipt_sources: dict[str, ArtifactRecord] = {}
@@ -2227,12 +2228,21 @@ class OutlineV3Executor:
                 "cross_group_comparison_provider",
                 "global_synthesis_provider",
             ))
+            or (
+                self.semantic_provider_synthesis_enabled
+                and node_id in {"topic_synthesis", "cross_group_comparison", "global_synthesis"}
+            )
             or any(
                 node_id.startswith(f"{role}:")
                 for role in ("structure_critique", "coverage_critique", "evidence_critique")
             )
         )
-        resolved_route = route if route is not None else (self._node_route(node_id) if provider_node else None)
+        resolved_route = route if route is not None else (
+            self._node_route("candidate_1_provider_generation")
+            if self.semantic_provider_synthesis_enabled
+            and node_id in {"topic_synthesis", "cross_group_comparison", "global_synthesis"}
+            else (self._node_route(node_id) if provider_node else None)
+        )
         if provider_node and resolved_route is not None:
             bind_provider = resolved_route.provider_name
             bind_model = resolved_route.model
@@ -2944,7 +2954,7 @@ class OutlineV3Executor:
             job_id=self.job_id,
             attempt_id=call_id,
             stage_name="outline_v3",
-            node_id=semantic_node_id,
+            node_id=self._semantic_receipt_node_id(semantic_node_id),
             closure_epoch_id=self.closure_epoch_id,
             logical_attempt_identity=self.logical_attempt_identity,
             expected_call_graph_hash=self.expected_call_graph_hash,
@@ -3206,9 +3216,41 @@ class OutlineV3Executor:
         if not Path(path).is_file():
             return None
         if node.execution_binding != binding:
-            if node.status == "succeeded":
+            semantic_static = (
+                self.semantic_provider_synthesis_enabled
+                and node_id in {"topic_synthesis", "cross_group_comparison", "global_synthesis"}
+            )
+            if semantic_static and node.status == "succeeded":
+                identity_fields = (
+                    "provider_route",
+                    "provider_family",
+                    "model_name",
+                    "endpoint_type",
+                    "route_fingerprint",
+                    "context_profile_hash",
+                    "current_summary_hashes",
+                    "review_intent_hash",
+                    "coverage_contract_hash",
+                    "quality_gate_hash",
+                )
+                if all(
+                    str(node.execution_binding.get(field) or "")
+                    == str(binding.get(field) or "")
+                    for field in identity_fields
+                ):
+                    # Derived semantic artifacts may carry provider output
+                    # hashes whose dependency projection changes when the
+                    # Registry is rehydrated.  Source/config identity is the
+                    # reusable boundary; the provider receipts remain bound
+                    # to their own immutable response artifacts.
+                    binding = dict(node.execution_binding)
+            if node.execution_binding == binding:
+                pass
+            elif node.status == "succeeded":
                 self._dag = self._node_store.invalidate_subgraph(node_id, reason="execution_binding_changed")
-            return None
+                return None
+            else:
+                return None
         try:
             value = json.loads(Path(path).read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
@@ -3654,6 +3696,55 @@ class OutlineV3Executor:
                 registered_artifact_hash=artifact.content_hash,
                 node_output_hash=artifact.content_hash,
             )
+            pending = self._pending_replays.pop(node_id, None)
+            if pending is not None and expected.normalized_output_hash:
+                replay_key, normalized_hash, receipt_id = pending
+                self._replay_store.append(
+                    replay_key,
+                    output_hash=normalized_hash,
+                    normalized_output_hash=normalized_hash,
+                    registered_artifact_hash=artifact.content_hash,
+                    node_output_hash=artifact.content_hash,
+                    output_artifact_ids=(artifact_id,),
+                    receipt_ids=(receipt_id,),
+                    audit_node_id=node_id,
+                    closure_epoch_id=self.closure_epoch_id,
+                )
+                self._expected_provider_calls[expected.call_id] = replace(
+                    self._expected_provider_calls[expected.call_id],
+                    replay_output_hash=normalized_hash,
+                )
+            base_node = self._semantic_receipt_node_id(node_id)
+            base_record = self.artifact_records.get(base_node)
+            binding = self._dynamic_provider_bindings.get(node_id)
+            if base_record is not None and binding is not None:
+                static_binding = self.build_current_node_binding(base_node)
+                base_output_hash = base_record.content_hash
+                try:
+                    base_envelope = json.loads(Path(base_record.path).read_text(encoding="utf-8"))
+                    if isinstance(base_envelope, Mapping) and str(base_envelope.get("content_hash") or ""):
+                        base_output_hash = str(base_envelope["content_hash"])
+                except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
+                    pass
+                receipt_ids = [
+                    receipt.receipt_id
+                    for receipt in self._receipt_ledger.list_receipts()
+                    if receipt.call_id == expected.call_id
+                ]
+                self._dag = self._node_store.record_node(
+                    base_node,
+                    status="succeeded",
+                    input_hash=_hash_payload(dict(static_binding.get("dependency_hashes") or {})),
+                    output_hash=base_output_hash,
+                    output_artifact_ids=(base_record.artifact_id,),
+                    model_route=str(static_binding.get("provider_route") or ""),
+                    model_name=str(static_binding.get("model_name") or ""),
+                    provider=str(static_binding.get("provider_family") or ""),
+                    config_snapshot={"candidate_count": self.candidate_count},
+                    budget_snapshot={"input_budget": self._node_route("candidate_1_provider_generation").profile.input_budget},
+                    receipt_ids=receipt_ids,
+                    execution_binding=static_binding,
+                )
         return record
 
     def _critique_artifact_class(self, node_id: str) -> type[OutlineArtifact]:
@@ -4121,6 +4212,17 @@ class OutlineV3Executor:
             ),
         )
 
+    @staticmethod
+    def _semantic_receipt_node_id(node_id: str) -> str:
+        text = str(node_id or "")
+        if text.startswith("topic_synthesis_provider"):
+            return "topic_synthesis"
+        if text.startswith("cross_group_comparison_provider"):
+            return "cross_group_comparison"
+        if text.startswith("global_synthesis_provider"):
+            return "global_synthesis"
+        return text
+
     def _provider_call(
         self,
         node_id: str,
@@ -4204,10 +4306,11 @@ class OutlineV3Executor:
         if transport_node_id is not None:
             binding_kwargs["route"] = route
         binding = self._provider_binding(node_id, request, **binding_kwargs)
+        self._dynamic_provider_bindings[node_id] = dict(binding)
         call_id = self._register_expected_from_binding(node_id, binding)
         semantic_node_id = self._semantic_node_id(node_id)
         replay_key = ModelCallReplayKey(
-            node_id=semantic_node_id,
+            node_id=self._semantic_receipt_node_id(semantic_node_id),
             node_version="v3",
             schema_version="outline-v3",
             model_route=route.config_section or route.provider_name,
@@ -4369,7 +4472,7 @@ class OutlineV3Executor:
             attempt_id=call_id,
             stage_name="outline_v3",
             route=semantic_node_id,
-            node_id=semantic_node_id,
+            node_id=self._semantic_receipt_node_id(semantic_node_id),
             call_id=call_id,
             closure_epoch_id=self.closure_epoch_id,
             logical_attempt_identity=self.logical_attempt_identity,
@@ -5790,8 +5893,31 @@ class OutlineV3Executor:
                 "deterministic",
                 "local",
             ))
+            def _semantic_node_reusable(node_id: str) -> bool:
+                try:
+                    existing = self._dag.get(node_id)
+                    if existing.status != "succeeded" or not existing.execution_binding:
+                        return False
+                    current = self.build_current_node_binding(node_id)
+                    identity_fields = (
+                        "provider_route",
+                        "provider_family",
+                        "model_name",
+                        "endpoint_type",
+                        "route_fingerprint",
+                        "context_profile_hash",
+                    )
+                    return all(
+                        str(existing.execution_binding.get(field) or "")
+                        == str(current.get(field) or "")
+                        for field in identity_fields
+                    )
+                except (KeyError, ValueError, TypeError):
+                    return False
+
+            topic_semantic_reused = _semantic_node_reusable("topic_synthesis")
             semantic_provider_results: list[dict[str, Any]] = []
-            if self.semantic_provider_synthesis_enabled and topic_plan:
+            if self.semantic_provider_synthesis_enabled and topic_plan and not topic_semantic_reused:
                 topic_batches: list[list[TopicSynthesis]] = []
                 current_batch: list[TopicSynthesis] = []
                 current_size = 0
@@ -5857,6 +5983,8 @@ class OutlineV3Executor:
                     "diagnostics": [] if matching else ["offline/local route retained deterministic projection; no external synthesis call was admitted"],
                 })
                 topic_payloads.append(topic_payload)
+            if topic_semantic_reused:
+                semantic_provider_results = []
             topic_synthesis = self._run_node("topic_synthesis", lambda: (
                 self._artifact(
                     OutlineArtifact,
@@ -5889,7 +6017,8 @@ class OutlineV3Executor:
                 result["artifact_id"] = record.artifact_id
                 result["artifact_hash"] = record.content_hash
             cross_provider_result: dict[str, Any] | None = None
-            if self.semantic_provider_synthesis_enabled:
+            cross_semantic_reused = _semantic_node_reusable("cross_group_comparison")
+            if self.semantic_provider_synthesis_enabled and not cross_semantic_reused:
                 candidate_relation_payloads = [item.to_dict() for item in candidate_map_model.relations]
                 cross_provider_result = self._run_semantic_provider_call(
                     "cross_group_comparison_provider",
@@ -5940,7 +6069,8 @@ class OutlineV3Executor:
                     dependency_hashes={"topic_synthesis": _hash_payload(topic_synthesis), "semantic_chunk_plan": _hash_payload(semantic_chunk_plan)},
                 )
             global_provider_result: dict[str, Any] | None = None
-            if self.semantic_provider_synthesis_enabled:
+            global_semantic_reused = _semantic_node_reusable("global_synthesis")
+            if self.semantic_provider_synthesis_enabled and not global_semantic_reused:
                 global_provider_result = self._run_semantic_provider_call(
                     "global_synthesis_provider",
                     {
