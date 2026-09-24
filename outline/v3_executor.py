@@ -1885,7 +1885,15 @@ class OutlineV3Executor:
                     candidate_route.profile,
                     variant_name=variant_name,
                 )
-                if candidate_shard_count > 1:
+                candidate_plan_estimate = max(
+                    (
+                        int(plan.estimated_input_tokens)
+                        for plan in self.provider_call_plans
+                        if str(plan.node_id).endswith("_provider_generation")
+                    ),
+                    default=int(_candidate_input),
+                )
+                if candidate_shard_count > 1 and candidate_plan_estimate > int(self.technical_shard_target_tokens):
                     hierarchical_candidate_shard_calls += self.candidate_count * (candidate_shard_count - 1)
             if hierarchical_candidate_shard_calls:
                 candidate_route = self._role_route("candidate_1_provider_generation")
@@ -1919,7 +1927,16 @@ class OutlineV3Executor:
                     # calls.  The provider-call plan already contains one
                     # static relation row, so only the surplus dynamic calls
                     # belong in the extra-call budget.
-                    hierarchical_relation_shard_calls += max(0, relation_call_count - 1)
+                    relation_plan_estimate = max(
+                        (
+                            int(plan.estimated_input_tokens)
+                            for plan in self.provider_call_plans
+                            if plan.node_id == "relation_adjudication"
+                        ),
+                        default=int(_relation_input),
+                    )
+                    if relation_plan_estimate > int(self.technical_shard_target_tokens):
+                        hierarchical_relation_shard_calls += max(0, relation_call_count - 1)
             if hierarchical_relation_shard_calls:
                 relation_route = self._role_route("relation_adjudication")
                 relation_output = max(1, int(relation_route.profile.max_output_tokens))
@@ -6238,9 +6255,19 @@ class OutlineV3Executor:
                 "relation_shard_plan": _hash_payload(relation_shard_plan),
                 "semantic_chunk_plan": _hash_payload(semantic_chunk_plan),
             }
+            relation_route = self._role_route("relation_adjudication")
+            relation_budget = relation_route.profile.estimate_request(relation_request)
+            relation_estimated_input = int(
+                relation_budget.get("estimated_input_tokens")
+                or relation_route.profile.estimate_tokens(relation_request)
+            )
+            relation_target = int(self.technical_shard_target_tokens or 0)
             use_hierarchical_relations = (
-                self.technical_shard_target_tokens > 0
-                and int(relation_shard_plan_payload.get("shard_count") or 0) > 1
+                relation_target > 0
+                and (
+                    relation_estimated_input > relation_target
+                    or not bool(relation_budget.get("within_budget"))
+                )
                 and not (
                     self.enabled_semantic_roles is not None
                     and "relation_adjudication" not in self.enabled_semantic_roles
