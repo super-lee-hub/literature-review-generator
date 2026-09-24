@@ -11,9 +11,9 @@
   "identity": {
     "base_sha": "bf00852fb627ac0519d96287d2d27b36f17a99ea",
     "executable_sha": "75c7a9024627b4149d435bd42bdf8be4844afe10",
-    "evidence_head_sha": "899fb97754e8be8e98425dea421fe6116e388021",
+    "evidence_head_sha": "850b094e2af3f2bda3af1a4cc9ca82e1e86a0447",
     "remote_branch": "codex/r1-outline-final-repair",
-    "remote_sha_readback": "899fb97754e8be8e98425dea421fe6116e388021",
+    "remote_sha_readback": "850b094e2af3f2bda3af1a4cc9ca82e1e86a0447",
     "pr": "https://github.com/super-lee-hub/literature-review-generator/pull/25",
     "existing_pr_24": "https://github.com/super-lee-hub/literature-review-generator/pull/24",
     "merge_status": "UNMERGED"
@@ -27,7 +27,7 @@
     {"id": "preprocess_service", "status": "PASS", "count": 35},
     {"id": "runtime_cli_validation", "status": "PASS", "count": 15},
     {"id": "focused_outline_preprocess_receipt_export", "status": "PASS", "count": 52},
-    {"id": "hosted_ci_pr25", "status": "PENDING", "run": "https://github.com/super-lee-hub/literature-review-generator/actions/runs/35944006722", "head_sha": "899fb97754e8be8e98425dea421fe6116e388021"},
+    {"id": "hosted_ci_pr25", "status": "PENDING", "run": "https://github.com/super-lee-hub/literature-review-generator/actions/runs/35944006722", "head_sha": "850b094e2af3f2bda3af1a4cc9ca82e1e86a0447"},
     {"id": "r1_live_provider_outline", "status": "BLOCKED_EXTERNAL", "reason": "No live provider execution was authorized or performed in this coding turn"},
     {"id": "r1_writer_validator_repair", "status": "NOT_VERIFIED", "reason": "Depends on a successful current R1 outline"},
     {"id": "r1_citation_docx_export_gui", "status": "NOT_VERIFIED", "reason": "Depends on Writer/Validator and live current artifact set"},
