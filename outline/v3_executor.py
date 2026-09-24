@@ -3685,6 +3685,8 @@ class OutlineV3Executor:
             artifact_id=artifact_id,
             metadata={"job_id": self.job_id, "node_id": node_id, "content_hash": artifact.content_hash},
         )
+        self.artifact_paths[node_id] = record.path
+        self.artifact_records[node_id] = record
         expected = self._expected_provider_calls.get(self._provider_call_id(node_id))
         if expected is not None:
             self._expected_provider_calls[expected.call_id] = replace(
@@ -8062,6 +8064,22 @@ class OutlineV3Executor:
                 expected.node_id
                 for expected in canonical_expected
                 if expected.node_id in self.artifact_records
+            )
+            # Dynamic semantic synthesis calls expose a physical response
+            # artifact whose receipt node is normalized to the static DAG
+            # node for replay/readback.  Include that exact Registry record in
+            # the closure dependencies as well, otherwise validation sees a
+            # valid expected path that is absent from the closure dependency
+            # projection and marks the whole job blocked.
+            expected_artifact_paths = {
+                str(expected.artifact_path).lower()
+                for expected in canonical_expected
+                if str(expected.artifact_path or "")
+            }
+            closure_dependency_ids.extend(
+                artifact_id
+                for artifact_id, record in self.artifact_records.items()
+                if str(record.path).lower() in expected_artifact_paths
             )
             closure_dependencies = {
                 key: self.artifact_records[key].content_hash
