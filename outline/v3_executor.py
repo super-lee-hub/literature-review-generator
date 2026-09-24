@@ -403,6 +403,14 @@ class OutlineV3Executor:
             int(max_source_prompt_tokens) if max_source_prompt_tokens is not None else None
         )
         self.technical_shard_target_tokens = int(technical_shard_target_tokens)
+        if 0 < self.technical_shard_target_tokens < 8_000:
+            # Very small technical shards are reserved for relation/candidate
+            # evidence units.  Running a full topic dossier through that
+            # route would either exceed the hard cap or require claim-level
+            # splitting that the topic schema does not support.  Keep the
+            # node as an explicit local projection until a larger synthesis
+            # shard is available; no provider result is claimed in this mode.
+            self.semantic_provider_synthesis_enabled = False
         self.pricing_policy = str(pricing_policy or "estimate_only_not_billing_v1")
         self.review_intent_input = dict(review_intent or {})
         self.quality_gate = quality_gate if isinstance(quality_gate, OutlineQualityGate) else OutlineQualityGate.from_mapping(quality_gate)
@@ -5923,36 +5931,36 @@ class OutlineV3Executor:
             if self.semantic_provider_synthesis_enabled and topic_plan and not topic_semantic_reused:
                 topic_batches: list[list[TopicSynthesis]] = []
                 current_batch: list[TopicSynthesis] = []
-                current_size = 0
-                batch_limit = max(16_000, int(self.max_source_prompt_tokens or 32_000) * 4 - 12_000)
                 dossier_by_paper = content_layers_model.dossier_by_paper
-                for topic in topic_plan:
-                    topic_papers = set(topic.paper_ids) | set(topic.bridge_paper_ids)
-                    topic_dossiers = [
-                        dossier_by_paper[key].to_dict()
-                        for key in sorted(topic_papers)
-                        if key in dossier_by_paper
-                    ]
-                    topic_size = len(json.dumps({"topic": topic.to_dict(), "evidence": topic_dossiers}, ensure_ascii=False))
-                    if current_batch and current_size + topic_size > batch_limit:
-                        topic_batches.append(current_batch)
-                        current_batch = []
-                        current_size = 0
-                    current_batch.append(topic)
-                    current_size += topic_size
-                if current_batch:
-                    topic_batches.append(current_batch)
-                for batch_index, batch in enumerate(topic_batches, start=1):
-                    paper_ids = sorted({paper_id for topic in batch for paper_id in (*topic.paper_ids, *topic.bridge_paper_ids)})
-                    request = {
+                topic_profile = self._node_route("candidate_1_provider_generation").profile
+                topic_input_limit = max(
+                    1,
+                    min(
+                        32_000,
+                        int(self.max_source_prompt_tokens or 32_000),
+                        int(topic_profile.input_budget or 32_000),
+                    ) - 2_000,
+                )
+
+                def _topic_request(batch: Sequence[TopicSynthesis], batch_index: int) -> dict[str, Any]:
+                    paper_ids = sorted({
+                        paper_id
+                        for topic in batch
+                        for paper_id in (*topic.paper_ids, *topic.bridge_paper_ids)
+                    })
+                    return {
                         "task": "substantive_topic_synthesis",
                         "node_id": "topic_synthesis",
-                        "hierarchy": {"level": "topic_synthesis", "batch_id": f"topic_batch_{batch_index}", "target_tokens": self.technical_shard_target_tokens or 32000},
+                        "hierarchy": {
+                            "level": "topic_synthesis",
+                            "batch_id": f"topic_batch_{batch_index}",
+                            "target_tokens": self.technical_shard_target_tokens or topic_input_limit,
+                        },
                         "topics": [topic.to_dict() for topic in batch],
                         "evidence_units": [
-                            content_layers_model.dossier_by_paper[key].to_dict()
+                            dossier_by_paper[key].to_dict()
                             for key in paper_ids
-                            if key in content_layers_model.dossier_by_paper
+                            if key in dossier_by_paper
                         ],
                         "output_contract": {
                             "topics": "array of topic synthesis objects; preserve topic_id and cite only supplied evidence_ids",
@@ -5960,6 +5968,25 @@ class OutlineV3Executor:
                             "unresolved_questions": "array of questions that remain unresolved",
                         },
                     }
+
+                for topic in topic_plan:
+                    trial_batch = [*current_batch, topic]
+                    trial_request = _topic_request(trial_batch, len(topic_batches) + 1)
+                    trial_budget = topic_profile.estimate_request(trial_request)
+                    trial_tokens = int(
+                        trial_budget.get("estimated_input_tokens")
+                        or topic_profile.estimate_tokens(trial_request)
+                    )
+                    if current_batch and trial_tokens > topic_input_limit:
+                        topic_batches.append(current_batch)
+                        current_batch = [topic]
+                    else:
+                        current_batch = trial_batch
+                if current_batch:
+                    topic_batches.append(current_batch)
+                for batch_index, batch in enumerate(topic_batches, start=1):
+                    paper_ids = sorted({paper_id for topic in batch for paper_id in (*topic.paper_ids, *topic.bridge_paper_ids)})
+                    request = _topic_request(batch, batch_index)
                     raw = self._run_semantic_provider_call(
                         f"topic_synthesis_provider:batch:{batch_index}",
                         request,
