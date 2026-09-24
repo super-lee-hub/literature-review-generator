@@ -1163,6 +1163,508 @@ class OutlineV3Executor:
         return chunks
 
     @staticmethod
+    def _compact_topic_route(topic: Any) -> dict[str, Any]:
+        """Return the routing portion of one topic without its ID list.
+
+        The complete evidence IDs remain in the content-layer artifact.  The
+        provider receives their count and per-unit hashes below, which keeps a
+        large topic request bounded without deleting a fact or silently
+        slicing a source field.
+        """
+
+        return {
+            "topic_id": str(getattr(topic, "topic_id", "") or ""),
+            "question": str(getattr(topic, "question", "") or ""),
+            "paper_ids": [str(item) for item in getattr(topic, "paper_ids", []) if str(item)],
+            "bridge_paper_ids": [
+                str(item) for item in getattr(topic, "bridge_paper_ids", []) if str(item)
+            ],
+            "dimensions": [str(item) for item in getattr(topic, "dimensions", []) if str(item)],
+            "comparison_questions": [
+                str(item)
+                for item in getattr(topic, "comparison_questions", [])
+                if str(item).strip()
+            ],
+            "required_evidence_count": len(getattr(topic, "required_evidence_ids", []) or []),
+            "status": str(getattr(topic, "status", "") or ""),
+        }
+
+    @staticmethod
+    def _topic_projection_fields(dimensions: Sequence[str]) -> tuple[str, ...]:
+        """Choose complete semantic fields needed by a topic route.
+
+        This is a semantic projection, not character truncation.  Omitted
+        fields are declared with hashes/counts and remain available in the
+        content-layer dossier referenced by the request.
+        """
+
+        fields: set[str] = set()
+        for dimension in dimensions:
+            normalized = str(dimension or "").strip().casefold()
+            if normalized == "context":
+                fields.update(("findings",))
+            elif normalized == "method":
+                fields.update(("method",))
+            elif normalized == "theory":
+                fields.update(("theories", "findings"))
+            elif normalized == "mechanism":
+                fields.update(("mechanisms", "findings"))
+            else:
+                fields.update(
+                    (
+                        "research_questions",
+                        "theories",
+                        "constructs",
+                        "mechanisms",
+                        "method",
+                        "sample_or_context",
+                        "findings",
+                        "conclusions",
+                        "limitations",
+                        "research_gaps",
+                        "future_directions",
+                    )
+                )
+        return tuple(sorted(fields))
+
+    @classmethod
+    def _compact_topic_evidence_unit(
+        cls,
+        view: Any,
+        dossier: Any | None,
+        *,
+        fields: Sequence[str],
+        include_field_refs: bool = True,
+    ) -> dict[str, Any]:
+        payload = view.to_dict() if hasattr(view, "to_dict") else dict(view)
+        dossier_payload = dossier.to_dict() if dossier is not None and hasattr(dossier, "to_dict") else {}
+        raw_evidence_ids = dossier_payload.get("evidence_ids_by_field")
+        evidence_ids_by_field = (
+            raw_evidence_ids if isinstance(raw_evidence_ids, Mapping) else {}
+        )
+        evidence_refs = {
+            str(field_name): {
+                "count": len(values) if isinstance(values, list) else 0,
+                "ids_hash": hash_json(values if isinstance(values, list) else []),
+            }
+            for field_name, values in evidence_ids_by_field.items()
+        }
+        available_fields = {
+            str(field_name): {
+                "value_count": len(value) if isinstance(value, list) else int(bool(value)),
+                "value_hash": hash_json(value),
+            }
+            for field_name, value in payload.items()
+            if field_name
+            in {
+                "research_questions",
+                "theories",
+                "constructs",
+                "mechanisms",
+                "method",
+                "sample_or_context",
+                "findings",
+                "conclusions",
+                "limitations",
+                "research_gaps",
+                "future_directions",
+            }
+        }
+        return {
+            "paper_key": str(payload.get("paper_key") or payload.get("canonical_paper_key") or ""),
+            "source_summary_hash": str(payload.get("source_summary_hash") or ""),
+            "evidence_unit_id": str(
+                getattr(dossier, "dossier_id", "")
+                or f"dossier:{payload.get('paper_key') or payload.get('canonical_paper_key') or ''}"
+            ),
+            "evidence_unit_hash": str(getattr(dossier, "content_hash", "") or ""),
+            "evidence_fields": {
+                str(field_name): payload.get(field_name)
+                for field_name in fields
+                if field_name in payload
+            },
+            "evidence_field_refs": (
+                {
+                    "field_names": sorted(evidence_refs),
+                    "refs_hash": hash_json(evidence_refs),
+                }
+                if include_field_refs
+                else {"refs_hash": hash_json(evidence_refs)}
+            ),
+            "available_field_refs": (
+                {
+                    "field_names": sorted(available_fields),
+                    "refs_hash": hash_json(available_fields),
+                }
+                if include_field_refs
+                else {"refs_hash": hash_json(available_fields)}
+            ),
+            "projection": "complete_field_values_plus_registry_refs_v1",
+        }
+
+    @classmethod
+    def _compact_candidate_evidence_refs(
+        cls,
+        views: Sequence[Any],
+        content_layers: Any,
+        semantic_plan: Any,
+    ) -> list[dict[str, Any]]:
+        topic_ids_by_paper: dict[str, list[str]] = {}
+        for topic in getattr(semantic_plan, "topics", []) or []:
+            for paper_id in (
+                *list(getattr(topic, "paper_ids", []) or []),
+                *list(getattr(topic, "bridge_paper_ids", []) or []),
+            ):
+                topic_ids_by_paper.setdefault(str(paper_id), []).append(
+                    str(getattr(topic, "topic_id", "") or "")
+                )
+        dossiers = getattr(content_layers, "dossier_by_paper", {})
+        refs: list[dict[str, Any]] = []
+        for view in views:
+            payload = view.to_dict() if hasattr(view, "to_dict") else dict(view)
+            paper_key = str(payload.get("paper_key") or payload.get("canonical_paper_key") or "")
+            dossier = dossiers.get(paper_key) if isinstance(dossiers, Mapping) else None
+            field_refs = cls._compact_topic_evidence_unit(
+                view,
+                dossier,
+                fields=(),
+            )
+            refs.append(
+                {
+                    "paper_key": paper_key,
+                    "title": str(payload.get("title") or ""),
+                    "source_summary_hash": str(payload.get("source_summary_hash") or ""),
+                    "evidence_unit_id": field_refs["evidence_unit_id"],
+                    "evidence_unit_hash": field_refs["evidence_unit_hash"],
+                    "topic_ids": sorted(set(topic_ids_by_paper.get(paper_key, []))),
+                    "projection": "registry_complete_evidence_ref_v1",
+                }
+            )
+        return refs
+
+    @staticmethod
+    def _compact_relation_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
+        evidence_ids = [str(item) for item in candidate.get("evidence_ids") or () if str(item)]
+        return {
+            "relation_id": str(candidate.get("relation_id") or ""),
+            "relation_type": str(candidate.get("relation_type") or ""),
+            "paper_keys": [str(item) for item in candidate.get("paper_keys") or () if str(item)],
+            "comparison_question": str(candidate.get("comparison_question") or ""),
+            "evidence_fields": dict(candidate.get("evidence_fields") or {}),
+            "source_fields": dict(candidate.get("source_fields") or {}),
+            "supporting_labels": [
+                str(item) for item in candidate.get("supporting_labels") or () if str(item)
+            ],
+            "evidence_id_count": len(evidence_ids),
+            "evidence_ids_hash": hash_json(evidence_ids),
+            "source_summary_hashes": [
+                str(item) for item in candidate.get("source_summary_hashes") or () if str(item)
+            ],
+        }
+
+    @classmethod
+    def _compact_relation_bundle(cls, bundle: Any) -> dict[str, Any]:
+        payload = bundle.to_dict() if hasattr(bundle, "to_dict") else dict(bundle)
+        required = [str(item) for item in payload.get("required_evidence_ids") or () if str(item)]
+        provided = [str(item) for item in payload.get("provided_evidence_ids") or () if str(item)]
+        return {
+            "relation_id": str(payload.get("relation_id") or ""),
+            "comparison_question": str(payload.get("comparison_question") or ""),
+            "relation_type": str(payload.get("relation_type") or ""),
+            "paper_ids": [str(item) for item in payload.get("paper_ids") or () if str(item)],
+            "findings_left": list(payload.get("findings_left") or []),
+            "findings_right": list(payload.get("findings_right") or []),
+            "contexts_and_boundaries": dict(payload.get("contexts_and_boundaries") or {}),
+            "source_locators": dict(payload.get("source_locators") or {}),
+            "required_evidence_id_count": len(required),
+            "required_evidence_ids_hash": hash_json(required),
+            "provided_evidence_id_count": len(provided),
+            "provided_evidence_ids_hash": hash_json(provided),
+            "missing_evidence_ids": [
+                str(item) for item in payload.get("missing_evidence_ids") or () if str(item)
+            ],
+            "evidence_completeness": str(payload.get("evidence_completeness") or ""),
+            "decision": str(payload.get("decision") or ""),
+            "projection": "complete_relation_bundle_plus_evidence_refs_v1",
+        }
+
+    def _build_topic_provider_request(
+        self,
+        batch: Sequence[TopicSynthesis],
+        *,
+        topic_routes: Mapping[str, Any],
+        evidence_model: Any,
+        content_layers_model: Any,
+        batch_index: int,
+    ) -> dict[str, Any]:
+        paper_ids = sorted(
+            {
+                str(paper_id)
+                for topic in batch
+                for paper_id in (
+                    *list(getattr(topic, "paper_ids", []) or []),
+                    *list(getattr(topic, "bridge_paper_ids", []) or []),
+                )
+                if str(paper_id)
+            }
+        )
+        dimensions = sorted(
+            {
+                str(dimension)
+                for topic in batch
+                for dimension in (
+                    getattr(topic_routes.get(topic.topic_id), "dimensions", []) or []
+                )
+                if str(dimension)
+            }
+        )
+        fields = self._topic_projection_fields(dimensions)
+        view_by_paper = {
+            str(getattr(view, "paper_key", "")): view
+            for view in getattr(evidence_model, "views", []) or []
+            if str(getattr(view, "paper_key", ""))
+        }
+        dossiers = getattr(content_layers_model, "dossier_by_paper", {})
+        evidence_units = [
+            self._compact_topic_evidence_unit(
+                view_by_paper[paper_id],
+                dossiers.get(paper_id) if isinstance(dossiers, Mapping) else None,
+                fields=fields,
+                include_field_refs=False,
+            )
+            for paper_id in paper_ids
+            if paper_id in view_by_paper
+        ]
+        return {
+            "task": "substantive_topic_synthesis",
+            "node_id": "topic_synthesis",
+            "hierarchy": {
+                "level": "topic_synthesis",
+                "batch_id": f"topic_batch_{batch_index}",
+                "target_tokens": self.technical_shard_target_tokens or 30_000,
+            },
+            "topics": [
+                {
+                    **self._compact_topic_route(topic_routes[topic.topic_id]),
+                    "paper_ids": [
+                        str(item) for item in topic.paper_ids if str(item)
+                    ],
+                    "bridge_paper_ids": [
+                        str(item) for item in topic.bridge_paper_ids if str(item)
+                    ],
+                    "required_evidence_count": len(
+                        getattr(topic, "supporting_evidence_ids", []) or []
+                    ),
+                }
+                for topic in batch
+                if topic.topic_id in topic_routes
+            ],
+            "evidence_units": evidence_units,
+            "evidence_projection": {
+                "projection": "complete_field_values_plus_registry_refs_v1",
+                "fields_in_prompt": list(fields),
+                "omitted_fields_are_registry_bound": True,
+                "content_layers_hash": getattr(content_layers_model, "content_hash", ""),
+            },
+            "output_contract": {
+                "topics": "array of topic synthesis objects; preserve topic_id and cite supplied paper_key, source_summary_hash, evidence_unit_id, or evidence field refs",
+                "claims": "array of evidence-bound claims with paper_key/source_summary_hash/evidence_unit_id and source_locators when available",
+                "unresolved_questions": "array of questions that remain unresolved",
+            },
+        }
+
+    def _topic_provider_batch_count(
+        self,
+        summaries: Sequence[Mapping[str, Any]],
+        profile: ProviderContextProfile,
+    ) -> int:
+        """Count the bounded topic requests used by the real executor."""
+
+        evidence_model = build_outline_evidence_views(summaries, self.job_id)
+        ledger = build_global_corpus_ledger(evidence_model)
+        matrix = build_multi_view_matrix(evidence_model)
+        relation_map = build_global_relation_map(evidence_model, matrix, ledger)
+        content_layers_model = build_paper_content_layers(
+            summaries,
+            evidence_model,
+            job_id=self.job_id,
+        )
+        semantic_plan = build_semantic_chunk_plan(
+            content_layers_model,
+            relation_map,
+            candidate_count=self.candidate_count,
+            physical_call_limit=min(24, max(0, int(self.max_provider_calls or 24))),
+        )
+        topic_plan = build_topic_synthesis_plan(semantic_plan)
+        topic_routes = {topic.topic_id: topic for topic in semantic_plan.topics}
+        topic_input_limit = max(
+            1,
+            min(
+                32_000,
+                int(self.max_source_prompt_tokens or 32_000),
+                int(profile.input_budget or 32_000),
+            )
+            - 2_000,
+        )
+        topic_plan = self._split_topic_plan_for_budget(
+            topic_plan,
+            topic_routes=topic_routes,
+            evidence_model=evidence_model,
+            content_layers_model=content_layers_model,
+            profile=profile,
+            input_limit=topic_input_limit,
+        )
+        batches: list[list[TopicSynthesis]] = []
+        current: list[TopicSynthesis] = []
+        for topic in topic_plan:
+            trial = [*current, topic]
+            request = self._build_topic_provider_request(
+                trial,
+                topic_routes=topic_routes,
+                evidence_model=evidence_model,
+                content_layers_model=content_layers_model,
+                batch_index=len(batches) + 1,
+            )
+            budget = profile.estimate_request(
+                self._attach_prompt_authority(
+                    f"topic_synthesis:preflight:{len(batches) + 1}",
+                    request,
+                )
+            )
+            estimate = int(
+                budget.get("estimated_input_tokens") or profile.estimate_tokens(request)
+            )
+            if current and estimate > topic_input_limit:
+                batches.append(current)
+                current = [topic]
+            else:
+                current = trial
+        if current:
+            batches.append(current)
+        return len(batches)
+
+    def _split_topic_plan_for_budget(
+        self,
+        topics: Sequence[TopicSynthesis],
+        *,
+        topic_routes: Mapping[str, Any],
+        evidence_model: Any,
+        content_layers_model: Any,
+        profile: ProviderContextProfile,
+        input_limit: int,
+    ) -> list[TopicSynthesis]:
+        """Split oversized topic routes only at paper/evidence-unit boundaries."""
+
+        expanded: list[TopicSynthesis] = []
+        for topic in topics:
+            full_request = self._build_topic_provider_request(
+                [topic],
+                topic_routes=topic_routes,
+                evidence_model=evidence_model,
+                content_layers_model=content_layers_model,
+                batch_index=len(expanded) + 1,
+            )
+            full_budget = profile.estimate_request(
+                self._attach_prompt_authority(
+                    f"topic_synthesis:preflight:{len(expanded) + 1}",
+                    full_request,
+                )
+            )
+            full_estimate = int(
+                full_budget.get("estimated_input_tokens")
+                or profile.estimate_tokens(full_request)
+            )
+            if full_estimate <= input_limit or len(topic.paper_ids) <= 1:
+                expanded.append(topic)
+                continue
+            paper_ids = [str(item) for item in topic.paper_ids if str(item)]
+            current: list[str] = []
+            for paper_id in paper_ids:
+                trial_ids = [*current, paper_id]
+                trial_topic = replace(
+                    topic,
+                    paper_ids=trial_ids,
+                    bridge_paper_ids=[
+                        value
+                        for value in topic.bridge_paper_ids
+                        if value in trial_ids
+                    ],
+                )
+                trial_request = self._build_topic_provider_request(
+                    [trial_topic],
+                    topic_routes=topic_routes,
+                    evidence_model=evidence_model,
+                    content_layers_model=content_layers_model,
+                    batch_index=len(expanded) + 1,
+                )
+                trial_budget = profile.estimate_request(
+                    self._attach_prompt_authority(
+                        f"topic_synthesis:preflight:{len(expanded) + 1}",
+                        trial_request,
+                    )
+                )
+                trial_estimate = int(
+                    trial_budget.get("estimated_input_tokens")
+                    or profile.estimate_tokens(trial_request)
+                )
+                if current and trial_estimate > input_limit:
+                    expanded.append(
+                        replace(
+                            topic,
+                            paper_ids=list(current),
+                            bridge_paper_ids=[
+                                value for value in topic.bridge_paper_ids if value in current
+                            ],
+                        )
+                    )
+                    current = [paper_id]
+                else:
+                    current = trial_ids
+                if len(current) == 1:
+                    one_request = self._build_topic_provider_request(
+                        [
+                            replace(
+                                topic,
+                                paper_ids=list(current),
+                                bridge_paper_ids=[
+                                    value
+                                    for value in topic.bridge_paper_ids
+                                    if value in current
+                                ],
+                            )
+                        ],
+                        topic_routes=topic_routes,
+                        evidence_model=evidence_model,
+                        content_layers_model=content_layers_model,
+                        batch_index=len(expanded) + 1,
+                    )
+                    one_budget = profile.estimate_request(
+                        self._attach_prompt_authority(
+                            f"topic_synthesis:preflight:{len(expanded) + 1}",
+                            one_request,
+                        )
+                    )
+                    one_estimate = int(
+                        one_budget.get("estimated_input_tokens")
+                        or profile.estimate_tokens(one_request)
+                    )
+                    if one_estimate > input_limit:
+                        raise OutlineV3ExecutionError(
+                            f"BLOCKED_BUDGET: topic {topic.topic_id} paper {paper_id} exceeds effective input cap"
+                        )
+            if current:
+                expanded.append(
+                    replace(
+                        topic,
+                        paper_ids=list(current),
+                        bridge_paper_ids=[
+                            value for value in topic.bridge_paper_ids if value in current
+                        ],
+                    )
+                )
+        return expanded
+
+    @staticmethod
     def _estimate_source_summary_excerpts(
         summaries: Sequence[Mapping[str, Any]],
     ) -> list[dict[str, str]]:
@@ -1481,86 +1983,90 @@ class OutlineV3Executor:
         *,
         variant_name: str,
     ) -> tuple[int, int, dict[str, Any]]:
-        """Estimate the actual local/cross relation requests, not a monolith."""
+        """Estimate the compact evidence-bundle relation request.
+
+        The full relation shard planner remains available for explicit
+        low-target callers and regression tests. Production R1 uses complete
+        relation bundles plus Registry-bound evidence references, so the
+        normal 63-paper request is one bounded provider call.
+        """
+
+        if 0 < self.technical_shard_target_tokens < 8_000:
+            # Preserve the explicit low-target evidence-shard contract used by
+            # the adversarial shard tests. Production R1 uses the compact
+            # bundle path below at the 32k target.
+            evidence = build_outline_evidence_views(summaries, self.job_id)
+            ledger = build_global_corpus_ledger(evidence)
+            matrix = build_multi_view_matrix(evidence)
+            candidates = build_global_relation_map(evidence, matrix, ledger)
+            relation_candidates = [item.to_dict() for item in candidates.relations]
+            plan = self._build_relation_shard_plan(evidence.views, relation_candidates)
+            estimates = [
+                max(1, int(item.get("estimated_input_tokens") or 1))
+                for item in plan.get("shards") or ()
+                if isinstance(item, Mapping)
+            ]
+            return max(estimates, default=1), max(1, len(estimates)), plan
 
         evidence = build_outline_evidence_views(summaries, self.job_id)
         ledger = build_global_corpus_ledger(evidence)
         matrix = build_multi_view_matrix(evidence)
         candidates = build_global_relation_map(evidence, matrix, ledger)
         relation_candidates = [item.to_dict() for item in candidates.relations]
-        plan = self._build_relation_shard_plan(evidence.views, relation_candidates)
-        candidate_by_id = {
-            str(item.get("relation_id") or ""): item
+        content_layers = build_paper_content_layers(
+            summaries,
+            evidence,
+            job_id=self.job_id,
+        )
+        semantic_plan = build_semantic_chunk_plan(
+            content_layers,
+            candidates,
+            candidate_count=self.candidate_count,
+            physical_call_limit=min(24, max(0, int(self.max_provider_calls or 24))),
+        )
+        selected_ids = set(semantic_plan.coverage.get("selected_relation_ids") or ())
+        selected = [
+            item for item in semantic_plan.relation_bundles if item.relation_id in selected_ids
+        ]
+        compact_candidates = [
+            self._compact_relation_candidate(item)
             for item in relation_candidates
-            if str(item.get("relation_id") or "")
+            if str(item.get("relation_id") or "") in selected_ids
+        ]
+        request = {
+            "relation_candidates": compact_candidates,
+            "relation_evidence_bundles": [self._compact_relation_bundle(item) for item in selected],
+            "evidence_projection": {
+                "content_layers_hash": content_layers.content_hash,
+                "full_evidence_views_are_registry_local": True,
+            },
+            "relation_adjudication_contract": {
+                "allowed_relation_ids": sorted(selected_ids),
+                "must_return_confirmed_relation_ids": True,
+                "must_reject_without_recorded_evidence": True,
+            },
         }
-        contract = {
-            "allowed_relation_ids": sorted(candidate_by_id),
-            "must_return_confirmed_relation_ids": True,
-            "must_reject_without_recorded_evidence": True,
+        enriched = self._attach_prompt_authority(
+            f"relation_adjudication:preflight:{variant_name}:1",
+            request,
+        )
+        budget = profile.estimate_request(enriched)
+        estimate = max(
+            1,
+            int(budget.get("estimated_input_tokens") or profile.estimate_tokens(enriched)),
+        )
+        return estimate, 1, {
+            "schema_version": "outline-relation-shard-plan-v1",
+            "target_tokens": int(self.technical_shard_target_tokens or 0),
+            "shard_count": 1,
+            "shards": [],
+            "coverage": {
+                "input_view_count": len(evidence.views),
+                "planned_view_count": len(evidence.views),
+                "missing_view_hashes": [],
+                "compact_provider_projection": True,
+            },
         }
-        requests: list[dict[str, Any]] = []
-        reviewed: set[str] = set()
-        for shard in plan.get("shards") or ():
-            if not isinstance(shard, Mapping):
-                continue
-            shard_id = str(shard.get("shard_id") or "")
-            relation_ids = {
-                str(item)
-                for item in shard.get("relation_candidate_ids") or ()
-                if str(item) in candidate_by_id
-            }
-            if not relation_ids:
-                continue
-            reviewed.update(relation_ids)
-            requests.append({
-                "hierarchy": {
-                    "level": "local_shard",
-                    "shard_id": shard_id,
-                    "target_tokens": self.technical_shard_target_tokens,
-                    "paper_keys": list(shard.get("paper_keys") or ()),
-                    "relation_candidate_ids": sorted(relation_ids),
-                    "evidence_view_hashes": list(shard.get("view_hashes") or ()),
-                },
-                "relation_candidates": [candidate_by_id[item] for item in sorted(relation_ids)],
-                "evidence_views": [dict(item) for item in shard.get("evidence_chunks") or () if isinstance(item, Mapping)],
-                "relation_adjudication_contract": {
-                    **contract,
-                    "allowed_relation_ids": sorted(relation_ids),
-                },
-            })
-        remaining = set(candidate_by_id) - reviewed
-        if remaining:
-            compact_preflight_views = [
-                self._compact_relation_digest(
-                    request,
-                    [str(item) for item in request.get("relation_candidate_ids") or () if str(item)],
-                    [],
-                    [],
-                )
-                for request in requests
-            ]
-            requests.extend(
-                request
-                for _node_id, request, _batch_ids in self._relation_cross_batch_requests(
-                    candidate_by_id=candidate_by_id,
-                    relation_ids=sorted(remaining),
-                    shard_plan=plan,
-                    relation_contract=contract,
-                    profile=profile,
-                    node_prefix=f"preflight:{variant_name}",
-                    evidence_views_override=compact_preflight_views,
-                )
-            )
-        estimates: list[int] = []
-        for index, request in enumerate(requests, start=1):
-            enriched = self._attach_prompt_authority(
-                f"relation_adjudication:preflight:{variant_name}:{index}",
-                request,
-            )
-            budget = profile.estimate_request(enriched)
-            estimates.append(max(1, int(budget.get("estimated_input_tokens") or profile.estimate_tokens(enriched))))
-        return max(estimates, default=1), len(requests), plan
 
     def _candidate_hierarchical_preflight(
         self,
@@ -1569,56 +2075,60 @@ class OutlineV3Executor:
         *,
         variant_name: str,
     ) -> tuple[int, int]:
-        """Estimate candidate-generation shard requests at their final shape."""
+        """Estimate one compact candidate request at its final shape."""
 
         evidence = build_outline_evidence_views(summaries, self.job_id)
         ledger = build_global_corpus_ledger(evidence)
         matrix = build_multi_view_matrix(evidence)
         candidates = build_global_relation_map(evidence, matrix, ledger)
-        relation_candidates = [item.to_dict() for item in candidates.relations]
-        plan = self._build_relation_shard_plan(evidence.views, relation_candidates)
-        estimates: list[int] = []
-        for index, shard in enumerate(plan.get("shards") or (), start=1):
-            if not isinstance(shard, Mapping):
-                continue
-            shard_data: dict[str, Any] = dict(shard)
-            raw_paper_keys = shard_data.get("paper_keys")
-            raw_relation_ids = shard_data.get("relation_candidate_ids")
-            raw_evidence_chunks = shard_data.get("evidence_chunks")
-            paper_keys = [str(item) for item in raw_paper_keys if str(item)] if isinstance(raw_paper_keys, list) else []
-            relation_ids = [str(item) for item in raw_relation_ids if str(item)] if isinstance(raw_relation_ids, list) else []
-            request = {
-                "candidate_id": "candidate_1",
-                "variant_name": variant_name,
-                "hierarchy": {
-                    "level": "candidate_local_shard",
-                    "shard_id": str(shard_data.get("shard_id") or f"candidate_shard_{index}"),
-                    "target_tokens": self.technical_shard_target_tokens,
-                    "paper_keys": paper_keys,
-                    "relation_candidate_ids": relation_ids,
-                },
-                "paper_keys": paper_keys,
-                "relation_ids": relation_ids,
-                "relations": [
-                    item for item in relation_candidates
-                    if str(item.get("relation_id") or "") in set(relation_ids)
-                ],
-                "evidence": [
-                    dict(item)
-                    for item in raw_evidence_chunks
-                    if isinstance(item, Mapping)
-                ] if isinstance(raw_evidence_chunks, list) else [],
-                "source_summary_hashes": sorted(evidence.source_summary_hashes),
-                "candidate_count": self.candidate_count,
-                "evidence_bound": True,
-            }
-            enriched = self._attach_prompt_authority(
-                f"candidate_1_provider_generation:preflight:{variant_name}:{index}",
-                request,
-            )
-            budget = profile.estimate_request(enriched)
-            estimates.append(max(1, int(budget.get("estimated_input_tokens") or profile.estimate_tokens(enriched))))
-        return max(estimates, default=1), len(estimates)
+        content_layers = build_paper_content_layers(summaries, evidence, job_id=self.job_id)
+        semantic_plan = build_semantic_chunk_plan(
+            content_layers,
+            candidates,
+            candidate_count=self.candidate_count,
+            physical_call_limit=min(24, max(0, int(self.max_provider_calls or 24))),
+        )
+        paper_keys = [str(view.paper_key) for view in evidence.views if str(view.paper_key)]
+        selected_relation_ids = {
+            str(item)
+            for item in semantic_plan.coverage.get("selected_relation_ids") or ()
+            if str(item)
+        }
+        relation_ids = [
+            str(item.relation_id)
+            for item in candidates.relations
+            if str(item.relation_id) in selected_relation_ids
+        ]
+        request = {
+            "candidate_id": "candidate_1",
+            "variant_name": variant_name,
+            "paper_keys": paper_keys,
+            "relation_ids": relation_ids,
+            "relations": [
+                self._compact_relation_candidate(item.to_dict())
+                for item in candidates.relations
+                if str(item.relation_id) in selected_relation_ids
+            ],
+            "evidence": self._compact_candidate_evidence_refs(
+                evidence.views,
+                content_layers,
+                semantic_plan,
+            ),
+            "source_summary_hashes": sorted(evidence.source_summary_hashes),
+            "candidate_count": self.candidate_count,
+            "evidence_bound": True,
+            "evidence_projection": "registry_complete_evidence_ref_v1",
+        }
+        enriched = self._attach_prompt_authority(
+            f"candidate_1_provider_generation:preflight:{variant_name}:1",
+            request,
+        )
+        budget = profile.estimate_request(enriched)
+        estimate = max(
+            1,
+            int(budget.get("estimated_input_tokens") or profile.estimate_tokens(enriched)),
+        )
+        return estimate, 1
 
     def _build_provider_call_plans(self) -> tuple[OutlineProviderCallPlan, ...]:
         plans: list[OutlineProviderCallPlan] = []
@@ -1714,14 +2224,20 @@ class OutlineV3Executor:
                 )
                 base_input_estimate = estimated_input
                 estimated_output = max(1, int(profile.max_output_tokens))
-                if node_id.endswith("_provider_generation") and candidate_shard_multiplier > 1:
-                    estimated_output = min(estimated_output, 1024)
+                if node_id.endswith("_provider_generation") and self.technical_shard_target_tokens > 0:
+                    # The compact R1 candidate contract enforces this same
+                    # output cap at transport, keeping critique/arbitration
+                    # admission from reserving an unbounded candidate blob.
+                    estimated_output = min(estimated_output, 4_096)
+                elif node_id in {
+                    "structure_critique",
+                    "coverage_critique",
+                    "evidence_critique",
+                    "arbitration",
+                }:
+                    estimated_output = min(estimated_output, 2_048)
                 estimated_reasoning = max(0, int(profile.reasoning_reserve))
-                candidate_output_cap = (
-                    min(estimated_output, 1024)
-                    if self.technical_shard_target_tokens > 0 and candidate_shard_multiplier > 1
-                    else estimated_output
-                )
+                candidate_output_cap = estimated_output
                 candidate_output_upper_bound = (
                     self.candidate_count
                     * max(1, candidate_shard_multiplier)
@@ -1855,14 +2371,16 @@ class OutlineV3Executor:
         )
         semantic_synthesis_calls = 0
         if self.semantic_provider_synthesis_enabled:
-            # The exact topic batches are materialized after the shared
-            # content layers are built.  Reserve a conservative upper bound
-            # here so an aggregate call limit can block before the first
-            # provider request rather than failing halfway through semantic
-            # synthesis.  The production corpus is capped at twelve candidate
-            # topics; cross-group and global synthesis add two calls.
-            semantic_synthesis_calls = max(1, min(12, len(self.summaries) + 1)) + 2
             semantic_route = self._role_route("candidate_1_provider_generation")
+            # Count the exact compact topic batches used by ``run``.  Each
+            # batch carries complete values for the route's semantic fields
+            # plus Registry-bound hashes for the remaining dossier fields;
+            # cross-group and global synthesis add two calls.
+            semantic_topic_batches = self._topic_provider_batch_count(
+                self.summaries,
+                semantic_route.profile,
+            )
+            semantic_synthesis_calls = semantic_topic_batches + 2
             semantic_output = min(max(1, int(semantic_route.profile.max_output_tokens)), 4096)
             semantic_reasoning = max(0, int(semantic_route.profile.reasoning_reserve))
             estimated_provider_calls += semantic_synthesis_calls
@@ -4236,7 +4754,7 @@ class OutlineV3Executor:
             transport_node_id="candidate_1_provider_generation",
             output_tokens=min(
                 int(self._node_route("candidate_1_provider_generation").profile.max_output_tokens),
-                4096,
+                16_384,
             ),
         )
 
@@ -4800,12 +5318,26 @@ class OutlineV3Executor:
             raise
 
     def _run_provider_node(self, node_id: str, request: Mapping[str, Any], cls: type[OutlineArtifact], deps: Mapping[str, str], *, minimum_output: int = 2) -> tuple[OutlineArtifact, Sequence[str], str, str]:
-        content = self._provider_call(node_id, request, expect_json=True, input_artifact_hashes=tuple(deps.values()))
+        route = self._node_route(node_id)
+        bounded_output = int(route.profile.max_output_tokens)
+        if node_id in {
+            "structure_critique",
+            "coverage_critique",
+            "evidence_critique",
+            "arbitration",
+        }:
+            bounded_output = min(bounded_output, 2_048)
+        content = self._provider_call(
+            node_id,
+            request,
+            expect_json=True,
+            input_artifact_hashes=tuple(deps.values()),
+            output_tokens=bounded_output,
+        )
         # The provider receipt has already been appended when this hook runs.
         # Recovery tests use it to model a worker failure after transport
         # success but before the node output is persisted.
         self._check(node_id, phase="provider_success")
-        route = self._node_route(node_id)
         return self._artifact(cls, content, deps), tuple(deps), route.model, route.provider_name
 
     @staticmethod
@@ -5948,7 +6480,9 @@ class OutlineV3Executor:
             if self.semantic_provider_synthesis_enabled and topic_plan and not topic_semantic_reused:
                 topic_batches: list[list[TopicSynthesis]] = []
                 current_batch: list[TopicSynthesis] = []
-                dossier_by_paper = content_layers_model.dossier_by_paper
+                topic_routes = {
+                    topic.topic_id: topic for topic in semantic_chunk_plan_model.topics
+                }
                 topic_profile = self._node_route("candidate_1_provider_generation").profile
                 topic_input_limit = max(
                     1,
@@ -5958,38 +6492,36 @@ class OutlineV3Executor:
                         int(topic_profile.input_budget or 32_000),
                     ) - 2_000,
                 )
+                topic_plan = self._split_topic_plan_for_budget(
+                    topic_plan,
+                    topic_routes=topic_routes,
+                    evidence_model=evidence_model,
+                    content_layers_model=content_layers_model,
+                    profile=topic_profile,
+                    input_limit=topic_input_limit,
+                )
 
-                def _topic_request(batch: Sequence[TopicSynthesis], batch_index: int) -> dict[str, Any]:
-                    paper_ids = sorted({
-                        paper_id
-                        for topic in batch
-                        for paper_id in (*topic.paper_ids, *topic.bridge_paper_ids)
-                    })
-                    return {
-                        "task": "substantive_topic_synthesis",
-                        "node_id": "topic_synthesis",
-                        "hierarchy": {
-                            "level": "topic_synthesis",
-                            "batch_id": f"topic_batch_{batch_index}",
-                            "target_tokens": self.technical_shard_target_tokens or topic_input_limit,
-                        },
-                        "topics": [topic.to_dict() for topic in batch],
-                        "evidence_units": [
-                            dossier_by_paper[key].to_dict()
-                            for key in paper_ids
-                            if key in dossier_by_paper
-                        ],
-                        "output_contract": {
-                            "topics": "array of topic synthesis objects; preserve topic_id and cite only supplied evidence_ids",
-                            "claims": "array of evidence-bound claims with evidence_ids and source_locators",
-                            "unresolved_questions": "array of questions that remain unresolved",
-                        },
-                    }
+                def _topic_request(
+                    batch: Sequence[TopicSynthesis],
+                    batch_index: int,
+                ) -> dict[str, Any]:
+                    return self._build_topic_provider_request(
+                        batch,
+                        topic_routes=topic_routes,
+                        evidence_model=evidence_model,
+                        content_layers_model=content_layers_model,
+                        batch_index=batch_index,
+                    )
 
                 for topic in topic_plan:
                     trial_batch = [*current_batch, topic]
                     trial_request = _topic_request(trial_batch, len(topic_batches) + 1)
-                    trial_budget = topic_profile.estimate_request(trial_request)
+                    trial_budget = topic_profile.estimate_request(
+                        self._attach_prompt_authority(
+                            f"topic_synthesis:preflight:{len(topic_batches) + 1}",
+                            trial_request,
+                        )
+                    )
                     trial_tokens = int(
                         trial_budget.get("estimated_input_tokens")
                         or topic_profile.estimate_tokens(trial_request)
@@ -6030,6 +6562,30 @@ class OutlineV3Executor:
                     "diagnostics": [] if matching else ["offline/local route retained deterministic projection; no external synthesis call was admitted"],
                 })
                 topic_payloads.append(topic_payload)
+            compact_topic_payloads = [
+                {
+                    "topic_id": str(item.get("topic_id") or ""),
+                    "paper_ids": [
+                        str(value) for value in item.get("paper_ids") or () if str(value)
+                    ],
+                    "bridge_paper_ids": [
+                        str(value)
+                        for value in item.get("bridge_paper_ids") or ()
+                        if str(value)
+                    ],
+                    "status": str(item.get("status") or ""),
+                    "provider_batch_ids": [
+                        str(value)
+                        for value in item.get("provider_batch_ids") or ()
+                        if str(value)
+                    ],
+                    "provider_outputs": list(item.get("provider_outputs") or []),
+                    "supporting_evidence_count": len(
+                        item.get("supporting_evidence_ids") or []
+                    ),
+                }
+                for item in topic_payloads
+            ]
             if topic_semantic_reused:
                 semantic_provider_results = []
             topic_synthesis = self._run_node("topic_synthesis", lambda: (
@@ -6063,17 +6619,62 @@ class OutlineV3Executor:
                 )
                 result["artifact_id"] = record.artifact_id
                 result["artifact_hash"] = record.content_hash
+            semantic_topic_context = [
+                {
+                    "topic_id": str(item.get("topic_id") or ""),
+                    "paper_ids": [
+                        str(value) for value in item.get("paper_ids") or () if str(value)
+                    ],
+                    "bridge_paper_ids": [
+                        str(value)
+                        for value in item.get("bridge_paper_ids") or ()
+                        if str(value)
+                    ],
+                    "provider_batch_ids": [
+                        str(value)
+                        for value in item.get("provider_batch_ids") or ()
+                        if str(value)
+                    ],
+                    "provider_output_artifact_hashes": sorted(
+                        {
+                            str(result.get("artifact_hash") or "")
+                            for result in semantic_provider_results
+                            if item.get("topic_id") in result.get("topic_ids", [])
+                            and str(result.get("artifact_hash") or "")
+                        }
+                    ),
+                    "supporting_evidence_count": int(
+                        item.get("supporting_evidence_count") or 0
+                    ),
+                    "full_topic_synthesis_artifact": "outline-v3:topic_synthesis",
+                }
+                for item in compact_topic_payloads
+            ]
+            semantic_relation_candidates = [
+                self._compact_relation_candidate(item.to_dict())
+                for item in candidate_map_model.relations
+                if str(item.relation_id) in {
+                    str(value)
+                    for value in (
+                        semantic_chunk_plan_model.coverage.get(
+                            "selected_relation_ids"
+                        )
+                        or ()
+                    )
+                    if str(value)
+                }
+            ]
             cross_provider_result: dict[str, Any] | None = None
             cross_semantic_reused = _semantic_node_reusable("cross_group_comparison")
             if self.semantic_provider_synthesis_enabled and not cross_semantic_reused:
-                candidate_relation_payloads = [item.to_dict() for item in candidate_map_model.relations]
+                candidate_relation_payloads = semantic_relation_candidates
                 cross_provider_result = self._run_semantic_provider_call(
                     "cross_group_comparison_provider",
                     {
                         "task": "substantive_cross_group_comparison",
                         "node_id": "cross_group_comparison",
                         "questions": list(semantic_chunk_plan_model.cross_group_questions),
-                        "topic_synthesis": topic_payloads,
+                        "topic_synthesis": semantic_topic_context,
                         "relation_candidates": candidate_relation_payloads,
                         "output_contract": {
                             "comparisons": "array of evidence-bound cross-topic comparisons",
@@ -6123,9 +6724,9 @@ class OutlineV3Executor:
                     {
                         "task": "substantive_global_synthesis",
                         "node_id": "global_synthesis",
-                        "topic_synthesis": topic_payloads,
+                        "topic_synthesis": semantic_topic_context,
                         "cross_group_comparison": cross_provider_result or {"questions": semantic_chunk_plan_model.cross_group_questions},
-                        "relation_candidates": [item.to_dict() for item in candidate_map_model.relations],
+                        "relation_candidates": semantic_relation_candidates,
                         "output_contract": {
                             "synthesis_claims": "array of claims each bound to supplied evidence_ids",
                             "organizing_principles": "array",
@@ -6208,24 +6809,45 @@ class OutlineV3Executor:
                 }
             )
             relation_request = {
-                "relation_candidates": selected_relation_candidates,
-                "evidence_views": self._prompt_evidence_views(evidence_model.views),
-                "relation_shard_plan": relation_shard_plan_payload,
+                "relation_candidates": [
+                    self._compact_relation_candidate(item)
+                    for item in selected_relation_candidates
+                ],
+                "evidence_views": [],
+                "evidence_projection": {
+                    "projection": "complete_relation_bundle_plus_evidence_refs_v1",
+                    "full_evidence_views_are_registry_local": True,
+                    "content_layers_hash": content_layers_model.content_hash,
+                },
+                "relation_shard_plan": {
+                    "schema_version": str(
+                        relation_shard_plan_payload.get("schema_version") or ""
+                    ),
+                    "target_tokens": int(
+                        relation_shard_plan_payload.get("target_tokens") or 0
+                    ),
+                    "shard_count": int(
+                        relation_shard_plan_payload.get("shard_count") or 0
+                    ),
+                    "coverage": {"compact_provider_projection": True},
+                    "provider_projection": "compact_relation_bundle_v1",
+                },
                 # The provider sees a bounded navigation layer and the
                 # evidence-complete relation bundles selected for adjudication;
                 # full dossiers remain Registry artifacts addressed by ids.
-                "navigation_cards": [card.to_dict() for card in content_layers_model.index_cards],
+                "navigation_cards": [],
                 "content_layer_refs": {
                     "artifact_type": "outline_content_layers",
                     "artifact_hash": content_layers_model.content_hash,
-                    "dossier_ids": [dossier.dossier_id for dossier in content_layers_model.dossiers],
+                    "dossier_count": len(content_layers_model.dossiers),
                 },
                 "relation_evidence_bundles": [
-                    item.to_dict()
+                    self._compact_relation_bundle(item)
                     for item in semantic_chunk_plan_model.relation_bundles
                     if item.relation_id in selected_relation_ids
                 ],
-                "excluded_relation_ids": excluded_relation_ids,
+                "excluded_relation_count": len(excluded_relation_ids),
+                "excluded_relation_ids_hash": hash_json(excluded_relation_ids),
                 "semantic_chunk_plan_hash": semantic_chunk_plan_model.content_hash,
                 "relation_adjudication_contract": {
                     "must_return_confirmed_relation_ids": True,
@@ -6493,11 +7115,17 @@ class OutlineV3Executor:
                 ))
                 paper_keys = [item.paper_key for item in ledger_model.entries]
                 allowed_relation_ids = [item.relation_id for item in confirmed_map_model.relations]
-                candidate_evidence = self._prompt_evidence_views(
-                    [view for view in evidence_model.views if view.paper_key in set(paper_keys)]
+                candidate_evidence = self._compact_candidate_evidence_refs(
+                    [
+                        view
+                        for view in evidence_model.views
+                        if view.paper_key in set(paper_keys)
+                    ],
+                    content_layers_model,
+                    semantic_chunk_plan_model,
                 )
                 candidate_relations = [
-                    item.to_dict()
+                    self._compact_relation_candidate(item.to_dict())
                     for item in confirmed_map_model.relations
                     if set(item.paper_keys).issubset(set(paper_keys))
                 ]
@@ -6508,15 +7136,21 @@ class OutlineV3Executor:
                     "relation_ids": allowed_relation_ids,
                     "relations": candidate_relations,
                     "evidence": candidate_evidence,
+                    "evidence_projection": {
+                        "projection": "registry_complete_evidence_ref_v1",
+                        "full_evidence_artifact_type": "outline_content_layers",
+                        "full_evidence_artifact_hash": content_layers_model.content_hash,
+                        "shared_semantic_context": "global_synthesis_and_topic_routes",
+                    },
                     "semantic_chunk_plan": {
                         "content_layers_hash": semantic_chunk_plan_model.content_layers_hash,
                         "topic_routes": [
                             {
                                 "topic_id": item.topic_id,
-                                "question": item.question,
-                                "paper_ids": item.paper_ids,
-                                "bridge_paper_ids": item.bridge_paper_ids,
                                 "dimensions": item.dimensions,
+                                "paper_count": len(item.paper_ids),
+                                "bridge_paper_count": len(item.bridge_paper_ids),
+                                "paper_ids_hash": hash_json(item.paper_ids),
                                 "required_evidence_count": len(item.required_evidence_ids),
                                 "status": item.status,
                             }
@@ -6526,7 +7160,8 @@ class OutlineV3Executor:
                             {
                                 "relation_id": item.relation_id,
                                 "relation_type": item.relation_type,
-                                "paper_ids": item.paper_ids,
+                                "paper_count": len(item.paper_ids),
+                                "paper_ids_hash": hash_json(item.paper_ids),
                                 "evidence_completeness": item.evidence_completeness,
                                 "decision": item.decision,
                                 "missing_evidence_count": len(item.missing_evidence_ids),
@@ -6551,6 +7186,16 @@ class OutlineV3Executor:
                     "source_summary_hashes": sorted(evidence_model.source_summary_hashes),
                     "shared_hashes": plan.shared_artifact_hashes,
                     "global_synthesis_hash": _hash_payload(global_synthesis),
+                    "shared_semantic_context": {
+                        "global_synthesis": global_provider_result or {
+                            "execution_mode": "local_shared_synthesis_base",
+                            "topic_count": len(semantic_chunk_plan_model.topics),
+                            "content_layers_hash": content_layers_model.content_hash,
+                        },
+                        "cross_group_comparison": cross_provider_result
+                        or {"questions": semantic_chunk_plan_model.cross_group_questions},
+                        "topic_routes": semantic_topic_context,
+                    },
                     "output_contract": {
                         "output_fields": {
                             "candidate_id": (
@@ -6680,6 +7325,10 @@ class OutlineV3Executor:
                             provider_request,
                             expect_json=True,
                             input_artifact_hashes=tuple(generation_deps.values()),
+                            output_tokens=min(
+                                int(generation_route.profile.max_output_tokens),
+                                4_096,
+                            ),
                         )
                     content = (
                         canonicalize_structural(dict(raw_generation), alias_map)
@@ -6833,14 +7482,74 @@ class OutlineV3Executor:
                         "Repeated use is allowed when roles/functions differ; repeated "
                         "occurrences do not create new unique-paper coverage."
                     ),
-                    "coverage_contract": contract_model.to_dict(),
-                    "corpus_ledger": ledger_model.to_dict(),
+                    "coverage_contract": {
+                        "content_hash": contract_model.content_hash,
+                        "required_paper_count": len(contract_model.corpus_paper_keys),
+                        "must_use_paper_count": len(contract_model.must_use_paper_keys),
+                        "must_use_paper_keys_hash": hash_json(
+                            contract_model.must_use_paper_keys
+                        ),
+                        "projection": "registry_complete_coverage_contract_ref_v1",
+                    },
+                    "corpus_ledger": {
+                        "artifact_type": ledger_model.artifact_type,
+                        "content_hash": ledger_model.content_hash,
+                        "paper_keys": [
+                            str(item.paper_key)
+                            for item in ledger_model.entries
+                            if str(item.paper_key)
+                        ],
+                        "entry_count": len(ledger_model.entries),
+                        "assignment_status_counts": {
+                            status: sum(
+                                1
+                                for item in ledger_model.entries
+                                if item.assignment_status == status
+                            )
+                            for status in sorted(
+                                {
+                                    str(item.assignment_status)
+                                    for item in ledger_model.entries
+                                }
+                            )
+                        },
+                        "projection": "registry_complete_ledger_ref_v1",
+                    },
                     "must_use_paper_keys": list(contract_model.must_use_paper_keys),
-                    "relations": [item.to_dict() for item in confirmed_map_model.relations],
-                    "contradictions": [item.to_dict() for item in confirmed_map_model.relations if item.relation_type in {"contradicts", "explains_discrepancy"}],
-                    "gaps": [item.to_dict() for item in confirmed_map_model.relations if item.relation_type in {"qualifies", "explains_discrepancy"}],
-                    "methods": sorted({value for view in evidence_model.views for value in view.method}),
-                    "contexts": sorted({value for view in evidence_model.views for value in view.sample_or_context}),
+                    "relations": [
+                        self._compact_relation_candidate(item.to_dict())
+                        for item in confirmed_map_model.relations
+                    ],
+                    "contradictions": [
+                        self._compact_relation_candidate(item.to_dict())
+                        for item in confirmed_map_model.relations
+                        if item.relation_type in {"contradicts", "explains_discrepancy"}
+                    ],
+                    "gaps": [
+                        self._compact_relation_candidate(item.to_dict())
+                        for item in confirmed_map_model.relations
+                        if item.relation_type in {"qualifies", "explains_discrepancy"}
+                    ],
+                    "methods": {
+                        "count": sum(len(view.method) for view in evidence_model.views),
+                        "values_hash": hash_json(
+                            sorted({value for view in evidence_model.views for value in view.method})
+                        ),
+                    },
+                    "contexts": {
+                        "count": sum(
+                            len(view.sample_or_context) for view in evidence_model.views
+                        ),
+                        "values_hash": hash_json(
+                            sorted(
+                                {
+                                    value
+                                    for view in evidence_model.views
+                                    for value in view.sample_or_context
+                                }
+                            )
+                        ),
+                    },
                 },
                 "evidence_critique": {
                     "node_id": "evidence_critique",
@@ -6857,15 +7566,19 @@ class OutlineV3Executor:
                     "source_summary_hashes": sorted(evidence_model.source_summary_hashes),
                     "relation_evidence": [item.to_dict() for item in confirmed_map_model.relations],
                     "contradictions": [item.to_dict() for item in confirmed_map_model.relations if item.relation_type in {"contradicts", "explains_discrepancy"}],
-                    "boundaries": self._prompt_evidence_views(
-                        [view for view in evidence_model.views if view.limitations]
+                    "boundaries": self._compact_candidate_evidence_refs(
+                        [view for view in evidence_model.views if view.limitations],
+                        content_layers_model,
+                        semantic_chunk_plan_model,
                     ),
-                    "gaps": self._prompt_evidence_views(
+                    "gaps": self._compact_candidate_evidence_refs(
                         [
                             view
                             for view in evidence_model.views
                             if view.research_gaps or view.future_directions
-                        ]
+                        ],
+                        content_layers_model,
+                        semantic_chunk_plan_model,
                     ),
                 },
             }

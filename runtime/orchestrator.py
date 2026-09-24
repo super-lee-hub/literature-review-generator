@@ -46,7 +46,12 @@ from services.artifact_registry import (
     RegistryError,
     file_sha256,
 )
-from services.job_runner import JobRunRequest, JobRunner, validate_job_request_options
+from services.job_runner import (
+    JobRunRequest,
+    JobRunner,
+    _typed_reuse_manifest_mode,
+    validate_job_request_options,
+)
 from services.job_workspace import (
     JobWorkspace,
     publish_bytes_artifact,
@@ -56,6 +61,10 @@ from services.job_workspace import (
 from services.progress_state import Stage1ProgressSnapshot
 from services.queue_service import CancelToken
 from services.stage1_analysis_service import Stage1AnalysisService
+from services.stage1_reuse import (
+    Stage1ReusableSummaryBindingV1,
+    verify_stage1_typed_manifest_authority,
+)
 
 
 class _OutlineProviderTransportAdapter:
@@ -985,6 +994,19 @@ class InternalStageExecutorRegistry:
             )
         if not summaries:
             raise RuntimeError("Stage 1 requires a source work item or a canonical summary source")
+        if session.request.reuse_summary_files:
+            typed_flags = [
+                isinstance(item.get("stage1_reuse"), Mapping)
+                and str(item["stage1_reuse"].get("authority_kind") or "").strip()
+                == "typed_manifest"
+                for item in summaries
+            ]
+            if any(typed_flags):
+                if not all(typed_flags):
+                    raise RuntimeError(
+                        "reuse_summary_files mixed typed and legacy Stage 1 authorities"
+                    )
+                self._verify_typed_reuse_summaries(summaries)
         normalized = self._validate_summary_identity(summaries, bundle)
         generation_service = Stage1AnalysisService(
             job_id=session.context.workspace.job_id,
@@ -1008,6 +1030,33 @@ class InternalStageExecutorRegistry:
             ),
             0,
         )
+
+    @staticmethod
+    def _verify_typed_reuse_summaries(
+        summaries: Sequence[Mapping[str, Any]],
+    ) -> None:
+        """Verify reusable Stage 1 authorities before accepting zero transport."""
+
+        for index, summary in enumerate(summaries):
+            metadata = summary.get("stage1_reuse")
+            if not isinstance(metadata, Mapping) or str(
+                metadata.get("authority_kind") or ""
+            ).strip() != "typed_manifest":
+                raise RuntimeError(
+                    f"reuse_summary_files[{index}] is not a typed Stage 1 manifest authority"
+                )
+            raw_binding = metadata.get("binding")
+            binding = Stage1ReusableSummaryBindingV1.from_mapping(
+                raw_binding if isinstance(raw_binding, Mapping) else None
+            )
+            authority, reason = verify_stage1_typed_manifest_authority(
+                summary,
+                binding,
+            )
+            if authority is None:
+                raise RuntimeError(
+                    f"reuse_summary_files[{index}] typed Stage 1 authority rejected: {reason}"
+                )
 
     @staticmethod
     def _positive_int(value: Any, default: int) -> int:
@@ -1629,6 +1678,26 @@ class AgentRuntimeBridge:
         has_f1_corpus_binding = isinstance(
             self.job_spec.metadata.get("f1_corpus_binding"), Mapping
         )
+        if (
+            _typed_reuse_manifest_mode(list(request.reuse_summary_files))
+            and not has_f1_corpus_binding
+        ):
+            # A reusable manifest is already the Stage 1 source authority.
+            # Building a Zotero/direct bundle here would make the reuse
+            # contract ineffective and may start PDF preprocessing before
+            # typed-manifest verification. Keep this path zero-transport;
+            # _execute_analyze verifies every manifest before accepting it.
+            return SourceBundle(
+                source_mode=request.source_mode,
+                project_name=self.job_spec.project_name,
+                paper_work_items=[],
+                source_snapshot={
+                    "canonical_ready": True,
+                    "summary_only": True,
+                    "reuse_only_stage1": True,
+                    "summary_sources": list(summary_sources),
+                },
+            )
         if (
             request.action not in {"analyze", "run_all", "retry_failed"}
             and summary_sources

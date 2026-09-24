@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Mapping, Optional, cast
+from typing import Any, Mapping, Optional, Sequence, cast
 
 from runtime.source_intake import build_source_bundle_for_request
 from runtime.stage_contracts import SourceBundle
@@ -118,6 +119,23 @@ def _normalize_string_list(raw_value: Any) -> tuple[str, ...]:
     if isinstance(raw_value, str):
         return tuple(item.strip() for item in raw_value.splitlines() if item.strip())
     return tuple(str(item).strip() for item in raw_value or () if str(item).strip())
+
+
+def _typed_reuse_manifest_mode(paths: Sequence[str]) -> bool:
+    """Return whether an explicit reuse source starts the typed-manifest path.
+
+    Legacy summary files remain supported when PDF-backed reuse is requested;
+    only the portable ``stage1_reusable_summary_manifest/v1`` contract is
+    allowed to take the zero-preprocessing fast path.
+    """
+
+    if not paths:
+        return False
+    try:
+        payload = json.loads(Path(paths[0]).expanduser().read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    return isinstance(payload, Mapping) and payload.get("artifact_type") == "stage1_reusable_summary_manifest" and payload.get("artifact_version") == "v1"
 
 
 def build_job_request_from_mapping(params: Mapping[str, Any]) -> JobRunRequest:
@@ -279,7 +297,19 @@ class JobRunner:
         diagnostics: list[SourceInventoryDiagnosticV1] = []
         degradation: list[str] = []
         bundle: SourceBundle | None = None
-        if request.source_mode == "direct" and request.pdf_folder and not summary_paths:
+        # Explicit reusable manifests are already the Stage 1 authority. Do
+        # not resolve a source bundle before their authority is checked: a
+        # Zotero bundle can otherwise start PDF preprocessing even when the
+        # job contract requests source transport ``never``.
+        reuse_only_stage1 = _typed_reuse_manifest_mode(
+            [str(item) for item in request.reuse_summary_files]
+        )
+        if (
+            request.source_mode == "direct"
+            and request.pdf_folder
+            and not summary_paths
+            and not reuse_only_stage1
+        ):
             try:
                 bundle = build_source_bundle_for_request(request, project_name=project_name)
             except Exception as exc:
@@ -293,7 +323,12 @@ class JobRunner:
                     )
                 )
                 degradation.append(f"source_intake_error:{type(exc).__name__}")
-        elif request.source_mode == "zotero" and request.zotero_report and request.library_path:
+        elif (
+            request.source_mode == "zotero"
+            and request.zotero_report
+            and request.library_path
+            and not reuse_only_stage1
+        ):
             try:
                 bundle = build_source_bundle_for_request(request, project_name=project_name)
             except Exception as exc:
@@ -344,7 +379,9 @@ class JobRunner:
             # normal PDF-backed identity gate when PDFs are present, but let
             # the runtime's summary-only branch reach its explicit zero-call
             # closure contract when the external source is the only input.
-            summary_only_stage1 = bool(summary_paths and not ready_pdfs)
+            summary_only_stage1 = bool(
+                reuse_only_stage1 or (summary_paths and not ready_pdfs)
+            )
             if summary_only_stage1:
                 canonical_ready = bool(
                     not errors and ready_summaries == len(summary_paths)
