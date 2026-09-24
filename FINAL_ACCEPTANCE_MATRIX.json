@@ -1,0 +1,45 @@
+{
+  "schema_version": "r1-final-acceptance-matrix-v1",
+  "status": "NOT_READY",
+  "target": {
+    "name": "R1",
+    "required_source_count": 63,
+    "isolated_source_count": 3,
+    "original_import_count": 66,
+    "f1_status": "UNACCEPTED_INDEPENDENT_REGRESSION"
+  },
+  "identity": {
+    "base_sha": "bf00852fb627ac0519d96287d2d27b36f17a99ea",
+    "executable_sha": "75c7a9024627b4149d435bd42bdf8be4844afe10",
+    "remote_branch": "codex/r1-outline-final-repair",
+    "remote_sha_readback": "75c7a9024627b4149d435bd42bdf8be4844afe10",
+    "pr": "https://github.com/super-lee-hub/literature-review-generator/pull/25",
+    "existing_pr_24": "https://github.com/super-lee-hub/literature-review-generator/pull/24",
+    "merge_status": "UNMERGED"
+  },
+  "checks": [
+    {"id": "compileall", "status": "PASS", "evidence": "python -m compileall -q outline runtime preprocess reviewctl.py ai_interface.py"},
+    {"id": "changed_ruff_e9_f", "status": "PASS", "evidence": "ruff check changed modules --select E9,F"},
+    {"id": "changed_pyright", "status": "PASS", "evidence": "0 errors, 0 warnings, 0 informations"},
+    {"id": "outline_semantic_execution", "status": "PASS", "count": 31},
+    {"id": "outline_replay_invalidation", "status": "PASS", "count": 9},
+    {"id": "preprocess_service", "status": "PASS", "count": 35},
+    {"id": "runtime_cli_validation", "status": "PASS", "count": 15},
+    {"id": "focused_outline_preprocess_receipt_export", "status": "PASS", "count": 52},
+    {"id": "hosted_ci_pr25", "status": "PENDING", "run": "https://github.com/super-lee-hub/literature-review-generator/actions/runs/35943868620"},
+    {"id": "r1_live_provider_outline", "status": "BLOCKED_EXTERNAL", "reason": "No live provider execution was authorized or performed in this coding turn"},
+    {"id": "r1_writer_validator_repair", "status": "NOT_VERIFIED", "reason": "Depends on a successful current R1 outline"},
+    {"id": "r1_citation_docx_export_gui", "status": "NOT_VERIFIED", "reason": "Depends on Writer/Validator and live current artifact set"},
+    {"id": "f1_independent_regression", "status": "UNACCEPTED", "reason": "Separate 15-paper/OCR acceptance authority"}
+  ],
+  "pip_check": {
+    "status": "ENVIRONMENT_GAP",
+    "detail": "fusion-reviewer 0.2.0 requires pypdf, which is not installed"
+  },
+  "safety": {
+    "external_provider_posts_in_local_tests": 0,
+    "credentials_or_private_full_text_committed": false,
+    "pr24_merged": false,
+    "pr25_merged": false
+  }
+}
