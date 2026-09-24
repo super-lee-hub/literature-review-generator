@@ -650,7 +650,7 @@ class ReviewControlPlane:
                 else:
                     embedded = payload.get("summary_payload")
                     if isinstance(embedded, Mapping):
-                        payload = embedded
+                        payload = dict(embedded)
                     else:
                         raise ControlPlaneError(
                             "typed summary manifest must provide materialized_summary_file or summary_payload"

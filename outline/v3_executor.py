@@ -3950,7 +3950,8 @@ class OutlineV3Executor:
                     for entry in ledger.get("entries") or ():
                         if not isinstance(entry, Mapping):
                             continue
-                        paper_info = entry.get("paper_info") if isinstance(entry.get("paper_info"), Mapping) else {}
+                        raw_paper_info = entry.get("paper_info")
+                        paper_info: Mapping[str, Any] = raw_paper_info if isinstance(raw_paper_info, Mapping) else {}
                         paper_key = str(entry.get("paper_key") or entry.get("canonical_paper_key") or paper_info.get("canonical_paper_key") or "")
                         if paper_key and paper_key in candidate_papers:
                             entries.append(dict(entry))
