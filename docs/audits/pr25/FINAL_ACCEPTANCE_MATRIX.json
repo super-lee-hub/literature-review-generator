@@ -32,6 +32,18 @@
     {"id": "r1_citation_docx_export_gui", "status": "NOT_VERIFIED", "reason": "Depends on Writer/Validator and live current artifact set"},
     {"id": "f1_independent_regression", "status": "UNACCEPTED", "reason": "Separate 15-paper/OCR acceptance authority"}
   ],
+  "r1_input_readiness": {
+    "status": "BLOCKED_EXTERNAL",
+    "spec_source": "D:/auto-generate/acceptance_artifacts/r1_20260920/R1_RUNTIME_JOB_SPEC_FULL_R1_CURRENT.json",
+    "typed_manifest_count": 63,
+    "typed_manifest_artifact_type": "stage1_reusable_summary_manifest/v1",
+    "unique_paper_key_count": 63,
+    "manifest_decode_errors": 0,
+    "config_file": "R1_REVIEW_CONFIG.ini",
+    "config_present_in_current_acceptance_input": false,
+    "external_host_acknowledgement_expires_at": "2026-09-21T08:30:20Z",
+    "blocker": "fresh owner-supplied provider config, credentials, budget, and external-host acknowledgement are required before live execution"
+  },
   "pip_check": {
     "status": "PASS",
     "detail": "No broken requirements found after installing pypdf 6.19.0"

@@ -81,6 +81,12 @@ for the active Python 3.13 environment. PDF/DOCX/export focused tests passed
   turn. They require owner-authorized credentials, budget, and the frozen R1
   manifest. The machine-readable matrix marks them `BLOCKED_EXTERNAL` or
   `NOT_VERIFIED`, never PASS.
+- The historical R1 spec was machine-checked read-only: 63 typed
+  `stage1_reusable_summary_manifest/v1` files exist and decode with 63 unique
+  paper keys. Its referenced `R1_REVIEW_CONFIG.ini` is absent from the current
+  acceptance input, and its external-host acknowledgement expired on
+  2026-09-21, so it cannot be promoted into a live run without a fresh owner
+  supplied config/acknowledgement.
 - F1 remains an independent regression corpus and is `UNACCEPTED`; no R1
   evidence is promoted to F1.
 - Full-repository Ruff still reports pre-existing unused-import and duplicate
