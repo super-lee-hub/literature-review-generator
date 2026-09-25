@@ -3,7 +3,7 @@
 This branch implements the repair plan against PR #24's hardening head
 `bf00852fb627ac0519d96287d2d27b36f17a99ea`.
 
-The current executable code commit is `97e6001368c948a1d36a16b900da6d74e3dba95e`.
+The current executable code commit is `4ced4c0303450ed13523229e6e5d8c7641d487e8`.
 The remote branch is `codex/r1-outline-final-repair`; PR #25 is open and
 unmerged. PR #24 remains open and unmerged.
 
@@ -75,6 +75,9 @@ unmerged. PR #24 remains open and unmerged.
   (`changed`, `already_satisfied`, `unresolved`, or `failed`) and reject a
   recommendation when any required target remains unresolved. The revised
   candidate hash is persisted with a post-revision verification record.
+- Semantic provider outputs now reject unknown paper/study/evidence identities
+  before persistence, with source claim IDs and synthesized claim IDs kept in
+  separate namespaces.
 - `reviewctl config-migrate` now removes obsolete GPT route sections, migrates
   their `OutlineModels` references to `Backup_Reader_API`, and removes the
   unsupported Writer fallback key. The user's config was migrated with an
