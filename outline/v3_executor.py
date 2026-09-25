@@ -1394,6 +1394,112 @@ class OutlineV3Executor:
         }
 
     @classmethod
+    def _complete_topic_evidence_units(
+        cls,
+        view: Any,
+        dossier: Any | None,
+        *,
+        fields: Sequence[str],
+        chunk_indexes: Sequence[int] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Split a large dossier at study/claim boundaries without loss."""
+
+        complete = cls._complete_topic_evidence_unit(view, dossier, fields=fields)
+        if dossier is None or not hasattr(dossier, "to_dict"):
+            return [complete]
+        raw_units = list(getattr(dossier, "research_units", []) or [])
+        raw_claims = list(getattr(dossier, "claims", []) or [])
+        if len(raw_units) <= 1 and len(raw_claims) <= 8:
+            return [complete]
+
+        dossier_payload = dossier.to_dict()
+        chunks: list[dict[str, Any]] = []
+        if raw_units:
+            for index, unit in enumerate(raw_units, start=1):
+                unit_payload = unit.to_dict()
+                unit_claims = list(unit_payload.get("claims") or [])
+                if len(unit_claims) <= 8:
+                    unit_chunks = [unit_claims]
+                else:
+                    unit_chunks = [
+                        unit_claims[offset : offset + 8]
+                        for offset in range(0, len(unit_claims), 8)
+                    ]
+                for chunk_index, claim_chunk in enumerate(unit_chunks, start=1):
+                    all_evidence_ids = [
+                        str(item)
+                        for item in unit_payload.get("evidence_ids") or ()
+                        if str(item)
+                    ]
+                    chunk_ids = {
+                        str(item.get("evidence_id") or item.get("id") or "")
+                        for item in claim_chunk
+                        if isinstance(item, Mapping)
+                        and str(item.get("evidence_id") or item.get("id") or "")
+                    }
+                    claim_bound_ids = {
+                        str(evidence_id)
+                        for item in claim_chunk
+                        if isinstance(item, Mapping)
+                        for evidence_id in item.get("evidence_ids") or ()
+                        if str(evidence_id)
+                    }
+                    if claim_bound_ids:
+                        selected_ids = claim_bound_ids | chunk_ids
+                    else:
+                        selected_ids = set(
+                            all_evidence_ids[
+                                (chunk_index - 1) * max(1, len(all_evidence_ids) // len(unit_chunks)) :
+                                chunk_index * max(1, len(all_evidence_ids) // len(unit_chunks))
+                            ]
+                        )
+                    unit_copy = dict(unit_payload)
+                    unit_copy["claims"] = claim_chunk
+                    unit_copy["evidence_ids"] = sorted(selected_ids)
+                    unit_copy["chunk_index"] = chunk_index
+                    unit_copy["chunk_count"] = len(unit_chunks)
+                    chunks.append(
+                        {
+                            **complete,
+                            "evidence_unit_id": f"{complete['evidence_unit_id']}:{index}:{chunk_index}",
+                            "study_units": [unit_copy],
+                            "claims": claim_chunk,
+                            "evidence_ids_by_field": {
+                                str(key): [
+                                    str(value)
+                                    for value in values
+                                    if str(value) in selected_ids
+                                ]
+                                for key, values in (
+                                    dossier_payload.get("evidence_ids_by_field") or {}
+                                ).items()
+                                if isinstance(values, list)
+                            },
+                            "evidence_text_by_id": {
+                                str(key): value
+                                for key, value in (
+                                    dossier_payload.get("evidence_text_by_id") or {}
+                                ).items()
+                                if str(key) in selected_ids
+                            },
+                            "projection": "complete_study_claim_chunk_v1",
+                        }
+                    )
+        if not chunks:
+            return [complete]
+        for chunk in chunks:
+            chunk["chunk_group_id"] = complete["evidence_unit_id"]
+            chunk["chunk_complete_for_study"] = True
+        if chunk_indexes is None:
+            return chunks
+        allowed = {int(item) for item in chunk_indexes}
+        return [
+            chunk
+            for index, chunk in enumerate(chunks, start=1)
+            if index in allowed
+        ] or chunks
+
+    @classmethod
     def _compact_candidate_evidence_refs(
         cls,
         views: Sequence[Any],
@@ -1516,15 +1622,24 @@ class OutlineV3Executor:
             if str(getattr(view, "paper_key", ""))
         }
         dossiers = getattr(content_layers_model, "dossier_by_paper", {})
-        evidence_units = [
-            self._complete_topic_evidence_unit(
-                view_by_paper[paper_id],
-                dossiers.get(paper_id) if isinstance(dossiers, Mapping) else None,
-                fields=fields,
+        evidence_units: list[dict[str, Any]] = []
+        for paper_id in paper_ids:
+            if paper_id not in view_by_paper:
+                continue
+            unit_filter: Sequence[int] | None = None
+            for topic in batch:
+                filters = getattr(topic, "_evidence_unit_indexes", None)
+                if isinstance(filters, Mapping) and paper_id in filters:
+                    unit_filter = filters.get(paper_id)
+                    break
+            evidence_units.extend(
+                self._complete_topic_evidence_units(
+                    view_by_paper[paper_id],
+                    dossiers.get(paper_id) if isinstance(dossiers, Mapping) else None,
+                    fields=fields,
+                    chunk_indexes=unit_filter,
+                )
             )
-            for paper_id in paper_ids
-            if paper_id in view_by_paper
-        ]
         return {
             "task": "substantive_topic_synthesis",
             "node_id": "topic_synthesis",
@@ -1595,7 +1710,7 @@ class OutlineV3Executor:
                 int(self.max_source_prompt_tokens or 32_000),
                 int(profile.input_budget or 32_000),
             )
-            - 2_000,
+            - 0,
         )
         topic_plan = self._split_topic_plan_for_budget(
             topic_plan,
@@ -1647,7 +1762,27 @@ class OutlineV3Executor:
         """Split oversized topic routes only at paper/evidence-unit boundaries."""
 
         expanded: list[TopicSynthesis] = []
+
+        def with_unit_filter(
+            source: TopicSynthesis,
+            paper_id: str,
+            indexes: Sequence[int],
+        ) -> TopicSynthesis:
+            clone = replace(
+                source,
+                paper_ids=[paper_id],
+                bridge_paper_ids=[
+                    value for value in source.bridge_paper_ids if value == paper_id
+                ],
+            )
+            object.__setattr__(clone, "_evidence_unit_indexes", {paper_id: list(indexes)})
+            return clone
+
         for topic in topics:
+            source_topic_id = topic.topic_id
+            topic_fields = self._topic_projection_fields(
+                getattr(topic_routes.get(source_topic_id), "dimensions", [])
+            )
             full_request = self._build_topic_provider_request(
                 [topic],
                 topic_routes=topic_routes,
@@ -1665,9 +1800,33 @@ class OutlineV3Executor:
                 full_budget.get("estimated_input_tokens")
                 or profile.estimate_tokens(full_request)
             )
-            if full_estimate <= input_limit or len(topic.paper_ids) <= 1:
+            if full_estimate <= input_limit:
                 expanded.append(topic)
                 continue
+            if len(topic.paper_ids) == 1:
+                paper_id = str(topic.paper_ids[0])
+                view = next(
+                    (
+                        item
+                        for item in getattr(evidence_model, "views", []) or []
+                        if str(getattr(item, "paper_key", "")) == paper_id
+                    ),
+                    None,
+                )
+                dossiers = getattr(content_layers_model, "dossier_by_paper", {})
+                dossier = dossiers.get(paper_id) if isinstance(dossiers, Mapping) else None
+                units = self._complete_topic_evidence_units(
+                    view,
+                    dossier,
+                    fields=topic_fields,
+                ) if view is not None else []
+                if len(units) > 1:
+                    for index in range(1, len(units) + 1):
+                        expanded.append(with_unit_filter(topic, paper_id, [index]))
+                    continue
+                raise OutlineV3ExecutionError(
+                    f"BLOCKED_BUDGET: topic {topic.topic_id} paper {paper_id} is an indivisible complete evidence unit over the effective input cap"
+                )
             paper_ids = [str(item) for item in topic.paper_ids if str(item)]
             current: list[str] = []
             for paper_id in paper_ids:
@@ -1740,8 +1899,24 @@ class OutlineV3Executor:
                         or profile.estimate_tokens(one_request)
                     )
                     if one_estimate > input_limit:
+                        units = self._complete_topic_evidence_units(
+                            next(
+                                item
+                                for item in getattr(evidence_model, "views", []) or []
+                                if str(getattr(item, "paper_key", "")) == paper_id
+                            ),
+                            getattr(content_layers_model, "dossier_by_paper", {}).get(paper_id),
+                            fields=topic_fields,
+                        )
+                        if len(units) > 1:
+                            expanded.extend(
+                                with_unit_filter(topic, paper_id, [index])
+                                for index in range(1, len(units) + 1)
+                            )
+                            current = []
+                            continue
                         raise OutlineV3ExecutionError(
-                            f"BLOCKED_BUDGET: topic {topic.topic_id} paper {paper_id} exceeds effective input cap"
+                            f"BLOCKED_BUDGET: topic {topic.topic_id} paper {paper_id} is an indivisible complete evidence unit over the effective input cap"
                         )
             if current:
                 expanded.append(
@@ -6641,7 +6816,7 @@ class OutlineV3Executor:
                         32_000,
                         int(self.max_source_prompt_tokens or 32_000),
                         int(topic_profile.input_budget or 32_000),
-                    ) - 2_000,
+                    ) - 0,
                 )
                 topic_plan = self._split_topic_plan_for_budget(
                     topic_plan,

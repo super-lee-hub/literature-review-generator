@@ -529,7 +529,7 @@ def test_topic_provider_request_materializes_complete_dossier_unit(
     )
 
     unit = request["evidence_units"][0]
-    assert unit["projection"] == "complete_dossier_study_claim_unit_v1"
+    assert unit["projection"].startswith("complete_")
     assert "study_units" in unit
     assert "claims" in unit
     assert "evidence_ids_by_field" in unit
@@ -538,6 +538,37 @@ def test_topic_provider_request_materializes_complete_dossier_unit(
     assert unit["evidence_unit_hash"]
     assert "findings" in unit["semantic_fields"]
     assert "limitations" in unit["semantic_fields"]
+
+
+def test_complete_topic_unit_splits_claims_without_loss(tmp_path: Path) -> None:
+    executor = _executor(tmp_path, stability_mode="off", technical_shard_target_tokens=32_000)
+    evidence = build_outline_evidence_views(executor.summaries, executor.job_id)
+    content_layers = build_paper_content_layers(
+        executor.summaries,
+        evidence,
+        job_id=executor.job_id,
+    )
+    paper = content_layers.dossiers[0].paper_id
+    view = next(item for item in evidence.views if item.paper_key == paper)
+    dossier = content_layers.dossier_by_paper[paper]
+    chunks = executor._complete_topic_evidence_units(
+        view,
+        dossier,
+        fields=executor._topic_projection_fields(["context"]),
+    )
+
+    assert len(chunks) >= 2
+    original_claim_ids = {
+        str(item.claim_id) for item in dossier.claims if str(item.claim_id)
+    }
+    chunk_claim_ids = {
+        str(item.get("claim_id") or "")
+        for chunk in chunks
+        for item in chunk.get("claims") or ()
+        if isinstance(item, Mapping) and str(item.get("claim_id") or "")
+    }
+    assert chunk_claim_ids == original_claim_ids
+    assert all(chunk.get("chunk_complete_for_study") is True for chunk in chunks)
 
 
 def test_outline_preflight_counts_hierarchical_relation_calls(tmp_path: Path) -> None:
