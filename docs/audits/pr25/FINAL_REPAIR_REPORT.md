@@ -36,6 +36,8 @@ unmerged. PR #24 remains open and unmerged.
 - Added fail-closed pause state handling and propagated the pause path through
   the runtime provider admission context, including Stage 1/Writer/Validator
   provider runtimes.
+- Public resume now validates the persisted normalized spec and fingerprint
+  before clearing a pause marker; a rejected resume preserves the paused state.
 - Fixed the hidden timeout hostname override, MinerU page-index JSON
   classification, and retained the PR baseline's binary/ZIP size limits,
   NULL-parent Zotero handling, and terminal MinerU error propagation.
@@ -100,6 +102,8 @@ Fresh local checks on this code commit:
   regression group: 48 passed.
 - Current semantic execution, invalidation, and routed-replay regression group:
   58 passed, including a long bilingual qualifier-tail wire-request check.
+- Public control-plane pause/resume rejection regression: 1 passed; a stale
+  resume identity leaves the job paused until a valid resume is supplied.
 - Additional focused provider/outline tests: 52 passed.
 - Provider routing/replay and current production-chain regressions: 14 passed
   in the latest local run after semantic response replay/closure fixes.

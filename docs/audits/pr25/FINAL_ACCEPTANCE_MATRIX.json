@@ -88,6 +88,15 @@
       "positive_long_bilingual_wire_request": true
     },
     {
+      "id": "public_control_plane_pause_resume_rejection",
+      "status": "PASS",
+      "count": 1,
+      "scope": [
+        "tests/test_control_plane_pause_resume.py"
+      ],
+      "rejected_resume_preserves_pause": true
+    },
+    {
       "id": "hosted_ci_pr25",
       "status": "PASS",
       "run": "https://github.com/super-lee-hub/literature-review-generator/actions/runs/36095307505",

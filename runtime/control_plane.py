@@ -4344,6 +4344,26 @@ class ReviewControlPlane:
                 cancel_store.clear(cleared_by="reviewctl", reason="resume_requested")
         except (OSError, RegistryError, ValueError, TypeError) as exc:
             raise ControlPlaneError(f"resume cancellation state is invalid: {exc}") from exc
+        # Validate the persisted runtime identity before clearing a user pause.
+        # A malformed/stale spec or fingerprint must leave the job paused so a
+        # rejected resume cannot accidentally reopen provider admission.
+        try:
+            from dataclasses import replace
+
+            resume_job_id = Path(resolved).name.rsplit("__", 1)[-1]
+            persisted_spec = _load_spec_path(spec_path)
+            if resume_job_id:
+                persisted_spec = replace(persisted_spec, job_id=resume_job_id)
+            normalized_resume_spec = AgentRuntimeRunner(persisted_spec)._normalized_spec(
+                resume=True
+            )
+            AgentRuntimeRunner._validate_persisted_spec(
+                workspace_obj,
+                normalized_resume_spec.to_dict(),
+                registry,
+            )
+        except (OSError, RegistryError, ValueError, TypeError, RuntimeError) as exc:
+            raise ControlPlaneError(f"resume identity preflight is invalid: {exc}") from exc
         try:
             pause_store = PauseStateStore(workspace_obj, registry)
             pause_state = pause_store.read()
