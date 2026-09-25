@@ -86,6 +86,44 @@ def test_dead_retry_sections_are_removed() -> None:
     _assert_valid_and_idempotent(migrated)
 
 
+def test_obsolete_gpt_route_blocks_and_fallback_key_are_removed() -> None:
+    text = (
+        "[Application]\nconfig_schema = 4\n"
+        "[Outline_API]\nmodel = current\n"
+        "[Writer_API]\nfallback_section = Writer_GPT_Fallback_API\n"
+        "[Outline_GPT_API]\nmodel = obsolete\n"
+        "[Outline_GPT_Fallback_API]\nmodel = obsolete-fallback\n"
+        "[Writer_GPT_Fallback_API]\nmodel = obsolete-writer-fallback\n"
+    )
+    migrated, report = migrate_config_text(text)
+
+    parsed = _parse(migrated)
+    assert "Outline_GPT_API" not in parsed
+    assert "Outline_GPT_Fallback_API" not in parsed
+    assert "Writer_GPT_Fallback_API" not in parsed
+    assert "fallback_section" not in parsed["Writer_API"]
+    assert any("removed dead legacy section [Outline_GPT_API]" in change for change in report.changes)
+    _assert_valid_and_idempotent(migrated)
+
+
+def test_obsolete_route_references_are_migrated_in_outline_models() -> None:
+    text = (
+        "[Application]\nconfig_schema = 4\n"
+        "[Backup_Reader_API]\nmodel = backup\n"
+        "[OutlineModels]\n"
+        "outline_model = Outline_API\n"
+        "structure_critic_model = Outline_GPT_API\n"
+        "evidence_critic_model = Writer_GPT_Fallback_API\n"
+    )
+    migrated, report = migrate_config_text(text)
+
+    parsed = _parse(migrated)
+    assert parsed["OutlineModels"]["structure_critic_model"] == "Backup_Reader_API"
+    assert parsed["OutlineModels"]["evidence_critic_model"] == "Backup_Reader_API"
+    assert any("structure_critic_model" in change for change in report.changes)
+    _assert_valid_and_idempotent(migrated)
+
+
 def test_test_dev_fixture_mode_is_removed() -> None:
     text = "[Outline]\ncandidate_count = 5\ntest_dev_fixture_mode = false\n"
     migrated, _ = migrate_config_text(text)
