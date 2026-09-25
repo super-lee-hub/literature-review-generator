@@ -77,6 +77,17 @@
       ]
     },
     {
+      "id": "current_semantic_execution_invalidation_routing_regression",
+      "status": "PASS",
+      "count": 58,
+      "scope": [
+        "test_outline_v3_semantic_execution.py",
+        "test_outline_v3_executor_invalidation.py",
+        "test_outline_v3_real_transport_routing.py"
+      ],
+      "positive_long_bilingual_wire_request": true
+    },
+    {
       "id": "hosted_ci_pr25",
       "status": "PASS",
       "run": "https://github.com/super-lee-hub/literature-review-generator/actions/runs/36095307505",

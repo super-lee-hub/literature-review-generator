@@ -540,6 +540,61 @@ def test_topic_provider_request_materializes_complete_dossier_unit(
     assert "limitations" in unit["semantic_fields"]
 
 
+def test_complete_topic_request_preserves_long_bilingual_qualifier_tail(
+    tmp_path: Path,
+) -> None:
+    """A long bilingual finding keeps its terminal boundary in the wire request."""
+
+    executor = _executor(
+        tmp_path,
+        stability_mode="off",
+        technical_shard_target_tokens=32_000,
+        max_source_prompt_tokens=32_000,
+    )
+    bilingual = (
+        "中文条件说明：该结果只在动态定价且消费者知道参照价格时成立。 "
+        "English boundary: the effect is conditional on dynamic pricing and a known reference price. "
+    ) * 12
+    tail = bilingual + "TAIL_QUALIFIER_MUST_SURVIVE"
+    executor.summaries[0]["core_analysis"]["findings"] = tail
+    executor.summaries[0]["core_analysis"]["limitations"] = tail
+
+    evidence = build_outline_evidence_views(executor.summaries, executor.job_id)
+    ledger = build_global_corpus_ledger(evidence)
+    matrix = build_multi_view_matrix(evidence)
+    relation_map = build_global_relation_map(evidence, matrix, ledger)
+    content_layers = build_paper_content_layers(
+        executor.summaries,
+        evidence,
+        job_id=executor.job_id,
+    )
+    semantic_plan = build_semantic_chunk_plan(
+        content_layers,
+        relation_map,
+        candidate_count=executor.candidate_count,
+        physical_call_limit=24,
+    )
+    topic_plan = build_topic_synthesis_plan(semantic_plan)
+    routes = {topic.topic_id: topic for topic in semantic_plan.topics}
+    topic = next(topic for topic in topic_plan if "paper-a" in topic.paper_ids)
+    request = executor._build_topic_provider_request(
+        [topic],
+        topic_routes=routes,
+        evidence_model=evidence,
+        content_layers_model=content_layers,
+        batch_index=1,
+    )
+    serialized = json.dumps(request, ensure_ascii=False, sort_keys=True)
+    budget = executor.profile.estimate_request(
+        executor._attach_prompt_authority("topic_synthesis:long-bilingual", request)
+    )
+
+    assert "中文条件说明" in serialized
+    assert "English boundary" in serialized
+    assert "TAIL_QUALIFIER_MUST_SURVIVE" in serialized
+    assert budget["estimated_input_tokens"] <= 32_000
+
+
 def test_complete_topic_unit_splits_claims_without_loss(tmp_path: Path) -> None:
     executor = _executor(tmp_path, stability_mode="off", technical_shard_target_tokens=32_000)
     evidence = build_outline_evidence_views(executor.summaries, executor.job_id)

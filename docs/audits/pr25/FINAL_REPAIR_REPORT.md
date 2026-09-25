@@ -98,6 +98,8 @@ Fresh local checks on this code commit:
 - Runtime/CLI/validation/review generation group: 15 passed.
 - Current runtime/production/validation-repair/entrypoint-parity/GUI controller
   regression group: 48 passed.
+- Current semantic execution, invalidation, and routed-replay regression group:
+  58 passed, including a long bilingual qualifier-tail wire-request check.
 - Additional focused provider/outline tests: 52 passed.
 - Provider routing/replay and current production-chain regressions: 14 passed
   in the latest local run after semantic response replay/closure fixes.
