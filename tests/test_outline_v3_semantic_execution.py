@@ -189,6 +189,40 @@ def test_outline_v3_fixture_executes_evidence_bound_adoption(tmp_path: Path) -> 
     assert {"paper-a", "paper-b"}.issubset(set(graph["coverage"]["paper_keys"]))
 
 
+def test_selected_revision_requires_every_target_to_resolve(tmp_path: Path) -> None:
+    def provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        response = dict(_configured_test_provider(node_id, request))
+        if node_id == "arbitration":
+            response["content"] = {
+                "selected_candidate_id": "candidate_1",
+                "selection_reasons": ["fixture"],
+                "accepted_recommendations": [
+                    {
+                        "issue_id": "issue:multi-target",
+                        "target_section_ids": [
+                            "candidate_1_section_1",
+                            "candidate_1_section_missing",
+                        ],
+                        "operation": "replace_title",
+                        "replacement": "Revised title",
+                    }
+                ],
+                "rejected_recommendations": [],
+                "unresolved_risks": [],
+            }
+        return response
+
+    result = _executor(
+        tmp_path,
+        provider=provider,
+        stability_mode="off",
+    ).run()
+
+    assert result.ok is False
+    assert result.status == "blocked"
+    assert any("issue:multi-target" in item for item in result.diagnostics)
+
+
 def test_outline_v3_without_explicit_adoption_stops_at_ready_for_adoption(tmp_path: Path) -> None:
     result = _executor(tmp_path).run()
 

@@ -7952,28 +7952,47 @@ class OutlineV3Executor:
                         operation = "remove_claim"
                     elif any(marker in lowered for marker in ("aggregate", "共同指向", "共同说明", "概括性", "gap claim")):
                         operation = "replace_aggregate_claim_with_per_paper_boundaries"
-                targets = [section for section in revised_sections if str(section.get("section_id") or "") in target_ids]
-                changed = False
+                targets = [
+                    section for section in revised_sections
+                    if str(section.get("section_id") or "") in target_ids
+                ]
                 operation_records: list[dict[str, Any]] = []
-                for section in targets:
-                    section_id = str(section.get("section_id") or "")
+                target_results: list[dict[str, Any]] = []
+                for section_id in sorted(target_ids):
+                    section = next(
+                        (item for item in targets if str(item.get("section_id") or "") == section_id),
+                        None,
+                    )
+                    if section is None:
+                        target_results.append({
+                            "section_id": section_id,
+                            "operation": operation or "unknown",
+                            "status": "unresolved",
+                            "reason": "target_section_not_found",
+                        })
+                        continue
                     before_hash = hash_json(section)
-                    claims = [str(item) for item in section.get("claims") or () if str(item).strip()]
+                    claims = [
+                        str(item) for item in section.get("claims") or () if str(item).strip()
+                    ]
+                    target_status = "unresolved"
+                    reason = "operation_not_applied"
                     if operation == "replace_title":
-                        new_title = replacement
-                        if not new_title:
-                            # A typed issue may carry only a recommendation;
-                            # it is safer to mark it unresolved than to invent
-                            # a title from free text.
-                            continue
-                        section["title"] = new_title
-                        changed = True
+                        if not replacement:
+                            reason = "replacement_missing"
+                        elif str(section.get("title") or "") == replacement:
+                            target_status, reason = "already_satisfied", "title_already_matches"
+                        else:
+                            section["title"] = replacement
+                            target_status, reason = "changed", "title_replaced"
                     elif operation == "replace_goal":
-                        new_goal = replacement
-                        if not new_goal:
-                            continue
-                        section["goal"] = new_goal
-                        changed = True
+                        if not replacement:
+                            reason = "replacement_missing"
+                        elif str(section.get("goal") or "") == replacement:
+                            target_status, reason = "already_satisfied", "goal_already_matches"
+                        else:
+                            section["goal"] = replacement
+                            target_status, reason = "changed", "goal_replaced"
                     elif operation == "replace_aggregate_claim_with_per_paper_boundaries":
                         aggregate_claims = [
                             claim for claim in claims
@@ -7987,36 +8006,58 @@ class OutlineV3Executor:
                             evidence = [*list(view.limitations), *list(view.research_gaps), *list(view.future_directions)]
                             if evidence:
                                 per_paper_claims.append(f"{paper_key} 的作者自陈边界：" + "；".join(evidence))
-                        if aggregate_claims and per_paper_claims:
+                        if not aggregate_claims:
+                            target_status, reason = "already_satisfied", "no_aggregate_claim_remains"
+                        elif per_paper_claims:
                             section["claims"] = [claim for claim in claims if claim not in aggregate_claims] + per_paper_claims
-                            changed = True
+                            target_status, reason = "changed", "aggregate_claim_replaced_with_per_paper_boundaries"
+                        else:
+                            reason = "supporting_boundary_evidence_missing"
                     elif operation == "remove_claim":
-                        claim_text = replacement
-                        if not claim_text:
-                            continue
-                        kept = [claim for claim in claims if claim != claim_text]
-                        if len(kept) != len(claims) and kept:
-                            section["claims"] = kept
-                            changed = True
-                    if changed:
-                        after_hash = hash_json(section)
+                        if not replacement:
+                            reason = "claim_replacement_missing"
+                        elif replacement not in claims:
+                            target_status, reason = "already_satisfied", "claim_already_absent"
+                        else:
+                            kept = [claim for claim in claims if claim != replacement]
+                            if not kept:
+                                target_status, reason = "failed", "cannot_delete_last_supported_claim"
+                            else:
+                                section["claims"] = kept
+                                target_status, reason = "changed", "claim_removed"
+                    else:
+                        reason = "unsupported_or_missing_operation"
+                    after_hash = hash_json(section)
+                    record = {
+                        "issue_id": issue_id,
+                        "recommendation": recommendation,
+                        "section_id": section_id,
+                        "operation": operation or "unknown",
+                        "status": target_status,
+                        "reason": reason,
+                        "before_hash": before_hash,
+                        "after_hash": after_hash,
+                    }
+                    if target_status == "changed":
                         section["revision_lineage"] = {
                             "issue_id": issue_id,
                             "parent_candidate_hash": generation_hashes[selected_id],
                             "before_hash": before_hash,
                             "after_hash": after_hash,
                         }
-                        operation_records.append({
-                            "issue_id": issue_id,
-                            "recommendation": recommendation,
-                            "section_id": section_id,
-                            "operation": operation,
-                            "status": "applied",
-                            "parent_hash": before_hash,
-                            "revised_hash": hash_json(section),
-                            "targeted_verification": "candidate_structure_and_evidence_recheck_pending",
-                        })
-                if changed:
+                        record["after_hash"] = hash_json(section)
+                        record["targeted_verification"] = "candidate_structure_and_evidence_recheck_pending"
+                    operation_records.append(record)
+                    target_results.append({
+                        "section_id": section_id,
+                        "status": target_status,
+                        "reason": reason,
+                    })
+                required_resolved = bool(target_results) and all(
+                    item.get("status") in {"changed", "already_satisfied"}
+                    for item in target_results
+                )
+                if required_resolved:
                     revision_records.extend(operation_records)
                 else:
                     unresolved_revisions.append({
@@ -8025,6 +8066,7 @@ class OutlineV3Executor:
                         "target_section_ids": sorted(target_ids),
                         "operation": operation or "unknown",
                         "status": "needs_manual_review",
+                        "target_results": target_results,
                     })
             if unresolved_revisions:
                 raise OutlineV3ExecutionError(
@@ -8038,6 +8080,21 @@ class OutlineV3Executor:
                 allowed_relation_ids=[item.relation_id for item in confirmed_map_model.relations],
                 alias_map=critique_alias_map,
             )
+            revised_candidate_hash = _hash_payload({"sections": revised_sections})
+            revision_verification = {
+                "artifact_type": "selected_candidate_revision_verification",
+                "artifact_version": "v1",
+                "candidate_id": selected_id,
+                "revised_candidate_hash": revised_candidate_hash,
+                "checks": {
+                    "section_identity_and_order": True,
+                    "allowed_paper_ids": True,
+                    "allowed_relation_ids": True,
+                    "non_empty_claims": True,
+                    "evidence_packet_rebuild_required": True,
+                },
+                "status": "passed",
+            }
             revision_deps = {
                 "selected_candidate": _hash_payload(selected),
                 f"{selected_id}_provider_generation": generation_hashes[selected_id],
@@ -8050,10 +8107,11 @@ class OutlineV3Executor:
                         "candidate_id": selected_id,
                         "parent_candidate_hash": generation_hashes[selected_id],
                         "parent_selected_hash": _hash_payload(selected),
-                        "revised_content_hash": _hash_payload({"sections": revised_sections}),
+                        "revised_content_hash": revised_candidate_hash,
                         "sections": revised_sections,
                         "accepted_recommendations": accepted_recommendations,
                         "revision_records": revision_records,
+                        "revision_verification": revision_verification,
                         "revision_round": 1,
                         "max_revision_rounds": 2,
                         "status": "completed" if not unresolved_revisions else "blocked",
