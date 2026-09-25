@@ -14,6 +14,11 @@ from outline.v3_evidence import (
     build_outline_evidence_views,
 )
 from outline.v3_relations import build_global_relation_map
+from outline.semantic_chunking import (
+    build_paper_content_layers,
+    build_semantic_chunk_plan,
+    build_topic_synthesis_plan,
+)
 from runtime.provider_runtime import ProviderRuntimeLedger, hash_json
 from services.artifact_registry import ArtifactRegistry
 from services.job_workspace import JobWorkspace
@@ -452,6 +457,53 @@ def test_evidence_projection_preserves_tail_and_chunks_long_view(tmp_path: Path)
     )
     assert plan["coverage"]["missing_chunk_ids"] == []
     assert plan["coverage"]["input_chunk_count"] == len(chunks)
+
+
+def test_topic_provider_request_materializes_complete_dossier_unit(
+    tmp_path: Path,
+) -> None:
+    """Semantic topic requests carry actual study/claim evidence, not hashes only."""
+
+    executor = _executor(
+        tmp_path,
+        stability_mode="off",
+        technical_shard_target_tokens=32_000,
+    )
+    evidence = build_outline_evidence_views(executor.summaries, executor.job_id)
+    ledger = build_global_corpus_ledger(evidence)
+    matrix = build_multi_view_matrix(evidence)
+    relation_map = build_global_relation_map(evidence, matrix, ledger)
+    content_layers = build_paper_content_layers(
+        executor.summaries,
+        evidence,
+        job_id=executor.job_id,
+    )
+    semantic_plan = build_semantic_chunk_plan(
+        content_layers,
+        relation_map,
+        candidate_count=executor.candidate_count,
+        physical_call_limit=24,
+    )
+    topic_plan = build_topic_synthesis_plan(semantic_plan)
+    routes = {topic.topic_id: topic for topic in semantic_plan.topics}
+    request = executor._build_topic_provider_request(
+        [topic_plan[0]],
+        topic_routes=routes,
+        evidence_model=evidence,
+        content_layers_model=content_layers,
+        batch_index=1,
+    )
+
+    unit = request["evidence_units"][0]
+    assert unit["projection"] == "complete_dossier_study_claim_unit_v1"
+    assert "study_units" in unit
+    assert "claims" in unit
+    assert "evidence_ids_by_field" in unit
+    assert "source_locators" in unit
+    assert unit["evidence_unit_id"]
+    assert unit["evidence_unit_hash"]
+    assert "findings" in unit["semantic_fields"]
+    assert "limitations" in unit["semantic_fields"]
 
 
 def test_outline_preflight_counts_hierarchical_relation_calls(tmp_path: Path) -> None:

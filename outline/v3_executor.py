@@ -1202,13 +1202,58 @@ class OutlineV3Executor:
         for dimension in dimensions:
             normalized = str(dimension or "").strip().casefold()
             if normalized == "context":
-                fields.update(("findings",))
+                fields.update(
+                    (
+                        "research_questions",
+                        "theories",
+                        "constructs",
+                        "mechanisms",
+                        "method",
+                        "sample_or_context",
+                        "findings",
+                        "conclusions",
+                        "limitations",
+                        "research_gaps",
+                        "future_directions",
+                    )
+                )
             elif normalized == "method":
-                fields.update(("method",))
+                fields.update(
+                    (
+                        "research_questions",
+                        "constructs",
+                        "method",
+                        "sample_or_context",
+                        "findings",
+                        "conclusions",
+                        "limitations",
+                    )
+                )
             elif normalized == "theory":
-                fields.update(("theories", "findings"))
+                fields.update(
+                    (
+                        "theories",
+                        "constructs",
+                        "mechanisms",
+                        "method",
+                        "sample_or_context",
+                        "findings",
+                        "conclusions",
+                        "limitations",
+                    )
+                )
             elif normalized == "mechanism":
-                fields.update(("mechanisms", "findings"))
+                fields.update(
+                    (
+                        "mechanisms",
+                        "constructs",
+                        "method",
+                        "sample_or_context",
+                        "findings",
+                        "conclusions",
+                        "limitations",
+                    )
+                )
             else:
                 fields.update(
                     (
@@ -1300,6 +1345,52 @@ class OutlineV3Executor:
                 else {"refs_hash": hash_json(available_fields)}
             ),
             "projection": "complete_field_values_plus_registry_refs_v1",
+        }
+
+    @classmethod
+    def _complete_topic_evidence_unit(
+        cls,
+        view: Any,
+        dossier: Any | None,
+        *,
+        fields: Sequence[str],
+    ) -> dict[str, Any]:
+        """Materialize one complete provider-visible evidence unit.
+
+        This is intentionally separate from the routing projection used by
+        candidate/critique metadata. A semantic provider receives the actual
+        dossier bytes: study units, claim modality, evidence IDs, source
+        locators, qualifiers and null findings. If these complete units do
+        not fit the authorized budget, admission stops before transport.
+        """
+
+        payload = view.to_dict() if hasattr(view, "to_dict") else dict(view)
+        if dossier is None or not hasattr(dossier, "to_dict"):
+            return cls._compact_topic_evidence_unit(
+                view,
+                dossier,
+                fields=fields,
+                include_field_refs=True,
+            )
+        dossier_payload = dict(dossier.to_dict())
+        return {
+            "paper_key": str(payload.get("paper_key") or payload.get("canonical_paper_key") or ""),
+            "source_summary_hash": str(payload.get("source_summary_hash") or ""),
+            "evidence_unit_id": str(getattr(dossier, "dossier_id", "") or ""),
+            "evidence_unit_hash": str(getattr(dossier, "content_hash", "") or ""),
+            "study_units": list(dossier_payload.get("research_units") or []),
+            "claims": list(dossier_payload.get("claims") or []),
+            "evidence_ids_by_field": dict(dossier_payload.get("evidence_ids_by_field") or {}),
+            "evidence_text_by_id": dict(dossier_payload.get("evidence_text_by_id") or {}),
+            "source_locators": dict(dossier_payload.get("source_locators") or {}),
+            "semantic_fields": {
+                str(field_name): payload.get(field_name)
+                for field_name in fields
+                if field_name in payload
+            },
+            "dossier_status": str(dossier_payload.get("status") or ""),
+            "dossier_diagnostics": list(dossier_payload.get("diagnostics") or []),
+            "projection": "complete_dossier_study_claim_unit_v1",
         }
 
     @classmethod
@@ -1426,11 +1517,10 @@ class OutlineV3Executor:
         }
         dossiers = getattr(content_layers_model, "dossier_by_paper", {})
         evidence_units = [
-            self._compact_topic_evidence_unit(
+            self._complete_topic_evidence_unit(
                 view_by_paper[paper_id],
                 dossiers.get(paper_id) if isinstance(dossiers, Mapping) else None,
                 fields=fields,
-                include_field_refs=False,
             )
             for paper_id in paper_ids
             if paper_id in view_by_paper
@@ -1467,9 +1557,10 @@ class OutlineV3Executor:
                 "content_layers_hash": getattr(content_layers_model, "content_hash", ""),
             },
             "output_contract": {
-                "topics": "array of topic synthesis objects; preserve topic_id and cite supplied paper_key, source_summary_hash, evidence_unit_id, or evidence field refs",
-                "claims": "array of evidence-bound claims with paper_key/source_summary_hash/evidence_unit_id and source_locators when available",
+                "topics": "array of topic synthesis objects; preserve topic_id and cite only supplied paper_key, study_id, claim_id, evidence_id and source_locator values",
+                "claims": "array of evidence-bound claims with claim modality, paper_key, study_id, evidence_ids and source_locators",
                 "unresolved_questions": "array of questions that remain unresolved",
+                "no_external_evidence": "do not infer a finding, boundary or consensus from a missing field; emit an unresolved or insufficient-evidence record instead",
             },
         }
 
