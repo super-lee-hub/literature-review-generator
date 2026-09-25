@@ -65,6 +65,18 @@
       "count": 52
     },
     {
+      "id": "current_runtime_production_validation_gui_regression",
+      "status": "PASS",
+      "count": 48,
+      "scope": [
+        "current_runtime_full_e2e",
+        "current_production_full_e2e",
+        "current_validation_repair_e2e",
+        "validation_entrypoint_parity_e2e",
+        "gui_controller"
+      ]
+    },
+    {
       "id": "hosted_ci_pr25",
       "status": "PASS",
       "run": "https://github.com/super-lee-hub/literature-review-generator/actions/runs/36095307505",
@@ -136,7 +148,19 @@
       "estimated_semantic_topic_calls": 220,
       "estimated_total_provider_calls": 240,
       "claim_boundary_split": true,
-      "claim_ids_preserved": true
+      "claim_ids_preserved": true,
+      "independent_budget_probe": {
+        "typed_manifest_count": 63,
+        "topic_count_before_split": 13,
+        "complete_topic_units_after_split": 321,
+        "complete_paper_units": 325,
+        "greedy_batches_at_32000_tokens": 218,
+        "single_unit_estimate_min": 7886,
+        "single_unit_estimate_median": 18875,
+        "single_unit_estimate_max": 31977,
+        "single_unit_over_cap": 0,
+        "provider_posts": 0
+      }
     },
     "historical_compact_attempt": {
       "status": "BLOCKED_EXTERNAL",

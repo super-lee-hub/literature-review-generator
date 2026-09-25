@@ -96,6 +96,8 @@ Fresh local checks on this code commit:
 - Preprocess service: 35 passed.
 - Preprocess platform safety, Zotero attachment resolver, export: 26 passed.
 - Runtime/CLI/validation/review generation group: 15 passed.
+- Current runtime/production/validation-repair/entrypoint-parity/GUI controller
+  regression group: 48 passed.
 - Additional focused provider/outline tests: 52 passed.
 - Provider routing/replay and current production-chain regressions: 14 passed
   in the latest local run after semantic response replay/closure fixes.
@@ -123,9 +125,15 @@ authorized 24-call limit, and stops before transport with
 no paid request is made with incomplete evidence, but R1 is not READY until a
 valid within-budget execution design or an authorized budget change exists.
 
-The environment-wide `pip check` is now clean after installing `pypdf 6.19.0`
-for the active Python 3.13 environment. PDF/DOCX/export focused tests passed
-20/20 after installation.
+An independent provider-free probe against the same 63 typed manifests produced
+13 topics, 321 complete topic units (325 paper units), and 218 greedy batches
+under the 32,000-token input cap. Individual complete-unit requests ranged from
+7,886 to 31,977 estimated tokens, with no indivisible unit over the cap. This
+confirms that the rejection is caused by the complete evidence workload rather
+than a hard-coded call counter or an oversized-unit accounting error.
+
+The environment-wide `pip check` is clean with `pypdf 6.19.0` available in the
+active Python 3.13 environment. PDF/DOCX/export focused tests passed 20/20.
 
 ## Remaining acceptance boundaries
 
@@ -150,6 +158,9 @@ for the active Python 3.13 environment. PDF/DOCX/export focused tests passed
   `2627f1c`; the current branch head after that run contains documentation-only
   matrix updates. The older failure was the typed-manifest reuse path and was
   repaired and reproduced locally before the green run.
+- A later hosted Windows CI run `36096871967` also passed all six jobs on the
+  documentation head `f1df69d`; the final documentation commit may trigger a
+  subsequent equivalent run without changing the executable SHA.
 - The initial commit emitted a Git maintenance warning about pruned reflog
   objects while committing. The commit and remote read-back succeeded; the
   repository object-health warning should be repaired separately without
