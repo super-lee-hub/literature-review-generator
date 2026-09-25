@@ -14,6 +14,11 @@ from outline.v3_evidence import (
     build_outline_evidence_views,
 )
 from outline.v3_relations import build_global_relation_map
+from outline.semantic_chunking import (
+    build_paper_content_layers,
+    build_semantic_chunk_plan,
+    build_topic_synthesis_plan,
+)
 from runtime.provider_runtime import ProviderRuntimeLedger, hash_json
 from services.artifact_registry import ArtifactRegistry
 from services.job_workspace import JobWorkspace
@@ -120,6 +125,7 @@ def _executor(
     pricing_source: str | None = "tests:explicit-rates-v1",
     candidate_count: int = 2,
     technical_shard_target_tokens: int = 0,
+    max_source_prompt_tokens: int | None = None,
 ) -> OutlineV3Executor:
     workspace = JobWorkspace.create(str(tmp_path), "outline", job_id="outline-job")
     registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
@@ -142,6 +148,7 @@ def _executor(
         output_cost_per_1k_tokens=0.001,
         reasoning_cost_per_1k_tokens=0.001,
         technical_shard_target_tokens=technical_shard_target_tokens,
+        max_source_prompt_tokens=max_source_prompt_tokens,
         cache_read_cost_per_1k_tokens=0.0,
         cache_write_cost_per_1k_tokens=0.0,
     )
@@ -182,6 +189,40 @@ def test_outline_v3_fixture_executes_evidence_bound_adoption(tmp_path: Path) -> 
     assert {"paper-a", "paper-b"}.issubset(set(graph["coverage"]["paper_keys"]))
 
 
+def test_selected_revision_requires_every_target_to_resolve(tmp_path: Path) -> None:
+    def provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        response = dict(_configured_test_provider(node_id, request))
+        if node_id == "arbitration":
+            response["content"] = {
+                "selected_candidate_id": "candidate_1",
+                "selection_reasons": ["fixture"],
+                "accepted_recommendations": [
+                    {
+                        "issue_id": "issue:multi-target",
+                        "target_section_ids": [
+                            "candidate_1_section_1",
+                            "candidate_1_section_missing",
+                        ],
+                        "operation": "replace_title",
+                        "replacement": "Revised title",
+                    }
+                ],
+                "rejected_recommendations": [],
+                "unresolved_risks": [],
+            }
+        return response
+
+    result = _executor(
+        tmp_path,
+        provider=provider,
+        stability_mode="off",
+    ).run()
+
+    assert result.ok is False
+    assert result.status == "blocked"
+    assert any("issue:multi-target" in item for item in result.diagnostics)
+
+
 def test_outline_v3_without_explicit_adoption_stops_at_ready_for_adoption(tmp_path: Path) -> None:
     result = _executor(tmp_path).run()
 
@@ -214,6 +255,25 @@ def test_outline_v3_stability_provider_call_budget_rejects_before_transport(tmp_
     preflight = json.loads(preflight_paths[0].read_text(encoding="utf-8"))
     assert preflight["preflight_status"] == "rejected"
     assert preflight["rejection_reason"] == "max_provider_calls_exceeded"
+
+
+def test_outline_v3_actual_request_cap_blocks_before_provider_post(tmp_path: Path) -> None:
+    transport_calls: list[str] = []
+
+    def provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        transport_calls.append(node_id)
+        return _configured_test_provider(node_id, request)
+
+    result = _executor(
+        tmp_path,
+        provider=provider,
+        stability_mode="off",
+        max_source_prompt_tokens=1,
+    ).run()
+
+    assert result.ok is False
+    assert result.status == "blocked"
+    assert transport_calls == []
 
 
 def test_outline_v3_stability_cost_budget_rejects_before_transport(tmp_path: Path) -> None:
@@ -433,6 +493,172 @@ def test_evidence_projection_preserves_tail_and_chunks_long_view(tmp_path: Path)
     assert plan["coverage"]["input_chunk_count"] == len(chunks)
 
 
+def test_topic_provider_request_materializes_complete_dossier_unit(
+    tmp_path: Path,
+) -> None:
+    """Semantic topic requests carry actual study/claim evidence, not hashes only."""
+
+    executor = _executor(
+        tmp_path,
+        stability_mode="off",
+        technical_shard_target_tokens=32_000,
+    )
+    evidence = build_outline_evidence_views(executor.summaries, executor.job_id)
+    ledger = build_global_corpus_ledger(evidence)
+    matrix = build_multi_view_matrix(evidence)
+    relation_map = build_global_relation_map(evidence, matrix, ledger)
+    content_layers = build_paper_content_layers(
+        executor.summaries,
+        evidence,
+        job_id=executor.job_id,
+    )
+    semantic_plan = build_semantic_chunk_plan(
+        content_layers,
+        relation_map,
+        candidate_count=executor.candidate_count,
+        physical_call_limit=24,
+    )
+    topic_plan = build_topic_synthesis_plan(semantic_plan)
+    routes = {topic.topic_id: topic for topic in semantic_plan.topics}
+    request = executor._build_topic_provider_request(
+        [topic_plan[0]],
+        topic_routes=routes,
+        evidence_model=evidence,
+        content_layers_model=content_layers,
+        batch_index=1,
+    )
+
+    unit = request["evidence_units"][0]
+    assert unit["projection"].startswith("complete_")
+    assert "study_units" in unit
+    assert "claims" in unit
+    assert "evidence_ids_by_field" in unit
+    assert "source_locators" in unit
+    assert unit["evidence_unit_id"]
+    assert unit["evidence_unit_hash"]
+    assert "findings" in unit["semantic_fields"]
+    assert "limitations" in unit["semantic_fields"]
+
+
+def test_complete_topic_request_preserves_long_bilingual_qualifier_tail(
+    tmp_path: Path,
+) -> None:
+    """A long bilingual finding keeps its terminal boundary in the wire request."""
+
+    executor = _executor(
+        tmp_path,
+        stability_mode="off",
+        technical_shard_target_tokens=32_000,
+        max_source_prompt_tokens=32_000,
+    )
+    bilingual = (
+        "中文条件说明：该结果只在动态定价且消费者知道参照价格时成立。 "
+        "English boundary: the effect is conditional on dynamic pricing and a known reference price. "
+    ) * 12
+    tail = bilingual + "TAIL_QUALIFIER_MUST_SURVIVE"
+    executor.summaries[0]["core_analysis"]["findings"] = tail
+    executor.summaries[0]["core_analysis"]["limitations"] = tail
+
+    evidence = build_outline_evidence_views(executor.summaries, executor.job_id)
+    ledger = build_global_corpus_ledger(evidence)
+    matrix = build_multi_view_matrix(evidence)
+    relation_map = build_global_relation_map(evidence, matrix, ledger)
+    content_layers = build_paper_content_layers(
+        executor.summaries,
+        evidence,
+        job_id=executor.job_id,
+    )
+    semantic_plan = build_semantic_chunk_plan(
+        content_layers,
+        relation_map,
+        candidate_count=executor.candidate_count,
+        physical_call_limit=24,
+    )
+    topic_plan = build_topic_synthesis_plan(semantic_plan)
+    routes = {topic.topic_id: topic for topic in semantic_plan.topics}
+    topic = next(topic for topic in topic_plan if "paper-a" in topic.paper_ids)
+    request = executor._build_topic_provider_request(
+        [topic],
+        topic_routes=routes,
+        evidence_model=evidence,
+        content_layers_model=content_layers,
+        batch_index=1,
+    )
+    serialized = json.dumps(request, ensure_ascii=False, sort_keys=True)
+    budget = executor.profile.estimate_request(
+        executor._attach_prompt_authority("topic_synthesis:long-bilingual", request)
+    )
+
+    assert "中文条件说明" in serialized
+    assert "English boundary" in serialized
+    assert "TAIL_QUALIFIER_MUST_SURVIVE" in serialized
+    assert budget["estimated_input_tokens"] <= 32_000
+
+
+def test_complete_topic_unit_splits_claims_without_loss(tmp_path: Path) -> None:
+    executor = _executor(tmp_path, stability_mode="off", technical_shard_target_tokens=32_000)
+    evidence = build_outline_evidence_views(executor.summaries, executor.job_id)
+    content_layers = build_paper_content_layers(
+        executor.summaries,
+        evidence,
+        job_id=executor.job_id,
+    )
+    paper = content_layers.dossiers[0].paper_id
+    view = next(item for item in evidence.views if item.paper_key == paper)
+    dossier = content_layers.dossier_by_paper[paper]
+    chunks = executor._complete_topic_evidence_units(
+        view,
+        dossier,
+        fields=executor._topic_projection_fields(["context"]),
+    )
+
+    assert len(chunks) >= 2
+    original_claim_ids = {
+        str(item.claim_id) for item in dossier.claims if str(item.claim_id)
+    }
+    chunk_claim_ids = {
+        str(item.get("claim_id") or "")
+        for chunk in chunks
+        for item in chunk.get("claims") or ()
+        if isinstance(item, Mapping) and str(item.get("claim_id") or "")
+    }
+    assert chunk_claim_ids == original_claim_ids
+    assert all(chunk.get("chunk_complete_for_study") is True for chunk in chunks)
+
+
+def test_semantic_provider_output_rejects_unknown_evidence_identity(
+    tmp_path: Path,
+) -> None:
+    executor = _executor(tmp_path, stability_mode="off")
+    request = {
+        "topics": [{"topic_id": "topic:one"}],
+        "evidence_units": [
+            {
+                "paper_key": "paper-a",
+                "study_units": [{"study_id": "study-a"}],
+                "claims": [{"claim_id": "claim-a"}],
+                "evidence_ids_by_field": {"findings": ["evidence-a"]},
+                "evidence_text_by_id": {"evidence-a": "finding"},
+            }
+        ],
+    }
+
+    with pytest.raises(Exception, match="outside its evidence contract"):
+        executor._validate_semantic_provider_output(
+            "topic_synthesis_provider:batch:1",
+            request,
+            {
+                "topics": [{"topic_id": "topic:one", "paper_key": "paper-a"}],
+                "claims": [
+                    {
+                        "study_id": "study-a",
+                        "evidence_ids": ["evidence-not-supplied"],
+                    }
+                ],
+            },
+        )
+
+
 def test_outline_preflight_counts_hierarchical_relation_calls(tmp_path: Path) -> None:
     executor = _executor(
         tmp_path,
@@ -445,6 +671,27 @@ def test_outline_preflight_counts_hierarchical_relation_calls(tmp_path: Path) ->
     assert executor.stability_preflight["estimated_provider_calls"] > len(
         executor._provider_node_ids()
     )
+
+
+@pytest.mark.parametrize("target_tokens", [0, 24_000, 32_000, 50_000])
+def test_outline_preflight_positive_targets_use_effective_cap(
+    tmp_path: Path,
+    target_tokens: int,
+) -> None:
+    executor = _executor(
+        tmp_path / str(target_tokens),
+        stability_mode="off",
+        technical_shard_target_tokens=target_tokens,
+        max_source_prompt_tokens=32_000,
+    )
+    executor._preflight_stability_budget()
+
+    assert executor.stability_preflight["preflight_status"] == "accepted"
+    transport_plans = [
+        item for item in executor.provider_call_plans if item.transport_expected
+    ]
+    assert transport_plans
+    assert max(item.estimated_input_tokens for item in transport_plans) <= 32_000
 
 
 def test_hierarchical_relation_adjudication_emits_local_and_cross_shard_calls(

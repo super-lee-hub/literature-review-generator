@@ -274,12 +274,23 @@ def build_parser() -> argparse.ArgumentParser:
     acceptance_run = subparsers.add_parser("acceptance-run")
     acceptance_run.add_argument("--acceptance-spec", required=True)
 
+    chunk_plan = subparsers.add_parser(
+        "chunk-plan",
+        help="Build the provider-free semantic chunk plan from Stage 1 summaries",
+    )
+    chunk_plan.add_argument("--summary-file", "--summary-source", dest="summary_files", action="append", default=[])
+    chunk_plan.add_argument("--job-id", default="chunk-plan")
+    chunk_plan.add_argument("--candidate-count", type=int, default=3)
+    chunk_plan.add_argument("--physical-call-limit", type=int, default=24)
+    chunk_plan.add_argument("--output", default="")
+    chunk_plan.add_argument("--json", action="store_true")
+
     for command in ("run",):
         subparser = subparsers.add_parser(command)
         subparser.add_argument("--spec", required=True)
         subparser.add_argument("--job-id", default="")
 
-    for command in ("status", "inspect", "next-action", "resume", "retry-node", "reconcile", "repair-plan", "repair-apply", "repair-promote", "validate", "validation-status", "cancel", "adopt"):
+    for command in ("status", "inspect", "next-action", "resume", "retry-node", "reconcile", "repair-plan", "repair-apply", "repair-promote", "validate", "validation-status", "cancel", "pause", "adopt"):
         subparser = subparsers.add_parser(command)
         subparser.add_argument("--job", default="")
         subparser.add_argument("--workspace", default="")
@@ -298,7 +309,7 @@ def build_parser() -> argparse.ArgumentParser:
             subparser.add_argument("--actor", required=True)
             subparser.add_argument("--reason", required=True)
             subparser.add_argument("--expected-hash", required=True)
-        if command == "cancel":
+        if command in {"cancel", "pause"}:
             subparser.add_argument("--reason", default="user_requested")
         subparser.add_argument("--json", action="store_true", help="Emit JSON output (the default format)")
 
@@ -359,10 +370,12 @@ def _exit_code(command: str, payload: dict[str, Any]) -> int:
         return 0 if bool(payload.get("ok")) else 1
     if command in {"status", "inspect", "next-action", "reconcile", "repair-plan", "validate", "validation-status", "attest", "export", "queue-list"}:
         return 0
+    if command == "chunk-plan":
+        return 0 if payload.get("status") in {"planned", "complete", "available"} else 1
     if command == "config-migrate":
         return 0 if payload.get("status") == "ok" else 1
-    if command in {"retry-node", "repair-apply", "repair-promote", "cancel", "adopt", "queue-add", "queue-run", "queue-retry", "queue-cancel", "queue-remove", "queue-export", "queue-import"}:
-        success_statuses = {"available", "complete", "succeeded", "already_adopted", "planned", "requested", "added", "removed", "exported", "imported", "promoted", "already_promoted"}
+    if command in {"retry-node", "repair-apply", "repair-promote", "cancel", "pause", "adopt", "queue-add", "queue-run", "queue-retry", "queue-cancel", "queue-remove", "queue-export", "queue-import"}:
+        success_statuses = {"available", "complete", "succeeded", "already_adopted", "planned", "requested", "paused", "added", "removed", "exported", "imported", "promoted", "already_promoted"}
         if command == "queue-run":
             success_statuses.update({"completed", "idle"})
         return 0 if payload.get("status") in success_statuses else 1
@@ -414,6 +427,14 @@ def main(argv: list[str] | None = None) -> int:
             payload = control.plan(args.spec)
         elif args.command == "acceptance-run":
             payload = control.acceptance_run(args.acceptance_spec)
+        elif args.command == "chunk-plan":
+            payload = control.chunk_plan(
+                args.summary_files,
+                job_id=args.job_id,
+                candidate_count=args.candidate_count,
+                physical_call_limit=args.physical_call_limit,
+                output_path=args.output or None,
+            )
         elif args.command == "run":
             payload = control.run(
                 args.spec,
@@ -464,6 +485,12 @@ def main(argv: list[str] | None = None) -> int:
             payload = control.validation_status(job_id=args.job or None, workspace=args.workspace or None)
         elif args.command == "cancel":
             payload = control.cancel(
+                job_id=args.job or None,
+                workspace=args.workspace or None,
+                reason=args.reason,
+            )
+        elif args.command == "pause":
+            payload = control.pause(
                 job_id=args.job or None,
                 workspace=args.workspace or None,
                 reason=args.reason,

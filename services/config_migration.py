@@ -37,7 +37,18 @@ from typing import Dict, List, Mapping, Optional, Tuple, Union
 from services.settings import CONFIG_SCHEMA_VERSION
 
 # Legacy sections with no reader in any supported revision. Dropped, not mapped.
-DEAD_SECTIONS: frozenset[str] = frozenset({"Retry_Settings", "Stage2_Retry"})
+DEAD_SECTIONS: frozenset[str] = frozenset(
+    {
+        "Retry_Settings",
+        "Stage2_Retry",
+        # PR14-era duplicate routes. The current typed schema has one
+        # authoritative Outline_API/Writer_API route; keeping these sections
+        # live makes the current loader reject an otherwise usable config.
+        "Outline_GPT_API",
+        "Outline_GPT_Fallback_API",
+        "Writer_GPT_Fallback_API",
+    }
+)
 
 # The old catch-all parameter block. Values with an unambiguous per-provider home
 # are relocated; anything else is reported rather than guessed at.
@@ -71,6 +82,17 @@ API_PARAMETER_TIMEOUT_SECTIONS: Tuple[str, ...] = (
 DROPPED_KEYS: Dict[str, frozenset[str]] = {
     # Fixture providers are test-injected; production config must not enable one.
     "Outline": frozenset({"test_dev_fixture_mode"}),
+    "Writer_API": frozenset({"fallback_section"}),
+}
+
+# References in the current role table must be migrated together with the
+# obsolete sections. The old Outline_GPT routes were the same general-purpose
+# backup lane used by the current Backup_Reader_API; preserving that semantic
+# route is safer than leaving a dangling section name that fails validation.
+LEGACY_SECTION_ALIASES: Dict[str, str] = {
+    "Outline_GPT_API": "Backup_Reader_API",
+    "Outline_GPT_Fallback_API": "Backup_Reader_API",
+    "Writer_GPT_Fallback_API": "Backup_Reader_API",
 }
 
 # The pre-vision default. Only rewritten when it is still exactly this value, so
@@ -390,6 +412,15 @@ def migrate_config_text(
         if key in DROPPED_KEYS.get(current_section, frozenset()):
             report.note(f"removed [{current_section}].{key} (not accepted by the current schema)")
             continue
+
+        if current_section == "OutlineModels" and key.endswith("_model"):
+            replacement = LEGACY_SECTION_ALIASES.get(value)
+            if replacement:
+                report.note(
+                    f"migrated [{current_section}].{key} {value} -> {replacement}"
+                )
+                output.append(f"{key} = {replacement}\n")
+                continue
 
         if current_section == "Application" and key == "config_schema":
             if value != str(CONFIG_SCHEMA_VERSION):

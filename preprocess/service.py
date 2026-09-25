@@ -3216,10 +3216,10 @@ class PreprocessManager:
                 lowered = name.lower()
                 if lowered.endswith("normalized.md") or (lowered.endswith(".md") and markdown_candidate is None):
                     markdown_candidate = name
-                elif lowered.endswith("structured.json") or (lowered.endswith(".json") and structured_candidate is None):
-                    structured_candidate = name
                 elif lowered.endswith("page_index.json"):
                     page_index_candidate = name
+                elif lowered.endswith("structured.json") or (lowered.endswith(".json") and structured_candidate is None):
+                    structured_candidate = name
                 elif lowered.endswith("plain_text.txt"):
                     plain_text_candidate = name
             if markdown_candidate:

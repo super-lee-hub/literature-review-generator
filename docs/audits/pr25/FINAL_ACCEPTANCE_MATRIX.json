@@ -1,0 +1,214 @@
+{
+  "schema_version": "r1-final-acceptance-matrix-v1",
+  "status": "NOT_READY",
+  "target": {
+    "name": "R1",
+    "required_source_count": 63,
+    "isolated_source_count": 3,
+    "original_import_count": 66,
+    "f1_status": "UNACCEPTED_INDEPENDENT_REGRESSION"
+  },
+  "identity": {
+    "base_sha": "bf00852fb627ac0519d96287d2d27b36f17a99ea",
+  "executable_sha": "6d040ebbff4ef81f06c63e7ab9808cd3c790a674",
+    "remote_branch": "codex/r1-outline-final-repair",
+  "remote_executable_sha_readback": "6d040ebbff4ef81f06c63e7ab9808cd3c790a674",
+    "pr": "https://github.com/super-lee-hub/literature-review-generator/pull/25",
+    "existing_pr_24": "https://github.com/super-lee-hub/literature-review-generator/pull/24",
+    "merge_status": "UNMERGED"
+  },
+  "checks": [
+    {
+      "id": "compileall",
+      "status": "PASS",
+      "evidence": "python -m compileall -q outline runtime preprocess reviewctl.py ai_interface.py"
+    },
+    {
+      "id": "changed_ruff_e9_f",
+      "status": "PASS",
+      "evidence": "ruff check changed modules --select E9,F"
+    },
+    {
+      "id": "changed_pyright",
+      "status": "PASS",
+      "evidence": "0 errors, 0 warnings, 0 informations"
+    },
+    {
+      "id": "outline_semantic_execution",
+      "status": "PASS",
+      "count": 33,
+      "extra_regressions": {
+        "complete_dossier_topic_unit": 1,
+        "multi_target_revision": 1,
+        "positive_budget_targets": 4,
+        "http_524": 1
+      }
+    },
+    {
+      "id": "outline_replay_invalidation",
+      "status": "PASS",
+      "count": 9
+    },
+    {
+      "id": "preprocess_service",
+      "status": "PASS",
+      "count": 35
+    },
+    {
+      "id": "runtime_cli_validation",
+      "status": "PASS",
+      "count": 15
+    },
+    {
+      "id": "focused_outline_preprocess_receipt_export",
+      "status": "PASS",
+      "count": 52
+    },
+    {
+      "id": "current_runtime_production_validation_gui_regression",
+      "status": "PASS",
+      "count": 48,
+      "scope": [
+        "current_runtime_full_e2e",
+        "current_production_full_e2e",
+        "current_validation_repair_e2e",
+        "validation_entrypoint_parity_e2e",
+        "gui_controller"
+      ]
+    },
+    {
+      "id": "current_semantic_execution_invalidation_routing_regression",
+      "status": "PASS",
+      "count": 58,
+      "scope": [
+        "test_outline_v3_semantic_execution.py",
+        "test_outline_v3_executor_invalidation.py",
+        "test_outline_v3_real_transport_routing.py"
+      ],
+      "positive_long_bilingual_wire_request": true
+    },
+    {
+      "id": "public_control_plane_pause_resume_rejection",
+      "status": "PASS",
+      "count": 1,
+      "scope": [
+        "tests/test_control_plane_pause_resume.py"
+      ],
+      "rejected_resume_preserves_pause": true
+    },
+    {
+      "id": "hosted_ci_pr25",
+      "status": "PASS",
+      "run": "https://github.com/super-lee-hub/literature-review-generator/actions/runs/36095307505",
+      "validated_executable_sha": "2627f1ca97a445f8a46d7996bb8665b67a7adcdd",
+      "docs_only_head_after_run": true,
+      "last_green_executable_ancestor": "https://github.com/super-lee-hub/literature-review-generator/actions/runs/36008867733"
+    },
+    {
+      "id": "r1_live_provider_outline",
+      "status": "BLOCKED_BUDGET",
+      "reason": "Complete dossier/study/claim/locator materialization is split at claim boundaries without loss; the R1 plan estimates 220 semantic topic calls and 240 total provider calls before downstream work, exceeding the 24-call limit, and records a preflight rejection before transport. Historical compact attempt recorded HTTP 524 separately."
+    },
+    {
+      "id": "r1_writer_validator_repair",
+      "status": "NOT_VERIFIED",
+      "reason": "Not reached: current Outline is BLOCKED_BUDGET before provider transport"
+    },
+    {
+      "id": "r1_citation_docx_export_gui",
+      "status": "NOT_VERIFIED",
+      "reason": "Not reached: no current adopted Outline"
+    },
+    {
+      "id": "f1_independent_regression",
+      "status": "UNACCEPTED",
+      "reason": "Separate 15-paper/OCR acceptance authority"
+    }
+  ],
+  "r1_input_readiness": {
+    "status": "READY_FOR_PROVIDER_ATTEMPT",
+    "spec_source": "D:/auto-generate/acceptance_artifacts/r1_20260920/R1_RUNTIME_JOB_SPEC_FULL_R1_CURRENT.json",
+    "typed_manifest_count": 63,
+    "typed_manifest_artifact_type": "stage1_reusable_summary_manifest/v1",
+    "unique_paper_key_count": 63,
+    "manifest_decode_errors": 0,
+    "config_file": "config.ini",
+    "config_present_in_current_acceptance_input": true,
+    "config_path": "D:/auto-generate/config.ini",
+    "config_loader_status": "PASS_AFTER_SUPPORTED_MIGRATION",
+    "config_loader_blockers": [],
+    "template_credential_section_count": 0,
+    "template_credential_sections": [],
+    "external_host_acknowledgement_expires_at": "2026-09-25T12:24:57.513479Z",
+    "blocker": "complete evidence plan estimates 220 semantic topic calls and 240 total provider calls before downstream work, exceeding the authorized 24-call limit; ordinary config migration and credentials pass",
+    "credential_source": ".env",
+    "credential_value_readback": "allowlisted nonempty fields only; values withheld"
+  },
+  "pip_check": {
+    "status": "PASS",
+    "detail": "No broken requirements found after installing pypdf 6.19.0"
+  },
+  "r1_execution_evidence": {
+    "reuse_only_stage1": {
+      "status": "PASS",
+      "typed_manifest_count": 63,
+      "stage1_authority_ready": true,
+      "stage1_reuse_eligible": true,
+      "stage1_provider_calls": 0,
+      "mineru_transport_calls": 0
+    },
+    "complete_evidence_outline_admission": {
+      "status": "BLOCKED_BUDGET",
+      "effective_input_cap_tokens": 32000,
+      "max_provider_calls": 24,
+      "transport_before_block": 0,
+      "reason": "complete study/claim units are preserved, but the resulting plan estimates 220 semantic topic calls and 240 total provider calls over the authorized 24-call limit",
+      "preflight_artifact_type": "outline_preflight_rejection",
+      "current_executable_sha": "6d040ebbff4ef81f06c63e7ab9808cd3c790a674",
+      "estimated_semantic_topic_calls": 220,
+      "estimated_total_provider_calls": 240,
+      "claim_boundary_split": true,
+      "claim_ids_preserved": true,
+      "independent_budget_probe": {
+        "typed_manifest_count": 63,
+        "topic_count_before_split": 13,
+        "complete_topic_units_after_split": 321,
+        "complete_paper_units": 325,
+        "greedy_batches_at_32000_tokens": 218,
+        "single_unit_estimate_min": 7886,
+        "single_unit_estimate_median": 18875,
+        "single_unit_estimate_max": 31977,
+        "single_unit_over_cap": 0,
+        "provider_posts": 0
+      }
+    },
+    "historical_compact_attempt": {
+      "status": "BLOCKED_EXTERNAL",
+      "estimated_provider_calls": 21,
+      "semantic_synthesis_calls_reserved": 14,
+      "gateway": "api.yhlxj.ai",
+      "error": "Cloudflare HTTP 524 timeout",
+      "canonical_ready": false
+    }
+  },
+  "defect_disposition": {
+    "F01": "FIXED_ON_BRANCH_UNMERGED",
+    "F02": "PARTIAL_R1_BLOCKED_BEFORE_PAID_EXECUTION",
+    "F03": "FIXED_FAIL_CLOSED",
+    "F04": "PARTIAL_DOWNSTREAM_R1_UNVERIFIED",
+    "F05": "UNVERIFIED",
+    "F06": "FIXED_REGRESSION_SCOPE",
+    "F07": "FIXED_REGRESSION_SCOPE",
+    "F08": "FIXED_REGRESSION_SCOPE",
+    "F09": "FIXED_REGRESSION_SCOPE",
+    "R01_R14": "UNVERIFIED_ONE_BY_ONE_ON_FINAL_EXECUTABLE"
+  },
+  "safety": {
+    "external_provider_posts_in_local_tests": 0,
+    "credentials_or_private_full_text_committed": false,
+    "pr24_merged": false,
+    "pr25_merged": false,
+    "r1_provider_attempted": true,
+    "complete_evidence_transport_before_budget_block": 0
+  }
+}

@@ -49,6 +49,9 @@ class _LocalProvider:
                 if status_or_action == "raw":
                     status = 200
                     encoded = bytes(body)
+                elif status_or_action == "http_raw":
+                    status, raw_body = body
+                    encoded = bytes(raw_body)
                 elif status_or_action == "partial_close":
                     status = 200
                     encoded = bytes(body)
@@ -170,6 +173,32 @@ def test_real_local_http_statuses_are_recorded_once(tmp_path, status: int, error
     receipt = ledger.list_receipts()[0]
     assert receipt.http_status == status
     assert receipt.attempts == 1
+    assert aggregate.snapshot()["calls_used"] == 1
+
+
+@pytest.mark.integration
+def test_real_local_http_524_preserves_external_timeout_evidence(tmp_path) -> None:
+    html = b"<html><title>524: A timeout occurred</title></html>"
+    with _LocalProvider([("http_raw", (524, html))]) as provider:
+        runtime, aggregate, ledger = _runtime(tmp_path, max_calls=1, max_output_tokens=8)
+        result = ai_interface._call_ai_api_detailed(
+            "gateway timeout evidence test",
+            {**_config(provider.base_url), "raw_response_dir": str(tmp_path / "raw")},
+            "system",
+            max_tokens=8,
+            retry_attempts=1,
+            provider_runtime=runtime,
+        )
+
+    assert len(provider.requests) == 1
+    assert result["status"] == "failed"
+    assert result["error_kind"] == "retryable_http"
+    assert result["http_status"] == 524
+    assert result["error_response_sha256"]
+    assert Path(result["error_response_path"]).read_bytes() == html
+    receipt = ledger.list_receipts()[0]
+    assert receipt.http_status == 524
+    assert receipt.metadata["error_response_sha256"] == result["error_response_sha256"]
     assert aggregate.snapshot()["calls_used"] == 1
 
 

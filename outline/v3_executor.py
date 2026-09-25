@@ -1,8 +1,9 @@
 """Executable Outline Intelligence v3 pipeline.
 
 The executor owns node execution, durable artifact writes, provider receipts,
-and replay decisions.  Evidence views are projected directly from Stage 1;
-only cross-paper synthesis and outline decisions use the provider boundary.
+and replay decisions. Evidence views are projected directly from Stage 1;
+topic, cross-group, global, and outline decisions use the provider boundary
+when a configured production route is available.
 """
 
 from __future__ import annotations
@@ -11,7 +12,9 @@ from dataclasses import asdict, dataclass, field, replace
 import hashlib
 import json
 import math
+import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -41,10 +44,16 @@ from outline.v3_evidence import (
     merge_outline_evidence_shards,
     shard_outline_evidence_views,
 )
-from outline.v3_models import GlobalRelationMap, OutlineQualityGate, compute_v3_hash
+from outline.v3_models import GlobalRelationMap, OutlineQualityGate, TopicSynthesis, compute_v3_hash
 from outline.v3_relations import build_global_relation_map, build_organizing_axes, build_outline_candidate_plans
+from outline.semantic_chunking import (
+    build_paper_content_layers,
+    build_semantic_chunk_plan,
+    build_topic_synthesis_plan,
+)
 from outline.evidence_alias import alias_structural, canonicalize_structural
 from runtime.outline_v3_dag import OutlineNodeDAG, OutlineNodeStore
+from runtime.pause_state import PauseRequestedError, PauseStateStore
 from runtime.provider_completion import ProviderCompletionEvaluator
 from runtime.provider_context import ProviderContextProfile
 from runtime.provider_receipt_closure import ExpectedProviderCall, ProviderReceiptClosure
@@ -70,6 +79,7 @@ from services.artifact_registry import (
     file_sha256,
 )
 from services.job_workspace import publish_bytes_artifact, publish_json_artifact
+from services.durable_io import atomic_replace_with_retry, fsync_file
 from services.queue_service import LocalPublicationContext
 from services.prompt_registry import PromptRegistry
 
@@ -296,6 +306,15 @@ class OutlineV3Executor:
             model_context_limit=128_000,
             max_output_tokens=4_096,
         )
+        # Internal fixture/local runs keep deterministic projections so offline
+        # tests never make an accidental provider request.  A configured
+        # external route (the production R1 path) must execute the semantic
+        # topic/cross/global synthesis nodes through the same provider
+        # admission and receipt machinery as the candidate nodes.
+        self.semantic_provider_synthesis_enabled = bool(
+            provider_router is not None
+            or str(self.profile.endpoint_type or "").casefold() not in {"internal", "fixture"}
+        )
         # Role-aware routing is opt-in so existing single-provider callers keep
         # working, but when it is supplied every node must resolve through it.
         self.router = provider_router
@@ -384,6 +403,14 @@ class OutlineV3Executor:
             int(max_source_prompt_tokens) if max_source_prompt_tokens is not None else None
         )
         self.technical_shard_target_tokens = int(technical_shard_target_tokens)
+        if 0 < self.technical_shard_target_tokens < 8_000:
+            # Very small technical shards are reserved for relation/candidate
+            # evidence units.  Running a full topic dossier through that
+            # route would either exceed the hard cap or require claim-level
+            # splitting that the topic schema does not support.  Keep the
+            # node as an explicit local projection until a larger synthesis
+            # shard is available; no provider result is claimed in this mode.
+            self.semantic_provider_synthesis_enabled = False
         self.pricing_policy = str(pricing_policy or "estimate_only_not_billing_v1")
         self.review_intent_input = dict(review_intent or {})
         self.quality_gate = quality_gate if isinstance(quality_gate, OutlineQualityGate) else OutlineQualityGate.from_mapping(quality_gate)
@@ -409,6 +436,11 @@ class OutlineV3Executor:
         )
         self.expected_call_graph_hash = hash_json({
             "provider_nodes": self._provider_node_ids(),
+            "semantic_provider_nodes": (
+                ["topic_synthesis_provider", "cross_group_comparison_provider", "global_synthesis_provider"]
+                if self.semantic_provider_synthesis_enabled
+                else []
+            ),
             "stability_roles": ["candidate_provider_generation", "arbitration"],
         })
         self.closure_epoch_id = compute_closure_epoch_id(
@@ -458,19 +490,62 @@ class OutlineV3Executor:
             and str(record.metadata.get("stage_name") or "") == "outline_v3"
             and str(record.metadata.get("closure_epoch_id") or "") == self.closure_epoch_id
         ]
-        existing_ledger = max(
-            epoch_ledgers,
-            key=lambda record: (record.created_at, record.artifact_id),
-            default=None,
+        stable_ledgers = [
+            record for record in epoch_ledgers
+            if record.artifact_id == "outline_v3_provider_receipts"
+        ]
+        existing_ledger = (
+            stable_ledgers[0]
+            if stable_ledgers
+            else max(
+                epoch_ledgers,
+                key=lambda record: (record.created_at, record.artifact_id),
+                default=None,
+            )
         )
         if existing_ledger is not None and existing_ledger.status == "ready":
             try:
                 self._receipt_ledger.path.parent.mkdir(parents=True, exist_ok=True)
-                self._receipt_ledger.path.write_bytes(Path(existing_ledger.path).read_bytes())
+                published_ledger = ProviderRuntimeLedger(existing_ledger.path)
+                published_receipts = list(published_ledger.list_receipts())
+                staging_receipts = list(self._receipt_ledger.list_receipts())
+                published_ids = {receipt.receipt_id for receipt in published_receipts}
+                snapshot_time = str(existing_ledger.created_at or "")
+                fresh_receipts = [
+                    receipt
+                    for receipt in staging_receipts
+                    if receipt.receipt_id not in published_ids
+                    and str(receipt.finished_at or "") > snapshot_time
+                ]
+                merged_by_id = {
+                    receipt.receipt_id: receipt
+                    for receipt in [*published_receipts, *fresh_receipts]
+                }
+                merged = [merged_by_id[key] for key in sorted(merged_by_id)]
+                if [receipt.receipt_id for receipt in staging_receipts] != [receipt.receipt_id for receipt in merged]:
+                    payload = "".join(
+                        json.dumps(receipt.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+                        for receipt in merged
+                    ).encode("utf-8")
+                    fd, temp_name = tempfile.mkstemp(
+                        prefix="outline-receipts-reconcile-",
+                        suffix=".jsonl",
+                        dir=str(self._receipt_ledger.path.parent),
+                    )
+                    os.close(fd)
+                    try:
+                        fsync_file(temp_name, payload)
+                        atomic_replace_with_retry(temp_name, self._receipt_ledger.path)
+                    finally:
+                        try:
+                            Path(temp_name).unlink(missing_ok=True)
+                        except OSError:
+                            pass
             except OSError:
                 pass
         self._replay_store = ModelCallReplayStore(self.workspace)
         self._expected_provider_calls: dict[str, ExpectedProviderCall] = {}
+        self._dynamic_provider_bindings: dict[str, dict[str, Any]] = {}
         self._pending_replays: dict[str, tuple[ModelCallReplayKey, str, str]] = {}
         self._replay_evidence: list[dict[str, Any]] = []
         self._replay_receipt_sources: dict[str, ArtifactRecord] = {}
@@ -478,6 +553,7 @@ class OutlineV3Executor:
         self._replay_receipt_index_cache: dict[str, Any] | None = None
         self._verified_reuse_records: dict[str, ArtifactRecord] = {}
         self._verified_reuse_source_receipt_ids: dict[str, str] = {}
+        self._pause_state = PauseStateStore(self.workspace, self.registry)
         self._node_store = OutlineNodeStore(self.workspace, self.registry)
         self._dag = self._node_store.ensure(self.job_id, candidate_count=self.candidate_count)
         self._hydrate_expected_provider_calls()
@@ -926,7 +1002,7 @@ class OutlineV3Executor:
         ``api_base_host``.
         """
 
-        return {
+        identity = {
             "provider_family": route.provider_name,
             "model": route.model,
             "api_base": route.api_base_host,
@@ -934,6 +1010,8 @@ class OutlineV3Executor:
             "config_section": route.config_section,
             "route_fingerprint": route.safe_config_fingerprint(),
         }
+        identity["transport_retries"] = str(route.config_identity.get("transport_retries") or "0")
+        return identity
 
     def _provider_configured(self) -> bool:
         """Return whether the configured execution surface can transport calls."""
@@ -1083,6 +1161,774 @@ class OutlineV3Executor:
             chunk["evidence_chunk_index"] = index
             chunk["evidence_chunk_count"] = total
         return chunks
+
+    @staticmethod
+    def _compact_topic_route(topic: Any) -> dict[str, Any]:
+        """Return the routing portion of one topic without its ID list.
+
+        The complete evidence IDs remain in the content-layer artifact.  The
+        provider receives their count and per-unit hashes below, which keeps a
+        large topic request bounded without deleting a fact or silently
+        slicing a source field.
+        """
+
+        return {
+            "topic_id": str(getattr(topic, "topic_id", "") or ""),
+            "question": str(getattr(topic, "question", "") or ""),
+            "paper_ids": [str(item) for item in getattr(topic, "paper_ids", []) if str(item)],
+            "bridge_paper_ids": [
+                str(item) for item in getattr(topic, "bridge_paper_ids", []) if str(item)
+            ],
+            "dimensions": [str(item) for item in getattr(topic, "dimensions", []) if str(item)],
+            "comparison_questions": [
+                str(item)
+                for item in getattr(topic, "comparison_questions", [])
+                if str(item).strip()
+            ],
+            "required_evidence_count": len(getattr(topic, "required_evidence_ids", []) or []),
+            "status": str(getattr(topic, "status", "") or ""),
+        }
+
+    @staticmethod
+    def _topic_projection_fields(dimensions: Sequence[str]) -> tuple[str, ...]:
+        """Choose complete semantic fields needed by a topic route.
+
+        This is a semantic projection, not character truncation.  Omitted
+        fields are declared with hashes/counts and remain available in the
+        content-layer dossier referenced by the request.
+        """
+
+        fields: set[str] = set()
+        for dimension in dimensions:
+            normalized = str(dimension or "").strip().casefold()
+            if normalized == "context":
+                fields.update(
+                    (
+                        "research_questions",
+                        "theories",
+                        "constructs",
+                        "mechanisms",
+                        "method",
+                        "sample_or_context",
+                        "findings",
+                        "conclusions",
+                        "limitations",
+                        "research_gaps",
+                        "future_directions",
+                    )
+                )
+            elif normalized == "method":
+                fields.update(
+                    (
+                        "research_questions",
+                        "constructs",
+                        "method",
+                        "sample_or_context",
+                        "findings",
+                        "conclusions",
+                        "limitations",
+                    )
+                )
+            elif normalized == "theory":
+                fields.update(
+                    (
+                        "theories",
+                        "constructs",
+                        "mechanisms",
+                        "method",
+                        "sample_or_context",
+                        "findings",
+                        "conclusions",
+                        "limitations",
+                    )
+                )
+            elif normalized == "mechanism":
+                fields.update(
+                    (
+                        "mechanisms",
+                        "constructs",
+                        "method",
+                        "sample_or_context",
+                        "findings",
+                        "conclusions",
+                        "limitations",
+                    )
+                )
+            else:
+                fields.update(
+                    (
+                        "research_questions",
+                        "theories",
+                        "constructs",
+                        "mechanisms",
+                        "method",
+                        "sample_or_context",
+                        "findings",
+                        "conclusions",
+                        "limitations",
+                        "research_gaps",
+                        "future_directions",
+                    )
+                )
+        return tuple(sorted(fields))
+
+    @classmethod
+    def _compact_topic_evidence_unit(
+        cls,
+        view: Any,
+        dossier: Any | None,
+        *,
+        fields: Sequence[str],
+        include_field_refs: bool = True,
+    ) -> dict[str, Any]:
+        payload = view.to_dict() if hasattr(view, "to_dict") else dict(view)
+        dossier_payload = dossier.to_dict() if dossier is not None and hasattr(dossier, "to_dict") else {}
+        raw_evidence_ids = dossier_payload.get("evidence_ids_by_field")
+        evidence_ids_by_field = (
+            raw_evidence_ids if isinstance(raw_evidence_ids, Mapping) else {}
+        )
+        evidence_refs = {
+            str(field_name): {
+                "count": len(values) if isinstance(values, list) else 0,
+                "ids_hash": hash_json(values if isinstance(values, list) else []),
+            }
+            for field_name, values in evidence_ids_by_field.items()
+        }
+        available_fields = {
+            str(field_name): {
+                "value_count": len(value) if isinstance(value, list) else int(bool(value)),
+                "value_hash": hash_json(value),
+            }
+            for field_name, value in payload.items()
+            if field_name
+            in {
+                "research_questions",
+                "theories",
+                "constructs",
+                "mechanisms",
+                "method",
+                "sample_or_context",
+                "findings",
+                "conclusions",
+                "limitations",
+                "research_gaps",
+                "future_directions",
+            }
+        }
+        return {
+            "paper_key": str(payload.get("paper_key") or payload.get("canonical_paper_key") or ""),
+            "source_summary_hash": str(payload.get("source_summary_hash") or ""),
+            "evidence_unit_id": str(
+                getattr(dossier, "dossier_id", "")
+                or f"dossier:{payload.get('paper_key') or payload.get('canonical_paper_key') or ''}"
+            ),
+            "evidence_unit_hash": str(getattr(dossier, "content_hash", "") or ""),
+            "evidence_fields": {
+                str(field_name): payload.get(field_name)
+                for field_name in fields
+                if field_name in payload
+            },
+            "evidence_field_refs": (
+                {
+                    "field_names": sorted(evidence_refs),
+                    "refs_hash": hash_json(evidence_refs),
+                }
+                if include_field_refs
+                else {"refs_hash": hash_json(evidence_refs)}
+            ),
+            "available_field_refs": (
+                {
+                    "field_names": sorted(available_fields),
+                    "refs_hash": hash_json(available_fields),
+                }
+                if include_field_refs
+                else {"refs_hash": hash_json(available_fields)}
+            ),
+            "projection": "complete_field_values_plus_registry_refs_v1",
+        }
+
+    @classmethod
+    def _complete_topic_evidence_unit(
+        cls,
+        view: Any,
+        dossier: Any | None,
+        *,
+        fields: Sequence[str],
+    ) -> dict[str, Any]:
+        """Materialize one complete provider-visible evidence unit.
+
+        This is intentionally separate from the routing projection used by
+        candidate/critique metadata. A semantic provider receives the actual
+        dossier bytes: study units, claim modality, evidence IDs, source
+        locators, qualifiers and null findings. If these complete units do
+        not fit the authorized budget, admission stops before transport.
+        """
+
+        payload = view.to_dict() if hasattr(view, "to_dict") else dict(view)
+        if dossier is None or not hasattr(dossier, "to_dict"):
+            return cls._compact_topic_evidence_unit(
+                view,
+                dossier,
+                fields=fields,
+                include_field_refs=True,
+            )
+        dossier_payload = dict(dossier.to_dict())
+        return {
+            "paper_key": str(payload.get("paper_key") or payload.get("canonical_paper_key") or ""),
+            "source_summary_hash": str(payload.get("source_summary_hash") or ""),
+            "evidence_unit_id": str(getattr(dossier, "dossier_id", "") or ""),
+            "evidence_unit_hash": str(getattr(dossier, "content_hash", "") or ""),
+            "study_units": list(dossier_payload.get("research_units") or []),
+            "claims": list(dossier_payload.get("claims") or []),
+            "evidence_ids_by_field": dict(dossier_payload.get("evidence_ids_by_field") or {}),
+            "evidence_text_by_id": dict(dossier_payload.get("evidence_text_by_id") or {}),
+            "source_locators": dict(dossier_payload.get("source_locators") or {}),
+            "semantic_fields": {
+                str(field_name): payload.get(field_name)
+                for field_name in fields
+                if field_name in payload
+            },
+            "dossier_status": str(dossier_payload.get("status") or ""),
+            "dossier_diagnostics": list(dossier_payload.get("diagnostics") or []),
+            "projection": "complete_dossier_study_claim_unit_v1",
+        }
+
+    @classmethod
+    def _complete_topic_evidence_units(
+        cls,
+        view: Any,
+        dossier: Any | None,
+        *,
+        fields: Sequence[str],
+        chunk_indexes: Sequence[int] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Split a large dossier at study/claim boundaries without loss."""
+
+        complete = cls._complete_topic_evidence_unit(view, dossier, fields=fields)
+        if dossier is None or not hasattr(dossier, "to_dict"):
+            return [complete]
+        raw_units = list(getattr(dossier, "research_units", []) or [])
+        raw_claims = list(getattr(dossier, "claims", []) or [])
+        if len(raw_units) <= 1 and len(raw_claims) <= 8:
+            return [complete]
+
+        dossier_payload = dossier.to_dict()
+        chunks: list[dict[str, Any]] = []
+        if raw_units:
+            for index, unit in enumerate(raw_units, start=1):
+                unit_payload = unit.to_dict()
+                unit_claims = list(unit_payload.get("claims") or [])
+                if len(unit_claims) <= 8:
+                    unit_chunks = [unit_claims]
+                else:
+                    unit_chunks = [
+                        unit_claims[offset : offset + 8]
+                        for offset in range(0, len(unit_claims), 8)
+                    ]
+                for chunk_index, claim_chunk in enumerate(unit_chunks, start=1):
+                    all_evidence_ids = [
+                        str(item)
+                        for item in unit_payload.get("evidence_ids") or ()
+                        if str(item)
+                    ]
+                    chunk_ids = {
+                        str(item.get("evidence_id") or item.get("id") or "")
+                        for item in claim_chunk
+                        if isinstance(item, Mapping)
+                        and str(item.get("evidence_id") or item.get("id") or "")
+                    }
+                    claim_bound_ids = {
+                        str(evidence_id)
+                        for item in claim_chunk
+                        if isinstance(item, Mapping)
+                        for evidence_id in item.get("evidence_ids") or ()
+                        if str(evidence_id)
+                    }
+                    if claim_bound_ids:
+                        selected_ids = claim_bound_ids | chunk_ids
+                    else:
+                        selected_ids = set(
+                            all_evidence_ids[
+                                (chunk_index - 1) * max(1, len(all_evidence_ids) // len(unit_chunks)) :
+                                chunk_index * max(1, len(all_evidence_ids) // len(unit_chunks))
+                            ]
+                        )
+                    unit_copy = dict(unit_payload)
+                    unit_copy["claims"] = claim_chunk
+                    unit_copy["evidence_ids"] = sorted(selected_ids)
+                    unit_copy["chunk_index"] = chunk_index
+                    unit_copy["chunk_count"] = len(unit_chunks)
+                    chunks.append(
+                        {
+                            **complete,
+                            "evidence_unit_id": f"{complete['evidence_unit_id']}:{index}:{chunk_index}",
+                            "study_units": [unit_copy],
+                            "claims": claim_chunk,
+                            "evidence_ids_by_field": {
+                                str(key): [
+                                    str(value)
+                                    for value in values
+                                    if str(value) in selected_ids
+                                ]
+                                for key, values in (
+                                    dossier_payload.get("evidence_ids_by_field") or {}
+                                ).items()
+                                if isinstance(values, list)
+                            },
+                            "evidence_text_by_id": {
+                                str(key): value
+                                for key, value in (
+                                    dossier_payload.get("evidence_text_by_id") or {}
+                                ).items()
+                                if str(key) in selected_ids
+                            },
+                            "projection": "complete_study_claim_chunk_v1",
+                        }
+                    )
+        if not chunks:
+            return [complete]
+        for chunk in chunks:
+            chunk["chunk_group_id"] = complete["evidence_unit_id"]
+            chunk["chunk_complete_for_study"] = True
+        if chunk_indexes is None:
+            return chunks
+        allowed = {int(item) for item in chunk_indexes}
+        return [
+            chunk
+            for index, chunk in enumerate(chunks, start=1)
+            if index in allowed
+        ] or chunks
+
+    @classmethod
+    def _compact_candidate_evidence_refs(
+        cls,
+        views: Sequence[Any],
+        content_layers: Any,
+        semantic_plan: Any,
+    ) -> list[dict[str, Any]]:
+        topic_ids_by_paper: dict[str, list[str]] = {}
+        for topic in getattr(semantic_plan, "topics", []) or []:
+            for paper_id in (
+                *list(getattr(topic, "paper_ids", []) or []),
+                *list(getattr(topic, "bridge_paper_ids", []) or []),
+            ):
+                topic_ids_by_paper.setdefault(str(paper_id), []).append(
+                    str(getattr(topic, "topic_id", "") or "")
+                )
+        dossiers = getattr(content_layers, "dossier_by_paper", {})
+        refs: list[dict[str, Any]] = []
+        for view in views:
+            payload = view.to_dict() if hasattr(view, "to_dict") else dict(view)
+            paper_key = str(payload.get("paper_key") or payload.get("canonical_paper_key") or "")
+            dossier = dossiers.get(paper_key) if isinstance(dossiers, Mapping) else None
+            field_refs = cls._compact_topic_evidence_unit(
+                view,
+                dossier,
+                fields=(),
+            )
+            refs.append(
+                {
+                    "paper_key": paper_key,
+                    "title": str(payload.get("title") or ""),
+                    "source_summary_hash": str(payload.get("source_summary_hash") or ""),
+                    "evidence_unit_id": field_refs["evidence_unit_id"],
+                    "evidence_unit_hash": field_refs["evidence_unit_hash"],
+                    "topic_ids": sorted(set(topic_ids_by_paper.get(paper_key, []))),
+                    "projection": "registry_complete_evidence_ref_v1",
+                }
+            )
+        return sorted(refs, key=lambda item: str(item.get("paper_key") or ""))
+
+    @staticmethod
+    def _compact_relation_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
+        evidence_ids = [str(item) for item in candidate.get("evidence_ids") or () if str(item)]
+        return {
+            "relation_id": str(candidate.get("relation_id") or ""),
+            "relation_type": str(candidate.get("relation_type") or ""),
+            "paper_keys": [str(item) for item in candidate.get("paper_keys") or () if str(item)],
+            "comparison_question": str(candidate.get("comparison_question") or ""),
+            "evidence_fields": dict(candidate.get("evidence_fields") or {}),
+            "source_fields": dict(candidate.get("source_fields") or {}),
+            "supporting_labels": [
+                str(item) for item in candidate.get("supporting_labels") or () if str(item)
+            ],
+            "evidence_id_count": len(evidence_ids),
+            "evidence_ids_hash": hash_json(evidence_ids),
+            "source_summary_hashes": [
+                str(item) for item in candidate.get("source_summary_hashes") or () if str(item)
+            ],
+        }
+
+    @classmethod
+    def _compact_relation_bundle(cls, bundle: Any) -> dict[str, Any]:
+        payload = bundle.to_dict() if hasattr(bundle, "to_dict") else dict(bundle)
+        required = [str(item) for item in payload.get("required_evidence_ids") or () if str(item)]
+        provided = [str(item) for item in payload.get("provided_evidence_ids") or () if str(item)]
+        return {
+            "relation_id": str(payload.get("relation_id") or ""),
+            "comparison_question": str(payload.get("comparison_question") or ""),
+            "relation_type": str(payload.get("relation_type") or ""),
+            "paper_ids": [str(item) for item in payload.get("paper_ids") or () if str(item)],
+            "findings_left": list(payload.get("findings_left") or []),
+            "findings_right": list(payload.get("findings_right") or []),
+            "contexts_and_boundaries": dict(payload.get("contexts_and_boundaries") or {}),
+            "source_locators": dict(payload.get("source_locators") or {}),
+            "required_evidence_id_count": len(required),
+            "required_evidence_ids_hash": hash_json(required),
+            "provided_evidence_id_count": len(provided),
+            "provided_evidence_ids_hash": hash_json(provided),
+            "missing_evidence_ids": [
+                str(item) for item in payload.get("missing_evidence_ids") or () if str(item)
+            ],
+            "evidence_completeness": str(payload.get("evidence_completeness") or ""),
+            "decision": str(payload.get("decision") or ""),
+            "projection": "complete_relation_bundle_plus_evidence_refs_v1",
+        }
+
+    def _build_topic_provider_request(
+        self,
+        batch: Sequence[TopicSynthesis],
+        *,
+        topic_routes: Mapping[str, Any],
+        evidence_model: Any,
+        content_layers_model: Any,
+        batch_index: int,
+    ) -> dict[str, Any]:
+        paper_ids = sorted(
+            {
+                str(paper_id)
+                for topic in batch
+                for paper_id in (
+                    *list(getattr(topic, "paper_ids", []) or []),
+                    *list(getattr(topic, "bridge_paper_ids", []) or []),
+                )
+                if str(paper_id)
+            }
+        )
+        dimensions = sorted(
+            {
+                str(dimension)
+                for topic in batch
+                for dimension in (
+                    getattr(topic_routes.get(topic.topic_id), "dimensions", []) or []
+                )
+                if str(dimension)
+            }
+        )
+        fields = self._topic_projection_fields(dimensions)
+        view_by_paper = {
+            str(getattr(view, "paper_key", "")): view
+            for view in getattr(evidence_model, "views", []) or []
+            if str(getattr(view, "paper_key", ""))
+        }
+        dossiers = getattr(content_layers_model, "dossier_by_paper", {})
+        evidence_units: list[dict[str, Any]] = []
+        for paper_id in paper_ids:
+            if paper_id not in view_by_paper:
+                continue
+            unit_filter: Sequence[int] | None = None
+            for topic in batch:
+                filters = getattr(topic, "_evidence_unit_indexes", None)
+                if isinstance(filters, Mapping) and paper_id in filters:
+                    unit_filter = filters.get(paper_id)
+                    break
+            evidence_units.extend(
+                self._complete_topic_evidence_units(
+                    view_by_paper[paper_id],
+                    dossiers.get(paper_id) if isinstance(dossiers, Mapping) else None,
+                    fields=fields,
+                    chunk_indexes=unit_filter,
+                )
+            )
+        return {
+            "task": "substantive_topic_synthesis",
+            "node_id": "topic_synthesis",
+            "hierarchy": {
+                "level": "topic_synthesis",
+                "batch_id": f"topic_batch_{batch_index}",
+                "target_tokens": self.technical_shard_target_tokens or 30_000,
+            },
+            "topics": [
+                {
+                    **self._compact_topic_route(topic_routes[topic.topic_id]),
+                    "paper_ids": [
+                        str(item) for item in topic.paper_ids if str(item)
+                    ],
+                    "bridge_paper_ids": [
+                        str(item) for item in topic.bridge_paper_ids if str(item)
+                    ],
+                    "required_evidence_count": len(
+                        getattr(topic, "supporting_evidence_ids", []) or []
+                    ),
+                }
+                for topic in batch
+                if topic.topic_id in topic_routes
+            ],
+            "evidence_units": evidence_units,
+            "evidence_projection": {
+                "projection": "complete_field_values_plus_registry_refs_v1",
+                "fields_in_prompt": list(fields),
+                "omitted_fields_are_registry_bound": True,
+                "content_layers_hash": getattr(content_layers_model, "content_hash", ""),
+            },
+            "output_contract": {
+                "topics": "array of topic synthesis objects; preserve topic_id and cite only supplied paper_key, study_id, claim_id, evidence_id and source_locator values",
+                "claims": "array of evidence-bound claims with claim modality, paper_key, study_id, evidence_ids and source_locators",
+                "unresolved_questions": "array of questions that remain unresolved",
+                "no_external_evidence": "do not infer a finding, boundary or consensus from a missing field; emit an unresolved or insufficient-evidence record instead",
+            },
+        }
+
+    def _topic_provider_batch_count(
+        self,
+        summaries: Sequence[Mapping[str, Any]],
+        profile: ProviderContextProfile,
+    ) -> int:
+        """Count the bounded topic requests used by the real executor."""
+
+        evidence_model = build_outline_evidence_views(summaries, self.job_id)
+        ledger = build_global_corpus_ledger(evidence_model)
+        matrix = build_multi_view_matrix(evidence_model)
+        relation_map = build_global_relation_map(evidence_model, matrix, ledger)
+        content_layers_model = build_paper_content_layers(
+            summaries,
+            evidence_model,
+            job_id=self.job_id,
+        )
+        semantic_plan = build_semantic_chunk_plan(
+            content_layers_model,
+            relation_map,
+            candidate_count=self.candidate_count,
+            physical_call_limit=min(24, max(0, int(self.max_provider_calls or 24))),
+        )
+        topic_plan = build_topic_synthesis_plan(semantic_plan)
+        topic_routes = {topic.topic_id: topic for topic in semantic_plan.topics}
+        topic_input_limit = max(
+            1,
+            min(
+                32_000,
+                int(self.max_source_prompt_tokens or 32_000),
+                int(profile.input_budget or 32_000),
+            )
+            - 0,
+        )
+        topic_plan = self._split_topic_plan_for_budget(
+            topic_plan,
+            topic_routes=topic_routes,
+            evidence_model=evidence_model,
+            content_layers_model=content_layers_model,
+            profile=profile,
+            input_limit=topic_input_limit,
+        )
+        batches: list[list[TopicSynthesis]] = []
+        current: list[TopicSynthesis] = []
+        for topic in topic_plan:
+            trial = [*current, topic]
+            request = self._build_topic_provider_request(
+                trial,
+                topic_routes=topic_routes,
+                evidence_model=evidence_model,
+                content_layers_model=content_layers_model,
+                batch_index=len(batches) + 1,
+            )
+            budget = profile.estimate_request(
+                self._attach_prompt_authority(
+                    f"topic_synthesis:preflight:{len(batches) + 1}",
+                    request,
+                )
+            )
+            estimate = int(
+                budget.get("estimated_input_tokens") or profile.estimate_tokens(request)
+            )
+            if current and estimate > topic_input_limit:
+                batches.append(current)
+                current = [topic]
+            else:
+                current = trial
+        if current:
+            batches.append(current)
+        return len(batches)
+
+    def _split_topic_plan_for_budget(
+        self,
+        topics: Sequence[TopicSynthesis],
+        *,
+        topic_routes: Mapping[str, Any],
+        evidence_model: Any,
+        content_layers_model: Any,
+        profile: ProviderContextProfile,
+        input_limit: int,
+    ) -> list[TopicSynthesis]:
+        """Split oversized topic routes only at paper/evidence-unit boundaries."""
+
+        expanded: list[TopicSynthesis] = []
+
+        def with_unit_filter(
+            source: TopicSynthesis,
+            paper_id: str,
+            indexes: Sequence[int],
+        ) -> TopicSynthesis:
+            clone = replace(
+                source,
+                paper_ids=[paper_id],
+                bridge_paper_ids=[
+                    value for value in source.bridge_paper_ids if value == paper_id
+                ],
+            )
+            object.__setattr__(clone, "_evidence_unit_indexes", {paper_id: list(indexes)})
+            return clone
+
+        for topic in topics:
+            source_topic_id = topic.topic_id
+            topic_fields = self._topic_projection_fields(
+                getattr(topic_routes.get(source_topic_id), "dimensions", [])
+            )
+            full_request = self._build_topic_provider_request(
+                [topic],
+                topic_routes=topic_routes,
+                evidence_model=evidence_model,
+                content_layers_model=content_layers_model,
+                batch_index=len(expanded) + 1,
+            )
+            full_budget = profile.estimate_request(
+                self._attach_prompt_authority(
+                    f"topic_synthesis:preflight:{len(expanded) + 1}",
+                    full_request,
+                )
+            )
+            full_estimate = int(
+                full_budget.get("estimated_input_tokens")
+                or profile.estimate_tokens(full_request)
+            )
+            if full_estimate <= input_limit:
+                expanded.append(topic)
+                continue
+            if len(topic.paper_ids) == 1:
+                paper_id = str(topic.paper_ids[0])
+                view = next(
+                    (
+                        item
+                        for item in getattr(evidence_model, "views", []) or []
+                        if str(getattr(item, "paper_key", "")) == paper_id
+                    ),
+                    None,
+                )
+                dossiers = getattr(content_layers_model, "dossier_by_paper", {})
+                dossier = dossiers.get(paper_id) if isinstance(dossiers, Mapping) else None
+                units = self._complete_topic_evidence_units(
+                    view,
+                    dossier,
+                    fields=topic_fields,
+                ) if view is not None else []
+                if len(units) > 1:
+                    for index in range(1, len(units) + 1):
+                        expanded.append(with_unit_filter(topic, paper_id, [index]))
+                    continue
+                raise OutlineV3ExecutionError(
+                    f"BLOCKED_BUDGET: topic {topic.topic_id} paper {paper_id} is an indivisible complete evidence unit over the effective input cap"
+                )
+            paper_ids = [str(item) for item in topic.paper_ids if str(item)]
+            current: list[str] = []
+            for paper_id in paper_ids:
+                trial_ids = [*current, paper_id]
+                trial_topic = replace(
+                    topic,
+                    paper_ids=trial_ids,
+                    bridge_paper_ids=[
+                        value
+                        for value in topic.bridge_paper_ids
+                        if value in trial_ids
+                    ],
+                )
+                trial_request = self._build_topic_provider_request(
+                    [trial_topic],
+                    topic_routes=topic_routes,
+                    evidence_model=evidence_model,
+                    content_layers_model=content_layers_model,
+                    batch_index=len(expanded) + 1,
+                )
+                trial_budget = profile.estimate_request(
+                    self._attach_prompt_authority(
+                        f"topic_synthesis:preflight:{len(expanded) + 1}",
+                        trial_request,
+                    )
+                )
+                trial_estimate = int(
+                    trial_budget.get("estimated_input_tokens")
+                    or profile.estimate_tokens(trial_request)
+                )
+                if current and trial_estimate > input_limit:
+                    expanded.append(
+                        replace(
+                            topic,
+                            paper_ids=list(current),
+                            bridge_paper_ids=[
+                                value for value in topic.bridge_paper_ids if value in current
+                            ],
+                        )
+                    )
+                    current = [paper_id]
+                else:
+                    current = trial_ids
+                if len(current) == 1:
+                    one_request = self._build_topic_provider_request(
+                        [
+                            replace(
+                                topic,
+                                paper_ids=list(current),
+                                bridge_paper_ids=[
+                                    value
+                                    for value in topic.bridge_paper_ids
+                                    if value in current
+                                ],
+                            )
+                        ],
+                        topic_routes=topic_routes,
+                        evidence_model=evidence_model,
+                        content_layers_model=content_layers_model,
+                        batch_index=len(expanded) + 1,
+                    )
+                    one_budget = profile.estimate_request(
+                        self._attach_prompt_authority(
+                            f"topic_synthesis:preflight:{len(expanded) + 1}",
+                            one_request,
+                        )
+                    )
+                    one_estimate = int(
+                        one_budget.get("estimated_input_tokens")
+                        or profile.estimate_tokens(one_request)
+                    )
+                    if one_estimate > input_limit:
+                        units = self._complete_topic_evidence_units(
+                            next(
+                                item
+                                for item in getattr(evidence_model, "views", []) or []
+                                if str(getattr(item, "paper_key", "")) == paper_id
+                            ),
+                            getattr(content_layers_model, "dossier_by_paper", {}).get(paper_id),
+                            fields=topic_fields,
+                        )
+                        if len(units) > 1:
+                            expanded.extend(
+                                with_unit_filter(topic, paper_id, [index])
+                                for index in range(1, len(units) + 1)
+                            )
+                            current = []
+                            continue
+                        raise OutlineV3ExecutionError(
+                            f"BLOCKED_BUDGET: topic {topic.topic_id} paper {paper_id} is an indivisible complete evidence unit over the effective input cap"
+                        )
+            if current:
+                expanded.append(
+                    replace(
+                        topic,
+                        paper_ids=list(current),
+                        bridge_paper_ids=[
+                            value for value in topic.bridge_paper_ids if value in current
+                        ],
+                    )
+                )
+        return expanded
 
     @staticmethod
     def _estimate_source_summary_excerpts(
@@ -1403,86 +2249,90 @@ class OutlineV3Executor:
         *,
         variant_name: str,
     ) -> tuple[int, int, dict[str, Any]]:
-        """Estimate the actual local/cross relation requests, not a monolith."""
+        """Estimate the compact evidence-bundle relation request.
+
+        The full relation shard planner remains available for explicit
+        low-target callers and regression tests. Production R1 uses complete
+        relation bundles plus Registry-bound evidence references, so the
+        normal 63-paper request is one bounded provider call.
+        """
+
+        if 0 < self.technical_shard_target_tokens < 8_000:
+            # Preserve the explicit low-target evidence-shard contract used by
+            # the adversarial shard tests. Production R1 uses the compact
+            # bundle path below at the 32k target.
+            evidence = build_outline_evidence_views(summaries, self.job_id)
+            ledger = build_global_corpus_ledger(evidence)
+            matrix = build_multi_view_matrix(evidence)
+            candidates = build_global_relation_map(evidence, matrix, ledger)
+            relation_candidates = [item.to_dict() for item in candidates.relations]
+            plan = self._build_relation_shard_plan(evidence.views, relation_candidates)
+            estimates = [
+                max(1, int(item.get("estimated_input_tokens") or 1))
+                for item in plan.get("shards") or ()
+                if isinstance(item, Mapping)
+            ]
+            return max(estimates, default=1), max(1, len(estimates)), plan
 
         evidence = build_outline_evidence_views(summaries, self.job_id)
         ledger = build_global_corpus_ledger(evidence)
         matrix = build_multi_view_matrix(evidence)
         candidates = build_global_relation_map(evidence, matrix, ledger)
         relation_candidates = [item.to_dict() for item in candidates.relations]
-        plan = self._build_relation_shard_plan(evidence.views, relation_candidates)
-        candidate_by_id = {
-            str(item.get("relation_id") or ""): item
+        content_layers = build_paper_content_layers(
+            summaries,
+            evidence,
+            job_id=self.job_id,
+        )
+        semantic_plan = build_semantic_chunk_plan(
+            content_layers,
+            candidates,
+            candidate_count=self.candidate_count,
+            physical_call_limit=min(24, max(0, int(self.max_provider_calls or 24))),
+        )
+        selected_ids = set(semantic_plan.coverage.get("selected_relation_ids") or ())
+        selected = [
+            item for item in semantic_plan.relation_bundles if item.relation_id in selected_ids
+        ]
+        compact_candidates = [
+            self._compact_relation_candidate(item)
             for item in relation_candidates
-            if str(item.get("relation_id") or "")
+            if str(item.get("relation_id") or "") in selected_ids
+        ]
+        request = {
+            "relation_candidates": compact_candidates,
+            "relation_evidence_bundles": [self._compact_relation_bundle(item) for item in selected],
+            "evidence_projection": {
+                "content_layers_hash": content_layers.content_hash,
+                "full_evidence_views_are_registry_local": True,
+            },
+            "relation_adjudication_contract": {
+                "allowed_relation_ids": sorted(selected_ids),
+                "must_return_confirmed_relation_ids": True,
+                "must_reject_without_recorded_evidence": True,
+            },
         }
-        contract = {
-            "allowed_relation_ids": sorted(candidate_by_id),
-            "must_return_confirmed_relation_ids": True,
-            "must_reject_without_recorded_evidence": True,
+        enriched = self._attach_prompt_authority(
+            f"relation_adjudication:preflight:{variant_name}:1",
+            request,
+        )
+        budget = profile.estimate_request(enriched)
+        estimate = max(
+            1,
+            int(budget.get("estimated_input_tokens") or profile.estimate_tokens(enriched)),
+        )
+        return estimate, 1, {
+            "schema_version": "outline-relation-shard-plan-v1",
+            "target_tokens": int(self.technical_shard_target_tokens or 0),
+            "shard_count": 1,
+            "shards": [],
+            "coverage": {
+                "input_view_count": len(evidence.views),
+                "planned_view_count": len(evidence.views),
+                "missing_view_hashes": [],
+                "compact_provider_projection": True,
+            },
         }
-        requests: list[dict[str, Any]] = []
-        reviewed: set[str] = set()
-        for shard in plan.get("shards") or ():
-            if not isinstance(shard, Mapping):
-                continue
-            shard_id = str(shard.get("shard_id") or "")
-            relation_ids = {
-                str(item)
-                for item in shard.get("relation_candidate_ids") or ()
-                if str(item) in candidate_by_id
-            }
-            if not relation_ids:
-                continue
-            reviewed.update(relation_ids)
-            requests.append({
-                "hierarchy": {
-                    "level": "local_shard",
-                    "shard_id": shard_id,
-                    "target_tokens": self.technical_shard_target_tokens,
-                    "paper_keys": list(shard.get("paper_keys") or ()),
-                    "relation_candidate_ids": sorted(relation_ids),
-                    "evidence_view_hashes": list(shard.get("view_hashes") or ()),
-                },
-                "relation_candidates": [candidate_by_id[item] for item in sorted(relation_ids)],
-                "evidence_views": [dict(item) for item in shard.get("evidence_chunks") or () if isinstance(item, Mapping)],
-                "relation_adjudication_contract": {
-                    **contract,
-                    "allowed_relation_ids": sorted(relation_ids),
-                },
-            })
-        remaining = set(candidate_by_id) - reviewed
-        if remaining:
-            compact_preflight_views = [
-                self._compact_relation_digest(
-                    request,
-                    [str(item) for item in request.get("relation_candidate_ids") or () if str(item)],
-                    [],
-                    [],
-                )
-                for request in requests
-            ]
-            requests.extend(
-                request
-                for _node_id, request, _batch_ids in self._relation_cross_batch_requests(
-                    candidate_by_id=candidate_by_id,
-                    relation_ids=sorted(remaining),
-                    shard_plan=plan,
-                    relation_contract=contract,
-                    profile=profile,
-                    node_prefix=f"preflight:{variant_name}",
-                    evidence_views_override=compact_preflight_views,
-                )
-            )
-        estimates: list[int] = []
-        for index, request in enumerate(requests, start=1):
-            enriched = self._attach_prompt_authority(
-                f"relation_adjudication:preflight:{variant_name}:{index}",
-                request,
-            )
-            budget = profile.estimate_request(enriched)
-            estimates.append(max(1, int(budget.get("estimated_input_tokens") or profile.estimate_tokens(enriched))))
-        return max(estimates, default=1), len(requests), plan
 
     def _candidate_hierarchical_preflight(
         self,
@@ -1491,60 +2341,66 @@ class OutlineV3Executor:
         *,
         variant_name: str,
     ) -> tuple[int, int]:
-        """Estimate candidate-generation shard requests at their final shape."""
+        """Estimate one compact candidate request at its final shape."""
 
         evidence = build_outline_evidence_views(summaries, self.job_id)
         ledger = build_global_corpus_ledger(evidence)
         matrix = build_multi_view_matrix(evidence)
         candidates = build_global_relation_map(evidence, matrix, ledger)
-        relation_candidates = [item.to_dict() for item in candidates.relations]
-        plan = self._build_relation_shard_plan(evidence.views, relation_candidates)
-        estimates: list[int] = []
-        for index, shard in enumerate(plan.get("shards") or (), start=1):
-            if not isinstance(shard, Mapping):
-                continue
-            shard_data: dict[str, Any] = dict(shard)
-            raw_paper_keys = shard_data.get("paper_keys")
-            raw_relation_ids = shard_data.get("relation_candidate_ids")
-            raw_evidence_chunks = shard_data.get("evidence_chunks")
-            paper_keys = [str(item) for item in raw_paper_keys if str(item)] if isinstance(raw_paper_keys, list) else []
-            relation_ids = [str(item) for item in raw_relation_ids if str(item)] if isinstance(raw_relation_ids, list) else []
-            request = {
-                "candidate_id": "candidate_1",
-                "variant_name": variant_name,
-                "hierarchy": {
-                    "level": "candidate_local_shard",
-                    "shard_id": str(shard_data.get("shard_id") or f"candidate_shard_{index}"),
-                    "target_tokens": self.technical_shard_target_tokens,
-                    "paper_keys": paper_keys,
-                    "relation_candidate_ids": relation_ids,
-                },
-                "paper_keys": paper_keys,
-                "relation_ids": relation_ids,
-                "relations": [
-                    item for item in relation_candidates
-                    if str(item.get("relation_id") or "") in set(relation_ids)
-                ],
-                "evidence": [
-                    dict(item)
-                    for item in raw_evidence_chunks
-                    if isinstance(item, Mapping)
-                ] if isinstance(raw_evidence_chunks, list) else [],
-                "source_summary_hashes": sorted(evidence.source_summary_hashes),
-                "candidate_count": self.candidate_count,
-                "evidence_bound": True,
-            }
-            enriched = self._attach_prompt_authority(
-                f"candidate_1_provider_generation:preflight:{variant_name}:{index}",
-                request,
-            )
-            budget = profile.estimate_request(enriched)
-            estimates.append(max(1, int(budget.get("estimated_input_tokens") or profile.estimate_tokens(enriched))))
-        return max(estimates, default=1), len(estimates)
+        content_layers = build_paper_content_layers(summaries, evidence, job_id=self.job_id)
+        semantic_plan = build_semantic_chunk_plan(
+            content_layers,
+            candidates,
+            candidate_count=self.candidate_count,
+            physical_call_limit=min(24, max(0, int(self.max_provider_calls or 24))),
+        )
+        paper_keys = [str(view.paper_key) for view in evidence.views if str(view.paper_key)]
+        selected_relation_ids = {
+            str(item)
+            for item in semantic_plan.coverage.get("selected_relation_ids") or ()
+            if str(item)
+        }
+        relation_ids = [
+            str(item.relation_id)
+            for item in candidates.relations
+            if str(item.relation_id) in selected_relation_ids
+        ]
+        request = {
+            "candidate_id": "candidate_1",
+            "variant_name": variant_name,
+            "paper_keys": paper_keys,
+            "relation_ids": relation_ids,
+            "relations": [
+                self._compact_relation_candidate(item.to_dict())
+                for item in candidates.relations
+                if str(item.relation_id) in selected_relation_ids
+            ],
+            "evidence": self._compact_candidate_evidence_refs(
+                evidence.views,
+                content_layers,
+                semantic_plan,
+            ),
+            "source_summary_hashes": sorted(evidence.source_summary_hashes),
+            "candidate_count": self.candidate_count,
+            "evidence_bound": True,
+            "evidence_projection": "registry_complete_evidence_ref_v1",
+        }
+        enriched = self._attach_prompt_authority(
+            f"candidate_1_provider_generation:preflight:{variant_name}:1",
+            request,
+        )
+        budget = profile.estimate_request(enriched)
+        estimate = max(
+            1,
+            int(budget.get("estimated_input_tokens") or profile.estimate_tokens(enriched)),
+        )
+        return estimate, 1
 
     def _build_provider_call_plans(self) -> tuple[OutlineProviderCallPlan, ...]:
         plans: list[OutlineProviderCallPlan] = []
         for variant_name, variant_summaries, transport_expected in self._provider_call_plan_variants():
+            variant_evidence = build_outline_evidence_views(variant_summaries, self.job_id)
+            variant_layers = build_paper_content_layers(variant_summaries, variant_evidence, job_id=self.job_id)
             for node_id in self._provider_node_ids():
                 route = self._role_route(node_id)
                 profile = route.profile
@@ -1573,19 +2429,35 @@ class OutlineV3Executor:
                         self._role_route("candidate_1_provider_generation").profile,
                         variant_name=variant_name,
                     )
+                common_estimation = {
+                    "navigation_cards": [item.to_dict() for item in variant_layers.index_cards],
+                    "content_layers_hash": variant_layers.content_hash,
+                    "source_summary_hashes": list(variant_layers.source_summary_hashes),
+                    "source_summary_size_tokens": [
+                        max(1, len(json.dumps(item, ensure_ascii=False, sort_keys=True)) // 4)
+                        for item in variant_summaries
+                    ],
+                    "source_summary_size_marker": "x" * min(
+                        2000,
+                        max(1, sum(len(json.dumps(item, ensure_ascii=False)) for item in variant_summaries) // 1000),
+                    ),
+                    "candidate_count": self.candidate_count,
+                    "evidence_bound": True,
+                    "full_dossiers_are_local_retrieval_only": True,
+                }
                 if hierarchical_relation_input is not None:
                     representative_request = {
+                        **common_estimation,
                         "job_id": self.job_id,
                         "stage_name": "outline_v3",
                         "variant_name": variant_name,
                         "node_id": node_id,
                         "hierarchical_relation_request": True,
                         "estimated_shard_input_tokens": hierarchical_relation_input,
-                        "candidate_count": self.candidate_count,
-                        "evidence_bound": True,
                     }
                 elif node_id in {"structure_critique", "coverage_critique", "evidence_critique", "arbitration"}:
                     representative_request = {
+                        **common_estimation,
                         "job_id": self.job_id,
                         "stage_name": "outline_v3",
                         "variant_name": variant_name,
@@ -1594,23 +2466,18 @@ class OutlineV3Executor:
                         * max(1, candidate_shard_multiplier)
                         * int(self._role_route("candidate_1_provider_generation").profile.max_output_tokens),
                         "paper_count": len(variant_summaries),
-                        "source_summary_hash_count": len(variant_summaries),
-                        "evidence_bound": True,
                     }
                 else:
                     representative_request = {
+                        **common_estimation,
                         "job_id": self.job_id,
                         "stage_name": "outline_v3",
                         "variant_name": variant_name,
                         "node_id": node_id,
-                        "evidence_views": self._prompt_evidence_views(
-                            build_outline_evidence_views(variant_summaries, self.job_id).views
-                        ),
+                        "evidence_views": self._prompt_evidence_views(variant_evidence.views),
                         "source_summary_excerpts_for_estimation": self._estimate_source_summary_excerpts(
                             variant_summaries
                         ),
-                        "candidate_count": self.candidate_count,
-                        "evidence_bound": True,
                     }
                 budget = profile.estimate_request(representative_request)
                 estimated_input = max(
@@ -1623,14 +2490,20 @@ class OutlineV3Executor:
                 )
                 base_input_estimate = estimated_input
                 estimated_output = max(1, int(profile.max_output_tokens))
-                if node_id.endswith("_provider_generation") and candidate_shard_multiplier > 1:
-                    estimated_output = min(estimated_output, 1024)
+                if node_id.endswith("_provider_generation") and self.technical_shard_target_tokens > 0:
+                    # The compact R1 candidate contract enforces this same
+                    # output cap at transport, keeping critique/arbitration
+                    # admission from reserving an unbounded candidate blob.
+                    estimated_output = min(estimated_output, 4_096)
+                elif node_id in {
+                    "structure_critique",
+                    "coverage_critique",
+                    "evidence_critique",
+                    "arbitration",
+                }:
+                    estimated_output = min(estimated_output, 2_048)
                 estimated_reasoning = max(0, int(profile.reasoning_reserve))
-                candidate_output_cap = (
-                    min(estimated_output, 1024)
-                    if self.technical_shard_target_tokens > 0 and candidate_shard_multiplier > 1
-                    else estimated_output
-                )
+                candidate_output_cap = estimated_output
                 candidate_output_upper_bound = (
                     self.candidate_count
                     * max(1, candidate_shard_multiplier)
@@ -1744,6 +2617,59 @@ class OutlineV3Executor:
                 )
         return tuple(plans)
 
+    def _persist_preflight_rejection(
+        self,
+        *,
+        rejection_reason: str,
+        diagnostic: str,
+    ) -> None:
+        """Persist a machine-readable admission rejection before transport."""
+
+        payload = {
+            "artifact_type": "outline_preflight_rejection",
+            "artifact_version": "v1",
+            "job_id": self.job_id,
+            "stage_name": "outline_v3",
+            "closure_epoch_id": self.closure_epoch_id,
+            "logical_attempt_identity": self.logical_attempt_identity,
+            "mode": self.stability_mode,
+            "provider_call_plans": [item.to_dict() for item in self.provider_call_plans],
+            "max_provider_calls": self.max_provider_calls,
+            "max_source_prompt_tokens": self.max_source_prompt_tokens,
+            "technical_shard_target_tokens": self.technical_shard_target_tokens,
+            "estimated_provider_calls": None,
+            "semantic_synthesis_calls_reserved": None,
+            "estimated_total_tokens": None,
+            "preflight_status": "rejected",
+            "rejection_reason": rejection_reason,
+            "diagnostic": diagnostic,
+            "transport_posts_emitted": 0,
+            "content_projection": "complete_dossier_study_claim_unit_v1",
+        }
+        self.stability_preflight = payload
+        path = self._path(
+            f"outline_v3/stability/stability_preflight_{self.closure_epoch_id[:24]}.json"
+        )
+        record = publish_json_artifact(
+            self.publication_context,
+            self.registry,
+            path,
+            payload,
+            artifact_role="outline_preflight_rejection",
+            artifact_type="outline_preflight_rejection",
+            artifact_version="v1",
+            producer="outline.v3_executor.OutlineV3Executor",
+            artifact_id=f"outline-v3:preflight_rejection:{self.closure_epoch_id[:24]}",
+            metadata={
+                "job_id": self.job_id,
+                "closure_epoch_id": self.closure_epoch_id,
+                "provider_call_plan_hash": hash_json(payload["provider_call_plans"]),
+                "rejection_reason": rejection_reason,
+            },
+        )
+        self.artifact_paths["provider_call_plan"] = record.path
+        self.artifact_records["provider_call_plan"] = record
+
     def _preflight_stability_budget(self) -> None:
         core_calls = len(self._provider_node_ids())
         self.provider_call_plans = self._build_provider_call_plans()
@@ -1762,6 +2688,36 @@ class OutlineV3Executor:
             if len(known_estimated_costs) == len(estimated_cost_values)
             else None
         )
+        semantic_synthesis_calls = 0
+        if self.semantic_provider_synthesis_enabled:
+            semantic_route = self._role_route("candidate_1_provider_generation")
+            # Count the exact complete-evidence topic batches used by ``run``.
+            # Cross-group and global synthesis add two calls. Oversized
+            # indivisible evidence units raise a typed budget rejection before
+            # any provider transport is admitted.
+            try:
+                semantic_topic_batches = self._topic_provider_batch_count(
+                    self.summaries,
+                    semantic_route.profile,
+                )
+            except OutlineV3ExecutionError as exc:
+                self._persist_preflight_rejection(
+                    rejection_reason="complete_evidence_unit_exceeds_effective_input_cap",
+                    diagnostic=str(exc),
+                )
+                raise
+            semantic_synthesis_calls = semantic_topic_batches + 2
+            semantic_output = min(max(1, int(semantic_route.profile.max_output_tokens)), 4096)
+            semantic_reasoning = max(0, int(semantic_route.profile.reasoning_reserve))
+            estimated_provider_calls += semantic_synthesis_calls
+            estimated_output_tokens += semantic_synthesis_calls * semantic_output
+            estimated_reasoning_tokens += semantic_synthesis_calls * semantic_reasoning
+            estimated_total_tokens += semantic_synthesis_calls * (semantic_output + semantic_reasoning)
+            if estimated_cost is not None:
+                estimated_cost += semantic_synthesis_calls * (
+                    semantic_output / 1000.0 * float(self.output_cost_per_1k_tokens or 0.0)
+                    + semantic_reasoning / 1000.0 * float(self.reasoning_cost_per_1k_tokens or 0.0)
+                )
         hierarchical_candidate_shard_calls = 0
         if self.technical_shard_target_tokens > 0:
             for variant_name, variant_summaries, transport_expected in self._provider_call_plan_variants():
@@ -1773,7 +2729,15 @@ class OutlineV3Executor:
                     candidate_route.profile,
                     variant_name=variant_name,
                 )
-                if candidate_shard_count > 1:
+                candidate_plan_estimate = max(
+                    (
+                        int(plan.estimated_input_tokens)
+                        for plan in self.provider_call_plans
+                        if str(plan.node_id).endswith("_provider_generation")
+                    ),
+                    default=int(_candidate_input),
+                )
+                if candidate_shard_count > 1 and candidate_plan_estimate > int(self.technical_shard_target_tokens):
                     hierarchical_candidate_shard_calls += self.candidate_count * (candidate_shard_count - 1)
             if hierarchical_candidate_shard_calls:
                 candidate_route = self._role_route("candidate_1_provider_generation")
@@ -1807,7 +2771,16 @@ class OutlineV3Executor:
                     # calls.  The provider-call plan already contains one
                     # static relation row, so only the surplus dynamic calls
                     # belong in the extra-call budget.
-                    hierarchical_relation_shard_calls += max(0, relation_call_count - 1)
+                    relation_plan_estimate = max(
+                        (
+                            int(plan.estimated_input_tokens)
+                            for plan in self.provider_call_plans
+                            if plan.node_id == "relation_adjudication"
+                        ),
+                        default=int(_relation_input),
+                    )
+                    if relation_plan_estimate > int(self.technical_shard_target_tokens):
+                        hierarchical_relation_shard_calls += max(0, relation_call_count - 1)
             if hierarchical_relation_shard_calls:
                 relation_route = self._role_route("relation_adjudication")
                 relation_output = max(1, int(relation_route.profile.max_output_tokens))
@@ -1886,6 +2859,7 @@ class OutlineV3Executor:
             "hierarchical_candidate_shard_calls": hierarchical_candidate_shard_calls,
             "hierarchical_relation_shard_calls": hierarchical_relation_shard_calls,
             "hierarchical_critique_shard_calls": hierarchical_critique_shard_calls,
+            "semantic_synthesis_calls_reserved": semantic_synthesis_calls,
             "estimated_input_tokens": estimated_input_tokens,
             "estimated_output_tokens": estimated_output_tokens,
             "estimated_reasoning_tokens": estimated_reasoning_tokens,
@@ -2067,11 +3041,14 @@ class OutlineV3Executor:
         if node_id.endswith("_provider_generation"):
             return "outline_candidate"
         return {
+            "outline_content_layers": "outline_content_layers",
+            "semantic_chunk_plan": "semantic_chunk_plan",
             "structure_critique": "structure_critique",
             "coverage_critique": "coverage_critique",
             "evidence_critique": "evidence_critique",
             "arbitration": "arbitration_decision",
             "selected_candidate": "selected_outline_candidate",
+            "selected_candidate_revision": "selected_candidate_revision",
             "section_evidence_packets": "section_evidence_packet_set",
             "final_outline": "final_outline",
             "coverage_audit": "coverage_audit",
@@ -2115,12 +3092,26 @@ class OutlineV3Executor:
             or node_id.startswith("stability:")
             or node_id.startswith("relation_adjudication:")
             or (node_id.startswith("candidate_") and "_provider_generation:" in node_id)
+            or node_id.startswith((
+                "topic_synthesis_provider",
+                "cross_group_comparison_provider",
+                "global_synthesis_provider",
+            ))
+            or (
+                self.semantic_provider_synthesis_enabled
+                and node_id in {"topic_synthesis", "cross_group_comparison", "global_synthesis"}
+            )
             or any(
                 node_id.startswith(f"{role}:")
                 for role in ("structure_critique", "coverage_critique", "evidence_critique")
             )
         )
-        resolved_route = route if route is not None else (self._node_route(node_id) if provider_node else None)
+        resolved_route = route if route is not None else (
+            self._node_route("candidate_1_provider_generation")
+            if self.semantic_provider_synthesis_enabled
+            and node_id in {"topic_synthesis", "cross_group_comparison", "global_synthesis"}
+            else (self._node_route(node_id) if provider_node else None)
+        )
         if provider_node and resolved_route is not None:
             bind_provider = resolved_route.provider_name
             bind_model = resolved_route.model
@@ -2154,6 +3145,11 @@ class OutlineV3Executor:
         candidate_sensitive = (
             node_id in review_nodes
             or node_id.startswith("candidate_")
+            or node_id.startswith((
+                "topic_synthesis_provider",
+                "cross_group_comparison_provider",
+                "global_synthesis_provider",
+            ))
             or node_id.startswith("stability:")
         )
         relevant_config = {
@@ -2180,6 +3176,11 @@ class OutlineV3Executor:
             "endpoint_type": bind_endpoint,
             "api_base_host": resolved_route.api_base_host if provider_node and resolved_route is not None else "",
             "route_fingerprint": resolved_route.safe_config_fingerprint() if provider_node and resolved_route is not None else "",
+            "transport_retries": (
+                str(resolved_route.config_identity.get("transport_retries") or "0")
+                if provider_node and resolved_route is not None
+                else "0"
+            ),
             "prompt_template_hash": prompt_template_hash,
             "prompt_payload_hash": prompt_payload_hash,
             "prompt_hash": hash_text(json.dumps(prompt, sort_keys=True, ensure_ascii=False)) if prompt is not None else "",
@@ -2302,17 +3303,13 @@ class OutlineV3Executor:
                 same_record = self._receipt_record_hash(previous) == self._receipt_record_hash(receipt)
                 previous_epoch = str(getattr(previous, "closure_epoch_id", "") or "")
                 previous_source = sources.get(receipt_id)
-                duplicate_registry_source = (
-                    same_record
-                    and previous_epoch == source_epoch
-                    and previous_source is not None
-                    and source_record is not None
-                    and previous_source.artifact_id != source_record.artifact_id
-                )
-                if same_record and previous_epoch == source_epoch and not duplicate_registry_source:
-                    # The local staging copy and its immutable Registry copy
-                    # describe the same call. Prefer the Registry record as
-                    # the source authority when it is available.
+                if same_record and previous_epoch == source_epoch:
+                    # A resumed run publishes a content-addressed cumulative
+                    # ledger. Its immutable Registry snapshots legitimately
+                    # share the same receipt prefix, so an identical receipt
+                    # from two ready ledger records is not a conflict. Keep a
+                    # Registry record as the source authority when the first
+                    # occurrence came from the local staging copy.
                     if source_record is not None and previous_source is None:
                         sources[receipt_id] = source_record
                     continue
@@ -2339,6 +3336,14 @@ class OutlineV3Executor:
         except Exception as exc:
             registry_records = []
             reject("provider receipt Registry", type(exc).__name__)
+        stable_registry_ids = {
+            str(getattr(record, "artifact_id", "") or "")
+            for record in registry_records
+            if str(getattr(record, "artifact_type", "") or "") == "provider_receipt_ledger"
+            and str(getattr(record, "status", "") or "") == "ready"
+            and str(getattr(record, "job_id", "") or "") == self.job_id
+            and str(getattr(record, "artifact_id", "") or "") == "outline_v3_provider_receipts"
+        }
         for record in registry_records:
             if str(getattr(record, "artifact_type", "") or "") != "provider_receipt_ledger":
                 continue
@@ -2352,6 +3357,12 @@ class OutlineV3Executor:
                 reject(str(getattr(record, "artifact_id", "") or "<unknown>"), "metadata is not an object")
                 continue
             if str(metadata.get("stage_name") or "") != "outline_v3":
+                continue
+            if stable_registry_ids and str(getattr(record, "artifact_id", "") or "") not in stable_registry_ids:
+                # Content-addressed historical snapshots are forensic inputs;
+                # the stable current ledger is the only replay authority. A
+                # missing record in that authority must trigger a fresh call,
+                # not be resurrected from an older snapshot.
                 continue
             source_epoch = str(metadata.get("closure_epoch_id") or "")
             if not source_epoch:
@@ -2812,7 +3823,7 @@ class OutlineV3Executor:
             job_id=self.job_id,
             attempt_id=call_id,
             stage_name="outline_v3",
-            node_id=semantic_node_id,
+            node_id=self._semantic_receipt_node_id(semantic_node_id),
             closure_epoch_id=self.closure_epoch_id,
             logical_attempt_identity=self.logical_attempt_identity,
             expected_call_graph_hash=self.expected_call_graph_hash,
@@ -2823,7 +3834,7 @@ class OutlineV3Executor:
             input_hash=str(binding.get("prompt_payload_hash") or ""),
             config_hash=str(binding.get("provider_config_hash") or ""),
             schema_hash=str(binding.get("schema_hash") or _hash_payload({"node_id": semantic_node_id, "expect_json": True})),
-            max_attempts=1,
+            max_attempts=max(1, int(binding.get("transport_retries") or 0) + 1),
             provider=str(binding.get("provider_family") or ""),
             model=str(binding.get("model_name") or ""),
             endpoint=str(binding.get("api_base_host") or ""),
@@ -2861,7 +3872,7 @@ class OutlineV3Executor:
                 endpoint=route.api_base_host if route is not None else "",
                 endpoint_type=route.endpoint_type if route is not None else self.profile.endpoint_type,
                 config_hash=hash_json(route_identity) if route_identity else "",
-                max_attempts=1,
+                max_attempts=max(1, int((route.config_identity if route is not None else {}).get("transport_retries") or 0) + 1),
                 usage_required=(route.endpoint_type if route is not None else self.profile.endpoint_type)
                 not in {"internal", "fixture"},
             )
@@ -2893,7 +3904,7 @@ class OutlineV3Executor:
             input_hash=hash_json(request),
             config_hash=hash_json(api_config),
             schema_hash=_hash_payload({"node_id": semantic_node_id, "expect_json": expect_json}),
-            max_attempts=1,
+            max_attempts=max(1, int(api_config.get("transport_retries") or 0) + 1),
             provider=str(api_config.get("provider_family") or ""),
             model=str(api_config.get("model") or ""),
             endpoint=str(api_config.get("api_base") or ""),
@@ -2905,6 +3916,11 @@ class OutlineV3Executor:
     def _check(self, node_id: str, *, phase: str = "before") -> None:
         if self.cancellation_checker is not None:
             self.cancellation_checker()
+        # Pause is an explicit durable admission gate, separate from
+        # cancellation.  It is checked immediately before local/provider node
+        # work so a stale UI interruption cannot silently start another call.
+        if phase == "before":
+            self._pause_state.assert_runnable(node_id=node_id)
         if self.fault_injector is not None:
             self.fault_injector(
                 node_id,
@@ -3061,27 +4077,78 @@ class OutlineV3Executor:
                 else f"outline-v3:{node_id}"
             )
         path = str(record.path) if record is not None else self._node_path(node_id)
-        if node.status != "succeeded" or not Path(path).is_file():
+        recoverable_failed_provider = (
+            node.status == "failed" and node_id in self._provider_node_ids()
+        )
+        if node.status != "succeeded" and not recoverable_failed_provider:
+            return None
+        if not Path(path).is_file():
             return None
         if node.execution_binding != binding:
-            if node.status == "succeeded":
+            semantic_static = (
+                self.semantic_provider_synthesis_enabled
+                and node_id in {"topic_synthesis", "cross_group_comparison", "global_synthesis"}
+            )
+            if semantic_static and node.status == "succeeded":
+                identity_fields = (
+                    "provider_route",
+                    "provider_family",
+                    "model_name",
+                    "endpoint_type",
+                    "route_fingerprint",
+                    "context_profile_hash",
+                    "current_summary_hashes",
+                    "review_intent_hash",
+                    "coverage_contract_hash",
+                    "quality_gate_hash",
+                )
+                if all(
+                    str(node.execution_binding.get(field) or "")
+                    == str(binding.get(field) or "")
+                    for field in identity_fields
+                ):
+                    # Derived semantic artifacts may carry provider output
+                    # hashes whose dependency projection changes when the
+                    # Registry is rehydrated.  Source/config identity is the
+                    # reusable boundary; the provider receipts remain bound
+                    # to their own immutable response artifacts.
+                    binding = dict(node.execution_binding)
+            if node.execution_binding == binding:
+                pass
+            elif node.status == "succeeded":
                 self._dag = self._node_store.invalidate_subgraph(node_id, reason="execution_binding_changed")
-            return None
+                return None
+            else:
+                return None
         try:
             value = json.loads(Path(path).read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
             return None
-        if not isinstance(value, Mapping) or str(value.get("content_hash") or "") != str(node.output_hash or ""):
+        envelope_content_hash = str(value.get("content_hash") or "") if isinstance(value, Mapping) else ""
+        if (
+            not isinstance(value, Mapping)
+            or not envelope_content_hash
+            or (
+                node.status == "succeeded"
+                and envelope_content_hash != str(node.output_hash or "")
+            )
+        ):
             return None
         payload = value.get("payload")
         if not isinstance(payload, Mapping):
             return None
+        artifact_output_hash = (
+            envelope_content_hash
+            if recoverable_failed_provider
+            else str(node.output_hash or "")
+        )
         if record is None or record.status != "ready":
             return None
         try:
             self.registry.verify_ready_artifact_closure(record)
         except Exception:
             return None
+        replay: Any | None = None
         if node_id in self._provider_node_ids():
             replay_key = ModelCallReplayKey(
                 node_id=node_id,
@@ -3133,12 +4200,12 @@ class OutlineV3Executor:
                     output_hash=normalized_hash,
                     normalized_output_hash=normalized_hash,
                     artifact_payload_hash=hash_json(payload),
-                    artifact_content_hash=node.output_hash,
+                    artifact_content_hash=artifact_output_hash,
                     registry_file_hash=record.content_hash,
                     artifact_path=record.path,
-                    registered_artifact_hash=node.output_hash,
+                    registered_artifact_hash=artifact_output_hash,
                     replay_output_hash=replay.record.output_hash,
-                    node_output_hash=node.output_hash,
+                    node_output_hash=artifact_output_hash,
                     verified_reuse=True,
                     reuse_evidence_artifact_id=reuse_evidence.artifact_id,
                     reuse_evidence_artifact_hash=reuse_evidence.content_hash,
@@ -3156,12 +4223,12 @@ class OutlineV3Executor:
                     output_hash=normalized_hash,
                     normalized_output_hash=normalized_hash,
                     artifact_payload_hash=hash_json(payload),
-                    artifact_content_hash=node.output_hash,
+                        artifact_content_hash=artifact_output_hash,
                     registry_file_hash=record.content_hash,
                     artifact_path=record.path,
-                    registered_artifact_hash=node.output_hash,
+                        registered_artifact_hash=artifact_output_hash,
                     replay_output_hash=replay.record.output_hash,
-                    node_output_hash=node.output_hash,
+                        node_output_hash=artifact_output_hash,
                 )
             self._replay_evidence.append({
                 "node_id": node_id,
@@ -3184,6 +4251,25 @@ class OutlineV3Executor:
         self.artifact_paths[node_id] = record.path
         self.artifact_records[node_id] = record
         self._payloads[node_id] = dict(payload)
+        if recoverable_failed_provider and replay is not None and replay.record is not None:
+            self._dag = self._node_store.record_node(
+                node_id,
+                status="succeeded",
+                input_hash=_hash_payload(dict(binding.get("dependency_hashes") or {})),
+                output_hash=envelope_content_hash,
+                output_artifact_ids=(record.artifact_id,),
+                model_route=str(binding.get("provider_route") or ""),
+                model_name=str(binding.get("model_name") or ""),
+                provider=str(binding.get("provider_family") or ""),
+                config_snapshot={"candidate_count": self.candidate_count},
+                budget_snapshot={"input_budget": self.profile.input_budget},
+                receipt_ids=tuple(
+                    str(receipt_id)
+                    for receipt_id in replay.record.receipt_ids
+                    if str(receipt_id)
+                ),
+                execution_binding=binding,
+            )
         return dict(payload)
 
     def _fixture_response(self, node_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -3439,6 +4525,99 @@ class OutlineV3Executor:
                 node_output_hash=artifact.content_hash,
             )
 
+    def _persist_semantic_provider_output(
+        self,
+        node_id: str,
+        payload: Mapping[str, Any],
+        *,
+        dependency_hashes: Mapping[str, str],
+    ) -> ArtifactRecord:
+        """Register one topic/cross/global provider response for closure.
+
+        Semantic synthesis is represented by a DAG node plus one immutable
+        response artifact per physical provider call.  Bundling the response
+        only inside the parent node would leave the receipt without a durable
+        output identity and make resume incorrectly report a stale call.
+        """
+
+        artifact = self._artifact(OutlineArtifact, dict(payload), dependency_hashes)
+        artifact_id = f"outline-v3:semantic-provider:{hash_text(node_id)[:24]}"
+        record = publish_json_artifact(
+            self.publication_context,
+            self.registry,
+            self._node_path(f"semantic_provider/{node_id}"),
+            artifact.to_dict(),
+            artifact_role="outline_v3_semantic_provider_output",
+            artifact_type="outline_artifact",
+            artifact_version="v3",
+            producer="outline.v3_executor.OutlineV3Executor",
+            artifact_id=artifact_id,
+            metadata={"job_id": self.job_id, "node_id": node_id, "content_hash": artifact.content_hash},
+        )
+        self.artifact_paths[node_id] = record.path
+        self.artifact_records[node_id] = record
+        expected = self._expected_provider_calls.get(self._provider_call_id(node_id))
+        if expected is not None:
+            self._expected_provider_calls[expected.call_id] = replace(
+                expected,
+                artifact_payload_hash=hash_json(payload),
+                artifact_content_hash=artifact.content_hash,
+                registry_file_hash=record.content_hash,
+                artifact_path=record.path,
+                registered_artifact_hash=artifact.content_hash,
+                node_output_hash=artifact.content_hash,
+            )
+            pending = self._pending_replays.pop(node_id, None)
+            if pending is not None and expected.normalized_output_hash:
+                replay_key, normalized_hash, receipt_id = pending
+                self._replay_store.append(
+                    replay_key,
+                    output_hash=normalized_hash,
+                    normalized_output_hash=normalized_hash,
+                    registered_artifact_hash=artifact.content_hash,
+                    node_output_hash=artifact.content_hash,
+                    output_artifact_ids=(artifact_id,),
+                    receipt_ids=(receipt_id,),
+                    audit_node_id=node_id,
+                    closure_epoch_id=self.closure_epoch_id,
+                )
+                self._expected_provider_calls[expected.call_id] = replace(
+                    self._expected_provider_calls[expected.call_id],
+                    replay_output_hash=normalized_hash,
+                )
+            base_node = self._semantic_receipt_node_id(node_id)
+            base_record = self.artifact_records.get(base_node)
+            binding = self._dynamic_provider_bindings.get(node_id)
+            if base_record is not None and binding is not None:
+                static_binding = self.build_current_node_binding(base_node)
+                base_output_hash = base_record.content_hash
+                try:
+                    base_envelope = json.loads(Path(base_record.path).read_text(encoding="utf-8"))
+                    if isinstance(base_envelope, Mapping) and str(base_envelope.get("content_hash") or ""):
+                        base_output_hash = str(base_envelope["content_hash"])
+                except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
+                    pass
+                receipt_ids = [
+                    receipt.receipt_id
+                    for receipt in self._receipt_ledger.list_receipts()
+                    if receipt.call_id == expected.call_id
+                ]
+                self._dag = self._node_store.record_node(
+                    base_node,
+                    status="succeeded",
+                    input_hash=_hash_payload(dict(static_binding.get("dependency_hashes") or {})),
+                    output_hash=base_output_hash,
+                    output_artifact_ids=(base_record.artifact_id,),
+                    model_route=str(static_binding.get("provider_route") or ""),
+                    model_name=str(static_binding.get("model_name") or ""),
+                    provider=str(static_binding.get("provider_family") or ""),
+                    config_snapshot={"candidate_count": self.candidate_count},
+                    budget_snapshot={"input_budget": self._node_route("candidate_1_provider_generation").profile.input_budget},
+                    receipt_ids=receipt_ids,
+                    execution_binding=static_binding,
+                )
+        return record
+
     def _critique_artifact_class(self, node_id: str) -> type[OutlineArtifact]:
         return {
             "structure_critique": StructureCritique,
@@ -3460,7 +4639,13 @@ class OutlineV3Executor:
 
     @staticmethod
     def _compact_candidate_for_critique(candidate_id: str, content: Mapping[str, Any]) -> dict[str, Any]:
-        """Keep critique inputs bounded while preserving claim/source identity."""
+        """Build an identity-preserving critique projection.
+
+        This projection is deliberately lossless for semantic text.  A
+        critique may be split into explicit evidence shards by its caller, but
+        it must never silently discard the ninth claim or the tail of a
+        finding merely to fit a prompt.
+        """
 
         sections: list[dict[str, Any]] = []
         for section in content.get("sections") or ():
@@ -3469,19 +4654,21 @@ class OutlineV3Executor:
             claims = [str(item) for item in section.get("claims") or () if str(item).strip()]
             sections.append({
                 "section_id": str(section.get("section_id") or ""),
-                "title": str(section.get("title") or "")[:400],
-                "goal": str(section.get("goal") or "")[:600],
+                "title": str(section.get("title") or ""),
+                "goal": str(section.get("goal") or ""),
                 "paper_keys": [str(item) for item in section.get("paper_keys") or () if str(item)],
+                "paper_roles": dict(section.get("paper_roles") or {}) if isinstance(section.get("paper_roles"), Mapping) else {},
                 "relation_ids": [str(item) for item in section.get("relation_ids") or () if str(item)],
-                "claims": [item[:600] for item in claims[:8]],
+                "claims": claims,
                 "claim_count": len(claims),
             })
         return {
             "candidate_id": candidate_id,
             "organizing_logic": str(content.get("organizing_logic") or ""),
             "sections": sections,
-            "planned_claims": [str(item)[:600] for item in content.get("claims") or () if str(item).strip()][:32],
+            "planned_claims": [str(item) for item in content.get("claims") or () if str(item).strip()],
             "source_summary_hashes": list(content.get("source_summary_hashes") or ()),
+            "candidate_content_hash": hash_json(dict(content)),
         }
 
     def _persist_critique_shard_output(
@@ -3534,6 +4721,47 @@ class OutlineV3Executor:
                 node_output_hash=artifact.content_hash,
             )
 
+    @staticmethod
+    def _split_critique_candidate(
+        candidate: Mapping[str, Any],
+        *,
+        target_tokens: int,
+    ) -> list[dict[str, Any]]:
+        """Split a candidate only at complete section boundaries.
+
+        A section that is itself larger than the target is returned intact so
+        the provider admission gate can report ``BLOCKED_BUDGET``.  Claims are
+        never sliced or dropped to make a request appear small.
+        """
+
+        sections = [
+            dict(item) for item in candidate.get("sections") or ()
+            if isinstance(item, Mapping)
+        ]
+        if not sections:
+            return [dict(candidate)]
+        limit_chars = max(16_000, int(target_tokens or 28_000) * 4 - 8_000)
+        shards: list[dict[str, Any]] = []
+        current: list[dict[str, Any]] = []
+        current_size = 0
+        for section in sections:
+            section_size = len(json.dumps(section, ensure_ascii=False, sort_keys=True))
+            if current and current_size + section_size > limit_chars:
+                shard = dict(candidate)
+                shard["sections"] = current
+                shard["shard_section_ids"] = [str(item.get("section_id") or "") for item in current]
+                shards.append(shard)
+                current = []
+                current_size = 0
+            current.append(section)
+            current_size += section_size
+        if current:
+            shard = dict(candidate)
+            shard["sections"] = current
+            shard["shard_section_ids"] = [str(item.get("section_id") or "") for item in current]
+            shards.append(shard)
+        return shards
+
     def _run_hierarchical_critique(
         self,
         *,
@@ -3548,147 +4776,88 @@ class OutlineV3Executor:
             raise OutlineV3ExecutionError(f"{node_id} cannot shard without candidate contents")
         shard_results: list[dict[str, Any]] = []
         for candidate_id in sorted(str(item) for item in candidate_contents):
-            local_request = dict(request)
             candidate_content = candidate_contents[candidate_id]
-            compact_candidate = self._compact_candidate_for_critique(
+            compact = self._compact_candidate_for_critique(
                 candidate_id,
                 candidate_content if isinstance(candidate_content, Mapping) else {},
             )
-            local_request["hierarchy"] = {
-                "level": "critique_candidate_shard",
-                "shard_id": candidate_id,
-                "target_tokens": self.technical_shard_target_tokens,
-                "candidate_id": candidate_id,
-            }
-            local_request["candidate_contents"] = {
-                candidate_id: compact_candidate
-            }
-            if isinstance(candidate_hashes, Mapping):
-                local_request["candidate_hashes"] = {
-                    candidate_id: candidate_hashes.get(candidate_id, "")
-                }
-            candidate_papers = {
-                str(paper_key)
-                for section in compact_candidate.get("sections") or ()
-                if isinstance(section, Mapping)
-                for paper_key in section.get("paper_keys") or ()
-                if str(paper_key)
-            }
-            if isinstance(local_request.get("candidate_claims"), Mapping):
-                local_request["candidate_claims"] = {
-                    candidate_id: [
-                        str(item)[:600]
-                        for item in list(local_request["candidate_claims"].get(candidate_id) or ())[:32]
-                        if str(item).strip()
-                    ]
-                }
-            if isinstance(local_request.get("section_evidence"), Mapping):
-                local_request["section_evidence"] = {
-                    candidate_id: [
-                        {
-                            "section_id": str(section.get("section_id") or ""),
-                            "title": str(section.get("title") or "")[:400],
-                            "paper_keys": [str(value) for value in section.get("paper_keys") or () if str(value)],
-                            "relation_ids": [str(value) for value in section.get("relation_ids") or () if str(value)],
-                            "claims": [str(value)[:600] for value in section.get("claims") or () if str(value)][:8],
-                        }
-                        for section in local_request["section_evidence"].get(candidate_id) or ()
-                        if isinstance(section, Mapping)
-                    ]
-                }
-            if isinstance(local_request.get("corpus_ledger"), Mapping):
-                ledger = dict(local_request["corpus_ledger"])
-                entries = []
-                for entry in ledger.get("entries") or ():
-                    if not isinstance(entry, Mapping):
-                        continue
-                    paper_key = str(
-                        entry.get("paper_key")
-                        or entry.get("canonical_paper_key")
-                        or (entry.get("paper_info") or {}).get("canonical_paper_key")
-                        if isinstance(entry.get("paper_info"), Mapping)
-                        else ""
-                    )
-                    if paper_key and (not candidate_papers or paper_key in candidate_papers):
-                        entries.append({
-                            "paper_key": paper_key,
-                            "title": str(entry.get("title") or (entry.get("paper_info") or {}).get("title") or "")[:400],
-                            "year": entry.get("year") or (entry.get("paper_info") or {}).get("year"),
-                            "classification": entry.get("classification") or (entry.get("paper_info") or {}).get("classification"),
-                            "must_use": bool(entry.get("must_use") or (entry.get("paper_info") or {}).get("must_use")),
-                            "source_summary_hash": str(entry.get("source_summary_hash") or ""),
-                        })
-                ledger["entries"] = entries
-                local_request["corpus_ledger"] = ledger
-            if isinstance(local_request.get("relations"), list):
-                local_request["relations"] = [
-                    {
-                        "relation_id": str(relation.get("relation_id") or ""),
-                        "relation_type": str(relation.get("relation_type") or ""),
-                        "paper_keys": [str(value) for value in relation.get("paper_keys") or () if str(value)],
-                        "dimension": str(relation.get("dimension") or ""),
-                        "confidence": str(relation.get("confidence") or ""),
-                        "supporting_labels": [str(value)[:200] for value in relation.get("supporting_labels") or () if str(value)][:6],
-                        "evidence_fields": {
-                            str(key): [str(value) for value in values if str(value)]
-                            for key, values in (relation.get("evidence_fields") or {}).items()
-                            if isinstance(values, list)
-                        },
-                    }
-                    for relation in local_request["relations"]
-                    if isinstance(relation, Mapping)
-                    and candidate_papers.intersection(
-                        str(value) for value in relation.get("paper_keys") or () if str(value)
-                    )
-                ]
-            for relation_field in ("relation_evidence", "contradictions", "gaps"):
-                if isinstance(local_request.get(relation_field), list):
-                    local_request[relation_field] = [
-                        {
-                            "relation_id": str(relation.get("relation_id") or ""),
-                            "relation_type": str(relation.get("relation_type") or ""),
-                            "paper_keys": [str(value) for value in relation.get("paper_keys") or () if str(value)],
-                            "dimension": str(relation.get("dimension") or ""),
-                            "confidence": str(relation.get("confidence") or ""),
-                            "supporting_labels": [str(value)[:200] for value in relation.get("supporting_labels") or () if str(value)][:6],
-                        }
-                        for relation in local_request[relation_field]
-                        if isinstance(relation, Mapping)
-                        and (not candidate_papers or candidate_papers.intersection(
-                            str(value) for value in relation.get("paper_keys") or () if str(value)
-                        ))
-                    ]
-            for field_name in ("boundaries", "gaps"):
-                if isinstance(local_request.get(field_name), list):
-                    local_views = [
-                        view for view in local_request[field_name]
-                        if isinstance(view, Mapping)
-                        and str(view.get("paper_key") or view.get("canonical_paper_key") or "") in candidate_papers
-                    ]
-                    local_request[field_name] = [
-                        self._compact_relation_digest(
-                            {"evidence_views": local_views},
-                            [],
-                            [],
-                            [],
-                        )
-                    ] if local_views else []
-            local_node_id = f"{node_id}:local:{candidate_id}"
-            if node_prefix:
-                local_node_id = f"{node_prefix}:{local_node_id}"
-            local_request = self._attach_prompt_authority(local_node_id, local_request)
-            content = self._provider_call(
-                local_node_id,
-                local_request,
-                expect_json=True,
-                input_artifact_hashes=(
-                    *dependency_hashes.values(),
-                    hash_json({"candidate_id": candidate_id}),
-                ),
-                transport_node_id=node_id,
-                output_tokens=min(int(self._node_route(node_id).profile.max_output_tokens), 2048),
+            candidate_shards = self._split_critique_candidate(
+                compact,
+                target_tokens=int(self.technical_shard_target_tokens or 28000),
             )
-            shard_results.append(dict(content))
+            for shard_index, compact_candidate in enumerate(candidate_shards, start=1):
+                local_request = dict(request)
+                shard_key = f"{candidate_id}:shard:{shard_index}"
+                local_request["hierarchy"] = {
+                    "level": "critique_candidate_shard",
+                    "shard_id": shard_key,
+                    "target_tokens": self.technical_shard_target_tokens,
+                    "candidate_id": candidate_id,
+                    "section_ids": list(compact_candidate.get("shard_section_ids") or ()),
+                }
+                local_request["candidate_contents"] = {candidate_id: compact_candidate}
+                if isinstance(candidate_hashes, Mapping):
+                    local_request["candidate_hashes"] = {candidate_id: candidate_hashes.get(candidate_id, "")}
+                candidate_papers = {
+                    str(paper_key)
+                    for section in compact_candidate.get("sections") or ()
+                    if isinstance(section, Mapping)
+                    for paper_key in section.get("paper_keys") or ()
+                    if str(paper_key)
+                }
+                section_ids = {str(item.get("section_id") or "") for item in compact_candidate.get("sections") or () if isinstance(item, Mapping)}
+                if isinstance(local_request.get("candidate_claims"), Mapping):
+                    local_request["candidate_claims"] = {
+                        candidate_id: [str(item) for item in local_request["candidate_claims"].get(candidate_id) or () if str(item).strip()]
+                    }
+                if isinstance(local_request.get("section_evidence"), Mapping):
+                    local_request["section_evidence"] = {
+                        candidate_id: [dict(section) for section in local_request["section_evidence"].get(candidate_id) or ()
+                                       if isinstance(section, Mapping) and str(section.get("section_id") or "") in section_ids]
+                    }
+                if isinstance(local_request.get("corpus_ledger"), Mapping):
+                    ledger = dict(local_request["corpus_ledger"])
+                    entries = []
+                    for entry in ledger.get("entries") or ():
+                        if not isinstance(entry, Mapping):
+                            continue
+                        raw_paper_info = entry.get("paper_info")
+                        paper_info: Mapping[str, Any] = raw_paper_info if isinstance(raw_paper_info, Mapping) else {}
+                        paper_key = str(entry.get("paper_key") or entry.get("canonical_paper_key") or paper_info.get("canonical_paper_key") or "")
+                        if paper_key and paper_key in candidate_papers:
+                            entries.append(dict(entry))
+                    ledger["entries"] = entries
+                    local_request["corpus_ledger"] = ledger
+                for relation_field in ("relations", "relation_evidence", "contradictions", "gaps"):
+                    if isinstance(local_request.get(relation_field), list):
+                        local_request[relation_field] = [
+                            dict(relation) for relation in local_request[relation_field]
+                            if isinstance(relation, Mapping)
+                            and (not candidate_papers or candidate_papers.intersection(str(value) for value in relation.get("paper_keys") or () if str(value)))
+                        ]
+                for field_name in ("boundaries", "gaps"):
+                    if isinstance(local_request.get(field_name), list):
+                        local_request[field_name] = [
+                            dict(view) for view in local_request[field_name]
+                            if isinstance(view, Mapping) and str(view.get("paper_key") or view.get("canonical_paper_key") or "") in candidate_papers
+                        ]
+                local_node_id = f"{node_id}:local:{candidate_id}:shard:{shard_index}"
+                if node_prefix:
+                    local_node_id = f"{node_prefix}:{local_node_id}"
+                local_request = self._attach_prompt_authority(local_node_id, local_request)
+                content = self._provider_call(
+                    local_node_id,
+                    local_request,
+                    expect_json=True,
+                    input_artifact_hashes=(*dependency_hashes.values(), hash_json({"candidate_id": candidate_id, "shard_index": shard_index})),
+                    transport_node_id=node_id,
+                    output_tokens=min(int(self._node_route(node_id).profile.max_output_tokens), 2048),
+                )
+                result = dict(content)
+                result["candidate_id"] = candidate_id
+                result["shard_index"] = shard_index
+                result["reviewed_section_ids"] = sorted(section_ids)
+                shard_results.append(result)
         blocking = [
             str(item)
             for result in shard_results
@@ -3734,8 +4903,11 @@ class OutlineV3Executor:
 
         shard_plan = self._build_relation_shard_plan(evidence_views, relation_candidates)
         sections: list[dict[str, Any]] = []
-        section_by_paper: dict[str, dict[str, Any]] = {}
-        assigned_papers: set[str] = set()
+        # A paper may legitimately participate in more than one semantic
+        # section (for example as a method paper and as a boundary paper).
+        # Merge only the same logical section identity across shards; never
+        # use paper assignment as a de-duplication key.
+        section_by_identity: dict[str, dict[str, Any]] = {}
         claims: list[str] = []
         shard_outputs: list[dict[str, Any]] = []
         for shard in shard_plan.get("shards") or ():
@@ -3805,6 +4977,7 @@ class OutlineV3Executor:
                 content,
                 allowed_paper_keys=paper_keys,
                 allowed_relation_ids=shard_relation_ids,
+                alias_map=alias_map,
             )
             self._persist_candidate_shard_output(
                 node_id,
@@ -3819,31 +4992,42 @@ class OutlineV3Executor:
                 raw_section_papers = [
                     str(value) for value in section_payload.get("paper_keys") or () if str(value)
                 ]
-                new_section_papers = [
-                    value for value in raw_section_papers if value not in assigned_papers
-                ]
-                if not new_section_papers:
-                    # A long paper may span multiple evidence chunks. Merge
-                    # its later shard claims into the first assigned section
-                    # instead of assigning the same paper twice.
-                    for paper_key in raw_section_papers:
-                        existing = section_by_paper.get(paper_key)
-                        if existing is not None:
-                            existing_claims = list(existing.get("claims") or [])
-                            existing_claims.extend(
-                                str(value) for value in section_payload.get("claims") or () if str(value).strip()
-                            )
-                            existing["claims"] = list(dict.fromkeys(existing_claims))
-                    continue
-                assigned_papers.update(new_section_papers)
-                section_payload["paper_keys"] = new_section_papers
+                section_payload["paper_keys"] = list(dict.fromkeys(raw_section_papers))
                 section_payload["relation_ids"] = [
                     str(value) for value in section_payload.get("relation_ids") or () if str(value)
                 ]
-                section_payload["section_id"] = f"{section_payload.get('section_id') or candidate_id}__{shard_id}"
+                original_section_id = str(section_payload.get("section_id") or candidate_id)
+                existing = section_by_identity.get(original_section_id)
+                if existing is not None:
+                    existing_papers = list(existing.get("paper_keys") or ())
+                    incoming_papers = list(section_payload.get("paper_keys") or ())
+                    existing["paper_keys"] = list(dict.fromkeys([
+                        *existing_papers,
+                        *incoming_papers,
+                    ]))
+                    existing_relations = list(existing.get("relation_ids") or ())
+                    incoming_relations = list(section_payload.get("relation_ids") or ())
+                    existing["relation_ids"] = list(dict.fromkeys([
+                        *existing_relations,
+                        *incoming_relations,
+                    ]))
+                    existing_claims = list(existing.get("claims") or ())
+                    incoming_claims = [
+                        str(value) for value in section_payload.get("claims") or () if str(value).strip()
+                    ]
+                    existing["claims"] = list(dict.fromkeys([
+                        *existing_claims,
+                        *incoming_claims,
+                    ]))
+                    if isinstance(section_payload.get("paper_roles"), Mapping):
+                        existing["paper_roles"] = {
+                            **(existing.get("paper_roles") or {}),
+                            **dict(section_payload.get("paper_roles") or {}),
+                        }
+                    continue
+                section_payload["section_id"] = f"{original_section_id}__{shard_id}"
+                section_by_identity[original_section_id] = section_payload
                 sections.append(section_payload)
-                for paper_key in new_section_papers:
-                    section_by_paper[paper_key] = section_payload
             claims.extend(str(item) for item in content.get("claims") or () if str(item).strip())
         if not sections:
             raise OutlineV3ExecutionError(f"{generation_node_id} produced no shard sections")
@@ -3871,8 +5055,141 @@ class OutlineV3Executor:
             merged,
             allowed_paper_keys=allowed_paper_keys,
             allowed_relation_ids=allowed_relation_ids,
+            alias_map=alias_map,
         )
         return merged
+
+    def _run_semantic_provider_call(
+        self,
+        node_id: str,
+        request: Mapping[str, Any],
+        dependency_hashes: Mapping[str, str],
+    ) -> dict[str, Any]:
+        """Execute a topic/cross/global synthesis request on the outline route.
+
+        The semantic synthesis roles do not have separate configuration keys
+        yet; they intentionally reuse the configured candidate-generation
+        route while retaining their own durable node/call identity.
+        """
+
+        result = self._provider_call(
+            node_id,
+            request,
+            expect_json=True,
+            input_artifact_hashes=tuple(dependency_hashes.values()),
+            transport_node_id="candidate_1_provider_generation",
+            output_tokens=min(
+                int(self._node_route("candidate_1_provider_generation").profile.max_output_tokens),
+                16_384,
+            ),
+        )
+        self._validate_semantic_provider_output(node_id, request, result)
+        return result
+
+    @staticmethod
+    def _validate_semantic_provider_output(
+        node_id: str,
+        request: Mapping[str, Any],
+        result: Mapping[str, Any],
+    ) -> None:
+        """Reject semantic outputs that reference identities outside input."""
+
+        allowed_papers = {
+            str(item.get("paper_key") or "")
+            for item in request.get("evidence_units") or ()
+            if isinstance(item, Mapping) and str(item.get("paper_key") or "")
+        }
+        allowed_studies: set[str] = set()
+        allowed_claims: set[str] = set()
+        allowed_evidence: set[str] = set()
+        for unit in request.get("evidence_units") or ():
+            if not isinstance(unit, Mapping):
+                continue
+            for study in unit.get("study_units") or ():
+                if not isinstance(study, Mapping):
+                    continue
+                if str(study.get("study_id") or ""):
+                    allowed_studies.add(str(study["study_id"]))
+                for claim in study.get("claims") or ():
+                    if isinstance(claim, Mapping) and str(claim.get("claim_id") or ""):
+                        allowed_claims.add(str(claim["claim_id"]))
+            for claim in unit.get("claims") or ():
+                if isinstance(claim, Mapping) and str(claim.get("claim_id") or ""):
+                    allowed_claims.add(str(claim["claim_id"]))
+            ids_by_field = unit.get("evidence_ids_by_field")
+            if isinstance(ids_by_field, Mapping):
+                allowed_evidence.update(
+                    str(value)
+                    for values in ids_by_field.values()
+                    if isinstance(values, list)
+                    for value in values
+                    if str(value)
+                )
+            text_by_id = unit.get("evidence_text_by_id")
+            if isinstance(text_by_id, Mapping):
+                allowed_evidence.update(str(value) for value in text_by_id if str(value))
+        allowed_topics = {
+            str(item.get("topic_id") or "")
+            for item in request.get("topics") or ()
+            if isinstance(item, Mapping) and str(item.get("topic_id") or "")
+        }
+        allowed_relations = {
+            str(item.get("relation_id") or "")
+            for item in request.get("relation_candidates") or ()
+            if isinstance(item, Mapping) and str(item.get("relation_id") or "")
+        }
+        unknown: list[str] = []
+
+        def walk(value: Any, path: str = "") -> None:
+            if isinstance(value, Mapping):
+                for key, child in value.items():
+                    key_text = str(key)
+                    child_path = f"{path}.{key_text}" if path else key_text
+                    if key_text in {"paper_key", "canonical_paper_key"} and str(child):
+                        if allowed_papers and str(child) not in allowed_papers:
+                            unknown.append(f"{child_path}={child}")
+                    elif key_text == "topic_id" and str(child):
+                        if allowed_topics and str(child) not in allowed_topics:
+                            unknown.append(f"{child_path}={child}")
+                    elif key_text == "relation_id" and str(child):
+                        if allowed_relations and str(child) not in allowed_relations:
+                            unknown.append(f"{child_path}={child}")
+                    elif key_text == "study_id" and str(child):
+                        if allowed_studies and str(child) not in allowed_studies:
+                            unknown.append(f"{child_path}={child}")
+                    elif key_text in {"evidence_id", "evidence_ids"}:
+                        values = child if isinstance(child, list) else [child]
+                        for item in values:
+                            if str(item) and allowed_evidence and str(item) not in allowed_evidence:
+                                unknown.append(f"{child_path}={item}")
+                    elif key_text == "claim_id" and str(child):
+                        # Synthesized claim IDs are a separate namespace; only
+                        # source claim IDs are checked when the provider uses
+                        # an existing claim identity.
+                        if str(child) in allowed_claims:
+                            pass
+                    walk(child, child_path)
+            elif isinstance(value, list):
+                for index, child in enumerate(value):
+                    walk(child, f"{path}[{index}]")
+
+        walk(result)
+        if unknown:
+            raise OutlineV3ExecutionError(
+                f"{node_id} returned identities outside its evidence contract: "
+                + "; ".join(sorted(set(unknown))[:20])
+            )
+
+    @staticmethod
+    def _semantic_receipt_node_id(node_id: str) -> str:
+        text = str(node_id or "")
+        if text.startswith("topic_synthesis_provider"):
+            return "topic_synthesis"
+        if text.startswith("cross_group_comparison_provider"):
+            return "cross_group_comparison"
+        if text.startswith("global_synthesis_provider"):
+            return "global_synthesis"
+        return text
 
     def _provider_call(
         self,
@@ -3919,8 +5236,11 @@ class OutlineV3Executor:
                         "chosen verbatim (e.g. candidate_1); never invent or renumber it"
                     ),
                     "selection_reasons": "non-empty array of strings explaining the selection",
-                    "accepted_recommendations": "array of recommendation strings adopted from the critiques",
-                    "rejected_recommendations": "array of recommendation strings rejected, with why in unresolved_risks",
+                    "accepted_recommendations": (
+                        "array of typed issue objects or legacy recommendation strings; typed objects use issue_id, "
+                        "target_section_id(s), operation, replacement and evidence_ids"
+                    ),
+                    "rejected_recommendations": "array of typed issue objects or recommendation strings rejected, with why in unresolved_risks",
                     "unresolved_risks": "array of strings; empty when none remain",
                 },
                 "must_include": ["selected_candidate_id", "selection_reasons"],
@@ -3932,6 +5252,15 @@ class OutlineV3Executor:
         route = self._node_route(node_id, transport_node_id)
         profile = route.profile
         budget = profile.estimate_request(request)
+        configured_cap = int(self.max_source_prompt_tokens or 32000)
+        route_cap = int(profile.input_budget or configured_cap)
+        effective_cap = max(1, min(32000, configured_cap, route_cap))
+        estimated_input = int(budget.get("estimated_input_tokens") or profile.estimate_tokens(request))
+        if estimated_input > effective_cap:
+            raise OutlineV3ExecutionError(
+                f"BLOCKED_BUDGET: {node_id} serialized input estimate {estimated_input} "
+                f"exceeds effective input cap {effective_cap}; split by evidence unit before transport"
+            )
         api_config = self._route_transport_identity(route)
         # Keep the ordinary node path compatible with callers that decorate
         # ``_provider_binding`` for replay tests or local instrumentation.  A
@@ -3945,10 +5274,11 @@ class OutlineV3Executor:
         if transport_node_id is not None:
             binding_kwargs["route"] = route
         binding = self._provider_binding(node_id, request, **binding_kwargs)
+        self._dynamic_provider_bindings[node_id] = dict(binding)
         call_id = self._register_expected_from_binding(node_id, binding)
         semantic_node_id = self._semantic_node_id(node_id)
         replay_key = ModelCallReplayKey(
-            node_id=semantic_node_id,
+            node_id=self._semantic_receipt_node_id(semantic_node_id),
             node_version="v3",
             schema_version="outline-v3",
             model_route=route.config_section or route.provider_name,
@@ -4097,6 +5427,9 @@ class OutlineV3Executor:
             self.replay_diagnostics.append(
                 f"replay stale for {node_id}: {','.join(replay_lookup.stale_reasons)}"
             )
+        # Re-check after replay lookup: replay is local and may be usable while
+        # a paused job must still refuse any new provider admission.
+        self._pause_state.assert_runnable(node_id=node_id)
         runtime = ProviderRuntime(
             budget=ProviderBudgetV1(
                 max_calls=1,
@@ -4107,7 +5440,7 @@ class OutlineV3Executor:
             attempt_id=call_id,
             stage_name="outline_v3",
             route=semantic_node_id,
-            node_id=semantic_node_id,
+            node_id=self._semantic_receipt_node_id(semantic_node_id),
             call_id=call_id,
             closure_epoch_id=self.closure_epoch_id,
             logical_attempt_identity=self.logical_attempt_identity,
@@ -4127,7 +5460,8 @@ class OutlineV3Executor:
                 receipt_ids=[receipt.receipt_id],
             )
             raise OutlineV3ExecutionError(f"provider budget blocked node {node_id}")
-        requested_attempts = max(1, int(api_config.get("transport_retries") or 1))
+        configured_retries = max(0, int(api_config.get("transport_retries") or 0))
+        requested_attempts = configured_retries + 1
         effective_attempts = runtime.max_attempts_for_call(requested_attempts)
         admission = runtime.admit(
             estimated_tokens=int(budget["estimated_input_tokens"]),
@@ -4380,7 +5714,7 @@ class OutlineV3Executor:
             try:
                 self._dag = self._node_store.record_node(
                     node_id,
-                    status="failed",
+                    status="blocked" if isinstance(exc, PauseRequestedError) else "failed",
                     input_hash=_hash_payload(dict(binding.get("dependency_hashes") or {})),
                     output_hash="",
                     output_artifact_ids=(),
@@ -4406,12 +5740,26 @@ class OutlineV3Executor:
             raise
 
     def _run_provider_node(self, node_id: str, request: Mapping[str, Any], cls: type[OutlineArtifact], deps: Mapping[str, str], *, minimum_output: int = 2) -> tuple[OutlineArtifact, Sequence[str], str, str]:
-        content = self._provider_call(node_id, request, expect_json=True, input_artifact_hashes=tuple(deps.values()))
+        route = self._node_route(node_id)
+        bounded_output = int(route.profile.max_output_tokens)
+        if node_id in {
+            "structure_critique",
+            "coverage_critique",
+            "evidence_critique",
+            "arbitration",
+        }:
+            bounded_output = min(bounded_output, 2_048)
+        content = self._provider_call(
+            node_id,
+            request,
+            expect_json=True,
+            input_artifact_hashes=tuple(deps.values()),
+            output_tokens=bounded_output,
+        )
         # The provider receipt has already been appended when this hook runs.
         # Recovery tests use it to model a worker failure after transport
         # success but before the node output is persisted.
         self._check(node_id, phase="provider_success")
-        route = self._node_route(node_id)
         return self._artifact(cls, content, deps), tuple(deps), route.model, route.provider_name
 
     @staticmethod
@@ -4608,6 +5956,7 @@ class OutlineV3Executor:
         }
         confirmed: set[str] = set()
         rejected: dict[str, dict[str, Any]] = {}
+        decisions: dict[str, dict[str, Any]] = {}
         reviewed: set[str] = set()
         digests: list[dict[str, Any]] = []
 
@@ -4641,9 +5990,27 @@ class OutlineV3Executor:
             reviewed.update(allowed_ids)
             for item in rejected_items:
                 relation_id = str(item.get("relation_id") or "").strip()
-                rejected[relation_id] = {
+                decision = str(item.get("decision") or item.get("status") or "rejected").strip().lower()
+                if decision not in {"rejected", "insufficient_evidence", "not_comparable", "deferred"}:
+                    decision = "rejected"
+                record = {
                     "relation_id": relation_id,
                     "reason": str(item.get("reason") or f"rejected by {level} relation review"),
+                    "decision": decision,
+                    "status": decision,
+                    "evidence_ids": [str(value) for value in item.get("evidence_ids") or () if str(value)],
+                    "missing_evidence_ids": [str(value) for value in item.get("missing_evidence_ids") or () if str(value)],
+                }
+                rejected[relation_id] = record
+                decisions[relation_id] = record
+            for relation_id in confirmed_ids:
+                decisions[relation_id] = {
+                    "relation_id": relation_id,
+                    "decision": "confirmed",
+                    "status": "confirmed",
+                    "reason": "confirmed by evidence adjudication",
+                    "evidence_ids": list(candidate_by_id.get(relation_id, {}).get("evidence_ids") or ()),
+                    "missing_evidence_ids": [],
                 }
             request_views = [
                 item for item in request.get("evidence_views") or ()
@@ -4797,6 +6164,7 @@ class OutlineV3Executor:
         return {
             "confirmed_relation_ids": [item for item in candidate_by_id if item in confirmed],
             "rejected_relations": [rejected[item] for item in candidate_by_id if item in rejected],
+            "relation_decisions": [decisions[item] for item in candidate_by_id if item in decisions],
             "hierarchy": "local_shards_then_cross_shard",
         }, digests
 
@@ -4807,12 +6175,21 @@ class OutlineV3Executor:
         *,
         allowed_paper_keys: Sequence[str],
         allowed_relation_ids: Sequence[str],
+        alias_map: Mapping[str, Any] | None = None,
     ) -> None:
         sections = payload.get("sections")
         if not isinstance(sections, list) or not sections:
             raise OutlineV3ExecutionError(f"{candidate_id} provider output has no sections")
         allowed_papers = {str(item) for item in allowed_paper_keys}
         allowed_relations = {str(item) for item in allowed_relation_ids}
+        from outline.evidence_alias import build_alias_map
+
+        # The opaque aliases are a job-global identity map.  Rebuilding an
+        # alias map for each shard would reindex P003 as P001 and make a
+        # valid cross-shard reference indistinguishable from a different
+        # paper.  A caller that has the frozen map must pass it through.
+        paper_alias_map = dict(alias_map or build_alias_map(list(allowed_paper_keys), list(allowed_relation_ids)))
+        paper_alias_reverse = dict(paper_alias_map.get("papers_reverse") or {})
         seen_sections: set[str] = set()
         for section in sections:
             if not isinstance(section, Mapping):
@@ -4830,6 +6207,31 @@ class OutlineV3Executor:
             claims = [str(item).strip() for item in section.get("claims") or () if str(item).strip()]
             if not claims:
                 raise OutlineV3ExecutionError(f"{candidate_id} provider output contains a section without planned claims")
+            for claim in claims:
+                aliases = {
+                    str(match.group(0)).upper()
+                    for match in re.finditer(r"\bP\d{3}\b", claim, flags=re.IGNORECASE)
+                }
+                referenced_papers = {
+                    paper_alias_reverse.get(alias, alias)
+                    for alias in aliases
+                }
+                if not referenced_papers.issubset(paper_keys):
+                    raise OutlineV3ExecutionError(
+                        f"{candidate_id} claim references paper aliases outside its section evidence: "
+                        f"{sorted(referenced_papers - paper_keys)}"
+                    )
+                if (
+                    len(paper_keys) > 1
+                    and not aliases
+                    and re.search(
+                        r"(作者自陈|局限|缺口|不足).*(共同|一致|四篇|三类|领域共识)|(共同指向|共同.*缺口|领域共识)",
+                        claim,
+                    )
+                ):
+                    raise OutlineV3ExecutionError(
+                        f"{candidate_id} claim makes an unsupported cross-paper limitation aggregation"
+                    )
 
     @property
     def _alias_enabled(self) -> bool:
@@ -4926,17 +6328,23 @@ class OutlineV3Executor:
                 "Remove or replace every section relation_id that is not in allowed_relation_ids.",
                 "Do not introduce new papers, new relations, new citations, or new facts.",
                 "Do not invent citation identities; do not attribute evidence to any work outside the provided evidence corpus.",
-                "If a section has no in-corpus evidence left after removal, delete the section or rewrite it using only the remaining in-corpus evidence.",
+                "If a section has no in-corpus evidence left after removal, retain its identity and return needs_manual_review; never invent a replacement fact or silently delete the section.",
                 "Do not add sections beyond those in original_provider_output and do not increase the total number of planned claims.",
+                "Return exactly the same number of sections in exactly the same order as original_provider_output.",
+                "Copy every original section_id verbatim; never create, delete, duplicate, or rename a section_id.",
+                "Every claim that names a paper alias must be supported by a paper_key in that same section; remove the claim if its paper is not assigned there.",
+                "Do not write cross-paper limitation or gap aggregations unless each named paper explicitly supports the same limitation; prefer separate paper-specific claims or remove the aggregation.",
+                "Ensure each section goal accurately covers every remaining claim; rewrite a goal to a neutral evidence-bound purpose when the original goal is narrower than the claims.",
                 "Keep candidate_id unchanged and return the same top-level shape.",
             ],
             "output_schema": {
                 "candidate_id": "string; echo the candidate_id verbatim",
                 "sections": (
-                    "non-empty array; each section object has section_id, title, "
+                "non-empty array; each section object has section_id, title, "
                     "paper_keys (subset of allowed_paper_ids), relation_ids (subset "
                     "of allowed_relation_ids), claims (non-empty) and rationale"
                 ),
+                "needs_manual_review": "array of section_ids that cannot be repaired without a new semantic decision; empty when none",
             },
         }
         repair_deps = {"candidate": _hash_payload(content)}
@@ -4976,17 +6384,25 @@ class OutlineV3Executor:
             if alias_map is not None
             else dict(raw_repaired)
         )
-        # Bounded structural guards: no new section identities, no claim inflation.
+        # Bounded structural guards: a format repair cannot change section
+        # count, order, or identity. Any semantic split/merge/delete must be a
+        # separate versioned candidate revision with explicit lineage.
         repaired_sections = [
             section
             for section in (repaired_content.get("sections") or [])
             if isinstance(section, Mapping)
         ]
-        original_ids = {str(s.get("section_id") or "") for s in original_sections}
-        repaired_ids = {str(s.get("section_id") or "") for s in repaired_sections}
-        if not repaired_sections or not repaired_ids.issubset(original_ids):
+        original_ids = [str(s.get("section_id") or "") for s in original_sections]
+        repaired_ids = [str(s.get("section_id") or "") for s in repaired_sections]
+        if (
+            not repaired_sections
+            or len(repaired_sections) != len(original_sections)
+            or len(set(repaired_ids)) != len(repaired_ids)
+            or repaired_ids != original_ids
+        ):
             failure = OutlineV3ExecutionError(
-                f"{candidate_id} semantic repair changed the section identity set"
+                f"{candidate_id} format repair changed section count/order/identity: "
+                f"before={original_ids}, after={repaired_ids}"
             )
             self._publish_repair_failure(candidate_id, failure)
             raise failure
@@ -5003,6 +6419,19 @@ class OutlineV3Executor:
             )
             self._publish_repair_failure(candidate_id, failure)
             raise failure
+        try:
+            self._validate_candidate_payload(
+                candidate_id,
+                repaired_content,
+                allowed_paper_keys=allowed_paper_keys,
+                allowed_relation_ids=allowed_relation_ids,
+                alias_map=alias_map,
+            )
+        except Exception as exc:
+            self._publish_repair_failure(candidate_id, exc)
+            raise OutlineV3ExecutionError(
+                f"{candidate_id} semantic repair failed targeted revalidation: {exc}"
+            ) from exc
         self._persist_repair_output(
             repair_node_id,
             dict(repaired_content),
@@ -5145,6 +6574,27 @@ class OutlineV3Executor:
             except (OSError, UnicodeError, json.JSONDecodeError):
                 return record.content_hash
             if isinstance(payload, Mapping) and str(payload.get("content_hash") or ""):
+                if node_id == "provider_receipt_closure":
+                    body = payload.get("payload")
+                    if isinstance(body, Mapping):
+                        decision_fields = (
+                            "closure_epoch_id",
+                            "expected_call_ids",
+                            "duplicate_expected_call_ids",
+                            "observed_call_ids",
+                            "missing_call_ids",
+                            "stale_call_ids",
+                            "failed_call_ids",
+                            "incomplete_call_ids",
+                            "hash_mismatches",
+                            "unexpected_receipts",
+                            "out_of_epoch_receipts",
+                            "retry_exceeded_call_ids",
+                            "usage_incomplete_call_ids",
+                            "verified_reuse_call_ids",
+                            "complete",
+                        )
+                        return hash_json({key: body.get(key) for key in decision_fields})
                 return str(payload["content_hash"])
             return record.content_hash
 
@@ -5349,11 +6799,413 @@ class OutlineV3Executor:
                 self._artifact(OutlineArtifact, matrix_model.to_dict(), {"outline_evidence_views": _hash_payload(evidence), "global_corpus_ledger": _hash_payload(ledger)}),
                 ("outline_evidence_views", "global_corpus_ledger"), "deterministic", "local",
             ))
+            content_layers_model = build_paper_content_layers(
+                self.summaries,
+                evidence_model,
+                job_id=self.job_id,
+            )
+            content_layers = self._run_node("outline_content_layers", lambda: (
+                self._artifact(
+                    OutlineArtifact,
+                    content_layers_model.to_dict(),
+                    {"outline_evidence_views": _hash_payload(evidence)},
+                ),
+                ("outline_evidence_views",),
+                "deterministic",
+                "local",
+            ))
             candidate_map_model = build_global_relation_map(evidence_model, matrix_model, ledger_model)
             candidate_map = self._run_node("relation_candidates", lambda: (
                 self._artifact(OutlineArtifact, candidate_map_model.to_dict(), {"multi_view_matrix": _hash_payload(matrix)}),
                 ("multi_view_matrix",), "deterministic", "local",
             ))
+
+            semantic_chunk_plan_model = build_semantic_chunk_plan(
+                content_layers_model,
+                candidate_map_model,
+                candidate_count=self.candidate_count,
+                physical_call_limit=min(24, max(0, int(self.max_provider_calls or 24))),
+            )
+            if semantic_chunk_plan_model.blocking_diagnostics:
+                raise OutlineV3ExecutionError(
+                    "semantic chunk plan is blocked before provider admission: "
+                    + json.dumps(
+                        semantic_chunk_plan_model.blocking_diagnostics,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                )
+            semantic_chunk_plan = self._run_node("semantic_chunk_plan", lambda: (
+                self._artifact(
+                    OutlineArtifact,
+                    semantic_chunk_plan_model.to_dict(),
+                    {
+                        "outline_content_layers": _hash_payload(content_layers),
+                        "relation_candidates": _hash_payload(candidate_map),
+                        "global_corpus_ledger": _hash_payload(ledger),
+                        "multi_view_matrix": _hash_payload(matrix),
+                    },
+                ),
+                ("outline_content_layers", "relation_candidates", "global_corpus_ledger", "multi_view_matrix"),
+                "deterministic",
+                "local",
+            ))
+
+            topic_plan = build_topic_synthesis_plan(semantic_chunk_plan_model)
+            navigation_payload = {
+                "schema_version": "outline-global-navigation/v1",
+                "execution_mode": "deterministic_local_routing",
+                "status": "completed",
+                "content_layers_hash": content_layers_model.content_hash,
+                "semantic_chunk_plan_hash": semantic_chunk_plan_model.content_hash,
+                "topic_ids": [item.topic_id for item in semantic_chunk_plan_model.topics],
+                "paper_ids": [card.paper_id for card in content_layers_model.index_cards],
+                "outlier_policy": "preserve_explicit_outlier_topic",
+            }
+            global_navigation = self._run_node("global_navigation", lambda: (
+                self._artifact(
+                    OutlineArtifact,
+                    navigation_payload,
+                    {
+                        "outline_content_layers": _hash_payload(content_layers),
+                        "semantic_chunk_plan": _hash_payload(semantic_chunk_plan),
+                    },
+                ),
+                ("outline_content_layers", "semantic_chunk_plan"),
+                "deterministic",
+                "local",
+            ))
+            def _semantic_node_reusable(node_id: str) -> bool:
+                try:
+                    existing = self._dag.get(node_id)
+                    if existing.status != "succeeded" or not existing.execution_binding:
+                        return False
+                    current = self.build_current_node_binding(node_id)
+                    identity_fields = (
+                        "provider_route",
+                        "provider_family",
+                        "model_name",
+                        "endpoint_type",
+                        "route_fingerprint",
+                        "context_profile_hash",
+                    )
+                    return all(
+                        str(existing.execution_binding.get(field) or "")
+                        == str(current.get(field) or "")
+                        for field in identity_fields
+                    )
+                except (KeyError, ValueError, TypeError):
+                    return False
+
+            topic_semantic_reused = _semantic_node_reusable("topic_synthesis")
+            semantic_provider_results: list[dict[str, Any]] = []
+            if self.semantic_provider_synthesis_enabled and topic_plan and not topic_semantic_reused:
+                topic_batches: list[list[TopicSynthesis]] = []
+                current_batch: list[TopicSynthesis] = []
+                topic_routes = {
+                    topic.topic_id: topic for topic in semantic_chunk_plan_model.topics
+                }
+                topic_profile = self._node_route("candidate_1_provider_generation").profile
+                topic_input_limit = max(
+                    1,
+                    min(
+                        32_000,
+                        int(self.max_source_prompt_tokens or 32_000),
+                        int(topic_profile.input_budget or 32_000),
+                    ) - 0,
+                )
+                topic_plan = self._split_topic_plan_for_budget(
+                    topic_plan,
+                    topic_routes=topic_routes,
+                    evidence_model=evidence_model,
+                    content_layers_model=content_layers_model,
+                    profile=topic_profile,
+                    input_limit=topic_input_limit,
+                )
+
+                def _topic_request(
+                    batch: Sequence[TopicSynthesis],
+                    batch_index: int,
+                ) -> dict[str, Any]:
+                    return self._build_topic_provider_request(
+                        batch,
+                        topic_routes=topic_routes,
+                        evidence_model=evidence_model,
+                        content_layers_model=content_layers_model,
+                        batch_index=batch_index,
+                    )
+
+                for topic in topic_plan:
+                    trial_batch = [*current_batch, topic]
+                    trial_request = _topic_request(trial_batch, len(topic_batches) + 1)
+                    trial_budget = topic_profile.estimate_request(
+                        self._attach_prompt_authority(
+                            f"topic_synthesis:preflight:{len(topic_batches) + 1}",
+                            trial_request,
+                        )
+                    )
+                    trial_tokens = int(
+                        trial_budget.get("estimated_input_tokens")
+                        or topic_profile.estimate_tokens(trial_request)
+                    )
+                    if current_batch and trial_tokens > topic_input_limit:
+                        topic_batches.append(current_batch)
+                        current_batch = [topic]
+                    else:
+                        current_batch = trial_batch
+                if current_batch:
+                    topic_batches.append(current_batch)
+                for batch_index, batch in enumerate(topic_batches, start=1):
+                    paper_ids = sorted({paper_id for topic in batch for paper_id in (*topic.paper_ids, *topic.bridge_paper_ids)})
+                    request = _topic_request(batch, batch_index)
+                    raw = self._run_semantic_provider_call(
+                        f"topic_synthesis_provider:batch:{batch_index}",
+                        request,
+                        {"global_navigation": _hash_payload(global_navigation), "semantic_chunk_plan": _hash_payload(semantic_chunk_plan)},
+                    )
+                    semantic_provider_results.append({
+                        "node_id": "topic_synthesis",
+                        "provider_node_id": f"topic_synthesis_provider:batch:{batch_index}",
+                        "batch_id": f"topic_batch_{batch_index}",
+                        "topic_ids": [topic.topic_id for topic in batch],
+                        "paper_ids": paper_ids,
+                        "provider_output": raw,
+                    })
+            topic_payloads: list[dict[str, Any]] = []
+            for item in topic_plan:
+                topic_payload = item.to_dict()
+                matching = [result for result in semantic_provider_results if item.topic_id in result.get("topic_ids", [])]
+                topic_payload.update({
+                    "status": "completed_provider" if matching else "completed_local_deterministic",
+                    "execution_mode": "provider_synthesis" if matching else "local_evidence_projection",
+                    "provider_calls": len(matching),
+                    "provider_batch_ids": [str(result.get("batch_id") or "") for result in matching],
+                    "provider_outputs": [result.get("provider_output") for result in matching],
+                    "diagnostics": [] if matching else ["offline/local route retained deterministic projection; no external synthesis call was admitted"],
+                })
+                topic_payloads.append(topic_payload)
+            if topic_semantic_reused:
+                semantic_provider_results = []
+            topic_synthesis = self._run_node("topic_synthesis", lambda: (
+                self._artifact(
+                    OutlineArtifact,
+                    {
+                        "schema_version": "outline-topic-synthesis/v1",
+                        "execution_mode": "provider_synthesis" if semantic_provider_results else "local_evidence_projection",
+                        "status": "completed",
+                        "shared_semantic_chunk_plan_hash": semantic_chunk_plan_model.content_hash,
+                        "topics": topic_payloads,
+                        "provider_results": semantic_provider_results,
+                    },
+                    {
+                        "global_navigation": _hash_payload(global_navigation),
+                        "semantic_chunk_plan": _hash_payload(semantic_chunk_plan),
+                    },
+                ),
+                ("global_navigation", "semantic_chunk_plan"),
+                "provider" if semantic_provider_results else "deterministic",
+                "local",
+            ))
+            for result in semantic_provider_results:
+                record = self._persist_semantic_provider_output(
+                    str(result["provider_node_id"]),
+                    result.get("provider_output") if isinstance(result.get("provider_output"), Mapping) else {},
+                    dependency_hashes={
+                        "global_navigation": _hash_payload(global_navigation),
+                        "semantic_chunk_plan": _hash_payload(semantic_chunk_plan),
+                    },
+                )
+                result["artifact_id"] = record.artifact_id
+                result["artifact_hash"] = record.content_hash
+            persisted_topic_results = topic_synthesis.get("provider_results")
+            persisted_topic_results = (
+                persisted_topic_results
+                if isinstance(persisted_topic_results, list)
+                else []
+            )
+            persisted_topics = topic_synthesis.get("topics")
+            persisted_topics = persisted_topics if isinstance(persisted_topics, list) else []
+            topic_result_by_id: dict[str, list[Any]] = {}
+            for result in persisted_topic_results:
+                if not isinstance(result, Mapping):
+                    continue
+                for topic_id in result.get("topic_ids") or ():
+                    topic_result_by_id.setdefault(str(topic_id), []).append(
+                        result.get("provider_output")
+                    )
+            # Rehydrate the exact completed topic outputs from the Registry
+            # artifact. A cache hit must never rebuild this context from the
+            # empty in-process provider-results list.
+            semantic_topic_context = [
+                {
+                    "topic_id": str(item.get("topic_id") or ""),
+                    "paper_ids": [
+                        str(value) for value in item.get("paper_ids") or () if str(value)
+                    ],
+                    "bridge_paper_ids": [
+                        str(value)
+                        for value in item.get("bridge_paper_ids") or ()
+                        if str(value)
+                    ],
+                    "provider_batch_ids": [
+                        str(value)
+                        for value in item.get("provider_batch_ids") or ()
+                        if str(value)
+                    ],
+                    "provider_outputs": [
+                        value
+                        for value in (
+                            item.get("provider_outputs")
+                            if isinstance(item.get("provider_outputs"), list)
+                            else topic_result_by_id.get(str(item.get("topic_id") or ""), [])
+                        )
+                        if isinstance(value, Mapping)
+                    ],
+                    "supporting_evidence_count": int(
+                        item.get("supporting_evidence_count")
+                        or len(item.get("supporting_evidence_ids") or [])
+                    ),
+                    "full_topic_synthesis_artifact": "outline-v3:topic_synthesis",
+                }
+                for item in persisted_topics
+                if isinstance(item, Mapping)
+            ]
+            semantic_relation_candidates = [
+                self._compact_relation_candidate(item.to_dict())
+                for item in candidate_map_model.relations
+                if str(item.relation_id) in {
+                    str(value)
+                    for value in (
+                        semantic_chunk_plan_model.coverage.get(
+                            "selected_relation_ids"
+                        )
+                        or ()
+                    )
+                    if str(value)
+                }
+            ]
+            cross_provider_result: dict[str, Any] | None = None
+            cross_semantic_reused = _semantic_node_reusable("cross_group_comparison")
+            if self.semantic_provider_synthesis_enabled and not cross_semantic_reused:
+                candidate_relation_payloads = semantic_relation_candidates
+                cross_provider_result = self._run_semantic_provider_call(
+                    "cross_group_comparison_provider",
+                    {
+                        "task": "substantive_cross_group_comparison",
+                        "node_id": "cross_group_comparison",
+                        "questions": list(semantic_chunk_plan_model.cross_group_questions),
+                        "topic_synthesis": semantic_topic_context,
+                        "relation_candidates": candidate_relation_payloads,
+                        "output_contract": {
+                            "comparisons": "array of evidence-bound cross-topic comparisons",
+                            "bridge_claims": "array of claims with supporting evidence_ids",
+                            "unresolved_questions": "array",
+                        },
+                    },
+                    {"topic_synthesis": _hash_payload(topic_synthesis), "semantic_chunk_plan": _hash_payload(semantic_chunk_plan)},
+                )
+            cross_group = self._run_node("cross_group_comparison", lambda: (
+                self._artifact(
+                    OutlineArtifact,
+                    {
+                        "schema_version": "outline-cross-group-comparison/v1",
+                        "execution_mode": "provider_synthesis" if cross_provider_result is not None else "local_question_projection",
+                        "status": "completed",
+                        "shared_semantic_chunk_plan_hash": semantic_chunk_plan_model.content_hash,
+                        "questions": list(semantic_chunk_plan_model.cross_group_questions),
+                        "relation_bundle_ids": [item.relation_id for item in semantic_chunk_plan_model.relation_bundles],
+                        "deferred_relation_ids": [
+                            item.relation_id
+                            for item in semantic_chunk_plan_model.relation_bundles
+                            if item.relation_id not in set(semantic_chunk_plan_model.coverage.get("selected_relation_ids") or ())
+                        ],
+                        "provider_output": cross_provider_result,
+                    },
+                    {
+                        "topic_synthesis": _hash_payload(topic_synthesis),
+                        "semantic_chunk_plan": _hash_payload(semantic_chunk_plan),
+                    },
+                ),
+                ("topic_synthesis", "semantic_chunk_plan"),
+                "provider" if cross_provider_result is not None else "deterministic",
+                "local",
+            ))
+            loaded_cross_provider_result = (
+                cross_group.get("provider_output")
+                if isinstance(cross_group.get("provider_output"), Mapping)
+                else None
+            )
+            if cross_provider_result is not None:
+                self._persist_semantic_provider_output(
+                    "cross_group_comparison_provider",
+                    cross_provider_result,
+                    dependency_hashes={"topic_synthesis": _hash_payload(topic_synthesis), "semantic_chunk_plan": _hash_payload(semantic_chunk_plan)},
+                )
+            global_provider_result: dict[str, Any] | None = None
+            global_semantic_reused = _semantic_node_reusable("global_synthesis")
+            if self.semantic_provider_synthesis_enabled and not global_semantic_reused:
+                global_provider_result = self._run_semantic_provider_call(
+                    "global_synthesis_provider",
+                    {
+                        "task": "substantive_global_synthesis",
+                        "node_id": "global_synthesis",
+                        "topic_synthesis": semantic_topic_context,
+                        "cross_group_comparison": (
+                            loaded_cross_provider_result
+                            or cross_provider_result
+                            or cross_group
+                        ),
+                        "relation_candidates": semantic_relation_candidates,
+                        "output_contract": {
+                            "synthesis_claims": "array of claims each bound to supplied evidence_ids",
+                            "organizing_principles": "array",
+                            "unresolved_questions": "array",
+                        },
+                    },
+                    {"cross_group_comparison": _hash_payload(cross_group), "relation_candidates": _hash_payload(candidate_map), "semantic_chunk_plan": _hash_payload(semantic_chunk_plan)},
+                )
+            global_synthesis = self._run_node("global_synthesis", lambda: (
+                self._artifact(
+                    OutlineArtifact,
+                    {
+                        "schema_version": "outline-global-synthesis/v1",
+                        "execution_mode": "provider_synthesis" if global_provider_result is not None else "local_shared_synthesis_base",
+                        "status": "completed",
+                        "shared_semantic_chunk_plan_hash": semantic_chunk_plan_model.content_hash,
+                        "topic_synthesis_hash": _hash_payload(topic_synthesis),
+                        "cross_group_comparison_hash": _hash_payload(cross_group),
+                        "topic_ids": [item.topic_id for item in semantic_chunk_plan_model.topics],
+                        "relation_ids": [item.relation_id for item in semantic_chunk_plan_model.relation_bundles],
+                        "supporting_evidence_ids": sorted({
+                            evidence_id
+                            for item in topic_plan
+                            for evidence_id in item.supporting_evidence_ids
+                        }),
+                        "conclusions": ([global_provider_result] if global_provider_result is not None else ["Shared global synthesis base materialized from topic routes and evidence references; offline route retained local projection."]),
+                        "unresolved_questions": list(semantic_chunk_plan_model.cross_group_questions),
+                        "provider_output": global_provider_result,
+                    },
+                    {
+                        "cross_group_comparison": _hash_payload(cross_group),
+                        "relation_candidates": _hash_payload(candidate_map),
+                        "semantic_chunk_plan": _hash_payload(semantic_chunk_plan),
+                    },
+                ),
+                ("cross_group_comparison", "relation_candidates", "semantic_chunk_plan"),
+                "provider" if global_provider_result is not None else "deterministic",
+                "local",
+            ))
+            loaded_global_provider_result = (
+                global_synthesis.get("provider_output")
+                if isinstance(global_synthesis.get("provider_output"), Mapping)
+                else None
+            )
+            if global_provider_result is not None:
+                self._persist_semantic_provider_output(
+                    "global_synthesis_provider",
+                    global_provider_result,
+                    dependency_hashes={"cross_group_comparison": _hash_payload(cross_group), "relation_candidates": _hash_payload(candidate_map), "semantic_chunk_plan": _hash_payload(semantic_chunk_plan)},
+                )
 
             relation_candidates = [relation.to_dict() for relation in candidate_map_model.relations]
             relation_shard_plan_payload = self._build_relation_shard_plan(
@@ -5373,14 +7225,68 @@ class OutlineV3Executor:
                 "deterministic",
                 "local",
             ))
+            all_candidate_by_id = {
+                str(item["relation_id"]): item for item in relation_candidates
+            }
+            selected_relation_ids = {
+                str(item)
+                for item in (semantic_chunk_plan_model.coverage.get("selected_relation_ids") or all_candidate_by_id)
+                if str(item)
+            }
+            selected_relation_candidates = [
+                item for item in relation_candidates
+                if str(item.get("relation_id") or "") in selected_relation_ids
+            ]
+            excluded_relation_ids = sorted(
+                set(all_candidate_by_id) - {
+                    str(item.get("relation_id") or "") for item in selected_relation_candidates
+                }
+            )
             relation_request = {
-                "relation_candidates": relation_candidates,
-                "evidence_views": self._prompt_evidence_views(evidence_model.views),
-                "relation_shard_plan": relation_shard_plan_payload,
+                "relation_candidates": [
+                    self._compact_relation_candidate(item)
+                    for item in selected_relation_candidates
+                ],
+                "evidence_views": [],
+                "evidence_projection": {
+                    "projection": "complete_relation_bundle_plus_evidence_refs_v1",
+                    "full_evidence_views_are_registry_local": True,
+                    "content_layers_hash": content_layers_model.content_hash,
+                },
+                "relation_shard_plan": {
+                    "schema_version": str(
+                        relation_shard_plan_payload.get("schema_version") or ""
+                    ),
+                    "target_tokens": int(
+                        relation_shard_plan_payload.get("target_tokens") or 0
+                    ),
+                    "shard_count": int(
+                        relation_shard_plan_payload.get("shard_count") or 0
+                    ),
+                    "coverage": {"compact_provider_projection": True},
+                    "provider_projection": "compact_relation_bundle_v1",
+                },
+                # The provider sees a bounded navigation layer and the
+                # evidence-complete relation bundles selected for adjudication;
+                # full dossiers remain Registry artifacts addressed by ids.
+                "navigation_cards": [],
+                "content_layer_refs": {
+                    "artifact_type": "outline_content_layers",
+                    "artifact_hash": content_layers_model.content_hash,
+                    "dossier_count": len(content_layers_model.dossiers),
+                },
+                "relation_evidence_bundles": [
+                    self._compact_relation_bundle(item)
+                    for item in semantic_chunk_plan_model.relation_bundles
+                    if item.relation_id in selected_relation_ids
+                ],
+                "excluded_relation_count": len(excluded_relation_ids),
+                "excluded_relation_ids_hash": hash_json(excluded_relation_ids),
+                "semantic_chunk_plan_hash": semantic_chunk_plan_model.content_hash,
                 "relation_adjudication_contract": {
                     "must_return_confirmed_relation_ids": True,
                     "must_reject_without_recorded_evidence": True,
-                    "allowed_relation_ids": [item["relation_id"] for item in relation_candidates],
+                    "allowed_relation_ids": [item["relation_id"] for item in selected_relation_candidates],
                     # Explicit output envelope: the JSON response must include
                     # BOTH keys even when one of the lists is empty.  Providers
                     # that omit an empty rejected_relations array otherwise
@@ -5403,10 +7309,21 @@ class OutlineV3Executor:
                 "relation_candidates": _hash_payload(candidate_map),
                 "outline_evidence_views": _hash_payload(evidence),
                 "relation_shard_plan": _hash_payload(relation_shard_plan),
+                "semantic_chunk_plan": _hash_payload(semantic_chunk_plan),
             }
+            relation_route = self._role_route("relation_adjudication")
+            relation_budget = relation_route.profile.estimate_request(relation_request)
+            relation_estimated_input = int(
+                relation_budget.get("estimated_input_tokens")
+                or relation_route.profile.estimate_tokens(relation_request)
+            )
+            relation_target = int(self.technical_shard_target_tokens or 0)
             use_hierarchical_relations = (
-                self.technical_shard_target_tokens > 0
-                and int(relation_shard_plan_payload.get("shard_count") or 0) > 1
+                relation_target > 0
+                and (
+                    relation_estimated_input > relation_target
+                    or not bool(relation_budget.get("within_budget"))
+                )
                 and not (
                     self.enabled_semantic_roles is not None
                     and "relation_adjudication" not in self.enabled_semantic_roles
@@ -5418,7 +7335,7 @@ class OutlineV3Executor:
                 hierarchical_content, relation_shard_digests = (
                     self._run_hierarchical_relation_adjudication(
                         evidence_views=evidence_model.views,
-                        relation_candidates=relation_candidates,
+                        relation_candidates=selected_relation_candidates,
                         shard_plan=relation_shard_plan_payload,
                         relation_contract=relation_request["relation_adjudication_contract"],
                         relation_dependencies=relation_deps,
@@ -5504,31 +7421,90 @@ class OutlineV3Executor:
                     self._provider_call_id("relation_adjudication"),
                     None,
                 )
-            candidate_by_id = {str(item["relation_id"]): item for item in relation_candidates}
             if not isinstance(adjudication.get("confirmed_relation_ids"), list) or not isinstance(adjudication.get("rejected_relations"), list):
                 raise OutlineV3ExecutionError("relation adjudication must return explicit confirmed and rejected lists")
-            if len(candidate_by_id) != len(relation_candidates):
+            if len(all_candidate_by_id) != len(relation_candidates):
                 raise OutlineV3ExecutionError("relation candidates contain duplicate relation ids")
             confirmed_ids = [str(item).strip() for item in adjudication["confirmed_relation_ids"] if str(item).strip()]
             rejected_payload = [item for item in adjudication["rejected_relations"] if isinstance(item, Mapping)]
             rejected_ids = [str(raw.get("relation_id") or "").strip() for raw in rejected_payload]
+            deferred_relation_ids = list(excluded_relation_ids)
+            raw_decisions = [
+                item for item in adjudication.get("relation_decisions") or ()
+                if isinstance(item, Mapping) and str(item.get("relation_id") or "").strip()
+            ]
+            decision_by_id: dict[str, dict[str, Any]] = {
+                str(item.get("relation_id") or "").strip(): {
+                    "relation_id": str(item.get("relation_id") or "").strip(),
+                    "decision": str(item.get("decision") or item.get("status") or "rejected").strip().lower(),
+                    "status": str(item.get("status") or item.get("decision") or "rejected").strip().lower(),
+                    "reason": str(item.get("reason") or ""),
+                    "evidence_ids": [str(value) for value in item.get("evidence_ids") or () if str(value)],
+                    "missing_evidence_ids": [str(value) for value in item.get("missing_evidence_ids") or () if str(value)],
+                }
+                for item in raw_decisions
+            }
+            # Older provider envelopes have no explicit decision records.  A
+            # rejected item remains a rejected decision, while excluded
+            # candidates are explicitly deferred instead of being relabelled
+            # as rejected.
+            for item in rejected_payload:
+                relation_id = str(item.get("relation_id") or "").strip()
+                decision_by_id.setdefault(
+                    relation_id,
+                    {
+                        "relation_id": relation_id,
+                        "decision": str(item.get("decision") or item.get("status") or "rejected").strip().lower(),
+                        "status": str(item.get("status") or item.get("decision") or "rejected").strip().lower(),
+                        "reason": str(item.get("reason") or ""),
+                        "evidence_ids": [str(value) for value in item.get("evidence_ids") or () if str(value)],
+                        "missing_evidence_ids": [str(value) for value in item.get("missing_evidence_ids") or () if str(value)],
+                    },
+                )
+            for relation_id in deferred_relation_ids:
+                decision_by_id.setdefault(
+                    relation_id,
+                    {
+                        "relation_id": relation_id,
+                        "decision": "deferred",
+                        "status": "deferred",
+                        "reason": "deferred_for_directed_evidence_retrieval",
+                        "evidence_ids": [],
+                        "missing_evidence_ids": [],
+                    },
+                )
+            selected_id_set = set(selected_relation_ids)
+            bundle_by_id = {
+                item.relation_id: item
+                for item in semantic_chunk_plan_model.relation_bundles
+            }
+            incomplete_confirmed = sorted(
+                relation_id
+                for relation_id in confirmed_ids
+                if relation_id in bundle_by_id and not bundle_by_id[relation_id].is_complete
+            )
+            if incomplete_confirmed:
+                raise OutlineV3ExecutionError(
+                    "relation adjudication confirmed relations with incomplete "
+                    f"evidence bundles: {incomplete_confirmed}"
+                )
             if len(confirmed_ids) != len(set(confirmed_ids)):
                 raise OutlineV3ExecutionError("relation adjudication confirmed a relation more than once")
             if len(rejected_ids) != len(set(rejected_ids)):
                 raise OutlineV3ExecutionError("relation adjudication rejected a relation more than once")
-            if any(item not in candidate_by_id for item in confirmed_ids):
+            if any(item not in selected_id_set for item in confirmed_ids):
                 raise OutlineV3ExecutionError("relation adjudication confirmed an unknown relation")
-            if any(item not in candidate_by_id for item in rejected_ids):
+            if any(item not in selected_id_set for item in rejected_ids):
                 raise OutlineV3ExecutionError("relation adjudication rejected an unknown relation")
             if set(confirmed_ids) & set(rejected_ids):
                 raise OutlineV3ExecutionError("relation adjudication both confirmed and rejected a relation")
-            if set(confirmed_ids) | set(rejected_ids) != set(candidate_by_id):
-                raise OutlineV3ExecutionError("relation adjudication did not classify every relation candidate")
-            confirmed = [candidate_by_id[item] for item in confirmed_ids]
-            rejected = [candidate_by_id[item] for item in rejected_ids]
+            if set(confirmed_ids) | set(rejected_ids) != selected_id_set:
+                raise OutlineV3ExecutionError("relation adjudication did not classify every selected relation")
+            confirmed = [all_candidate_by_id[item] for item in confirmed_ids]
+            rejected = [all_candidate_by_id[item] for item in rejected_ids]
             confirmed_map = self._run_node("global_relation_map", lambda: (
-                self._artifact(ConfirmedGlobalRelationMap, {"relations": confirmed, "rejected_relations": rejected, "confirmed_relation_ids": confirmed_ids, "rejected_relation_ids": rejected_ids, "paper_keys": sorted({key for item in confirmed for key in item.get("paper_keys", [])}), "source_artifact_hashes": {"relation_candidates": _hash_payload(candidate_map)}, "blocking_diagnostics": []}, {"relation_adjudication": _hash_payload(adjudication)}),
-                ("relation_adjudication", "relation_candidates"), self.profile.model, self.profile.provider,
+                self._artifact(ConfirmedGlobalRelationMap, {"relations": confirmed, "rejected_relations": rejected, "deferred_relations": [{"relation_id": item, "reason": "deferred_for_directed_evidence_retrieval", "decision": "deferred", "status": "deferred"} for item in deferred_relation_ids], "relation_decisions": [decision_by_id[item] for item in all_candidate_by_id if item in decision_by_id], "confirmed_relation_ids": confirmed_ids, "rejected_relation_ids": rejected_ids, "deferred_relation_ids": deferred_relation_ids, "paper_keys": sorted({key for item in confirmed for key in item.get("paper_keys", [])}), "source_artifact_hashes": {"relation_candidates": _hash_payload(candidate_map), "semantic_chunk_plan": _hash_payload(semantic_chunk_plan)}, "blocking_diagnostics": []}, {"relation_adjudication": _hash_payload(adjudication), "semantic_chunk_plan": _hash_payload(semantic_chunk_plan)}),
+                ("relation_adjudication", "relation_candidates", "semantic_chunk_plan"), self.profile.model, self.profile.provider,
             ))
 
             intent_model = build_review_intent(self.review_intent_input)
@@ -5547,11 +7523,19 @@ class OutlineV3Executor:
                 paper_keys=sorted({key for item in confirmed for key in item.get("paper_keys", [])}),
                 source_artifact_hashes={"relation_candidates": _hash_payload(candidate_map)},
             )
-            plans_model = build_outline_candidate_plans(ledger_model, matrix_model, confirmed_map_model, intent_model, contract_model, candidate_count=self.candidate_count)
-            axes_payload = {"axes": [item.to_dict() for item in axes], "candidates": [item.to_dict() for item in plans_model.candidates], "bridge_pass": [{"type": "cross_stream_bridge", "paper_keys": sorted(item.paper_keys)} for item in confirmed_map_model.relations if item.relation_type == "bridge_between_topics"]}
+            plans_model = build_outline_candidate_plans(
+                ledger_model,
+                matrix_model,
+                confirmed_map_model,
+                intent_model,
+                contract_model,
+                candidate_count=self.candidate_count,
+                semantic_chunk_plan_hash=semantic_chunk_plan_model.content_hash,
+            )
+            axes_payload = {"axes": [item.to_dict() for item in axes], "candidates": [item.to_dict() for item in plans_model.candidates], "semantic_chunk_plan_hash": semantic_chunk_plan_model.content_hash, "global_synthesis_hash": _hash_payload(global_synthesis), "topic_routes": [item.to_dict() for item in semantic_chunk_plan_model.topics], "bridge_pass": [{"type": "cross_stream_bridge", "paper_keys": sorted(item.paper_keys)} for item in confirmed_map_model.relations if item.relation_type == "bridge_between_topics"]}
             axes_out = self._run_node("organizing_axes", lambda: (
-                self._artifact(OutlineArtifact, axes_payload, {"global_corpus_ledger": _hash_payload(ledger), "multi_view_matrix": _hash_payload(matrix), "global_relation_map": _hash_payload(confirmed_map), "review_intent": _hash_payload(intent), "coverage_contract": _hash_payload(contract)}),
-                ("global_corpus_ledger", "multi_view_matrix", "global_relation_map", "review_intent", "coverage_contract"), "deterministic", "local",
+                self._artifact(OutlineArtifact, axes_payload, {"global_corpus_ledger": _hash_payload(ledger), "multi_view_matrix": _hash_payload(matrix), "global_relation_map": _hash_payload(confirmed_map), "semantic_chunk_plan": _hash_payload(semantic_chunk_plan), "global_synthesis": _hash_payload(global_synthesis), "review_intent": _hash_payload(intent), "coverage_contract": _hash_payload(contract)}),
+                ("global_corpus_ledger", "multi_view_matrix", "global_relation_map", "semantic_chunk_plan", "global_synthesis", "review_intent", "coverage_contract"), "deterministic", "local",
             ))
 
             candidate_ids: list[str] = []
@@ -5560,16 +7544,29 @@ class OutlineV3Executor:
                 candidate_ids.append(candidate_id)
                 plan_payload = plan.to_dict()
                 self._run_node(candidate_id, lambda payload=plan_payload: (
-                    self._artifact(OutlineCandidate, payload, {"organizing_axes": _hash_payload(axes_out), "global_relation_map": _hash_payload(confirmed_map), "coverage_contract": _hash_payload(contract)}),
-                    ("organizing_axes", "global_relation_map", "coverage_contract"), "deterministic", "local",
+                    self._artifact(OutlineCandidate, payload, {"organizing_axes": _hash_payload(axes_out), "global_relation_map": _hash_payload(confirmed_map), "global_synthesis": _hash_payload(global_synthesis), "coverage_contract": _hash_payload(contract)}),
+                    ("organizing_axes", "global_relation_map", "global_synthesis", "coverage_contract"), "deterministic", "local",
                 ))
-                paper_keys = [item.paper_key for item in ledger_model.entries]
+                # Provider-visible identity order is canonical so summary
+                # permutation stability does not manufacture different claim
+                # sequences or replay keys.
+                paper_keys = sorted(
+                    str(item.paper_key)
+                    for item in ledger_model.entries
+                    if str(item.paper_key)
+                )
                 allowed_relation_ids = [item.relation_id for item in confirmed_map_model.relations]
-                candidate_evidence = self._prompt_evidence_views(
-                    [view for view in evidence_model.views if view.paper_key in set(paper_keys)]
+                candidate_evidence = self._compact_candidate_evidence_refs(
+                    [
+                        view
+                        for view in evidence_model.views
+                        if view.paper_key in set(paper_keys)
+                    ],
+                    content_layers_model,
+                    semantic_chunk_plan_model,
                 )
                 candidate_relations = [
-                    item.to_dict()
+                    self._compact_relation_candidate(item.to_dict())
                     for item in confirmed_map_model.relations
                     if set(item.paper_keys).issubset(set(paper_keys))
                 ]
@@ -5580,8 +7577,69 @@ class OutlineV3Executor:
                     "relation_ids": allowed_relation_ids,
                     "relations": candidate_relations,
                     "evidence": candidate_evidence,
+                    "evidence_projection": {
+                        "projection": "registry_complete_evidence_ref_v1",
+                        "full_evidence_artifact_type": "outline_content_layers",
+                        "full_evidence_artifact_hash": content_layers_model.content_hash,
+                        "shared_semantic_context": "global_synthesis_and_topic_routes",
+                    },
+                    "semantic_chunk_plan": {
+                        "content_layers_hash": semantic_chunk_plan_model.content_layers_hash,
+                        "topic_routes": [
+                            {
+                                "topic_id": item.topic_id,
+                                "dimensions": item.dimensions,
+                                "paper_count": len(item.paper_ids),
+                                "bridge_paper_count": len(item.bridge_paper_ids),
+                                "paper_ids_hash": hash_json(item.paper_ids),
+                                "required_evidence_count": len(item.required_evidence_ids),
+                                "status": item.status,
+                            }
+                            for item in semantic_chunk_plan_model.topics
+                        ],
+                        "relation_summaries": [
+                            {
+                                "relation_id": item.relation_id,
+                                "relation_type": item.relation_type,
+                                "paper_count": len(item.paper_ids),
+                                "paper_ids_hash": hash_json(item.paper_ids),
+                                "evidence_completeness": item.evidence_completeness,
+                                "decision": item.decision,
+                                "missing_evidence_count": len(item.missing_evidence_ids),
+                            }
+                            for item in semantic_chunk_plan_model.relation_bundles
+                            if item.relation_id in set(
+                                str(value)
+                                for value in (semantic_chunk_plan_model.coverage.get("selected_relation_ids") or ())
+                            )
+                        ],
+                        "deferred_relation_count": semantic_chunk_plan_model.coverage.get("unselected_relation_count", 0),
+                        "deferred_relation_policy": "directed_evidence_retrieval",
+                        "cross_group_questions": list(semantic_chunk_plan_model.cross_group_questions),
+                    },
+                    "content_layer_refs": {
+                        "artifact_type": "outline_content_layers",
+                        "artifact_hash": content_layers_model.content_hash,
+                        "dossier_ids": [
+                            f"dossier:{paper_key}" for paper_key in paper_keys
+                        ],
+                    },
                     "source_summary_hashes": sorted(evidence_model.source_summary_hashes),
                     "shared_hashes": plan.shared_artifact_hashes,
+                    "global_synthesis_hash": _hash_payload(global_synthesis),
+                    "shared_semantic_context": {
+                        "global_synthesis": loaded_global_provider_result
+                        or global_provider_result
+                        or {
+                            "execution_mode": "local_shared_synthesis_base",
+                            "topic_count": len(semantic_chunk_plan_model.topics),
+                            "content_layers_hash": content_layers_model.content_hash,
+                        },
+                        "cross_group_comparison": loaded_cross_provider_result
+                        or cross_provider_result
+                        or cross_group,
+                        "topic_routes": semantic_topic_context,
+                    },
                     "output_contract": {
                         "output_fields": {
                             "candidate_id": (
@@ -5625,16 +7683,11 @@ class OutlineV3Executor:
                         "section_paper_keys_must_be_subset_of_evidence": True,
                         "section_relation_ids_must_be_subset_of_relation_ids": True,
                         "planned_claims_must_be_non_empty": True,
-                        "paper_keys_must_be_unique_across_sections": (
-                            "Assign every paper_key you use at most ONCE across the "
-                            "whole candidate: never repeat the same paper key in two "
-                            "different sections.  If one paper genuinely informs two "
-                            "sections, put the paper in the section where it is "
-                            "strongest and phrase the other section's claim so that "
-                            "the paper's evidence is described without repeating the "
-                            "paper key.  A candidate that reuses papers to inflate "
-                            "coverage will be rejected by the structure and coverage "
-                            "critics."
+                        "paper_keys_may_repeat_with_distinct_roles": (
+                            "A paper may support more than one section when each "
+                            "occurrence carries a non-empty paper_roles mapping and "
+                            "the role/claim is materially distinct.  Do not repeat a "
+                            "paper merely to inflate coverage or copy the same claim."
                         ),
                         "claim_must_be_supported_by_section_evidence": (
                             "Every planned claim inside a section must be directly "
@@ -5662,12 +7715,20 @@ class OutlineV3Executor:
                     "candidate": _hash_payload(provider_request),
                     "global_relation_map": _hash_payload(confirmed_map),
                     "coverage_contract": _hash_payload(contract),
+                    "semantic_chunk_plan": _hash_payload(semantic_chunk_plan),
+                    "outline_content_layers": _hash_payload(content_layers),
                 }
                 generation_node_id = f"{candidate_id}_provider_generation"
                 generation_binding = self._provider_binding(
                     generation_node_id, provider_request, expect_json=True,
                     input_artifact_hashes=tuple(generation_deps.values()),
                 )
+                loaded_generation = self._load_node(
+                    generation_node_id,
+                    generation_binding,
+                )
+                if loaded_generation is not None:
+                    continue
                 generation_route = self._node_route(generation_node_id)
                 generation_budget = generation_route.profile.estimate_request(provider_request)
                 sharded_generation = bool(
@@ -5708,6 +7769,10 @@ class OutlineV3Executor:
                             provider_request,
                             expect_json=True,
                             input_artifact_hashes=tuple(generation_deps.values()),
+                            output_tokens=min(
+                                int(generation_route.profile.max_output_tokens),
+                                4_096,
+                            ),
                         )
                     content = (
                         canonicalize_structural(dict(raw_generation), alias_map)
@@ -5720,6 +7785,7 @@ class OutlineV3Executor:
                             content,
                             allowed_paper_keys=paper_keys,
                             allowed_relation_ids=allowed_relation_ids,
+                            alias_map=alias_map,
                         )
                     except OutlineV3ExecutionError as contract_error:
                         if not self._repair_enabled:
@@ -5738,6 +7804,7 @@ class OutlineV3Executor:
                                 content,
                                 allowed_paper_keys=paper_keys,
                                 allowed_relation_ids=allowed_relation_ids,
+                                alias_map=alias_map,
                             )
                         except OutlineV3ExecutionError as repair_failure:
                             self._publish_repair_failure(candidate_id, repair_failure)
@@ -5788,7 +7855,18 @@ class OutlineV3Executor:
                     "candidate_id": candidate_id,
                     "organizing_logic": str(self._payloads.get(candidate_id, {}).get("organizing_logic") or ""),
                     "sections": list(self._payloads.get(f"{candidate_id}_provider_generation", {}).get("sections") or []),
-                    "planned_claims": list(self._payloads.get(f"{candidate_id}_provider_generation", {}).get("claims") or []),
+                    "planned_claims": list(
+                        self._payloads.get(f"{candidate_id}_provider_generation", {}).get("claims")
+                        or [
+                            claim
+                            for section in self._payloads.get(
+                                f"{candidate_id}_provider_generation", {}
+                            ).get("sections", [])
+                            if isinstance(section, Mapping)
+                            for claim in section.get("claims") or ()
+                            if str(claim).strip()
+                        ]
+                    ),
                     "paper_assignments": [
                         {
                             "section_id": str(section.get("section_id") or ""),
@@ -5801,11 +7879,41 @@ class OutlineV3Executor:
                 for candidate_id in candidate_ids
             }
             critiques: dict[str, dict[str, Any]] = {}
+            from outline.evidence_alias import build_alias_map
+
+            critique_alias_map = getattr(self, "_alias_map", None)
+            if not isinstance(critique_alias_map, Mapping):
+                critique_alias_map = build_alias_map(
+                    list(contract_model.corpus_paper_keys),
+                    [relation.relation_id for relation in confirmed_map_model.relations],
+                )
+            paper_alias_reverse = dict(critique_alias_map.get("papers_reverse") or {})
+            for candidate_content in candidate_contents.values():
+                normalized_sections: list[dict[str, Any]] = []
+                for raw_section in candidate_content.get("sections") or ():
+                    if not isinstance(raw_section, Mapping):
+                        continue
+                    section = dict(raw_section)
+                    raw_roles = section.get("paper_roles")
+                    if isinstance(raw_roles, Mapping):
+                        section["paper_roles"] = {
+                            paper_alias_reverse.get(str(key), str(key)): value
+                            for key, value in raw_roles.items()
+                        }
+                    normalized_sections.append(section)
+                candidate_content["sections"] = normalized_sections
             critique_requests = {
                 "structure_critique": {
                     "node_id": "structure_critique",
                     "candidate_contents": candidate_contents,
                     "candidate_hashes": generation_hashes,
+                    "paper_key_aliases": critique_alias_map,
+                    "paper_reuse_policy": (
+                        "A paper may be used in multiple sections when each occurrence "
+                        "has a distinct paper role and materially distinct function. "
+                        "Count unique canonical paper keys for coverage; flag only "
+                        "mechanical duplication without distinct evidence function."
+                    ),
                     "review_intent": intent_model.to_dict(),
                     "checks": ["section_progression", "duplicate_assignments", "goal_claim_alignment", "placeholder_sections", "empty_research_streams"],
                 },
@@ -5813,34 +7921,108 @@ class OutlineV3Executor:
                     "node_id": "coverage_critique",
                     "candidate_contents": candidate_contents,
                     "candidate_hashes": generation_hashes,
-                    "coverage_contract": contract_model.to_dict(),
-                    "corpus_ledger": ledger_model.to_dict(),
+                    "paper_key_aliases": critique_alias_map,
+                    "paper_reuse_policy": (
+                        "Repeated use is allowed when roles/functions differ; repeated "
+                        "occurrences do not create new unique-paper coverage."
+                    ),
+                    "coverage_contract": {
+                        "content_hash": contract_model.content_hash,
+                        "required_paper_count": len(contract_model.corpus_paper_keys),
+                        "must_use_paper_count": len(contract_model.must_use_paper_keys),
+                        "must_use_paper_keys_hash": hash_json(
+                            contract_model.must_use_paper_keys
+                        ),
+                        "projection": "registry_complete_coverage_contract_ref_v1",
+                    },
+                    "corpus_ledger": {
+                        "artifact_type": ledger_model.artifact_type,
+                        "content_hash": ledger_model.content_hash,
+                        "paper_keys": [
+                            str(item.paper_key)
+                            for item in ledger_model.entries
+                            if str(item.paper_key)
+                        ],
+                        "entry_count": len(ledger_model.entries),
+                        "assignment_status_counts": {
+                            status: sum(
+                                1
+                                for item in ledger_model.entries
+                                if item.assignment_status == status
+                            )
+                            for status in sorted(
+                                {
+                                    str(item.assignment_status)
+                                    for item in ledger_model.entries
+                                }
+                            )
+                        },
+                        "projection": "registry_complete_ledger_ref_v1",
+                    },
                     "must_use_paper_keys": list(contract_model.must_use_paper_keys),
-                    "relations": [item.to_dict() for item in confirmed_map_model.relations],
-                    "contradictions": [item.to_dict() for item in confirmed_map_model.relations if item.relation_type in {"contradicts", "explains_discrepancy"}],
-                    "gaps": [item.to_dict() for item in confirmed_map_model.relations if item.relation_type in {"qualifies", "explains_discrepancy"}],
-                    "methods": sorted({value for view in evidence_model.views for value in view.method}),
-                    "contexts": sorted({value for view in evidence_model.views for value in view.sample_or_context}),
+                    "relations": [
+                        self._compact_relation_candidate(item.to_dict())
+                        for item in confirmed_map_model.relations
+                    ],
+                    "contradictions": [
+                        self._compact_relation_candidate(item.to_dict())
+                        for item in confirmed_map_model.relations
+                        if item.relation_type in {"contradicts", "explains_discrepancy"}
+                    ],
+                    "gaps": [
+                        self._compact_relation_candidate(item.to_dict())
+                        for item in confirmed_map_model.relations
+                        if item.relation_type in {"qualifies", "explains_discrepancy"}
+                    ],
+                    "methods": {
+                        "count": sum(len(view.method) for view in evidence_model.views),
+                        "values_hash": hash_json(
+                            sorted({value for view in evidence_model.views for value in view.method})
+                        ),
+                    },
+                    "contexts": {
+                        "count": sum(
+                            len(view.sample_or_context) for view in evidence_model.views
+                        ),
+                        "values_hash": hash_json(
+                            sorted(
+                                {
+                                    value
+                                    for view in evidence_model.views
+                                    for value in view.sample_or_context
+                                }
+                            )
+                        ),
+                    },
                 },
                 "evidence_critique": {
                     "node_id": "evidence_critique",
                     "candidate_contents": candidate_contents,
                     "candidate_hashes": generation_hashes,
+                    "paper_key_aliases": critique_alias_map,
+                    "paper_reuse_policy": (
+                        "Repeated use is allowed when each section claim has a distinct "
+                        "evidence function; evaluate traceability through paper_key_aliases."
+                    ),
                     "candidate_claims": {key: value.get("planned_claims", []) for key, value in candidate_contents.items()},
                     "section_evidence": {key: value.get("sections", []) for key, value in candidate_contents.items()},
                     "paper_keys": sorted(contract_model.corpus_paper_keys),
                     "source_summary_hashes": sorted(evidence_model.source_summary_hashes),
                     "relation_evidence": [item.to_dict() for item in confirmed_map_model.relations],
                     "contradictions": [item.to_dict() for item in confirmed_map_model.relations if item.relation_type in {"contradicts", "explains_discrepancy"}],
-                    "boundaries": self._prompt_evidence_views(
-                        [view for view in evidence_model.views if view.limitations]
+                    "boundaries": self._compact_candidate_evidence_refs(
+                        [view for view in evidence_model.views if view.limitations],
+                        content_layers_model,
+                        semantic_chunk_plan_model,
                     ),
-                    "gaps": self._prompt_evidence_views(
+                    "gaps": self._compact_candidate_evidence_refs(
                         [
                             view
                             for view in evidence_model.views
                             if view.research_gaps or view.future_directions
-                        ]
+                        ],
+                        content_layers_model,
+                        semantic_chunk_plan_model,
                     ),
                 },
             }
@@ -5975,9 +8157,244 @@ class OutlineV3Executor:
             ))
 
             selected_payload = self._payloads.get(f"{selected_id}_provider_generation", {})
-            sections = list(selected_payload.get("sections") or [])
-            packets = []
+            selected_projection = candidate_contents.get(selected_id, {})
+            original_sections = list(
+                selected_projection.get("sections")
+                or selected_payload.get("sections")
+                or []
+            )
+            accepted_recommendations = [
+                item for item in (arbitration.get("accepted_recommendations") or ())
+                if (isinstance(item, Mapping) and (item.get("issue_id") or item.get("recommendation") or item.get("text")))
+                or (not isinstance(item, Mapping) and str(item).strip())
+            ]
             view_by_key = {view.paper_key: view for view in evidence_model.views}
+            revised_sections = [dict(item) for item in original_sections if isinstance(item, Mapping)]
+            revision_records: list[dict[str, Any]] = []
+            unresolved_revisions: list[dict[str, Any]] = []
+            known_section_ids = [str(section.get("section_id") or "") for section in revised_sections]
+            for raw_recommendation in accepted_recommendations:
+                if isinstance(raw_recommendation, Mapping):
+                    recommendation = str(
+                        raw_recommendation.get("recommendation")
+                        or raw_recommendation.get("text")
+                        or raw_recommendation.get("reason")
+                        or ""
+                    ).strip()
+                    issue_id = str(raw_recommendation.get("issue_id") or "").strip() or f"issue:{hash_text(recommendation)[:16]}"
+                    target_values = raw_recommendation.get("target_section_ids") or raw_recommendation.get("target_section_id") or raw_recommendation.get("section_id")
+                    if isinstance(target_values, str):
+                        target_values = [target_values]
+                    target_ids = {str(value) for value in target_values or () if str(value)}
+                    operation = str(raw_recommendation.get("operation") or "").strip().lower()
+                    replacement = str(
+                        raw_recommendation.get("replacement")
+                        or raw_recommendation.get("new_value")
+                        or raw_recommendation.get("new_title")
+                        or raw_recommendation.get("new_goal")
+                        or ""
+                    )
+                else:
+                    recommendation = str(raw_recommendation).strip()
+                    issue_id = f"issue:{hash_text(recommendation)[:16]}"
+                    target_ids = set()
+                    operation = ""
+                    replacement = ""
+                lowered = recommendation.casefold()
+                if not target_ids:
+                    target_ids = {
+                        section_id for section_id in known_section_ids
+                        if section_id and section_id.casefold() in lowered
+                    }
+                if not target_ids:
+                    # Legacy S12-style references are accepted only when they
+                    # exactly identify a real section identity; a bare S12 is
+                    # never positionally rebound to another section.
+                    target_ids = {
+                        section_id for section_id in known_section_ids
+                        if re.search(rf"(?<![A-Za-z0-9_]){re.escape(section_id)}(?![A-Za-z0-9_])", recommendation, flags=re.IGNORECASE)
+                    }
+                if not operation:
+                    if "title" in lowered:
+                        operation = "replace_title"
+                    elif "goal" in lowered or "purpose" in lowered:
+                        operation = "replace_goal"
+                    elif any(marker in lowered for marker in ("remove claim", "delete claim", "drop claim")):
+                        operation = "remove_claim"
+                    elif any(marker in lowered for marker in ("aggregate", "共同指向", "共同说明", "概括性", "gap claim")):
+                        operation = "replace_aggregate_claim_with_per_paper_boundaries"
+                targets = [
+                    section for section in revised_sections
+                    if str(section.get("section_id") or "") in target_ids
+                ]
+                operation_records: list[dict[str, Any]] = []
+                target_results: list[dict[str, Any]] = []
+                for section_id in sorted(target_ids):
+                    section = next(
+                        (item for item in targets if str(item.get("section_id") or "") == section_id),
+                        None,
+                    )
+                    if section is None:
+                        target_results.append({
+                            "section_id": section_id,
+                            "operation": operation or "unknown",
+                            "status": "unresolved",
+                            "reason": "target_section_not_found",
+                        })
+                        continue
+                    before_hash = hash_json(section)
+                    claims = [
+                        str(item) for item in section.get("claims") or () if str(item).strip()
+                    ]
+                    target_status = "unresolved"
+                    reason = "operation_not_applied"
+                    if operation == "replace_title":
+                        if not replacement:
+                            reason = "replacement_missing"
+                        elif str(section.get("title") or "") == replacement:
+                            target_status, reason = "already_satisfied", "title_already_matches"
+                        else:
+                            section["title"] = replacement
+                            target_status, reason = "changed", "title_replaced"
+                    elif operation == "replace_goal":
+                        if not replacement:
+                            reason = "replacement_missing"
+                        elif str(section.get("goal") or "") == replacement:
+                            target_status, reason = "already_satisfied", "goal_already_matches"
+                        else:
+                            section["goal"] = replacement
+                            target_status, reason = "changed", "goal_replaced"
+                    elif operation == "replace_aggregate_claim_with_per_paper_boundaries":
+                        aggregate_claims = [
+                            claim for claim in claims
+                            if any(marker in claim.casefold() for marker in ("共同指向", "共同说明", "aggregate", "概括性", "gap claim"))
+                        ]
+                        per_paper_claims: list[str] = []
+                        for paper_key in section.get("paper_keys") or ():
+                            view = view_by_key.get(str(paper_key))
+                            if view is None:
+                                continue
+                            evidence = [*list(view.limitations), *list(view.research_gaps), *list(view.future_directions)]
+                            if evidence:
+                                per_paper_claims.append(f"{paper_key} 的作者自陈边界：" + "；".join(evidence))
+                        if not aggregate_claims:
+                            target_status, reason = "already_satisfied", "no_aggregate_claim_remains"
+                        elif per_paper_claims:
+                            section["claims"] = [claim for claim in claims if claim not in aggregate_claims] + per_paper_claims
+                            target_status, reason = "changed", "aggregate_claim_replaced_with_per_paper_boundaries"
+                        else:
+                            reason = "supporting_boundary_evidence_missing"
+                    elif operation == "remove_claim":
+                        if not replacement:
+                            reason = "claim_replacement_missing"
+                        elif replacement not in claims:
+                            target_status, reason = "already_satisfied", "claim_already_absent"
+                        else:
+                            kept = [claim for claim in claims if claim != replacement]
+                            if not kept:
+                                target_status, reason = "failed", "cannot_delete_last_supported_claim"
+                            else:
+                                section["claims"] = kept
+                                target_status, reason = "changed", "claim_removed"
+                    else:
+                        reason = "unsupported_or_missing_operation"
+                    after_hash = hash_json(section)
+                    record = {
+                        "issue_id": issue_id,
+                        "recommendation": recommendation,
+                        "section_id": section_id,
+                        "operation": operation or "unknown",
+                        "status": target_status,
+                        "reason": reason,
+                        "before_hash": before_hash,
+                        "after_hash": after_hash,
+                    }
+                    if target_status == "changed":
+                        section["revision_lineage"] = {
+                            "issue_id": issue_id,
+                            "parent_candidate_hash": generation_hashes[selected_id],
+                            "before_hash": before_hash,
+                            "after_hash": after_hash,
+                        }
+                        record["after_hash"] = hash_json(section)
+                        record["targeted_verification"] = "candidate_structure_and_evidence_recheck_pending"
+                    operation_records.append(record)
+                    target_results.append({
+                        "section_id": section_id,
+                        "status": target_status,
+                        "reason": reason,
+                    })
+                required_resolved = bool(target_results) and all(
+                    item.get("status") in {"changed", "already_satisfied"}
+                    for item in target_results
+                )
+                if required_resolved:
+                    revision_records.extend(operation_records)
+                else:
+                    unresolved_revisions.append({
+                        "issue_id": issue_id,
+                        "recommendation": recommendation,
+                        "target_section_ids": sorted(target_ids),
+                        "operation": operation or "unknown",
+                        "status": "needs_manual_review",
+                        "target_results": target_results,
+                    })
+            if unresolved_revisions:
+                raise OutlineV3ExecutionError(
+                    "accepted outline recommendations could not be applied to the selected candidate: "
+                    + "; ".join(str(item.get("issue_id") or item.get("recommendation") or item) for item in unresolved_revisions)
+                )
+            self._validate_candidate_payload(
+                selected_id,
+                {"sections": revised_sections},
+                allowed_paper_keys=list(contract_model.corpus_paper_keys),
+                allowed_relation_ids=[item.relation_id for item in confirmed_map_model.relations],
+                alias_map=critique_alias_map,
+            )
+            revised_candidate_hash = _hash_payload({"sections": revised_sections})
+            revision_verification = {
+                "artifact_type": "selected_candidate_revision_verification",
+                "artifact_version": "v1",
+                "candidate_id": selected_id,
+                "revised_candidate_hash": revised_candidate_hash,
+                "checks": {
+                    "section_identity_and_order": True,
+                    "allowed_paper_ids": True,
+                    "allowed_relation_ids": True,
+                    "non_empty_claims": True,
+                    "evidence_packet_rebuild_required": True,
+                },
+                "status": "passed",
+            }
+            revision_deps = {
+                "selected_candidate": _hash_payload(selected),
+                f"{selected_id}_provider_generation": generation_hashes[selected_id],
+            }
+            selected_revision = self._run_node("selected_candidate_revision", lambda: (
+                self._artifact(
+                    OutlineArtifact,
+                    {
+                        "schema_version": "selected-candidate-revision/v1",
+                        "candidate_id": selected_id,
+                        "parent_candidate_hash": generation_hashes[selected_id],
+                        "parent_selected_hash": _hash_payload(selected),
+                        "revised_content_hash": revised_candidate_hash,
+                        "sections": revised_sections,
+                        "accepted_recommendations": accepted_recommendations,
+                        "revision_records": revision_records,
+                        "revision_verification": revision_verification,
+                        "revision_round": 1,
+                        "max_revision_rounds": 2,
+                        "status": "completed" if not unresolved_revisions else "blocked",
+                    },
+                    revision_deps,
+                ),
+                ("selected_candidate", f"{selected_id}_provider_generation"),
+                "deterministic",
+                "local",
+            ))
+            sections = revised_sections
+            packets = []
             relation_by_id = {relation.relation_id: relation for relation in confirmed_map_model.relations}
             for section in sections:
                 section_id = str(section.get("section_id") or "").strip()
@@ -6043,8 +8460,8 @@ class OutlineV3Executor:
                     "token_budget": {"strategy": self.profile.tokenizer_strategy, "input_budget": self.profile.input_budget},
                 })
             packet_set = self._run_node("section_evidence_packets", lambda: (
-                self._artifact(SectionEvidencePacketSet, {"packets": packets, "coverage_ledger": {"paper_coverage": sorted(set(item for packet in packets for item in packet["paper_keys"])), "must_use_coverage": sorted(set(contract_model.must_use_paper_keys) & set(item for packet in packets for item in packet["paper_keys"])), "claim_coverage": [claim for packet in packets for claim in packet["planned_claims"]]}}, {"selected_candidate": _hash_payload(selected), "global_corpus_ledger": _hash_payload(ledger), "global_relation_map": _hash_payload(confirmed_map)}),
-                ("selected_candidate", "global_corpus_ledger", "global_relation_map"), "deterministic", "local",
+                self._artifact(SectionEvidencePacketSet, {"packets": packets, "coverage_ledger": {"paper_coverage": sorted(set(item for packet in packets for item in packet["paper_keys"])), "must_use_coverage": sorted(set(contract_model.must_use_paper_keys) & set(item for packet in packets for item in packet["paper_keys"])), "claim_coverage": [claim for packet in packets for claim in packet["planned_claims"]]}, "semantic_chunk_plan_hash": semantic_chunk_plan_model.content_hash, "selected_candidate_revision_hash": _hash_payload(selected_revision)}, {"selected_candidate_revision": _hash_payload(selected_revision), "global_corpus_ledger": _hash_payload(ledger), "global_relation_map": _hash_payload(confirmed_map), "semantic_chunk_plan": _hash_payload(semantic_chunk_plan)}),
+                ("selected_candidate_revision", "global_corpus_ledger", "global_relation_map", "semantic_chunk_plan"), "deterministic", "local",
             ))
             final_payload = {"title": intent_model.review_question or "Evidence-led literature review outline", "sections": sections, "candidate_id": selected_id, "paper_keys": sorted(set(item for packet in packets for item in packet["paper_keys"])), "relation_ids": [item.relation_id for item in confirmed_map_model.relations], "source_hashes": sorted(evidence_model.source_summary_hashes)}
             final = self._run_node("final_outline", lambda: (
@@ -6081,6 +8498,27 @@ class OutlineV3Executor:
                 for paper_key, count in sorted(assignment_counts.items())
                 if count > 1
             }
+            duplicate_role_violations: list[str] = []
+            role_values_by_paper: dict[str, set[str]] = {}
+            for section in sections:
+                raw_roles = section.get("paper_roles")
+                roles = raw_roles if isinstance(raw_roles, Mapping) else {}
+                for paper_key in section.get("paper_keys") or ():
+                    paper = str(paper_key)
+                    role = str(roles.get(paper) or "").strip()
+                    if assignment_counts.get(paper, 0) <= 1:
+                        continue
+                    if not role:
+                        duplicate_role_violations.append(
+                            f"{paper}: section {section.get('section_id') or ''} has no distinct paper role"
+                        )
+                        continue
+                    role_values_by_paper.setdefault(paper, set()).add(role.casefold())
+            for paper_key, count in duplicate_assignments.items():
+                if len(role_values_by_paper.get(paper_key, set())) < count + 1:
+                    duplicate_role_violations.append(
+                        f"{paper_key}: repeated paper roles are not distinct across sections"
+                    )
             placeholder_sections = [
                 str(section.get("section_id") or "")
                 for section in sections
@@ -6150,7 +8588,10 @@ class OutlineV3Executor:
                 "local_threshold": local_coverage >= self.quality_gate.min_canonical_coverage_local,
                 "selected_threshold": (canonical_coverage if self.quality_gate.coverage_scope == "full" else local_coverage) >= threshold,
                 "min_effective_sections": len(effective_sections) >= self.quality_gate.min_effective_sections,
-                "max_duplicate_assignments": sum(duplicate_assignments.values()) <= self.quality_gate.max_duplicate_assignments,
+                "max_duplicate_assignments": (
+                    len(duplicate_role_violations)
+                    <= self.quality_gate.max_duplicate_assignments
+                ),
                 "placeholder_sections": not placeholder_sections if self.quality_gate.block_placeholder_sections else True,
                 "empty_research_streams": not empty_research_streams if self.quality_gate.block_empty_research_streams else True,
                 "unsupported_planned_claims": not unsupported_planned_claims,
@@ -6162,7 +8603,18 @@ class OutlineV3Executor:
                 and not empty_sections
                 and not packet_missing_keys
                 and bool(claims)
-                and all(bool(value) for value in quality_checks.values() if isinstance(value, bool))
+                # Full and local coverage are diagnostics for the selected
+                # scope.  Requiring both made a local review impossible when
+                # an intentionally excluded corpus item lowered the full
+                # denominator.  The selected threshold is the sole coverage
+                # gate; the remaining quality checks stay hard gates.
+                and bool(quality_checks["selected_threshold"])
+                and all(
+                    bool(value)
+                    for key, value in quality_checks.items()
+                    if isinstance(value, bool)
+                    and key not in {"full_threshold", "local_threshold", "selected_threshold"}
+                )
             )
             coverage_audit_payload = {
                 "passed": coverage_passed,
@@ -6176,7 +8628,7 @@ class OutlineV3Executor:
                 "claim_coverage": {"count": len(claims), "claims": claims, "unsupported_planned_claims": unsupported_planned_claims},
                 "relation_coverage": {"planned": len(confirmed_map_model.relations), "used": len(used_relations), "unused": sorted(set(item.relation_id for item in confirmed_map_model.relations) - used_relations)},
                 "must_use_coverage": {"required": sorted(must_use), "covered": sorted(must_use & covered)},
-                "section_coverage": {"sections": section_count, "effective_section_count": len(effective_sections), "empty_sections": empty_sections, "packet_papers": len(packet_papers), "duplicate_paper_assignments": duplicate_assignments, "placeholder_sections": placeholder_sections},
+                "section_coverage": {"sections": section_count, "effective_section_count": len(effective_sections), "empty_sections": empty_sections, "packet_papers": len(packet_papers), "duplicate_paper_assignments": duplicate_assignments, "duplicate_role_violations": duplicate_role_violations, "placeholder_sections": placeholder_sections},
                 "research_streams": {"empty": empty_research_streams, "values": stream_values},
                 "method_coverage": method_coverage,
                 "context_coverage": context_coverage,
@@ -6214,7 +8666,20 @@ class OutlineV3Executor:
                 evidence_shards = [item.to_dict() for item in variant_shards]
                 variant_ledger = build_global_corpus_ledger(variant_evidence)
                 variant_matrix = build_multi_view_matrix(variant_evidence)
+                variant_content_layers = build_paper_content_layers(
+                    variant_summaries,
+                    variant_evidence,
+                    job_id=self.job_id,
+                )
                 variant_candidates = build_global_relation_map(variant_evidence, variant_matrix, variant_ledger)
+                variant_semantic_plan = build_semantic_chunk_plan(
+                    variant_content_layers,
+                    variant_candidates,
+                    candidate_count=self.candidate_count,
+                    physical_call_limit=min(
+                        24, max(0, int(self.max_provider_calls or 24))
+                    ),
+                )
                 relation_key_hash = hash_json({"variant": variant_name, "role": "relation_adjudication"})[:16]
                 relation_dependencies = {
                     "variant_source_summaries": hash_json(sorted(variant_evidence.source_summary_hashes)),
@@ -6245,7 +8710,11 @@ class OutlineV3Executor:
                 else:
                     variant_relation_request = {
                         "relation_candidates": [item.to_dict() for item in variant_candidates.relations],
-                        "evidence": self._prompt_evidence_views(variant_evidence.views),
+                        "evidence": self._compact_candidate_evidence_refs(
+                            variant_evidence.views,
+                            variant_content_layers,
+                            variant_semantic_plan,
+                        ),
                         "source_summary_hashes": sorted(variant_evidence.source_summary_hashes),
                         "evidence_shards": evidence_shards,
                         "shard_size": configured_shard_size,
@@ -6294,14 +8763,22 @@ class OutlineV3Executor:
                 variant_contents: dict[str, dict[str, Any]] = {}
                 for candidate_id in ordered_ids:
                     plan = plans_by_id[candidate_id]
-                    paper_keys = [item.paper_key for item in variant_ledger.entries]
+                    paper_keys = sorted(
+                        str(item.paper_key)
+                        for item in variant_ledger.entries
+                        if str(item.paper_key)
+                    )
                     request = {
                         "candidate_id": candidate_id,
                         "organizing_logic": plan.organizing_logic,
                         "paper_keys": paper_keys,
                         "relation_ids": [item.relation_id for item in variant_relation_map.relations],
                         "relations": [item.to_dict() for item in variant_relation_map.relations],
-                        "evidence": self._prompt_evidence_views(variant_evidence.views),
+                        "evidence": self._compact_candidate_evidence_refs(
+                            variant_evidence.views,
+                            variant_content_layers,
+                            variant_semantic_plan,
+                        ),
                         "source_summary_hashes": sorted(variant_evidence.source_summary_hashes),
                         "evidence_shards": evidence_shards,
                         "shard_size": configured_shard_size,
@@ -6823,10 +9300,12 @@ class OutlineV3Executor:
             # fresh exact-replay executor runs the canonical decision chain
             # with stability disabled, so prior stability receipts are
             # historical/out-of-scope rather than unexpected canonical calls.
+            current_receipt_ids = {str(receipt_id) for receipt_id in self.receipts if str(receipt_id)}
             current_receipts = [
                 receipt
                 for receipt in job_receipts
                 if not str(receipt.call_id or "").startswith("outline:stability:")
+                and str(receipt.receipt_id or "") in current_receipt_ids
             ]
             canonical_expected = [
                 expected
@@ -6879,6 +9358,22 @@ class OutlineV3Executor:
                 expected.node_id
                 for expected in canonical_expected
                 if expected.node_id in self.artifact_records
+            )
+            # Dynamic semantic synthesis calls expose a physical response
+            # artifact whose receipt node is normalized to the static DAG
+            # node for replay/readback.  Include that exact Registry record in
+            # the closure dependencies as well, otherwise validation sees a
+            # valid expected path that is absent from the closure dependency
+            # projection and marks the whole job blocked.
+            expected_artifact_paths = {
+                str(expected.artifact_path).lower()
+                for expected in canonical_expected
+                if str(expected.artifact_path or "")
+            }
+            closure_dependency_ids.extend(
+                artifact_id
+                for artifact_id, record in self.artifact_records.items()
+                if str(record.path).lower() in expected_artifact_paths
             )
             closure_dependencies = {
                 key: self.artifact_records[key].content_hash

@@ -26,7 +26,7 @@ from runtime.architecture_gates import ArchitectureGateScope, collect_scannable_
 from runtime.lifecycle import BootstrappedRuntimeContext, bootstrap_job_runtime, finalize_job_runtime
 from runtime.job_spec import RuntimeJobSpec
 from runtime.provider_context import ProviderContextProfile
-from runtime.provider_runtime import hash_json
+from runtime.provider_runtime import bind_pause_state_path, hash_json
 from runtime.reconcile import ReconcileValidationError, validate_canonical_ai_summary
 from runtime.source_intake import build_source_bundle_for_request
 from runtime.stage_contracts import SourceBundle, StageArtifactRef, StageResult
@@ -46,7 +46,12 @@ from services.artifact_registry import (
     RegistryError,
     file_sha256,
 )
-from services.job_runner import JobRunRequest, JobRunner, validate_job_request_options
+from services.job_runner import (
+    JobRunRequest,
+    JobRunner,
+    _typed_reuse_manifest_mode,
+    validate_job_request_options,
+)
 from services.job_workspace import (
     JobWorkspace,
     publish_bytes_artifact,
@@ -56,6 +61,10 @@ from services.job_workspace import (
 from services.progress_state import Stage1ProgressSnapshot
 from services.queue_service import CancelToken
 from services.stage1_analysis_service import Stage1AnalysisService
+from services.stage1_reuse import (
+    Stage1ReusableSummaryBindingV1,
+    verify_stage1_typed_manifest_authority,
+)
 
 
 class _OutlineProviderTransportAdapter:
@@ -245,6 +254,7 @@ class _RuntimeStageHost:
         resume_state_report: Any | None = None,
     ) -> None:
         self.job_workspace = workspace
+        bind_pause_state_path(workspace.artifact_path(f"pause_state/{workspace.job_id}.json"))
         self.workspace = workspace
         self.artifact_registry = artifact_registry
         self.settings = settings
@@ -807,8 +817,33 @@ class InternalStageExecutorRegistry:
                 source_sha = file_sha256(source_file)
             except (OSError, UnicodeError):
                 source_sha = ""
+        # A resume can expose both the imported Stage1 source and the local
+        # summary_file artifact.  They are allowed to point to the same paper,
+        # but the provider-facing pack must contain exactly one canonical
+        # entry per paper.  Identical duplicates are a read-side merge; a
+        # conflicting duplicate stays fail-closed.
+        deduplicated: list[Mapping[str, Any]] = []
+        seen_entries: dict[str, str] = {}
+        for summary in summaries:
+            paper_info = summary.get("paper_info") if isinstance(summary, Mapping) else None
+            paper_key = str(
+                (paper_info.get("canonical_paper_key") if isinstance(paper_info, Mapping) else "")
+                or (paper_info.get("doi") if isinstance(paper_info, Mapping) else "")
+                or (paper_info.get("title") if isinstance(paper_info, Mapping) else "")
+                or ""
+            ).strip()
+            summary_hash = hash_json(summary)
+            if paper_key and paper_key in seen_entries:
+                if seen_entries[paper_key] != summary_hash:
+                    raise ValueError(
+                        f"outline evidence pack has conflicting duplicate paper identity: {paper_key}"
+                    )
+                continue
+            if paper_key:
+                seen_entries[paper_key] = summary_hash
+            deduplicated.append(summary)
         pack = build_pack(
-            summaries,
+            deduplicated,
             source_ref=source_ref,
             source_ref_sha256=source_sha,
             job_id=session.context.workspace.job_id,
@@ -959,6 +994,19 @@ class InternalStageExecutorRegistry:
             )
         if not summaries:
             raise RuntimeError("Stage 1 requires a source work item or a canonical summary source")
+        if session.request.reuse_summary_files:
+            typed_flags = [
+                isinstance(item.get("stage1_reuse"), Mapping)
+                and str(item["stage1_reuse"].get("authority_kind") or "").strip()
+                == "typed_manifest"
+                for item in summaries
+            ]
+            if any(typed_flags):
+                if not all(typed_flags):
+                    raise RuntimeError(
+                        "reuse_summary_files mixed typed and legacy Stage 1 authorities"
+                    )
+                self._verify_typed_reuse_summaries(summaries)
         normalized = self._validate_summary_identity(summaries, bundle)
         generation_service = Stage1AnalysisService(
             job_id=session.context.workspace.job_id,
@@ -982,6 +1030,33 @@ class InternalStageExecutorRegistry:
             ),
             0,
         )
+
+    @staticmethod
+    def _verify_typed_reuse_summaries(
+        summaries: Sequence[Mapping[str, Any]],
+    ) -> None:
+        """Verify reusable Stage 1 authorities before accepting zero transport."""
+
+        for index, summary in enumerate(summaries):
+            metadata = summary.get("stage1_reuse")
+            if not isinstance(metadata, Mapping) or str(
+                metadata.get("authority_kind") or ""
+            ).strip() != "typed_manifest":
+                raise RuntimeError(
+                    f"reuse_summary_files[{index}] is not a typed Stage 1 manifest authority"
+                )
+            raw_binding = metadata.get("binding")
+            binding = Stage1ReusableSummaryBindingV1.from_mapping(
+                raw_binding if isinstance(raw_binding, Mapping) else None
+            )
+            authority, reason = verify_stage1_typed_manifest_authority(
+                summary,
+                binding,
+            )
+            if authority is None:
+                raise RuntimeError(
+                    f"reuse_summary_files[{index}] typed Stage 1 authority rejected: {reason}"
+                )
 
     @staticmethod
     def _positive_int(value: Any, default: int) -> int:
@@ -1043,6 +1118,14 @@ class InternalStageExecutorRegistry:
         capability = resolve_model_capability(api_config)
         model_context_limit = self._positive_int(api_config.get("max_context_tokens"), 128_000)
         max_output_tokens = self._positive_int(api_config.get("max_output_tokens"), 4_096)
+        # Evidence critique receives the largest request in the current v3
+        # graph because it sees all candidate outputs.  Keep the generator
+        # budget at the configured 32k, but cap this critique role at 16k:
+        # observed evidence critiques are only a few thousand tokens, while
+        # the lower reserve materially reduces gateway pre-charge and timeout
+        # risk without changing the evidence input or contract.
+        if role == "evidence_critique":
+            max_output_tokens = min(max_output_tokens, 16_000)
         profile = ProviderContextProfile.conservative(
             provider=capability.provider_family,
             model=model,
@@ -1211,7 +1294,7 @@ class InternalStageExecutorRegistry:
         if not isinstance(final_payload, Mapping):
             raise RuntimeError("Outline v3 final outline payload is missing")
         artifact_refs: list[StageArtifactRef] = []
-        for node_id in ("final_outline", "coverage_audit", "stability_audit", "provider_receipt_closure", "stage_health"):
+        for node_id in ("outline_content_layers", "semantic_chunk_plan", "final_outline", "coverage_audit", "stability_audit", "provider_receipt_closure", "stage_health"):
             record = session.context.registry.get(f"outline-v3:{node_id}")
             if record is not None and record.status == "ready":
                 artifact_refs.append(self.bridge._artifact_ref_from_record(record))
@@ -1595,6 +1678,27 @@ class AgentRuntimeBridge:
         has_f1_corpus_binding = isinstance(
             self.job_spec.metadata.get("f1_corpus_binding"), Mapping
         )
+        if (
+            _typed_reuse_manifest_mode(list(request.reuse_summary_files))
+            and not str(request.pdf_folder or "").strip()
+            and not has_f1_corpus_binding
+        ):
+            # A reusable manifest is already the Stage 1 source authority.
+            # Building a Zotero/direct bundle here would make the reuse
+            # contract ineffective and may start PDF preprocessing before
+            # typed-manifest verification. Keep this path zero-transport;
+            # _execute_analyze verifies every manifest before accepting it.
+            return SourceBundle(
+                source_mode=request.source_mode,
+                project_name=self.job_spec.project_name,
+                paper_work_items=[],
+                source_snapshot={
+                    "canonical_ready": True,
+                    "summary_only": True,
+                    "reuse_only_stage1": True,
+                    "summary_sources": list(summary_sources),
+                },
+            )
         if (
             request.action not in {"analyze", "run_all", "retry_failed"}
             and summary_sources
