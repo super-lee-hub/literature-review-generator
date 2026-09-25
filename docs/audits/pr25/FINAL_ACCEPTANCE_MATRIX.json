@@ -134,6 +134,7 @@
       "preflight_artifact_type": "outline_preflight_rejection",
       "current_executable_sha": "97e6001368c948a1d36a16b900da6d74e3dba95e",
       "estimated_semantic_topic_calls": 220,
+      "estimated_total_provider_calls": 240,
       "claim_boundary_split": true,
       "claim_ids_preserved": true
     },

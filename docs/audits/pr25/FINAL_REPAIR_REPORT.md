@@ -116,8 +116,9 @@ reached the configured gateway, which returned Cloudflare HTTP 524. That
 attempt is retained as historical external evidence. On the current
 executable, complete dossier/study/claim/locator materialization is restored
 and large papers split at study/claim boundaries without dropping claim IDs.
-The complete R1 plan now estimates 220 semantic topic calls before cross/global
-work, exceeding the authorized 24-call limit, and stops before transport with
+The complete R1 plan now estimates 220 semantic topic calls and 240 total
+provider calls before the downstream cross/global/review work, exceeding the
+authorized 24-call limit, and stops before transport with
 `max_provider_calls_exceeded`. This is the correct current internal boundary:
 no paid request is made with incomplete evidence, but R1 is not READY until a
 valid within-budget execution design or an authorized budget change exists.
