@@ -1680,6 +1680,7 @@ class AgentRuntimeBridge:
         )
         if (
             _typed_reuse_manifest_mode(list(request.reuse_summary_files))
+            and not str(request.pdf_folder or "").strip()
             and not has_f1_corpus_binding
         ):
             # A reusable manifest is already the Stage 1 source authority.

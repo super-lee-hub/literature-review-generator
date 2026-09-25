@@ -301,8 +301,11 @@ class JobRunner:
         # not resolve a source bundle before their authority is checked: a
         # Zotero bundle can otherwise start PDF preprocessing even when the
         # job contract requests source transport ``never``.
-        reuse_only_stage1 = _typed_reuse_manifest_mode(
-            [str(item) for item in request.reuse_summary_files]
+        reuse_only_stage1 = bool(
+            _typed_reuse_manifest_mode(
+                [str(item) for item in request.reuse_summary_files]
+            )
+            and not str(request.pdf_folder or "").strip()
         )
         if (
             request.source_mode == "direct"
