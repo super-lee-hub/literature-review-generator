@@ -146,6 +146,18 @@
       "canonical_ready": false
     }
   },
+  "defect_disposition": {
+    "F01": "FIXED_ON_BRANCH_UNMERGED",
+    "F02": "PARTIAL_R1_BLOCKED_BEFORE_PAID_EXECUTION",
+    "F03": "FIXED_FAIL_CLOSED",
+    "F04": "PARTIAL_DOWNSTREAM_R1_UNVERIFIED",
+    "F05": "UNVERIFIED",
+    "F06": "FIXED_REGRESSION_SCOPE",
+    "F07": "FIXED_REGRESSION_SCOPE",
+    "F08": "FIXED_REGRESSION_SCOPE",
+    "F09": "FIXED_REGRESSION_SCOPE",
+    "R01_R14": "UNVERIFIED_ONE_BY_ONE_ON_FINAL_EXECUTABLE"
+  },
   "safety": {
     "external_provider_posts_in_local_tests": 0,
     "credentials_or_private_full_text_committed": false,

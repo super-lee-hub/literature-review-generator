@@ -149,3 +149,22 @@ for the active Python 3.13 environment. PDF/DOCX/export focused tests passed
   objects while committing. The commit and remote read-back succeeded; the
   repository object-health warning should be repaired separately without
   rewriting user history.
+
+## Current defect disposition
+
+| Finding | Current disposition | Evidence boundary |
+|---|---|---|
+| F01 version identity split | Fixed on this branch | PR24 baseline and PR25 executable SHA are recorded; PRs remain unmerged. |
+| F02 planned-only semantic nodes | Partially fixed | Real semantic DAG paths exist; R1 complete-evidence admission blocks before paid execution. |
+| F03 plan/request budget mismatch | Fixed fail-closed | Complete request builder is estimated before transport; R1 records a machine-readable budget rejection. |
+| F04 truncated navigation used as facts | Partially fixed | Topic requests materialize complete units; later canonical adoption remains unverified for R1. |
+| F05 template-polluted grouping | Unverified | No full hostile R1 grouping adjudication was completed. |
+| F06 relation proposition mismatch | Fixed in regression scope | Relation comparability tests pass; R1 substantive relation adjudication was not executed. |
+| F07 deferred marked rejected | Fixed in regression scope | Decision-state tests pass; R1 live relation results are absent. |
+| F08 retry/closure conflict | Fixed in regression scope | Receipt/replay/closure suites pass. |
+| F09 repair identity/adoption | Fixed in regression scope | Revision and identity tests pass; no R1 adopted candidate exists. |
+
+The historical R01-R14 findings were not independently re-audited one by one
+on the final executable; they remain `UNVERIFIED` unless covered by the fresh
+tests above. This prevents historical PASS labels from being reused as current
+acceptance evidence.
