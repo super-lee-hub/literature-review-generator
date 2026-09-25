@@ -571,6 +571,39 @@ def test_complete_topic_unit_splits_claims_without_loss(tmp_path: Path) -> None:
     assert all(chunk.get("chunk_complete_for_study") is True for chunk in chunks)
 
 
+def test_semantic_provider_output_rejects_unknown_evidence_identity(
+    tmp_path: Path,
+) -> None:
+    executor = _executor(tmp_path, stability_mode="off")
+    request = {
+        "topics": [{"topic_id": "topic:one"}],
+        "evidence_units": [
+            {
+                "paper_key": "paper-a",
+                "study_units": [{"study_id": "study-a"}],
+                "claims": [{"claim_id": "claim-a"}],
+                "evidence_ids_by_field": {"findings": ["evidence-a"]},
+                "evidence_text_by_id": {"evidence-a": "finding"},
+            }
+        ],
+    }
+
+    with pytest.raises(Exception, match="outside its evidence contract"):
+        executor._validate_semantic_provider_output(
+            "topic_synthesis_provider:batch:1",
+            request,
+            {
+                "topics": [{"topic_id": "topic:one", "paper_key": "paper-a"}],
+                "claims": [
+                    {
+                        "study_id": "study-a",
+                        "evidence_ids": ["evidence-not-supplied"],
+                    }
+                ],
+            },
+        )
+
+
 def test_outline_preflight_counts_hierarchical_relation_calls(tmp_path: Path) -> None:
     executor = _executor(
         tmp_path,

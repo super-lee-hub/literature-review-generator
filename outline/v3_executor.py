@@ -5072,7 +5072,7 @@ class OutlineV3Executor:
         route while retaining their own durable node/call identity.
         """
 
-        return self._provider_call(
+        result = self._provider_call(
             node_id,
             request,
             expect_json=True,
@@ -5083,6 +5083,102 @@ class OutlineV3Executor:
                 16_384,
             ),
         )
+        self._validate_semantic_provider_output(node_id, request, result)
+        return result
+
+    @staticmethod
+    def _validate_semantic_provider_output(
+        node_id: str,
+        request: Mapping[str, Any],
+        result: Mapping[str, Any],
+    ) -> None:
+        """Reject semantic outputs that reference identities outside input."""
+
+        allowed_papers = {
+            str(item.get("paper_key") or "")
+            for item in request.get("evidence_units") or ()
+            if isinstance(item, Mapping) and str(item.get("paper_key") or "")
+        }
+        allowed_studies: set[str] = set()
+        allowed_claims: set[str] = set()
+        allowed_evidence: set[str] = set()
+        for unit in request.get("evidence_units") or ():
+            if not isinstance(unit, Mapping):
+                continue
+            for study in unit.get("study_units") or ():
+                if not isinstance(study, Mapping):
+                    continue
+                if str(study.get("study_id") or ""):
+                    allowed_studies.add(str(study["study_id"]))
+                for claim in study.get("claims") or ():
+                    if isinstance(claim, Mapping) and str(claim.get("claim_id") or ""):
+                        allowed_claims.add(str(claim["claim_id"]))
+            for claim in unit.get("claims") or ():
+                if isinstance(claim, Mapping) and str(claim.get("claim_id") or ""):
+                    allowed_claims.add(str(claim["claim_id"]))
+            ids_by_field = unit.get("evidence_ids_by_field")
+            if isinstance(ids_by_field, Mapping):
+                allowed_evidence.update(
+                    str(value)
+                    for values in ids_by_field.values()
+                    if isinstance(values, list)
+                    for value in values
+                    if str(value)
+                )
+            text_by_id = unit.get("evidence_text_by_id")
+            if isinstance(text_by_id, Mapping):
+                allowed_evidence.update(str(value) for value in text_by_id if str(value))
+        allowed_topics = {
+            str(item.get("topic_id") or "")
+            for item in request.get("topics") or ()
+            if isinstance(item, Mapping) and str(item.get("topic_id") or "")
+        }
+        allowed_relations = {
+            str(item.get("relation_id") or "")
+            for item in request.get("relation_candidates") or ()
+            if isinstance(item, Mapping) and str(item.get("relation_id") or "")
+        }
+        unknown: list[str] = []
+
+        def walk(value: Any, path: str = "") -> None:
+            if isinstance(value, Mapping):
+                for key, child in value.items():
+                    key_text = str(key)
+                    child_path = f"{path}.{key_text}" if path else key_text
+                    if key_text in {"paper_key", "canonical_paper_key"} and str(child):
+                        if allowed_papers and str(child) not in allowed_papers:
+                            unknown.append(f"{child_path}={child}")
+                    elif key_text == "topic_id" and str(child):
+                        if allowed_topics and str(child) not in allowed_topics:
+                            unknown.append(f"{child_path}={child}")
+                    elif key_text == "relation_id" and str(child):
+                        if allowed_relations and str(child) not in allowed_relations:
+                            unknown.append(f"{child_path}={child}")
+                    elif key_text == "study_id" and str(child):
+                        if allowed_studies and str(child) not in allowed_studies:
+                            unknown.append(f"{child_path}={child}")
+                    elif key_text in {"evidence_id", "evidence_ids"}:
+                        values = child if isinstance(child, list) else [child]
+                        for item in values:
+                            if str(item) and allowed_evidence and str(item) not in allowed_evidence:
+                                unknown.append(f"{child_path}={item}")
+                    elif key_text == "claim_id" and str(child):
+                        # Synthesized claim IDs are a separate namespace; only
+                        # source claim IDs are checked when the provider uses
+                        # an existing claim identity.
+                        if str(child) in allowed_claims:
+                            pass
+                    walk(child, child_path)
+            elif isinstance(value, list):
+                for index, child in enumerate(value):
+                    walk(child, f"{path}[{index}]")
+
+        walk(result)
+        if unknown:
+            raise OutlineV3ExecutionError(
+                f"{node_id} returned identities outside its evidence contract: "
+                + "; ".join(sorted(set(unknown))[:20])
+            )
 
     @staticmethod
     def _semantic_receipt_node_id(node_id: str) -> str:
