@@ -10,9 +10,9 @@
   },
   "identity": {
     "base_sha": "bf00852fb627ac0519d96287d2d27b36f17a99ea",
-  "executable_sha": "2627f1ca97a445f8a46d7996bb8665b67a7adcdd",
+  "executable_sha": "6d040ebbff4ef81f06c63e7ab9808cd3c790a674",
     "remote_branch": "codex/r1-outline-final-repair",
-  "remote_executable_sha_readback": "2627f1ca97a445f8a46d7996bb8665b67a7adcdd",
+  "remote_executable_sha_readback": "6d040ebbff4ef81f06c63e7ab9808cd3c790a674",
     "pr": "https://github.com/super-lee-hub/literature-review-generator/pull/25",
     "existing_pr_24": "https://github.com/super-lee-hub/literature-review-generator/pull/24",
     "merge_status": "UNMERGED"
@@ -164,7 +164,7 @@
       "transport_before_block": 0,
       "reason": "complete study/claim units are preserved, but the resulting plan estimates 220 semantic topic calls and 240 total provider calls over the authorized 24-call limit",
       "preflight_artifact_type": "outline_preflight_rejection",
-      "current_executable_sha": "2627f1ca97a445f8a46d7996bb8665b67a7adcdd",
+      "current_executable_sha": "6d040ebbff4ef81f06c63e7ab9808cd3c790a674",
       "estimated_semantic_topic_calls": 220,
       "estimated_total_provider_calls": 240,
       "claim_boundary_split": true,
