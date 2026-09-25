@@ -10,9 +10,9 @@
   },
   "identity": {
     "base_sha": "bf00852fb627ac0519d96287d2d27b36f17a99ea",
-    "executable_sha": "50291a135d03b9e6fdcadb2a61099b021fe6c883",
+    "executable_sha": "5220d1f24e5fd7881b4f66d4b7151cb9e6be8993",
     "remote_branch": "codex/r1-outline-final-repair",
-    "remote_executable_sha_readback": "50291a135d03b9e6fdcadb2a61099b021fe6c883",
+    "remote_executable_sha_readback": "5220d1f24e5fd7881b4f66d4b7151cb9e6be8993",
     "pr": "https://github.com/super-lee-hub/literature-review-generator/pull/25",
     "existing_pr_24": "https://github.com/super-lee-hub/literature-review-generator/pull/24",
     "merge_status": "UNMERGED"
@@ -36,7 +36,13 @@
     {
       "id": "outline_semantic_execution",
       "status": "PASS",
-      "count": 33
+      "count": 33,
+      "extra_regressions": {
+        "complete_dossier_topic_unit": 1,
+        "multi_target_revision": 1,
+        "positive_budget_targets": 4,
+        "http_524": 1
+      }
     },
     {
       "id": "outline_replay_invalidation",
@@ -61,13 +67,13 @@
     {
       "id": "hosted_ci_pr25",
       "status": "IN_PROGRESS",
-      "run": "https://github.com/super-lee-hub/literature-review-generator/actions/runs/36019794054",
+      "run": "https://github.com/super-lee-hub/literature-review-generator/actions/runs/36092135295",
       "last_green_executable_ancestor": "https://github.com/super-lee-hub/literature-review-generator/actions/runs/36008867733"
     },
     {
       "id": "r1_live_provider_outline",
       "status": "BLOCKED_BUDGET",
-      "reason": "Stage1 typed reuse passes with zero Stage1/MinerU transport; complete dossier/study/claim/locator materialization blocks before the first provider post because an indivisible paper unit exceeds the 32k effective cap. An earlier compact-projection attempt reached the gateway and recorded Cloudflare HTTP 524; that is historical external evidence, not current acceptance."
+      "reason": "Current executable materializes complete dossier/study/claim/locator units and stops before transport when an indivisible R1 unit exceeds 32k. Historical compact attempt reached api.yhlxj.ai and recorded HTTP 524."
     },
     {
       "id": "r1_writer_validator_repair",
@@ -102,7 +108,7 @@
     "template_credential_section_count": 0,
     "template_credential_sections": [],
     "external_host_acknowledgement_expires_at": "2026-09-25T12:24:57.513479Z",
-    "blocker": "complete evidence budget admission blocks R1 before provider transport; external 524 retained as prior compact-attempt evidence",
+    "blocker": "complete evidence budget admission blocks R1 before provider transport; normal config migration now passes; historical compact attempt 524 remains separately recorded",
     "credential_source": ".env",
     "credential_value_readback": "allowlisted nonempty fields only; values withheld"
   },
@@ -124,7 +130,9 @@
       "effective_input_cap_tokens": 32000,
       "max_provider_calls": 24,
       "transport_before_block": 0,
-      "reason": "an indivisible complete dossier/study/claim unit exceeds effective input cap"
+      "reason": "an indivisible complete dossier/study/claim unit exceeds effective input cap",
+      "preflight_artifact_type": "outline_preflight_rejection",
+      "current_executable_sha": "5220d1f24e5fd7881b4f66d4b7151cb9e6be8993"
     },
     "historical_compact_attempt": {
       "status": "BLOCKED_EXTERNAL",

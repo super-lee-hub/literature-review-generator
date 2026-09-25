@@ -3,7 +3,7 @@
 This branch implements the repair plan against PR #24's hardening head
 `bf00852fb627ac0519d96287d2d27b36f17a99ea`.
 
-The current executable code commit is `50291a135d03b9e6fdcadb2a61099b021fe6c883`.
+The current executable code commit is `5220d1f24e5fd7881b4f66d4b7151cb9e6be8993`.
 The remote branch is `codex/r1-outline-final-repair`; PR #25 is open and
 unmerged. PR #24 remains open and unmerged.
 
@@ -71,6 +71,10 @@ unmerged. PR #24 remains open and unmerged.
   outputs and cross-group artifact before constructing downstream requests;
   summary-order stability and route-only replay now use canonical paper order
   and equivalent provider-visible projections.
+- Selected-candidate repairs now record typed per-target outcomes
+  (`changed`, `already_satisfied`, `unresolved`, or `failed`) and reject a
+  recommendation when any required target remains unresolved. The revised
+  candidate hash is persisted with a post-revision verification record.
 - `reviewctl config-migrate` now removes obsolete GPT route sections, migrates
   their `OutlineModels` references to `Backup_Reader_API`, and removes the
   unsupported Writer fallback key. The user's config was migrated with an
@@ -98,6 +102,8 @@ Fresh local checks on this code commit:
 - Windows CI failures were reproduced locally and repaired: the invalidation
   and routed replay files now pass locally (`18 passed` combined), and the
   complete dossier request regression passes.
+- Config migration regression: `26 passed`; local HTTP 524 evidence regression:
+  `1 passed`; positive technical targets 0/24k/32k/50k: `4 passed`.
 
 The authorized R1 execution evidence has two distinct boundaries. The reuse-only
 run reused all 63 typed manifests with `STAGE1_AUTHORITY_READY=true` and made
