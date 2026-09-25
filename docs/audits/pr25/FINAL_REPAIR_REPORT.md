@@ -3,7 +3,7 @@
 This branch implements the repair plan against PR #24's hardening head
 `bf00852fb627ac0519d96287d2d27b36f17a99ea`.
 
-The current executable code commit is `be68e36768d478beb05ef22b63023aba49dc5fb4`.
+The current executable code commit is `50291a135d03b9e6fdcadb2a61099b021fe6c883`.
 The remote branch is `codex/r1-outline-final-repair`; PR #25 is open and
 unmerged. PR #24 remains open and unmerged.
 
@@ -63,6 +63,18 @@ unmerged. PR #24 remains open and unmerged.
   value. Topic units split only at paper boundaries when the effective input
   cap requires it. Candidate and critique output caps are enforced at both
   planning and transport.
+- Semantic provider topic requests now materialize complete dossier units,
+  including study units, claim modality, evidence IDs, source locators,
+  qualifiers and null findings. A genuinely oversized unit blocks admission
+  before paid transport instead of being replaced with a hash-only reference.
+- Cross/group/global/candidate cache reuse rehydrates the persisted provider
+  outputs and cross-group artifact before constructing downstream requests;
+  summary-order stability and route-only replay now use canonical paper order
+  and equivalent provider-visible projections.
+- `reviewctl config-migrate` now removes obsolete GPT route sections, migrates
+  their `OutlineModels` references to `Backup_Reader_API`, and removes the
+  unsupported Writer fallback key. The user's config was migrated with an
+  automatic backup and the ordinary preflight now passes using `.env` fields.
 
 ## Verification
 
@@ -83,17 +95,22 @@ Fresh local checks on this code commit:
 - Typed reuse admission regression: 1 passed; Stage 1 reuse regression group:
   2 passed; changed-file Pyright/Ruff remained clean after the final compact
   projection changes.
+- Windows CI failures were reproduced locally and repaired: the invalidation
+  and routed replay files now pass locally (`18 passed` combined), and the
+  complete dossier request regression passes.
 
-The authorized R1 execution evidence is now concrete. The reuse-only run
-reused all 63 typed manifests with `STAGE1_AUTHORITY_READY=true` and made zero
-Stage 1/MinerU calls. The compact Outline preflight reached
-`estimated_provider_calls=21`, `semantic_synthesis_calls_reserved=14`, and
-the route's 32k input cap without a budget rejection. A local 63-paper fake
-provider reached the late Outline quality gate with 22 receipts before it
-blocked its deliberately empty semantic fixture. The real provider attempt
-then reached the first topic call but the configured `api.yhlxj.ai` gateway
-returned Cloudflare HTTP 524 after waiting; this is an external transport
-blocker, not a PASS for Writer/Validator/DOCX.
+The authorized R1 execution evidence has two distinct boundaries. The reuse-only
+run reused all 63 typed manifests with `STAGE1_AUTHORITY_READY=true` and made
+zero Stage 1/MinerU calls. Under the earlier compact projection, the Outline
+preflight reached `estimated_provider_calls=21` and a real topic request
+reached the configured gateway, which returned Cloudflare HTTP 524. That
+attempt is retained as historical external evidence. On the current
+executable, complete dossier/study/claim/locator materialization is restored;
+the same R1 run now stops before transport with an explicit
+`BLOCKED_BUDGET: ... paper ... exceeds effective input cap` result. This is the
+correct current internal boundary: no paid request is made with incomplete
+evidence, but R1 is not READY until a valid within-budget execution design or
+an authorized budget change exists.
 
 The environment-wide `pip check` is now clean after installing `pypdf 6.19.0`
 for the active Python 3.13 environment. PDF/DOCX/export focused tests passed
@@ -101,16 +118,17 @@ for the active Python 3.13 environment. PDF/DOCX/export focused tests passed
 
 ## Remaining acceptance boundaries
 
-- The real R1 provider route is externally blocked by the gateway timeout
-  described above. Writer, Validator/repair, citation verification, DOCX
-  export, and GUI parity therefore remain `NOT_VERIFIED`; no artifact is
-  promoted to `canonical_ready`.
+- Current R1 is blocked internally by the complete-evidence 32k/24-call
+  admission gate. The earlier gateway timeout remains recorded separately.
+  Writer, Validator/repair, citation verification, DOCX export, and GUI parity
+  therefore remain `NOT_VERIFIED`; no artifact is promoted to
+  `canonical_ready`.
 - The historical R1 spec was machine-checked read-only: 63 typed
   `stage1_reusable_summary_manifest/v1` files exist and decode with 63 unique
-  paper keys. The original `D:\\auto-generate\\config.ini` still contains
-  legacy sections rejected by the current loader, so the live attempt used a
-  schema-normalized config outside the repository. Credentials were resolved
-  from the authorized `D:\\auto-generate\\.env`; values were not printed or
+  paper keys. The original `D:\\auto-generate\\config.ini` was migrated by
+  the supported `reviewctl config-migrate` command with a timestamped backup;
+  ordinary `reviewctl preflight` now passes. Credentials were resolved from
+  the authorized `D:\\auto-generate\\.env`; values were not printed or
   committed. A fresh external-host acknowledgement was used for the attempt.
 - F1 remains an independent regression corpus and is `UNACCEPTED`; no R1
   evidence is promoted to F1.

@@ -10,9 +10,9 @@
   },
   "identity": {
     "base_sha": "bf00852fb627ac0519d96287d2d27b36f17a99ea",
-    "executable_sha": "be68e36768d478beb05ef22b63023aba49dc5fb4",
+    "executable_sha": "50291a135d03b9e6fdcadb2a61099b021fe6c883",
     "remote_branch": "codex/r1-outline-final-repair",
-    "remote_executable_sha_readback": "be68e36768d478beb05ef22b63023aba49dc5fb4",
+    "remote_executable_sha_readback": "50291a135d03b9e6fdcadb2a61099b021fe6c883",
     "pr": "https://github.com/super-lee-hub/literature-review-generator/pull/25",
     "existing_pr_24": "https://github.com/super-lee-hub/literature-review-generator/pull/24",
     "merge_status": "UNMERGED"
@@ -61,23 +61,23 @@
     {
       "id": "hosted_ci_pr25",
       "status": "IN_PROGRESS",
-      "run": "https://github.com/super-lee-hub/literature-review-generator/actions/runs/36019060807",
-      "last_green_executable_ancestor": "https://github.com/super-lee-hub/literature-review-generator/actions/runs/35956150052"
+      "run": "https://github.com/super-lee-hub/literature-review-generator/actions/runs/36019794054",
+      "last_green_executable_ancestor": "https://github.com/super-lee-hub/literature-review-generator/actions/runs/36008867733"
     },
     {
       "id": "r1_live_provider_outline",
-      "status": "BLOCKED_EXTERNAL",
-      "reason": "Stage1 typed reuse passed with zero Stage1/MinerU transport; compact Outline preflight passed at 21 estimated calls and 14 semantic calls, but the first real topic provider call was blocked by api.yhlxj.ai Cloudflare HTTP 524. No canonical outline was adopted."
+      "status": "BLOCKED_BUDGET",
+      "reason": "Stage1 typed reuse passes with zero Stage1/MinerU transport; complete dossier/study/claim/locator materialization blocks before the first provider post because an indivisible paper unit exceeds the 32k effective cap. An earlier compact-projection attempt reached the gateway and recorded Cloudflare HTTP 524; that is historical external evidence, not current acceptance."
     },
     {
       "id": "r1_writer_validator_repair",
       "status": "NOT_VERIFIED",
-      "reason": "Not reached because the real Outline provider route timed out before a current outline was adopted"
+      "reason": "Not reached: current Outline is BLOCKED_BUDGET before provider transport"
     },
     {
       "id": "r1_citation_docx_export_gui",
       "status": "NOT_VERIFIED",
-      "reason": "Not reached because Writer/Validator require a current adopted Outline"
+      "reason": "Not reached: no current adopted Outline"
     },
     {
       "id": "f1_independent_regression",
@@ -92,17 +92,17 @@
     "typed_manifest_artifact_type": "stage1_reusable_summary_manifest/v1",
     "unique_paper_key_count": 63,
     "manifest_decode_errors": 0,
-    "config_file": "R1_CONFIG_NORMALIZED_32K.ini",
+    "config_file": "config.ini",
     "config_present_in_current_acceptance_input": true,
-    "config_path": "D:/auto-generate/R1_CONFIG_NORMALIZED_32K.ini",
-    "config_loader_status": "PASS_WITH_ENV_CREDENTIALS",
+    "config_path": "D:/auto-generate/config.ini",
+    "config_loader_status": "PASS_AFTER_SUPPORTED_MIGRATION",
     "config_loader_blockers": [
       "legacy Outline_GPT_* sections/keys are unsupported"
     ],
     "template_credential_section_count": 0,
     "template_credential_sections": [],
     "external_host_acknowledgement_expires_at": "2026-09-25T12:24:57.513479Z",
-    "blocker": "external provider gateway timeout after first topic request; original config.ini remains legacy-schema invalid and is not used by the normalized live attempt",
+    "blocker": "complete evidence budget admission blocks R1 before provider transport; external 524 retained as prior compact-attempt evidence",
     "credential_source": ".env",
     "credential_value_readback": "allowlisted nonempty fields only; values withheld"
   },
@@ -119,17 +119,17 @@
       "stage1_provider_calls": 0,
       "mineru_transport_calls": 0
     },
-    "compact_outline_preflight": {
-      "status": "PASS",
+    "complete_evidence_outline_admission": {
+      "status": "BLOCKED_BUDGET",
+      "effective_input_cap_tokens": 32000,
+      "max_provider_calls": 24,
+      "transport_before_block": 0,
+      "reason": "an indivisible complete dossier/study/claim unit exceeds effective input cap"
+    },
+    "historical_compact_attempt": {
+      "status": "BLOCKED_EXTERNAL",
       "estimated_provider_calls": 21,
       "semantic_synthesis_calls_reserved": 14,
-      "max_provider_calls": 24,
-      "effective_input_cap_tokens": 32000,
-      "transport_before_preflight": 0
-    },
-    "real_provider_attempt": {
-      "status": "BLOCKED_EXTERNAL",
-      "first_stage": "topic_synthesis",
       "gateway": "api.yhlxj.ai",
       "error": "Cloudflare HTTP 524 timeout",
       "canonical_ready": false
@@ -140,6 +140,7 @@
     "credentials_or_private_full_text_committed": false,
     "pr24_merged": false,
     "pr25_merged": false,
-    "r1_provider_attempted": true
+    "r1_provider_attempted": true,
+    "complete_evidence_transport_before_budget_block": 0
   }
 }
