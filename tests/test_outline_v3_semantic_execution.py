@@ -520,6 +520,27 @@ def test_outline_preflight_counts_hierarchical_relation_calls(tmp_path: Path) ->
     )
 
 
+@pytest.mark.parametrize("target_tokens", [0, 24_000, 32_000, 50_000])
+def test_outline_preflight_positive_targets_use_effective_cap(
+    tmp_path: Path,
+    target_tokens: int,
+) -> None:
+    executor = _executor(
+        tmp_path / str(target_tokens),
+        stability_mode="off",
+        technical_shard_target_tokens=target_tokens,
+        max_source_prompt_tokens=32_000,
+    )
+    executor._preflight_stability_budget()
+
+    assert executor.stability_preflight["preflight_status"] == "accepted"
+    transport_plans = [
+        item for item in executor.provider_call_plans if item.transport_expected
+    ]
+    assert transport_plans
+    assert max(item.estimated_input_tokens for item in transport_plans) <= 32_000
+
+
 def test_hierarchical_relation_adjudication_emits_local_and_cross_shard_calls(
     tmp_path: Path,
 ) -> None:

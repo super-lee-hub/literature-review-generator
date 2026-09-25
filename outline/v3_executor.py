@@ -2442,6 +2442,59 @@ class OutlineV3Executor:
                 )
         return tuple(plans)
 
+    def _persist_preflight_rejection(
+        self,
+        *,
+        rejection_reason: str,
+        diagnostic: str,
+    ) -> None:
+        """Persist a machine-readable admission rejection before transport."""
+
+        payload = {
+            "artifact_type": "outline_preflight_rejection",
+            "artifact_version": "v1",
+            "job_id": self.job_id,
+            "stage_name": "outline_v3",
+            "closure_epoch_id": self.closure_epoch_id,
+            "logical_attempt_identity": self.logical_attempt_identity,
+            "mode": self.stability_mode,
+            "provider_call_plans": [item.to_dict() for item in self.provider_call_plans],
+            "max_provider_calls": self.max_provider_calls,
+            "max_source_prompt_tokens": self.max_source_prompt_tokens,
+            "technical_shard_target_tokens": self.technical_shard_target_tokens,
+            "estimated_provider_calls": None,
+            "semantic_synthesis_calls_reserved": None,
+            "estimated_total_tokens": None,
+            "preflight_status": "rejected",
+            "rejection_reason": rejection_reason,
+            "diagnostic": diagnostic,
+            "transport_posts_emitted": 0,
+            "content_projection": "complete_dossier_study_claim_unit_v1",
+        }
+        self.stability_preflight = payload
+        path = self._path(
+            f"outline_v3/stability/stability_preflight_{self.closure_epoch_id[:24]}.json"
+        )
+        record = publish_json_artifact(
+            self.publication_context,
+            self.registry,
+            path,
+            payload,
+            artifact_role="outline_preflight_rejection",
+            artifact_type="outline_preflight_rejection",
+            artifact_version="v1",
+            producer="outline.v3_executor.OutlineV3Executor",
+            artifact_id=f"outline-v3:preflight_rejection:{self.closure_epoch_id[:24]}",
+            metadata={
+                "job_id": self.job_id,
+                "closure_epoch_id": self.closure_epoch_id,
+                "provider_call_plan_hash": hash_json(payload["provider_call_plans"]),
+                "rejection_reason": rejection_reason,
+            },
+        )
+        self.artifact_paths["provider_call_plan"] = record.path
+        self.artifact_records["provider_call_plan"] = record
+
     def _preflight_stability_budget(self) -> None:
         core_calls = len(self._provider_node_ids())
         self.provider_call_plans = self._build_provider_call_plans()
@@ -2467,10 +2520,17 @@ class OutlineV3Executor:
             # batch carries complete values for the route's semantic fields
             # plus Registry-bound hashes for the remaining dossier fields;
             # cross-group and global synthesis add two calls.
-            semantic_topic_batches = self._topic_provider_batch_count(
-                self.summaries,
-                semantic_route.profile,
-            )
+            try:
+                semantic_topic_batches = self._topic_provider_batch_count(
+                    self.summaries,
+                    semantic_route.profile,
+                )
+            except OutlineV3ExecutionError as exc:
+                self._persist_preflight_rejection(
+                    rejection_reason="complete_evidence_unit_exceeds_effective_input_cap",
+                    diagnostic=str(exc),
+                )
+                raise
             semantic_synthesis_calls = semantic_topic_batches + 2
             semantic_output = min(max(1, int(semantic_route.profile.max_output_tokens)), 4096)
             semantic_reasoning = max(0, int(semantic_route.profile.reasoning_reserve))
