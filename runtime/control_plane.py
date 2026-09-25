@@ -4329,24 +4329,9 @@ class ReviewControlPlane:
         spec_path = _persisted_runtime_spec_path(resolved, registry)
         if not spec_path.is_file():
             raise ControlPlaneError(f"persisted runtime spec is missing: {spec_path}")
-        outline_resume_plan: dict[str, Any] | None = None
-        try:
-            node_store = OutlineNodeStore(workspace_obj, registry)
-            dag = node_store.load()
-            if dag is not None and dag.failed_node_ids:
-                _updated, plan = node_store.resume()
-                outline_resume_plan = plan.to_dict()
-        except (OSError, ValueError, TypeError, RegistryError) as exc:
-            raise ControlPlaneError(f"Outline v3 resume planning is blocked: {exc}") from exc
-        try:
-            cancel_store = CancellationRequestStore(workspace_obj, registry)
-            if cancel_store.is_requested():
-                cancel_store.clear(cleared_by="reviewctl", reason="resume_requested")
-        except (OSError, RegistryError, ValueError, TypeError) as exc:
-            raise ControlPlaneError(f"resume cancellation state is invalid: {exc}") from exc
-        # Validate the persisted runtime identity before clearing a user pause.
-        # A malformed/stale spec or fingerprint must leave the job paused so a
-        # rejected resume cannot accidentally reopen provider admission.
+        # Validate the persisted runtime identity before mutating any resume
+        # state. A malformed/stale spec or fingerprint must leave the DAG,
+        # cancellation request, and pause marker untouched.
         try:
             from dataclasses import replace
 
@@ -4364,6 +4349,21 @@ class ReviewControlPlane:
             )
         except (OSError, RegistryError, ValueError, TypeError, RuntimeError) as exc:
             raise ControlPlaneError(f"resume identity preflight is invalid: {exc}") from exc
+        outline_resume_plan: dict[str, Any] | None = None
+        try:
+            node_store = OutlineNodeStore(workspace_obj, registry)
+            dag = node_store.load()
+            if dag is not None and dag.failed_node_ids:
+                _updated, plan = node_store.resume()
+                outline_resume_plan = plan.to_dict()
+        except (OSError, ValueError, TypeError, RegistryError) as exc:
+            raise ControlPlaneError(f"Outline v3 resume planning is blocked: {exc}") from exc
+        try:
+            cancel_store = CancellationRequestStore(workspace_obj, registry)
+            if cancel_store.is_requested():
+                cancel_store.clear(cleared_by="reviewctl", reason="resume_requested")
+        except (OSError, RegistryError, ValueError, TypeError) as exc:
+            raise ControlPlaneError(f"resume cancellation state is invalid: {exc}") from exc
         try:
             pause_store = PauseStateStore(workspace_obj, registry)
             pause_state = pause_store.read()

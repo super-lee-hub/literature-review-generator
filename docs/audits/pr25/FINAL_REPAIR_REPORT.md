@@ -37,7 +37,8 @@ unmerged. PR #24 remains open and unmerged.
   the runtime provider admission context, including Stage 1/Writer/Validator
   provider runtimes.
 - Public resume now validates the persisted normalized spec and fingerprint
-  before clearing a pause marker; a rejected resume preserves the paused state.
+  before mutating DAG resume state, cancellation, or pause markers; a rejected
+  resume preserves all three control boundaries.
 - Fixed the hidden timeout hostname override, MinerU page-index JSON
   classification, and retained the PR baseline's binary/ZIP size limits,
   NULL-parent Zotero handling, and terminal MinerU error propagation.

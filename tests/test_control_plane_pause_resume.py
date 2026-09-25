@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from runtime.control_plane import ControlPlaneError, ReviewControlPlane
+from runtime.cancellation import CancellationRequestStore
 from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec, save_runtime_job_spec
 from runtime.orchestrator import AgentRuntimeBridge
 from runtime.pause_state import PauseStateStore
@@ -72,6 +73,8 @@ def test_public_resume_rejection_keeps_job_paused(tmp_path: Path) -> None:
     opened_workspace, opened_registry = AgentRuntimeRunner._open_workspace(workspace.root_dir)
     state = PauseStateStore(opened_workspace, opened_registry).read()
     assert state is not None and state.paused
+    cancellation = CancellationRequestStore(opened_workspace, opened_registry)
+    cancellation.request(requested_by="tests.public_pause_resume", reason="keep until valid resume")
 
     with pytest.raises(ControlPlaneError, match="resume identity preflight"):
         control.resume(workspace=workspace.root_dir)
@@ -79,3 +82,4 @@ def test_public_resume_rejection_keeps_job_paused(tmp_path: Path) -> None:
     reopened_workspace, reopened_registry = AgentRuntimeRunner._open_workspace(workspace.root_dir)
     state_after = PauseStateStore(reopened_workspace, reopened_registry).read()
     assert state_after is not None and state_after.paused
+    assert CancellationRequestStore(reopened_workspace, reopened_registry).is_requested()
