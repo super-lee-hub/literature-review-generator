@@ -10,9 +10,9 @@
   },
   "identity": {
     "base_sha": "bf00852fb627ac0519d96287d2d27b36f17a99ea",
-  "executable_sha": "8cb596a1878d2b5c037f5a62d5fc7f5d5450eeea",
+    "executable_sha": "97e6001368c948a1d36a16b900da6d74e3dba95e",
     "remote_branch": "codex/r1-outline-final-repair",
-  "remote_executable_sha_readback": "8cb596a1878d2b5c037f5a62d5fc7f5d5450eeea",
+    "remote_executable_sha_readback": "97e6001368c948a1d36a16b900da6d74e3dba95e",
     "pr": "https://github.com/super-lee-hub/literature-review-generator/pull/25",
     "existing_pr_24": "https://github.com/super-lee-hub/literature-review-generator/pull/24",
     "merge_status": "UNMERGED"
@@ -67,13 +67,13 @@
     {
       "id": "hosted_ci_pr25",
       "status": "IN_PROGRESS",
-      "run": "https://github.com/super-lee-hub/literature-review-generator/actions/runs/36092135295",
+      "run": "https://github.com/super-lee-hub/literature-review-generator/actions/runs/36092714358",
       "last_green_executable_ancestor": "https://github.com/super-lee-hub/literature-review-generator/actions/runs/36008867733"
     },
     {
       "id": "r1_live_provider_outline",
       "status": "BLOCKED_BUDGET",
-      "reason": "Current executable materializes complete dossier/study/claim/locator units and stops before transport when an indivisible R1 unit exceeds 32k. Historical compact attempt reached api.yhlxj.ai and recorded HTTP 524."
+      "reason": "Complete dossier/study/claim/locator materialization is split at claim boundaries without loss; the R1 plan estimates 220 semantic topic calls before cross/global work, exceeding the 24-call limit, and records a preflight rejection before transport. Historical compact attempt recorded HTTP 524 separately."
     },
     {
       "id": "r1_writer_validator_repair",
@@ -108,7 +108,7 @@
     "template_credential_section_count": 0,
     "template_credential_sections": [],
     "external_host_acknowledgement_expires_at": "2026-09-25T12:24:57.513479Z",
-    "blocker": "complete evidence budget admission blocks R1 before provider transport; normal config migration now passes; historical compact attempt 524 remains separately recorded",
+    "blocker": "complete evidence plan estimates 220 semantic topic calls before cross/global work, exceeding the authorized 24-call limit; ordinary config migration and credentials pass",
     "credential_source": ".env",
     "credential_value_readback": "allowlisted nonempty fields only; values withheld"
   },
@@ -132,7 +132,10 @@
       "transport_before_block": 0,
       "reason": "an indivisible complete dossier/study/claim unit exceeds effective input cap",
       "preflight_artifact_type": "outline_preflight_rejection",
-      "current_executable_sha": "5220d1f24e5fd7881b4f66d4b7151cb9e6be8993"
+      "current_executable_sha": "97e6001368c948a1d36a16b900da6d74e3dba95e",
+      "estimated_semantic_topic_calls": 220,
+      "claim_boundary_split": true,
+      "claim_ids_preserved": true
     },
     "historical_compact_attempt": {
       "status": "BLOCKED_EXTERNAL",

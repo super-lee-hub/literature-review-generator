@@ -3,7 +3,7 @@
 This branch implements the repair plan against PR #24's hardening head
 `bf00852fb627ac0519d96287d2d27b36f17a99ea`.
 
-The current executable code commit is `8cb596a1878d2b5c037f5a62d5fc7f5d5450eeea`.
+The current executable code commit is `97e6001368c948a1d36a16b900da6d74e3dba95e`.
 The remote branch is `codex/r1-outline-final-repair`; PR #25 is open and
 unmerged. PR #24 remains open and unmerged.
 
@@ -111,12 +111,13 @@ zero Stage 1/MinerU calls. Under the earlier compact projection, the Outline
 preflight reached `estimated_provider_calls=21` and a real topic request
 reached the configured gateway, which returned Cloudflare HTTP 524. That
 attempt is retained as historical external evidence. On the current
-executable, complete dossier/study/claim/locator materialization is restored;
-the same R1 run now stops before transport with an explicit
-`BLOCKED_BUDGET: ... paper ... exceeds effective input cap` result. This is the
-correct current internal boundary: no paid request is made with incomplete
-evidence, but R1 is not READY until a valid within-budget execution design or
-an authorized budget change exists.
+executable, complete dossier/study/claim/locator materialization is restored
+and large papers split at study/claim boundaries without dropping claim IDs.
+The complete R1 plan now estimates 220 semantic topic calls before cross/global
+work, exceeding the authorized 24-call limit, and stops before transport with
+`max_provider_calls_exceeded`. This is the correct current internal boundary:
+no paid request is made with incomplete evidence, but R1 is not READY until a
+valid within-budget execution design or an authorized budget change exists.
 
 The environment-wide `pip check` is now clean after installing `pypdf 6.19.0`
 for the active Python 3.13 environment. PDF/DOCX/export focused tests passed
