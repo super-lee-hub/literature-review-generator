@@ -1340,7 +1340,7 @@ class OutlineV3Executor:
                     "projection": "registry_complete_evidence_ref_v1",
                 }
             )
-        return refs
+        return sorted(refs, key=lambda item: str(item.get("paper_key") or ""))
 
     @staticmethod
     def _compact_relation_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
@@ -6562,30 +6562,6 @@ class OutlineV3Executor:
                     "diagnostics": [] if matching else ["offline/local route retained deterministic projection; no external synthesis call was admitted"],
                 })
                 topic_payloads.append(topic_payload)
-            compact_topic_payloads = [
-                {
-                    "topic_id": str(item.get("topic_id") or ""),
-                    "paper_ids": [
-                        str(value) for value in item.get("paper_ids") or () if str(value)
-                    ],
-                    "bridge_paper_ids": [
-                        str(value)
-                        for value in item.get("bridge_paper_ids") or ()
-                        if str(value)
-                    ],
-                    "status": str(item.get("status") or ""),
-                    "provider_batch_ids": [
-                        str(value)
-                        for value in item.get("provider_batch_ids") or ()
-                        if str(value)
-                    ],
-                    "provider_outputs": list(item.get("provider_outputs") or []),
-                    "supporting_evidence_count": len(
-                        item.get("supporting_evidence_ids") or []
-                    ),
-                }
-                for item in topic_payloads
-            ]
             if topic_semantic_reused:
                 semantic_provider_results = []
             topic_synthesis = self._run_node("topic_synthesis", lambda: (
@@ -6619,6 +6595,25 @@ class OutlineV3Executor:
                 )
                 result["artifact_id"] = record.artifact_id
                 result["artifact_hash"] = record.content_hash
+            persisted_topic_results = topic_synthesis.get("provider_results")
+            persisted_topic_results = (
+                persisted_topic_results
+                if isinstance(persisted_topic_results, list)
+                else []
+            )
+            persisted_topics = topic_synthesis.get("topics")
+            persisted_topics = persisted_topics if isinstance(persisted_topics, list) else []
+            topic_result_by_id: dict[str, list[Any]] = {}
+            for result in persisted_topic_results:
+                if not isinstance(result, Mapping):
+                    continue
+                for topic_id in result.get("topic_ids") or ():
+                    topic_result_by_id.setdefault(str(topic_id), []).append(
+                        result.get("provider_output")
+                    )
+            # Rehydrate the exact completed topic outputs from the Registry
+            # artifact. A cache hit must never rebuild this context from the
+            # empty in-process provider-results list.
             semantic_topic_context = [
                 {
                     "topic_id": str(item.get("topic_id") or ""),
@@ -6635,20 +6630,23 @@ class OutlineV3Executor:
                         for value in item.get("provider_batch_ids") or ()
                         if str(value)
                     ],
-                    "provider_output_artifact_hashes": sorted(
-                        {
-                            str(result.get("artifact_hash") or "")
-                            for result in semantic_provider_results
-                            if item.get("topic_id") in result.get("topic_ids", [])
-                            and str(result.get("artifact_hash") or "")
-                        }
-                    ),
+                    "provider_outputs": [
+                        value
+                        for value in (
+                            item.get("provider_outputs")
+                            if isinstance(item.get("provider_outputs"), list)
+                            else topic_result_by_id.get(str(item.get("topic_id") or ""), [])
+                        )
+                        if isinstance(value, Mapping)
+                    ],
                     "supporting_evidence_count": int(
-                        item.get("supporting_evidence_count") or 0
+                        item.get("supporting_evidence_count")
+                        or len(item.get("supporting_evidence_ids") or [])
                     ),
                     "full_topic_synthesis_artifact": "outline-v3:topic_synthesis",
                 }
-                for item in compact_topic_payloads
+                for item in persisted_topics
+                if isinstance(item, Mapping)
             ]
             semantic_relation_candidates = [
                 self._compact_relation_candidate(item.to_dict())
@@ -6710,6 +6708,11 @@ class OutlineV3Executor:
                 "provider" if cross_provider_result is not None else "deterministic",
                 "local",
             ))
+            loaded_cross_provider_result = (
+                cross_group.get("provider_output")
+                if isinstance(cross_group.get("provider_output"), Mapping)
+                else None
+            )
             if cross_provider_result is not None:
                 self._persist_semantic_provider_output(
                     "cross_group_comparison_provider",
@@ -6725,7 +6728,11 @@ class OutlineV3Executor:
                         "task": "substantive_global_synthesis",
                         "node_id": "global_synthesis",
                         "topic_synthesis": semantic_topic_context,
-                        "cross_group_comparison": cross_provider_result or {"questions": semantic_chunk_plan_model.cross_group_questions},
+                        "cross_group_comparison": (
+                            loaded_cross_provider_result
+                            or cross_provider_result
+                            or cross_group
+                        ),
                         "relation_candidates": semantic_relation_candidates,
                         "output_contract": {
                             "synthesis_claims": "array of claims each bound to supplied evidence_ids",
@@ -6766,6 +6773,11 @@ class OutlineV3Executor:
                 "provider" if global_provider_result is not None else "deterministic",
                 "local",
             ))
+            loaded_global_provider_result = (
+                global_synthesis.get("provider_output")
+                if isinstance(global_synthesis.get("provider_output"), Mapping)
+                else None
+            )
             if global_provider_result is not None:
                 self._persist_semantic_provider_output(
                     "global_synthesis_provider",
@@ -7113,7 +7125,14 @@ class OutlineV3Executor:
                     self._artifact(OutlineCandidate, payload, {"organizing_axes": _hash_payload(axes_out), "global_relation_map": _hash_payload(confirmed_map), "global_synthesis": _hash_payload(global_synthesis), "coverage_contract": _hash_payload(contract)}),
                     ("organizing_axes", "global_relation_map", "global_synthesis", "coverage_contract"), "deterministic", "local",
                 ))
-                paper_keys = [item.paper_key for item in ledger_model.entries]
+                # Provider-visible identity order is canonical so summary
+                # permutation stability does not manufacture different claim
+                # sequences or replay keys.
+                paper_keys = sorted(
+                    str(item.paper_key)
+                    for item in ledger_model.entries
+                    if str(item.paper_key)
+                )
                 allowed_relation_ids = [item.relation_id for item in confirmed_map_model.relations]
                 candidate_evidence = self._compact_candidate_evidence_refs(
                     [
@@ -7187,13 +7206,16 @@ class OutlineV3Executor:
                     "shared_hashes": plan.shared_artifact_hashes,
                     "global_synthesis_hash": _hash_payload(global_synthesis),
                     "shared_semantic_context": {
-                        "global_synthesis": global_provider_result or {
+                        "global_synthesis": loaded_global_provider_result
+                        or global_provider_result
+                        or {
                             "execution_mode": "local_shared_synthesis_base",
                             "topic_count": len(semantic_chunk_plan_model.topics),
                             "content_layers_hash": content_layers_model.content_hash,
                         },
-                        "cross_group_comparison": cross_provider_result
-                        or {"questions": semantic_chunk_plan_model.cross_group_questions},
+                        "cross_group_comparison": loaded_cross_provider_result
+                        or cross_provider_result
+                        or cross_group,
                         "topic_routes": semantic_topic_context,
                     },
                     "output_contract": {
@@ -8164,7 +8186,20 @@ class OutlineV3Executor:
                 evidence_shards = [item.to_dict() for item in variant_shards]
                 variant_ledger = build_global_corpus_ledger(variant_evidence)
                 variant_matrix = build_multi_view_matrix(variant_evidence)
+                variant_content_layers = build_paper_content_layers(
+                    variant_summaries,
+                    variant_evidence,
+                    job_id=self.job_id,
+                )
                 variant_candidates = build_global_relation_map(variant_evidence, variant_matrix, variant_ledger)
+                variant_semantic_plan = build_semantic_chunk_plan(
+                    variant_content_layers,
+                    variant_candidates,
+                    candidate_count=self.candidate_count,
+                    physical_call_limit=min(
+                        24, max(0, int(self.max_provider_calls or 24))
+                    ),
+                )
                 relation_key_hash = hash_json({"variant": variant_name, "role": "relation_adjudication"})[:16]
                 relation_dependencies = {
                     "variant_source_summaries": hash_json(sorted(variant_evidence.source_summary_hashes)),
@@ -8195,7 +8230,11 @@ class OutlineV3Executor:
                 else:
                     variant_relation_request = {
                         "relation_candidates": [item.to_dict() for item in variant_candidates.relations],
-                        "evidence": self._prompt_evidence_views(variant_evidence.views),
+                        "evidence": self._compact_candidate_evidence_refs(
+                            variant_evidence.views,
+                            variant_content_layers,
+                            variant_semantic_plan,
+                        ),
                         "source_summary_hashes": sorted(variant_evidence.source_summary_hashes),
                         "evidence_shards": evidence_shards,
                         "shard_size": configured_shard_size,
@@ -8244,14 +8283,22 @@ class OutlineV3Executor:
                 variant_contents: dict[str, dict[str, Any]] = {}
                 for candidate_id in ordered_ids:
                     plan = plans_by_id[candidate_id]
-                    paper_keys = [item.paper_key for item in variant_ledger.entries]
+                    paper_keys = sorted(
+                        str(item.paper_key)
+                        for item in variant_ledger.entries
+                        if str(item.paper_key)
+                    )
                     request = {
                         "candidate_id": candidate_id,
                         "organizing_logic": plan.organizing_logic,
                         "paper_keys": paper_keys,
                         "relation_ids": [item.relation_id for item in variant_relation_map.relations],
                         "relations": [item.to_dict() for item in variant_relation_map.relations],
-                        "evidence": self._prompt_evidence_views(variant_evidence.views),
+                        "evidence": self._compact_candidate_evidence_refs(
+                            variant_evidence.views,
+                            variant_content_layers,
+                            variant_semantic_plan,
+                        ),
                         "source_summary_hashes": sorted(variant_evidence.source_summary_hashes),
                         "evidence_shards": evidence_shards,
                         "shard_size": configured_shard_size,
