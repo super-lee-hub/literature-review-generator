@@ -66,8 +66,10 @@
     },
     {
       "id": "hosted_ci_pr25",
-      "status": "IN_PROGRESS",
-      "run": "https://github.com/super-lee-hub/literature-review-generator/actions/runs/36093855884",
+      "status": "PASS",
+      "run": "https://github.com/super-lee-hub/literature-review-generator/actions/runs/36095307505",
+      "validated_executable_sha": "2627f1ca97a445f8a46d7996bb8665b67a7adcdd",
+      "docs_only_head_after_run": true,
       "last_green_executable_ancestor": "https://github.com/super-lee-hub/literature-review-generator/actions/runs/36008867733"
     },
     {

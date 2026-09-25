@@ -146,9 +146,10 @@ for the active Python 3.13 environment. PDF/DOCX/export focused tests passed
 - Full-repository Ruff still reports pre-existing unused-import and duplicate
   literal findings in unrelated modules. The changed-file lint surface is
   clean.
-- Hosted CI is being rerun against the current SHA; the prior run's failures
-  were type-check/strict-offline consequences of the semantic response
-  closure changes and are not treated as acceptance evidence.
+- Hosted Windows CI run `36095307505` passed on the same executable SHA
+  `2627f1c`; the current branch head after that run contains documentation-only
+  matrix updates. The older failure was the typed-manifest reuse path and was
+  repaired and reproduced locally before the green run.
 - The initial commit emitted a Git maintenance warning about pruned reflog
   objects while committing. The commit and remote read-back succeeded; the
   repository object-health warning should be repaired separately without
