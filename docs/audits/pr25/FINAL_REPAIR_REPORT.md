@@ -3,7 +3,7 @@
 This branch implements the repair plan against PR #24's hardening head
 `bf00852fb627ac0519d96287d2d27b36f17a99ea`.
 
-The current executable code commit is `5220d1f24e5fd7881b4f66d4b7151cb9e6be8993`.
+The current executable code commit is `8cb596a1878d2b5c037f5a62d5fc7f5d5450eeea`.
 The remote branch is `codex/r1-outline-final-repair`; PR #25 is open and
 unmerged. PR #24 remains open and unmerged.
 

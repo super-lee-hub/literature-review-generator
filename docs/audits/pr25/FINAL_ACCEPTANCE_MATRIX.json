@@ -10,9 +10,9 @@
   },
   "identity": {
     "base_sha": "bf00852fb627ac0519d96287d2d27b36f17a99ea",
-    "executable_sha": "5220d1f24e5fd7881b4f66d4b7151cb9e6be8993",
+  "executable_sha": "8cb596a1878d2b5c037f5a62d5fc7f5d5450eeea",
     "remote_branch": "codex/r1-outline-final-repair",
-    "remote_executable_sha_readback": "5220d1f24e5fd7881b4f66d4b7151cb9e6be8993",
+  "remote_executable_sha_readback": "8cb596a1878d2b5c037f5a62d5fc7f5d5450eeea",
     "pr": "https://github.com/super-lee-hub/literature-review-generator/pull/25",
     "existing_pr_24": "https://github.com/super-lee-hub/literature-review-generator/pull/24",
     "merge_status": "UNMERGED"
