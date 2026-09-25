@@ -2516,10 +2516,10 @@ class OutlineV3Executor:
         semantic_synthesis_calls = 0
         if self.semantic_provider_synthesis_enabled:
             semantic_route = self._role_route("candidate_1_provider_generation")
-            # Count the exact compact topic batches used by ``run``.  Each
-            # batch carries complete values for the route's semantic fields
-            # plus Registry-bound hashes for the remaining dossier fields;
-            # cross-group and global synthesis add two calls.
+            # Count the exact complete-evidence topic batches used by ``run``.
+            # Cross-group and global synthesis add two calls. Oversized
+            # indivisible evidence units raise a typed budget rejection before
+            # any provider transport is admitted.
             try:
                 semantic_topic_batches = self._topic_provider_batch_count(
                     self.summaries,
