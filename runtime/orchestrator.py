@@ -788,7 +788,13 @@ class InternalStageExecutorRegistry:
         results: Mapping[str, StageResult],
     ) -> list[dict[str, Any]]:
         if session.stage_host.summaries:
-            return [dict(item) for item in session.stage_host.summaries]
+            summaries = [dict(item) for item in session.stage_host.summaries]
+            if (
+                isinstance(self.bridge.job_spec.metadata.get("outline_pilot"), Mapping)
+                and self.bridge.job_spec.summary_sources
+            ):
+                self._verify_typed_reuse_summaries(summaries)
+            return summaries
 
         paths: list[str] = []
         for value in (
@@ -808,6 +814,14 @@ class InternalStageExecutorRegistry:
         summaries: list[dict[str, Any]] = []
         for path in dict.fromkeys(paths):
             summaries.extend(self._summary_payloads_from_file(path))
+        if (
+            isinstance(self.bridge.job_spec.metadata.get("outline_pilot"), Mapping)
+            and self.bridge.job_spec.summary_sources
+        ):
+            # A topic-only downstream run may consume Stage 1 typed manifests
+            # as summary_sources because reuse_stage1 is reserved for Stage 1
+            # actions. Preserve the typed authority check on that path.
+            self._verify_typed_reuse_summaries(summaries)
         return summaries
 
     def _build_outline_evidence_pack(
