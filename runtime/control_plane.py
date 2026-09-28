@@ -1852,7 +1852,35 @@ class ReviewControlPlane:
                 requested_stages=spec.metadata.get("requested_stages"),
                 free_mode_enabled=free_mode_enabled,
             )
-            policy = build_external_host_policy(normalized, route_plan)
+            pilot = spec.metadata.get("outline_pilot")
+            if (
+                isinstance(pilot, Mapping)
+                and spec.metadata.get("requested_stages") == ["outline"]
+            ):
+                # The topic pilot can execute only the selected topic requests
+                # on the candidate-generation route. This narrow policy is
+                # allowed only when no remote-parsing stage is requested.
+                # Keep acknowledgement scoped to the actual disclosure surface.
+                try:
+                    generation_route = route_plan.route_for_role(
+                        "candidate_provider_generation"
+                    )
+                except KeyError as exc:
+                    raise ExternalHostAdmissionError(
+                        "topic pilot generation route is unavailable"
+                    ) from exc
+                if not generation_route.resolved:
+                    raise ExternalHostAdmissionError(
+                        "topic pilot generation route is unresolved"
+                    )
+                policy = build_external_host_policy(
+                    normalized,
+                    route_plan,
+                    provider_sections=(generation_route.section_name,),
+                    include_mineru=False,
+                )
+            else:
+                policy = build_external_host_policy(normalized, route_plan)
             admission = validate_external_host_acknowledgement(
                 policy,
                 spec.metadata.get("external_host_acknowledgement"),
