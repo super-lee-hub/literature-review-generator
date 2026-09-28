@@ -118,6 +118,32 @@ class _OutlineProviderTransportAdapter:
         from ai_interface import _call_ai_api_detailed_uninstrumented
 
         config = dict(self.api_config)
+        requested_output_tokens = int(
+            self.profile.max_output_tokens if output_tokens is None else output_tokens
+        )
+        if requested_output_tokens <= 0:
+            raise ValueError("Outline provider output allowance must be positive")
+        # The formal Anthropic, Chat Completions, and Responses payload builders
+        # can prefer route-configured token fields over the max_tokens argument.
+        # Keep the physical wire ceiling equal to the admitted reservation.
+        for field in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
+            config[field] = requested_output_tokens
+        if str(config.get("model") or "").strip():
+            from services.model_capabilities import resolve_model_capability
+
+            capability = resolve_model_capability(cast(Any, config))
+            if (
+                capability.endpoint_type == "anthropic"
+                and capability.anthropic_thinking_mode == "manual"
+            ):
+                try:
+                    thinking_budget = int(str(config.get("thinking_budget_tokens") or "0"))
+                except ValueError:
+                    thinking_budget = 0
+                if thinking_budget >= requested_output_tokens:
+                    raise ValueError(
+                        "Outline manual thinking budget exceeds the admitted output allowance"
+                    )
         if runtime is not None:
             config.setdefault(
                 "operation_id",
@@ -140,7 +166,7 @@ class _OutlineProviderTransportAdapter:
             ),
             cast(Any, config),
             self.system_prompt,
-            max_tokens=int(output_tokens or self.profile.max_output_tokens),
+            max_tokens=requested_output_tokens,
             temperature=0.0,
             response_format="json",
             logger=self.logger,
@@ -1324,6 +1350,7 @@ class InternalStageExecutorRegistry:
             pricing_effective_date=stability.pricing_effective_date,
             max_smoke_overhead_ratio=stability.max_smoke_overhead_ratio,
             max_source_prompt_tokens=stability.max_source_prompt_tokens or None,
+            semantic_output_max_tokens=settings.outline.semantic_output_max_tokens,
             technical_shard_target_tokens=settings.outline.technical_shard_target_tokens,
             outline_pilot=self.bridge.job_spec.metadata.get("outline_pilot"),
         )

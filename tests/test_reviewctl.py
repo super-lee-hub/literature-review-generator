@@ -206,6 +206,28 @@ def test_chunk_plan_builds_route_bound_semantic_request_plan_without_posts(
     assert "topic_merge_policy" in result["r1_request_workload_audit"]
     assert "source_text_identity_records" not in json.dumps(result)
 
+    baseline_topic = next(
+        row for row in result["semantic_request_plan"]
+        if str(row.get("node_id") or "").startswith("topic_synthesis_provider:batch:")
+    )
+    updated_config = config_path.read_text(encoding="utf-8").replace(
+        "max_output_tokens = 4096", "max_output_tokens = 16384"
+    ).replace(
+        "candidate_count = 2", "candidate_count = 2\nsemantic_output_max_tokens = 8192"
+    )
+    config_path.write_text(updated_config, encoding="utf-8")
+    increased = ReviewControlPlane(repo_root=tmp_path).chunk_plan(
+        [summary_path], config_path=config_path
+    )
+    increased_topic = next(
+        row for row in increased["semantic_request_plan"]
+        if row["node_id"] == baseline_topic["node_id"]
+    )
+    assert baseline_topic["estimated_output_tokens"] == 4_096
+    assert increased_topic["estimated_output_tokens"] == 8_192
+    assert increased_topic["request_hash"] != baseline_topic["request_hash"]
+    assert increased["provider_posts_emitted"] == 0
+
 
 def test_config_migrate_cli_preserves_route_conflict_and_redacts_values(
     tmp_path: Path,

@@ -535,10 +535,17 @@ def test_workflow_actions_and_links(page, gui_server):
     # third-party gateway can receive manuscript content. Exercise that real
     # consent boundary before submitting the workflow actions.
     page.goto(f'{gui_server["base_url"]}/setup/api', wait_until="domcontentloaded")
-    for card in page.locator(".ag-card", has_text="确认第三方 gateway").all():
-        button = card.get_by_role("button", name="确认第三方 gateway")
-        if button.count() > 0:
-            button.click()
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.read(gui_server["config_path"], encoding="utf-8")
+    expected_cards = sum(section.endswith("_API") for section in parser.sections())
+    gateway_buttons = page.get_by_role("button", name="确认第三方 gateway")
+    expect(gateway_buttons).to_have_count(expected_cards)
+    for index in range(expected_cards):
+        button = gateway_buttons.nth(index)
+        card = button.locator("xpath=ancestor::*[contains(@class,'ag-card')][1]")
+        button.click()
+        card.get_by_role("button", name="检查配置").click()
+        expect(card.locator(".ag-inline-alert")).to_contain_text("当前配置格式看起来正确")
     page.goto(f'{gui_server["base_url"]}/workflow', wait_until="domcontentloaded")
     _open_page(page, f'{gui_server["base_url"]}/workflow')
 

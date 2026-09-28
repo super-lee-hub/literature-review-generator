@@ -170,6 +170,9 @@ require_explicit_adoption = true
 # 0 uses automatic request packing under the route and application input caps.
 # A positive value can make shards smaller; it never raises either cap.
 technical_shard_target_tokens = 0
+# Topic/cross/global synthesis output cap. Preflight reserves this per attempt;
+# raising it requires a matching aggregate budget and fresh request hashes.
+semantic_output_max_tokens = 4096
 allow_bibliometric_provider = false
 
 [OutlineModels]

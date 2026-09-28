@@ -350,6 +350,7 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
             "evidence_critique_enabled": "true",
             "require_explicit_adoption": "true",
             "technical_shard_target_tokens": "0",
+            "semantic_output_max_tokens": "4096",
             "allow_bibliometric_provider": "false",
         },
         "OutlineModels": {

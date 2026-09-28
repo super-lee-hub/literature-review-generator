@@ -1375,6 +1375,10 @@ class ReviewControlPlane:
                         cache_write_cost_per_1k_tokens=parsed_stability.cache_write_cost_per_1k_tokens,
                         max_smoke_overhead_ratio=parsed_stability.max_smoke_overhead_ratio,
                         max_source_prompt_tokens=source_token_limit or None,
+                        semantic_output_max_tokens=(
+                            configured_settings.outline.semantic_output_max_tokens
+                            if configured_settings is not None else 4_096
+                        ),
                         semantic_transport_retries=route_transport_retries,
                         technical_shard_target_tokens=technical_target,
                     )

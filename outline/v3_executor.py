@@ -274,6 +274,7 @@ class OutlineV3Executor:
         cache_write_cost_per_1k_tokens: float | None = None,
         max_smoke_overhead_ratio: float | None = None,
         max_source_prompt_tokens: int | None = None,
+        semantic_output_max_tokens: int = SEMANTIC_SYNTHESIS_OUTPUT_LIMIT,
         semantic_transport_retries: int | None = None,
         technical_shard_target_tokens: int = 0,
         pricing_source: str | None = None,
@@ -321,6 +322,13 @@ class OutlineV3Executor:
             raise ValueError("max_smoke_overhead_ratio must be at least 1")
         if max_source_prompt_tokens is not None and int(max_source_prompt_tokens) < 0:
             raise ValueError("max_source_prompt_tokens cannot be negative")
+        if (
+            isinstance(semantic_output_max_tokens, bool)
+            or not isinstance(semantic_output_max_tokens, int)
+            or semantic_output_max_tokens <= 0
+        ):
+            raise ValueError("semantic_output_max_tokens must be a positive integer")
+        self.semantic_output_max_tokens = semantic_output_max_tokens
         if semantic_transport_retries is not None and int(semantic_transport_retries) < 0:
             raise ValueError("semantic_transport_retries cannot be negative")
         if int(technical_shard_target_tokens) < 0:
@@ -2865,10 +2873,15 @@ class OutlineV3Executor:
                 "content_layers_hash": getattr(content_layers_model, "content_hash", ""),
             },
             "output_contract": {
-                "semantic_result_contract_version": "bounded-topic-synthesis/v1",
+                "semantic_result_contract_version": "bounded-topic-synthesis/v2",
                 "max_output_tokens": self._semantic_output_token_limit(
                     self._node_route("candidate_1_provider_generation").profile
                 ),
+                "response_root_type": "single JSON object, never a top-level array",
+                "required_top_level_keys": [
+                    "topics", "processed_fragment_ids", "claims", "unresolved_questions"
+                ],
+                "termination_rule": "Finish the complete JSON object before the output limit. If the supported synthesis will not fit, return a complete unresolved fragment with an explicit reason rather than a partial claim or unclosed JSON.",
                 "topics": "array of topic synthesis objects; return every requested fragment_id exactly once with topic_id, status, conclusions, unresolved_questions, and supporting_evidence_ids for any factual conclusion",
                 "processed_fragment_ids": "array containing every requested fragment_id exactly once",
                 "claims": "array of evidence-bound claims; each claim has claim_id='synthesis:topic_synthesis:<local-id>', fragment_id, claim_type, paper_key or paper_keys, evidence_ids, and optional source_claim_ids/source_field_ids/source_locators; claims using an interpretation-dependent finding must cite every required qualifier claim, evidence ID, and source field ID",
@@ -6228,6 +6241,16 @@ class OutlineV3Executor:
             "candidate_count": self.candidate_count if candidate_sensitive else 0,
             "quality_gate": self.quality_gate.to_dict() if candidate_sensitive else {},
             "provider_config": config,
+            "semantic_output_max_tokens": (
+                self.semantic_output_max_tokens
+                if node_id in {"topic_synthesis", "cross_group_comparison", "global_synthesis"}
+                or node_id.startswith((
+                    "topic_synthesis_provider",
+                    "cross_group_comparison_provider",
+                    "global_synthesis_provider",
+                ))
+                else 0
+            ),
         }
         interpretation_sensitive = (
             node_id in {
@@ -7191,6 +7214,7 @@ class OutlineV3Executor:
                     "review_intent_hash",
                     "coverage_contract_hash",
                     "quality_gate_hash",
+                    "relevant_runtime_config_hash",
                 )
                 if all(
                     str(node.execution_binding.get(field) or "")
@@ -8472,8 +8496,7 @@ class OutlineV3Executor:
         )
         return merged
 
-    @staticmethod
-    def _semantic_output_token_limit(profile: ProviderContextProfile) -> int:
+    def _semantic_output_token_limit(self, profile: ProviderContextProfile) -> int:
         """Bound semantic conclusions for both preflight and transport.
 
         Complete source material stays in the Registry and task input. These
@@ -8481,7 +8504,24 @@ class OutlineV3Executor:
         second copy of the source dossier. A truncated result fails closed.
         """
 
-        return min(SEMANTIC_SYNTHESIS_OUTPUT_LIMIT, max(1, int(profile.max_output_tokens)))
+        limit = min(self.semantic_output_max_tokens, max(1, int(profile.max_output_tokens)))
+        if str(profile.endpoint_type or "").casefold() == "anthropic":
+            from services.model_capabilities import anthropic_thinking_mode
+
+            route = self._role_route("candidate_1_provider_generation")
+            if anthropic_thinking_mode(route.model) == "manual":
+                raw_budget = route.config_identity.get("thinking_budget_tokens")
+                try:
+                    thinking_budget = int(str(raw_budget or "0"))
+                except ValueError as exc:
+                    raise OutlineV3ExecutionError(
+                        "semantic route manual thinking budget is invalid"
+                    ) from exc
+                if thinking_budget >= limit:
+                    raise OutlineV3ExecutionError(
+                        "semantic route manual thinking budget exceeds the planned output allowance"
+                    )
+        return limit
 
     def _semantic_transport_retry_count(self) -> int | None:
         route = self._node_route("candidate_1_provider_generation")
@@ -12218,6 +12258,7 @@ class OutlineV3Executor:
             max_estimated_total_tokens=self.max_estimated_total_tokens,
             estimated_cost_per_1k_tokens=self.estimated_cost_per_1k_tokens,
             max_source_prompt_tokens=self.max_source_prompt_tokens,
+            semantic_output_max_tokens=self.semantic_output_max_tokens,
             semantic_transport_retries=self.semantic_transport_retries,
             _skip_exact_replay_verification=True,
         )
@@ -12615,6 +12656,7 @@ class OutlineV3Executor:
                         "endpoint_type",
                         "route_fingerprint",
                         "context_profile_hash",
+                        "relevant_runtime_config_hash",
                     )
                     return all(
                         hash_json(existing.execution_binding.get(field))

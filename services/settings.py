@@ -278,6 +278,7 @@ CONFIG_KEYS: Dict[str, frozenset[str]] = {
             "evidence_critique_enabled",
             "require_explicit_adoption",
             "technical_shard_target_tokens",
+            "semantic_output_max_tokens",
             "allow_bibliometric_provider",
         }
     ),
@@ -521,11 +522,26 @@ class OutlineSettings:
     evidence_critique_enabled: bool = True
     require_explicit_adoption: bool = True
     technical_shard_target_tokens: int = 0
+    semantic_output_max_tokens: int = 4_096
     allow_bibliometric_provider: bool = False
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> "OutlineSettings":
         section = _section(config, "Outline")
+        raw_semantic_output = section.get("semantic_output_max_tokens")
+        if raw_semantic_output is None or str(raw_semantic_output).strip() == "":
+            semantic_output_max_tokens = 4_096
+        else:
+            if isinstance(raw_semantic_output, bool):
+                raise ValueError("Outline.semantic_output_max_tokens must be a positive integer")
+            try:
+                semantic_output_max_tokens = int(str(raw_semantic_output).strip())
+            except ValueError as exc:
+                raise ValueError(
+                    "Outline.semantic_output_max_tokens must be a positive integer"
+                ) from exc
+            if semantic_output_max_tokens <= 0:
+                raise ValueError("Outline.semantic_output_max_tokens must be a positive integer")
         return cls(
             candidate_count=_int(section.get("candidate_count"), 5),
             relation_adjudication_enabled=_bool(section.get("relation_adjudication_enabled"), True),
@@ -534,6 +550,7 @@ class OutlineSettings:
             evidence_critique_enabled=_bool(section.get("evidence_critique_enabled"), True),
             require_explicit_adoption=_bool(section.get("require_explicit_adoption"), True),
             technical_shard_target_tokens=_int(section.get("technical_shard_target_tokens"), 0),
+            semantic_output_max_tokens=semantic_output_max_tokens,
             allow_bibliometric_provider=_bool(section.get("allow_bibliometric_provider"), False),
         )
 

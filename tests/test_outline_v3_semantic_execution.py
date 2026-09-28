@@ -794,6 +794,11 @@ def test_topic_provider_request_materializes_complete_dossier_unit(
         content_layers_model=content_layers,
         batch_index=1,
     )
+    assert request["output_contract"]["semantic_result_contract_version"] == "bounded-topic-synthesis/v2"
+    assert request["output_contract"]["response_root_type"].startswith("single JSON object")
+    assert request["output_contract"]["required_top_level_keys"] == [
+        "topics", "processed_fragment_ids", "claims", "unresolved_questions"
+    ]
 
     unit = request["evidence_units"][0]
     assert unit["projection"].startswith("scoped_")
