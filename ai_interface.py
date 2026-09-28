@@ -1104,6 +1104,9 @@ def _format_success_result(content: Any, response_format: str, response: Any, fi
 
 
 def _post_with_proxy_mode(api_url: str, *, api_config: APIConfig, **kwargs: Any) -> Any:
+    # A 307/308 may replay the request body at another host. Each provider
+    # attempt must correspond to exactly one POST at the admitted endpoint.
+    kwargs["allow_redirects"] = False
     if should_bypass_environment_proxy(api_config):
         session = requests.Session()
         session.trust_env = False
@@ -2581,6 +2584,17 @@ def _call_ai_api_detailed_uninstrumented(
                 # Capture the remote identity before status/body handling can
                 # raise for an HTTP error or a truncated body.
                 provider_request_id = _response_header(response, "x-aihubmix-request-id")
+                response_status = getattr(response, "status_code", None)
+                if isinstance(response_status, int) and 300 <= response_status < 400:
+                    _close_provider_response(response)
+                    blocked = _api_result(
+                        status="failed",
+                        error_kind="outcome_unknown",
+                        http_status=response_status,
+                        message="provider redirect blocked without a follow-up request",
+                    )
+                    blocked["provider_request_id"] = provider_request_id
+                    return finish(blocked)
                 response.raise_for_status()
 
                 raw_root = str(
