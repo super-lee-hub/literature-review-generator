@@ -46,11 +46,12 @@ def test_executor_second_run_reuses_only_exact_binding_and_receipt_closure(tmp_p
     assert succeeded
     for node in succeeded:
         assert node.execution_binding["node_id"] == node.node_id
-        assert node.execution_binding["node_version"] == "v3"
+        assert node.execution_binding["node_version"] in {"v3", "v3-interpretation-v1"}
         assert node.execution_binding["schema_version"] == "outline-v3"
         assert "dependency_hashes" in node.execution_binding
         assert "current_summary_hashes" in node.execution_binding
         assert "quality_gate_hash" in node.execution_binding
+    assert dag.get("outline_content_layers").execution_binding["node_version"] == "v3-interpretation-v1"
 
 
 def test_executor_missing_receipt_invalidates_replay_before_reuse(tmp_path: Path) -> None:

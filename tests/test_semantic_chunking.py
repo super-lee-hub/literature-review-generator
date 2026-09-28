@@ -2,6 +2,7 @@ from __future__ import annotations
 
 
 from outline.semantic_chunking import (
+    _topic_candidates,
     build_paper_content_layers,
     build_relation_evidence_bundle,
     build_semantic_chunk_plan,
@@ -11,7 +12,7 @@ from outline.v3_evidence import (
     build_multi_view_matrix,
     build_outline_evidence_views,
 )
-from outline.v3_models import RelationCandidate
+from outline.v3_models import PaperContentLayers, PaperIndexCard, RelationCandidate
 from outline.v3_relations import build_global_relation_map
 from runtime.pause_state import PAUSED_BY_USER, PauseRequestedError, PauseStateStore
 from services.artifact_registry import ArtifactRegistry
@@ -87,6 +88,45 @@ def test_candidate_count_only_changes_organization_budget_not_shared_plan_hash()
     assert plan_two.shared_content_hash == plan_three.shared_content_hash
     assert plan_two.budgets["provider_posts_emitted"] == 0
     assert plan_three.budgets["provider_posts_emitted"] == 0
+
+
+def test_semantic_chunk_plan_clamps_requested_provider_calls_to_shared_authority():
+    summaries = [_summary("paper-a", "A", "A result"), _summary("paper-b", "B", "B result")]
+    layers, relations = _layers(summaries)
+    plan = build_semantic_chunk_plan(
+        layers,
+        relations,
+        candidate_count=2,
+        physical_call_limit=100,
+    )
+
+    assert plan.budgets["physical_call_limit"] == 24
+
+
+def test_topic_candidates_use_typed_labels_and_ignore_generic_navigation_tokens():
+    cards = [
+        PaperIndexCard(
+            paper_id=f"paper-{index}",
+            key_constructs=["fairness"],
+            topic_tags=["equity theory", "that", "state", "were"],
+            theories=["equity theory"],
+            mechanisms=["reference-price comparison"],
+            key_boundaries=["Authors state that only adults were sampled in this experiment."],
+        )
+        for index in range(4)
+    ]
+    content_layers = PaperContentLayers(index_cards=cards)
+
+    groups, paper_topics = _topic_candidates(content_layers)
+
+    labels = {(value["dimension"], value["label"]) for value in groups.values()}
+    assert labels == {
+        ("construct", "fairness"),
+        ("theory", "equity theory"),
+        ("mechanism", "reference-price comparison"),
+    }
+    assert all(not label.startswith("token:") for _, label in labels)
+    assert len({tuple(sorted(value)) for value in paper_topics.values()}) == 1
 
 
 def test_pause_state_blocks_new_admission_and_preserves_explicit_state(tmp_path):

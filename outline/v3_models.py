@@ -37,6 +37,8 @@ RELATION_DECISIONS = (
     "insufficient_evidence",
     "not_comparable",
 )
+SOURCE_FIELD_DISPOSITIONS = ("exact", "rewritten", "context", "unmapped")
+SOURCE_FIELD_SCOPES = ("paper", "explicit_study", "unresolved")
 
 
 def canonical_json(value: Any) -> str:
@@ -94,6 +96,117 @@ def _text_list(value: Any) -> List[str]:
 
 
 @dataclass(frozen=True)
+class SourceFieldLedgerEntry:
+    """One non-empty source field with an explicit projection and scope."""
+
+    source_field_id: str
+    source_path: str
+    source_value: str
+    disposition: str
+    canonical_field: str = ""
+    scope: str = "paper"
+    study_id: str = ""
+    interpretation_required: bool = False
+    source_summary_hash: str = ""
+    derived_value: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.source_field_id.strip():
+            raise ValueError("SourceFieldLedgerEntry.source_field_id is required")
+        if not self.source_path.strip():
+            raise ValueError("SourceFieldLedgerEntry.source_path is required")
+        if not self.source_value.strip():
+            raise ValueError("SourceFieldLedgerEntry.source_value is required")
+        if self.disposition not in SOURCE_FIELD_DISPOSITIONS:
+            raise ValueError(f"unsupported source field disposition: {self.disposition!r}")
+        if self.scope not in SOURCE_FIELD_SCOPES:
+            raise ValueError(f"unsupported source field scope: {self.scope!r}")
+        if self.disposition == "rewritten" and not self.derived_value.strip():
+            raise ValueError("rewritten source fields require a traceable derived_value")
+        if self.scope == "explicit_study" and not self.study_id.strip():
+            raise ValueError("explicit study source fields require their source study_id")
+        if self.scope != "explicit_study" and self.study_id:
+            raise ValueError("paper or unresolved source fields cannot claim a study_id")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "source_field_id": self.source_field_id,
+            "source_path": self.source_path,
+            "source_value": self.source_value,
+            "disposition": self.disposition,
+            "canonical_field": self.canonical_field,
+            "scope": self.scope,
+            "study_id": self.study_id,
+            "interpretation_required": bool(self.interpretation_required),
+            "source_summary_hash": self.source_summary_hash,
+            "derived_value": self.derived_value,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "SourceFieldLedgerEntry":
+        return cls(
+            source_field_id=str(data.get("source_field_id") or ""),
+            source_path=str(data.get("source_path") or ""),
+            source_value=str(data.get("source_value") or ""),
+            disposition=str(data.get("disposition") or ""),
+            canonical_field=str(data.get("canonical_field") or ""),
+            scope=str(data.get("scope") or "paper"),
+            study_id=str(data.get("study_id") or ""),
+            interpretation_required=bool(data.get("interpretation_required", False)),
+            source_summary_hash=str(data.get("source_summary_hash") or ""),
+            derived_value=str(data.get("derived_value") or ""),
+        )
+
+
+@dataclass(frozen=True)
+class InterpretationDependency:
+    """Typed source support required to interpret one primary finding claim."""
+
+    primary_claim_id: str
+    required_source_claim_ids: List[str] = field(default_factory=list)
+    required_evidence_ids: List[str] = field(default_factory=list)
+    required_source_field_ids: List[str] = field(default_factory=list)
+    scope: str = "unresolved"
+    study_id: str = ""
+    reason: str = ""
+
+    def __post_init__(self) -> None:
+        if self.scope not in SOURCE_FIELD_SCOPES:
+            raise ValueError(f"unsupported interpretation dependency scope: {self.scope!r}")
+        if self.scope == "explicit_study" and not self.study_id.strip():
+            raise ValueError("explicit study interpretation dependencies require study_id")
+        if self.scope != "explicit_study" and self.study_id:
+            raise ValueError("paper or unresolved dependencies cannot claim a study_id")
+        if not self.primary_claim_id.strip() and self.scope != "unresolved":
+            raise ValueError("only unresolved dependencies may omit primary_claim_id")
+        if not any((self.required_source_claim_ids, self.required_evidence_ids, self.required_source_field_ids)):
+            raise ValueError("interpretation dependencies require at least one source claim, evidence ID, or field ID")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "primary_claim_id": self.primary_claim_id,
+            "required_source_claim_ids": _stable_unique(self.required_source_claim_ids),
+            "required_evidence_ids": _stable_unique(self.required_evidence_ids),
+            "required_source_field_ids": _stable_unique(self.required_source_field_ids),
+            "scope": self.scope,
+            "study_id": self.study_id,
+            "reason": self.reason,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "InterpretationDependency":
+        return cls(
+            primary_claim_id=str(data.get("primary_claim_id") or ""),
+            required_source_claim_ids=_text_list(data.get("required_source_claim_ids")),
+            required_evidence_ids=_text_list(data.get("required_evidence_ids")),
+            required_source_field_ids=_text_list(data.get("required_source_field_ids")),
+            scope=str(data.get("scope") or "unresolved"),
+            study_id=str(data.get("study_id") or ""),
+            reason=str(data.get("reason") or ""),
+        )
+
+
+@dataclass(frozen=True)
 class OutlineEvidenceView:
     """Deterministic projection of one canonical Stage 1 summary.
 
@@ -131,6 +244,7 @@ class OutlineEvidenceView:
     classification: str = "support"
     must_use: bool = False
     diagnostics: List[str] = field(default_factory=list)
+    source_field_ledger: List[SourceFieldLedgerEntry] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -165,6 +279,10 @@ class OutlineEvidenceView:
             "classification": self.classification,
             "must_use": bool(self.must_use),
             "diagnostics": _stable_unique(self.diagnostics),
+            "source_field_ledger": [
+                entry.to_dict()
+                for entry in sorted(self.source_field_ledger, key=lambda item: item.source_field_id)
+            ],
         }
 
     @property
@@ -206,6 +324,11 @@ class OutlineEvidenceView:
             classification=str(data.get("classification") or "support"),
             must_use=bool(data.get("must_use", False)),
             diagnostics=_stable_unique(data.get("diagnostics") or []),
+            source_field_ledger=[
+                SourceFieldLedgerEntry.from_dict(item)
+                for item in data.get("source_field_ledger", [])
+                if isinstance(item, Mapping)
+            ],
         )
 
 
@@ -992,6 +1115,9 @@ class ResearchUnit:
     source_locators: Dict[str, List[str]] = field(default_factory=dict)
     evidence_ids: List[str] = field(default_factory=list)
     source_summary_hash: str = ""
+    source_study_id: str = ""
+    source_field_ids: List[str] = field(default_factory=list)
+    interpretation_dependencies: List[InterpretationDependency] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -1017,6 +1143,15 @@ class ResearchUnit:
             }),
             "evidence_ids": _stable_unique(self.evidence_ids),
             "source_summary_hash": self.source_summary_hash,
+            "source_study_id": self.source_study_id,
+            "source_field_ids": _stable_unique(self.source_field_ids),
+            "interpretation_dependencies": [
+                dependency.to_dict()
+                for dependency in sorted(
+                    self.interpretation_dependencies,
+                    key=lambda item: (item.primary_claim_id, item.scope, item.reason),
+                )
+            ],
         }
 
     @classmethod
@@ -1044,6 +1179,13 @@ class ResearchUnit:
             },
             evidence_ids=_text_list(data.get("evidence_ids")),
             source_summary_hash=str(data.get("source_summary_hash") or ""),
+            source_study_id=str(data.get("source_study_id") or ""),
+            source_field_ids=_text_list(data.get("source_field_ids")),
+            interpretation_dependencies=[
+                InterpretationDependency.from_dict(item)
+                for item in data.get("interpretation_dependencies", [])
+                if isinstance(item, Mapping)
+            ],
         )
 
 
@@ -1058,6 +1200,8 @@ class PaperIndexCard:
     key_boundaries: List[str] = field(default_factory=list)
     method_category: str = ""
     topic_tags: List[str] = field(default_factory=list)
+    theories: List[str] = field(default_factory=list)
+    mechanisms: List[str] = field(default_factory=list)
     evidence_package_id: str = ""
     source_summary_hash: str = ""
     source_locators: List[str] = field(default_factory=list)
@@ -1071,6 +1215,8 @@ class PaperIndexCard:
             "key_boundaries": _stable_unique(self.key_boundaries),
             "method_category": self.method_category,
             "topic_tags": _stable_unique(self.topic_tags),
+            "theories": _stable_unique(self.theories),
+            "mechanisms": _stable_unique(self.mechanisms),
             "evidence_package_id": self.evidence_package_id,
             "source_summary_hash": self.source_summary_hash,
             "source_locators": _stable_unique(self.source_locators),
@@ -1086,6 +1232,8 @@ class PaperIndexCard:
             key_boundaries=_text_list(data.get("key_boundaries")),
             method_category=str(data.get("method_category") or ""),
             topic_tags=_text_list(data.get("topic_tags")),
+            theories=_text_list(data.get("theories")),
+            mechanisms=_text_list(data.get("mechanisms")),
             evidence_package_id=str(data.get("evidence_package_id") or ""),
             source_summary_hash=str(data.get("source_summary_hash") or ""),
             source_locators=_text_list(data.get("source_locators")),
@@ -1121,6 +1269,7 @@ class PaperEvidenceDossier:
     evidence_text_by_id: Dict[str, str] = field(default_factory=dict)
     diagnostics: List[str] = field(default_factory=list)
     status: str = "ready"
+    source_field_ledger: List[SourceFieldLedgerEntry] = field(default_factory=list)
 
     @property
     def evidence_ids(self) -> List[str]:
@@ -1161,6 +1310,10 @@ class PaperEvidenceDossier:
             },
             "diagnostics": _stable_unique(self.diagnostics),
             "status": self.status,
+            "source_field_ledger": [
+                entry.to_dict()
+                for entry in sorted(self.source_field_ledger, key=lambda item: item.source_field_id)
+            ],
         }
 
     @property
@@ -1205,6 +1358,11 @@ class PaperEvidenceDossier:
             },
             diagnostics=_text_list(data.get("diagnostics")),
             status=str(data.get("status") or "ready"),
+            source_field_ledger=[
+                SourceFieldLedgerEntry.from_dict(item)
+                for item in data.get("source_field_ledger", [])
+                if isinstance(item, Mapping)
+            ],
         )
 
 
@@ -1416,6 +1574,12 @@ class TopicSynthesis:
     unresolved_questions: List[str] = field(default_factory=list)
     status: str = "planned"
     diagnostics: List[str] = field(default_factory=list)
+    # A logical topic may be split into bounded provider requests.  Keep the
+    # physical fragment identity and its selected source units in the durable
+    # plan so replay does not depend on an ad-hoc attribute attached at runtime.
+    fragment_id: str = ""
+    evidence_unit_indexes: Dict[str, List[int]] = field(default_factory=dict)
+    evidence_chunk_target_tokens: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -1431,6 +1595,12 @@ class TopicSynthesis:
             "unresolved_questions": _stable_unique(self.unresolved_questions),
             "status": self.status,
             "diagnostics": _stable_unique(self.diagnostics),
+            "fragment_id": self.fragment_id,
+            "evidence_unit_indexes": {
+                str(paper_id): sorted({int(index) for index in indexes})
+                for paper_id, indexes in sorted(self.evidence_unit_indexes.items())
+            },
+            "evidence_chunk_target_tokens": int(self.evidence_chunk_target_tokens),
         }
 
     @classmethod
@@ -1448,6 +1618,13 @@ class TopicSynthesis:
             unresolved_questions=_text_list(data.get("unresolved_questions")),
             status=str(data.get("status") or "planned"),
             diagnostics=_text_list(data.get("diagnostics")),
+            fragment_id=str(data.get("fragment_id") or ""),
+            evidence_unit_indexes={
+                str(paper_id): [int(index) for index in indexes]
+                for paper_id, indexes in _stable_mapping(data.get("evidence_unit_indexes")).items()
+                if isinstance(indexes, Sequence) and not isinstance(indexes, (str, bytes))
+            },
+            evidence_chunk_target_tokens=max(0, int(data.get("evidence_chunk_target_tokens") or 0)),
         )
 
 

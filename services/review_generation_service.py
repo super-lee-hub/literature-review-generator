@@ -18,6 +18,7 @@ from runtime.provider_runtime import (
     ProviderRuntime,
     ProviderRuntimeLedger,
     _redact_mapping,
+    canonical_provider_request_payload,
     compute_closure_epoch_id,
     hash_json,
     hash_text,
@@ -1164,16 +1165,16 @@ class ReviewGenerationService:
             return 32000
 
     def _writer_request_payload(self, prompt: str) -> dict[str, Any]:
-        """Build the exact payload hashed by the bound provider runtime."""
+        """Build the same canonical request identity used by provider transport."""
 
-        return {
-            "system": self._system_prompt(),
-            "user": prompt,
-            "user_content": None,
-            "response_format": "json",
-            "max_output_tokens": self._max_output_tokens(),
-            "temperature": 0.2,
-        }
+        return canonical_provider_request_payload(
+            prompt=prompt,
+            system_prompt=self._system_prompt(),
+            user_content=None,
+            response_format="json",
+            max_output_tokens=self._max_output_tokens(),
+            temperature=0.2,
+        )
 
     @staticmethod
     def _system_prompt() -> str:

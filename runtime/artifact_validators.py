@@ -89,6 +89,9 @@ CURRENT_PRODUCTION_ARTIFACT_TYPES = frozenset(
         "outline_adoption_pointer",
         "outline_request_payload_audit",
         "outline_hierarchical_call_graph",
+        "outline_topic_pilot_plan",
+        "outline_topic_pilot_receipt_closure",
+        "outline_topic_pilot_checkpoint",
         "export_bundle",
         "forensic_attestation",
         "provider_receipt_ledger",
@@ -2609,6 +2612,115 @@ def _validate_playwright_trace(
         raise ArtifactSchemaError("Playwright trace archive is invalid") from exc
 
 
+def _validate_outline_topic_pilot_artifact(
+    record: Any, _path: str | Path, root: Mapping[str, Any] | None
+) -> None:
+    """Keep a pilot checkpoint distinct from a canonical Outline result."""
+
+    if not isinstance(root, Mapping):
+        raise ArtifactSchemaError("topic pilot artifact must be a JSON object")
+    kind = str(getattr(record, "artifact_type", "") or "")
+    schemas = {
+        "outline_topic_pilot_plan": "outline-topic-pilot-plan/v1",
+        "outline_topic_pilot_receipt_closure": "outline-topic-pilot-receipt-closure/v1",
+        "outline_topic_pilot_checkpoint": "outline-topic-pilot-checkpoint/v1",
+    }
+    if root.get("schema_version") != schemas.get(kind):
+        raise ArtifactSchemaError("topic pilot artifact schema identity is invalid")
+
+    def sha(value: Any) -> bool:
+        return isinstance(value, str) and len(value) == 64 and all(
+            character in "0123456789abcdef" for character in value
+        )
+
+    if not sha(root.get("pilot_scope_hash")) or not str(root.get("acceptance_run_id") or ""):
+        raise ArtifactSchemaError("topic pilot scope or acceptance identity is missing")
+    if kind == "outline_topic_pilot_plan":
+        rows = root.get("selected_requests")
+        if (
+            root.get("status") != "accepted_before_transport"
+            or root.get("provider_posts_emitted") != 0
+            or not sha(root.get("source_summary_set_hash"))
+            or not sha(root.get("route_fingerprint"))
+            or not isinstance(rows, list)
+            or not rows
+        ):
+            raise ArtifactSchemaError("topic pilot plan is incomplete")
+        ids = [str(item.get("node_id") or "") for item in rows if isinstance(item, Mapping)]
+        if (
+            len(ids) != len(rows)
+            or len(set(ids)) != len(ids)
+            or any(not item.startswith("topic_synthesis_provider:batch:") for item in ids)
+            or any(not sha(item.get("request_hash")) for item in rows)
+            or root.get("logical_call_count") != len(rows)
+            or not isinstance(root.get("physical_attempt_upper_bound"), int)
+            or isinstance(root.get("physical_attempt_upper_bound"), bool)
+            or root["physical_attempt_upper_bound"] < len(rows)
+            or not isinstance(root.get("output_token_all_attempts_upper_bound"), int)
+            or isinstance(root.get("output_token_all_attempts_upper_bound"), bool)
+            or root["output_token_all_attempts_upper_bound"] <= 0
+        ):
+            raise ArtifactSchemaError("topic pilot plan request envelope is invalid")
+        return
+    if kind == "outline_topic_pilot_receipt_closure":
+        selected = root.get("selected_call_ids")
+        if (
+            root.get("complete") is not True
+            or root.get("canonical_outline_complete") is not False
+            or not isinstance(selected, list)
+            or not selected
+            or any(not isinstance(item, str) or not item for item in selected)
+            or sorted(selected) != sorted(root.get("expected_call_ids") or ())
+            or len(set(selected)) != len(selected)
+            or not sha(root.get("closure_hash"))
+            or any(
+                root.get(field)
+                for field in (
+                    "missing_call_ids", "stale_call_ids", "failed_call_ids",
+                    "incomplete_call_ids", "hash_mismatches", "unexpected_receipts",
+                    "retry_exceeded_call_ids", "usage_incomplete_call_ids",
+                )
+            )
+        ):
+            raise ArtifactSchemaError("topic pilot receipt closure is incomplete")
+        return
+    selected = root.get("selected_topic_batch_ids")
+    result_hashes = root.get("topic_result_hashes")
+    output_ids = root.get("provider_output_artifact_ids")
+    if (
+        root.get("status") != "TOPIC_PILOT_COMPLETE"
+        or root.get("canonical_ready") is not False
+        or root.get("auto_continue") is not False
+        or root.get("adoption_authorized") is not False
+        or root.get("final_outline_artifact_id") != ""
+        or not sha(root.get("source_summary_set_hash"))
+        or not sha(root.get("receipt_closure_hash"))
+        or not isinstance(selected, list)
+        or not selected
+        or any(not isinstance(item, str) or not item for item in selected)
+        or len(set(selected)) != len(selected)
+        or not isinstance(result_hashes, Mapping)
+        or set(result_hashes) != set(selected)
+        or any(not sha(value) for value in result_hashes.values())
+        or not isinstance(output_ids, list)
+        or len(output_ids) != len(selected)
+        or any(not isinstance(item, str) or not item for item in output_ids)
+        or len(set(output_ids)) != len(output_ids)
+        or not str(root.get("receipt_closure_artifact_id") or "")
+    ):
+        raise ArtifactSchemaError("topic pilot checkpoint is incomplete or canonicalized")
+    dependencies = {
+        str(item.artifact_id): str(item.content_hash)
+        for item in getattr(record, "depends_on", ())
+    }
+    if (
+        dependencies.get(str(root["receipt_closure_artifact_id"]))
+        != root["receipt_closure_hash"]
+        or any(str(item) not in dependencies for item in output_ids)
+    ):
+        raise ArtifactSchemaError("topic pilot checkpoint dependency binding is incomplete")
+
+
 def _validate_current_production_artifact(record: Any, path: str | Path, root: Mapping[str, Any] | None) -> None:
     artifact_type = str(getattr(record, "artifact_type", "") or "")
     version = str(getattr(record, "artifact_version", "") or "")
@@ -2635,6 +2747,9 @@ def _validate_current_production_artifact(record: Any, path: str | Path, root: M
         ("outline_provider_call_plan", "v1"): _validate_outline_provider_call_plan,
         ("outline_request_payload_audit", "v1"): _validate_outline_request_payload_audit,
         ("outline_hierarchical_call_graph", "v1"): _validate_outline_hierarchical_call_graph,
+        ("outline_topic_pilot_plan", "v1"): _validate_outline_topic_pilot_artifact,
+        ("outline_topic_pilot_receipt_closure", "v1"): _validate_outline_topic_pilot_artifact,
+        ("outline_topic_pilot_checkpoint", "v1"): _validate_outline_topic_pilot_artifact,
         ("validation_disposition", "v1"): _validate_validation_disposition,
         ("lease_publication_manifest", "v1"): _validate_lease_publication_manifest,
         ("provider_receipt_ledger", "v1"): _validate_receipt_ledger,

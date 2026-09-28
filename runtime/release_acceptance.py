@@ -7,39 +7,42 @@ own final-SHA-bound evidence and its own facts.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
 import hashlib
-from io import BytesIO
 import json
 import os
-from pathlib import Path
 import re
 import stat
 import subprocess
 import sys
+import time
+import uuid
+import zipfile
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
+from io import BytesIO
+from pathlib import Path
 from typing import Any, Iterable, Mapping, cast
 from urllib.parse import urlsplit
-import zipfile
 
 from runtime.f1_corpus import F1CorpusManifestError, F1CorpusManifestV1
 from runtime.provider_runtime import (
+    AUTHORIZED_PROVIDER_CALL_LIMIT,
     AcceptanceExecutionContextV1,
-    acceptance_context_environment,
     ProviderAggregateBudgetV1,
     ProviderBudgetController,
     ProviderReceiptConflict,
     ProviderRuntime,
     ProviderRuntimeContractError,
     ProviderRuntimeLedger,
+    acceptance_context_environment,
     is_process_alive,
     process_identity_for_pid,
 )
 from runtime.trust_admission import (
-    ACKNOWLEDGEMENT_SCHEMA_VERSION,
-    ACKNOWLEDGEMENT_VERSION,
     ACK_CLOCK_SKEW,
     ACK_MAX_TTL,
+    ACKNOWLEDGEMENT_SCHEMA_VERSION,
+    ACKNOWLEDGEMENT_VERSION,
 )
 from services.durable_io import atomic_replace_with_retry
 
@@ -291,7 +294,7 @@ def _integer(value: Any, *, field_name: str, positive: bool = True) -> int:
 
 @dataclass(frozen=True)
 class ReleaseAcceptanceBudget:
-    max_provider_calls_total: int = 24
+    max_provider_calls_total: int = AUTHORIZED_PROVIDER_CALL_LIMIT
     max_output_tokens_total: int = 5_000_000
     max_retry_attempts_total: int = 2
     max_wall_seconds: int = 900
@@ -1773,6 +1776,8 @@ def _contention_worker_main(payload: Mapping[str, Any]) -> None:
     registry_job_id = str(payload["registry_job_id"])
     queue_path = Path(str(payload["queue_path"])).expanduser().resolve()
     artifact_path = Path(str(payload["artifact_path"])).expanduser().resolve()
+    startup_identity_path = Path(str(payload["startup_identity_path"])).expanduser().resolve()
+    startup_release_path = Path(str(payload["startup_release_path"])).expanduser().resolve()
     identity = process_identity_for_pid(os.getpid())
     if identity.creation_time is None:
         raise RuntimeError("contention worker could not capture process creation identity")
@@ -1798,6 +1803,65 @@ def _contention_worker_main(payload: Mapping[str, Any]) -> None:
         )
 
     emit("process_started")
+    startup_timeout_seconds = max(
+        1.0,
+        min(30.0, float(payload.get("startup_timeout_seconds") or 15.0)),
+    )
+    atomic_write_json(
+        str(startup_identity_path),
+        {
+            "schema_version": "contention-worker-startup-identity-v1",
+            "acceptance_run_id": str(payload["acceptance_run_id"]),
+            "worker_index": index,
+            "worker_job_id": worker_job_id,
+            "pid": identity.pid,
+            "process_creation_identity": str(identity.creation_time),
+        },
+    )
+    startup_deadline = time.monotonic() + startup_timeout_seconds
+    while not startup_release_path.is_file():
+        if time.monotonic() >= startup_deadline:
+            raise TimeoutError("contention worker startup identity was not released")
+        time.sleep(0.01)
+    try:
+        startup_release = json.loads(startup_release_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("contention worker startup release is unreadable") from exc
+    release_worker_index = (
+        startup_release.get("worker_index")
+        if isinstance(startup_release, Mapping)
+        else None
+    )
+    if (
+        not isinstance(startup_release, Mapping)
+        or startup_release.get("schema_version") != "contention-worker-startup-release-v1"
+        or startup_release.get("acceptance_run_id") != str(payload["acceptance_run_id"])
+        or isinstance(release_worker_index, bool)
+        or not isinstance(release_worker_index, int)
+        or release_worker_index != index
+        or startup_release.get("worker_job_id") != worker_job_id
+        or type(startup_release.get("continue")) is not bool
+    ):
+        raise RuntimeError("contention worker startup release identity is invalid")
+    if not startup_release["continue"]:
+        emit("process_startup_aborted")
+        event_path.parent.mkdir(parents=True, exist_ok=True)
+        event_path.write_text(
+            "".join(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n" for item in events),
+            encoding="utf-8",
+        )
+        return
+    release_pid = startup_release.get("pid")
+    release_creation = startup_release.get("process_creation_identity")
+    if (
+        isinstance(release_pid, bool)
+        or not isinstance(release_pid, int)
+        or release_pid != identity.pid
+        or not isinstance(release_creation, str)
+        or release_creation != str(identity.creation_time)
+    ):
+        raise RuntimeError("contention worker startup release does not match its process identity")
+    emit("process_startup_released")
     requested_at = _scenario_now()
     with interprocess_file_lock(lock_target, timeout_seconds=15.0):
         acquired_at = _scenario_now()
@@ -2645,6 +2709,8 @@ class GateKScenario(AcceptanceScenario):
         worker_environment["AUTO_GENERATE_ACCEPTANCE_RUN_ID"] = context.acceptance_run_id
         processes: list[subprocess.Popen[Any]] = []
         event_paths: list[Path] = []
+        startup_handshakes: list[dict[str, Any]] = []
+        worker_identities: list[Any] = []
         exit_codes: list[int] = []
         liveness_checks: list[dict[str, Any]] = []
         try:
@@ -2656,6 +2722,17 @@ class GateKScenario(AcceptanceScenario):
             for index, job_id in enumerate(worker_job_ids):
                 event_path = root / f"worker-{index}-events.jsonl"
                 event_paths.append(event_path)
+                handshake_id = uuid.uuid4().hex
+                startup_identity_path = root / f"worker-{index}-{handshake_id}.ready.json"
+                startup_release_path = root / f"worker-{index}-{handshake_id}.release.json"
+                startup_handshakes.append(
+                    {
+                        "worker_index": index,
+                        "worker_job_id": job_id,
+                        "identity_path": startup_identity_path,
+                        "release_path": startup_release_path,
+                    }
+                )
                 worker_payload = {
                     "acceptance_run_id": context.acceptance_run_id,
                     "worker_index": index,
@@ -2669,6 +2746,9 @@ class GateKScenario(AcceptanceScenario):
                     "registry_path": str(registry_path),
                     "queue_path": str(queue_path),
                     "artifact_path": str(root / f"worker-{index}.json"),
+                    "startup_identity_path": str(startup_identity_path),
+                    "startup_release_path": str(startup_release_path),
+                    "startup_timeout_seconds": 15,
                 }
                 processes.append(
                     subprocess.Popen(
@@ -2679,26 +2759,141 @@ class GateKScenario(AcceptanceScenario):
                         stderr=subprocess.DEVNULL,
                     )
                 )
-                worker_identity = process_identity_for_pid(processes[-1].pid)
-                if worker_identity.creation_time is None or not is_process_alive(worker_identity):
+            startup_payloads: dict[int, Any] = {}
+            startup_deadline = time.monotonic() + 15.0
+            while (
+                len(startup_payloads) < len(startup_handshakes)
+                and time.monotonic() < startup_deadline
+            ):
+                for startup in startup_handshakes:
+                    index = int(startup["worker_index"])
+                    if index in startup_payloads:
+                        continue
+                    identity_path = cast(Path, startup["identity_path"])
+                    if not identity_path.is_file():
+                        continue
+                    try:
+                        startup_payloads[index] = json.loads(
+                            identity_path.read_text(encoding="utf-8")
+                        )
+                    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                        raise RuntimeError(
+                            f"contention worker {index} identity is unreadable"
+                        ) from exc
+                if len(startup_payloads) < len(startup_handshakes):
+                    time.sleep(0.01)
+            if len(startup_payloads) != len(startup_handshakes):
+                missing_indexes = sorted(
+                    int(startup["worker_index"])
+                    for startup in startup_handshakes
+                    if int(startup["worker_index"]) not in startup_payloads
+                )
+                raise TimeoutError(
+                    "contention workers did not publish actual process identities: "
+                    + ", ".join(str(index) for index in missing_indexes)
+                )
+            for startup in startup_handshakes:
+                index = int(startup["worker_index"])
+                worker_identity_payload = startup_payloads[index]
+                if not isinstance(worker_identity_payload, Mapping):
+                    raise RuntimeError(f"contention worker {index} identity is not an object")
+                raw_worker_index = worker_identity_payload.get("worker_index")
+                raw_worker_pid = worker_identity_payload.get("pid")
+                reported_creation = str(
+                    worker_identity_payload.get("process_creation_identity") or ""
+                ).strip()
+                if (
+                    worker_identity_payload.get("schema_version")
+                    != "contention-worker-startup-identity-v1"
+                    or worker_identity_payload.get("acceptance_run_id")
+                    != context.acceptance_run_id
+                    or isinstance(raw_worker_index, bool)
+                    or not isinstance(raw_worker_index, int)
+                    or raw_worker_index != startup["worker_index"]
+                    or worker_identity_payload.get("worker_job_id")
+                    != startup["worker_job_id"]
+                    or isinstance(raw_worker_pid, bool)
+                    or not isinstance(raw_worker_pid, int)
+                    or raw_worker_pid <= 0
+                    or not reported_creation
+                ):
+                    raise RuntimeError(
+                        f"contention worker {startup['worker_index']} published an invalid process identity"
+                    )
+                worker_identity = process_identity_for_pid(raw_worker_pid)
+                if (
+                    worker_identity.creation_time is None
+                    or str(worker_identity.creation_time) != reported_creation
+                    or not is_process_alive(worker_identity)
+                ):
                     raise RuntimeError(
                         f"contention worker {index} failed the production liveness probe"
                     )
+                worker_identities.append(worker_identity)
                 liveness_checks.append(
                     {
                         "target_pid": worker_identity.pid,
                         "target_process_creation_identity": str(
                             worker_identity.creation_time
                         ),
+                        "worker_index": startup["worker_index"],
+                        "worker_job_id": startup["worker_job_id"],
                         "alive": True,
                     }
                 )
-            exit_codes = [process.wait(timeout=30) for process in processes]
+            for startup, worker_identity in zip(startup_handshakes, worker_identities):
+                atomic_write_json(
+                    str(startup["release_path"]),
+                    {
+                        "schema_version": "contention-worker-startup-release-v1",
+                        "acceptance_run_id": context.acceptance_run_id,
+                        "worker_index": startup["worker_index"],
+                        "worker_job_id": startup["worker_job_id"],
+                        "pid": worker_identity.pid,
+                        "process_creation_identity": str(worker_identity.creation_time),
+                        "continue": True,
+                    },
+                )
+            try:
+                exit_codes = [process.wait(timeout=30) for process in processes]
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError("contention workers exceeded their bounded completion wait") from exc
+            worker_exit_deadline = time.monotonic() + 5.0
+            while any(is_process_alive(identity) for identity in worker_identities):
+                if time.monotonic() >= worker_exit_deadline:
+                    raise RuntimeError("contention worker process remained alive after its launcher exited")
+                time.sleep(0.01)
         finally:
+            for startup in startup_handshakes:
+                release_path = cast(Path, startup["release_path"])
+                if release_path.exists():
+                    continue
+                try:
+                    atomic_write_json(
+                        str(release_path),
+                        {
+                            "schema_version": "contention-worker-startup-release-v1",
+                            "acceptance_run_id": context.acceptance_run_id,
+                            "worker_index": startup["worker_index"],
+                            "worker_job_id": startup["worker_job_id"],
+                            "continue": False,
+                        },
+                    )
+                except OSError:
+                    pass
             for process in processes:
                 if process.poll() is None:
-                    process.terminate()
-                    process.wait(timeout=10)
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        process.terminate()
+                        process.wait(timeout=10)
+            for startup in startup_handshakes:
+                for key in ("identity_path", "release_path"):
+                    try:
+                        cast(Path, startup[key]).unlink(missing_ok=True)
+                    except OSError:
+                        pass
         if exit_codes != [0, 0] or not all(path.is_file() for path in event_paths):
             raise RuntimeError(f"contention workers did not exit cleanly: {exit_codes}")
         event_rows: list[Mapping[str, Any]] = []

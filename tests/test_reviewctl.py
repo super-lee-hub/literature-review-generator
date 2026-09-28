@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import configparser
 import json
 import os
 from pathlib import Path
@@ -8,11 +9,12 @@ import time
 from dataclasses import replace
 
 from reviewctl import main as reviewctl_main
-from runtime.control_plane import FORBIDDEN_ACTIONS, ReviewControlPlane
+from runtime.control_plane import ReviewControlPlane
 from runtime.outline_v3_dag import OutlineNodeStore
 from services.artifact_registry import ArtifactRegistry
 from services.credential_provenance import PREPROCESS_ENV_MAPPING
 from services.job_workspace import JobWorkspace
+from tests.test_outline_v3_semantic_execution import _summary
 
 
 def _spec(tmp_path: Path):
@@ -49,6 +51,188 @@ def test_reviewctl_plan_and_doctor_emit_machine_json(tmp_path: Path, capsys) -> 
     doctor = json.loads(capsys.readouterr().out)
     assert doctor["status"] == "fail"
     assert "dummy" not in json.dumps(doctor)
+
+
+def test_reviewctl_plan_projects_all_reachable_provider_work_without_posting(
+    tmp_path: Path, capsys,
+) -> None:
+    spec = _spec(tmp_path)
+    config = Path(spec.config)
+    parser = configparser.ConfigParser()
+    parser.read(Path(__file__).resolve().parents[1] / "config.ini.example", encoding="utf-8")
+    parser["Paths"]["output_path"] = str(tmp_path / "output")
+    for section in ("Primary_Reader_API", "Backup_Reader_API"):
+        parser[section]["api_key"] = "local-fixture-only"
+        parser[section]["api_base"] = "http://127.0.0.1:1/v1"
+    with config.open("w", encoding="utf-8") as handle:
+        parser.write(handle)
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(json.dumps(spec.to_dict()), encoding="utf-8")
+
+    assert reviewctl_main(["plan", "--spec", str(spec_path)]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    projection = plan["full_stage_request_plan"]
+    assert projection["schema_version"] == "full-stage-provider-request-plan-v1"
+    assert projection["limits"]["effective_provider_call_limit"] == 24
+    assert projection["totals"]["unknown_exposure_count"] >= 1
+    assert projection["budget_status"]["admission"] == "incomplete_unknown_exposure"
+    assert projection["boundary"]["no_provider_posts"] is True
+    assert projection["aggregate_budget_source"] == (
+        "application_call_cap_projection_without_bound_acceptance_run"
+    )
+    assert plan["provider_admission_status"] == "incomplete_unknown_exposure"
+    assert plan["ready_for_provider_admission"] is False
+    assert "local-fixture-only" not in json.dumps(plan)
+
+
+def test_chunk_plan_loads_summary_source_manifest_and_marks_navigation_scope(
+    tmp_path: Path,
+) -> None:
+    summary_path = tmp_path / "summaries.json"
+    summary_path.write_text(
+        json.dumps(
+            [
+                _summary("paper-a", "A", "A finding."),
+                _summary("paper-b", "B", "B finding."),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    manifest_path = tmp_path / "summary-source-manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "artifact_type": "summary_source_manifest",
+                "artifact_version": "v2",
+                "created_at": "2026-09-26T00:00:00Z",
+                "project_name": "chunk-plan-test",
+                "source_kind": "runtime_summary_source",
+                "source_path": str(summary_path),
+                "source_items": [],
+                "rejected_candidates": [],
+                "materialized_summary_file": summary_path.name,
+                "summary_count": 2,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = ReviewControlPlane(repo_root=tmp_path).chunk_plan([manifest_path])
+
+    assert result["source_summary_count"] == 2
+    assert result["provider_posts_emitted"] == 0
+    assert result["provider_call_budget_status"] == "NOT_PLANNED_END_TO_END"
+    assert result["provider_request_plan_status"] == "not_planned_config_missing"
+    assert result["semantic_chunk_plan"]["budgets"]["within_physical_call_limit"] is None
+
+
+def test_chunk_plan_builds_route_bound_semantic_request_plan_without_posts(
+    tmp_path: Path,
+) -> None:
+    summary_path = tmp_path / "summaries.json"
+    summary_path.write_text(
+        json.dumps(
+            [
+                _summary("paper-a", "A", "A finding."),
+                _summary("paper-b", "B", "B finding."),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "config.ini"
+    config_path.write_text(
+        "[Outline_API]\n"
+        "provider_family = anthropic\n"
+        "model = claude-opus-5\n"
+        "endpoint_type = anthropic\n"
+        "api_base = https://api.example.test\n"
+        "max_context_tokens = 32000\n"
+        "max_output_tokens = 4096\n\n"
+        "[OutlineModels]\n"
+            "outline_model = Outline_API\n"
+            "relation_adjudicator_model = Outline_API\n"
+            "structure_critic_model = Outline_API\n"
+            "coverage_critic_model = Outline_API\n"
+            "evidence_critic_model = Outline_API\n"
+            "arbitrator_model = Outline_API\n\n"
+        "[Outline]\n"
+        "candidate_count = 2\n\n"
+        "[OutlineStability]\n"
+        "mode = off\n"
+        "max_provider_calls = 24\n"
+        "max_source_prompt_tokens = 32000\n",
+        encoding="utf-8",
+    )
+
+    result = ReviewControlPlane(repo_root=tmp_path).chunk_plan(
+        [summary_path],
+        config_path=config_path,
+    )
+
+    assert result["provider_posts_emitted"] == 0
+    assert result["provider_request_plan_status"] == "planned_semantic_request_graph"
+    assert result["semantic_request_plan"]
+    assert all(
+        "request_hash" in item
+        for item in result["semantic_request_plan"]
+        if "batch_id" in item
+    )
+    assert all(
+        item["physical_attempt_upper_bound"] == 3
+        for item in result["semantic_request_plan"]
+    )
+    assert result["semantic_request_physical_attempts_upper_bound"] is not None
+    assert result["end_to_end_provider_budget_status"] == "NOT_PLANNED"
+    assert result["topic_request_plan_identity_hash"]
+    assert result["r1_request_workload_audit"]["topic_request_plan_identity_hash"] == result[
+        "topic_request_plan_identity_hash"
+    ]
+    coverage = result["r1_request_workload_audit"]["topic_wire_coverage"]
+    assert coverage["status"] == "complete"
+    assert coverage["all_planned_unit_sets_equal_materialized_unit_sets"] is True
+    assert coverage["missing_source_claim_identity_count"] == 0
+    assert coverage["missing_source_evidence_identity_count"] == 0
+    assert coverage["extra_topic_wire_claim_identity_count"] == 0
+    assert coverage["extra_topic_wire_evidence_identity_count"] == 0
+    text_metrics = result["r1_request_workload_audit"]["topic_wire_text"]
+    assert text_metrics["request_count"] > 0
+    assert text_metrics["source_text_occurrence_count"] >= text_metrics[
+        "unique_source_text_identity_count_across_requests"
+    ]
+    assert text_metrics["repeated_occurrence_count_total"] == (
+        text_metrics["source_text_occurrence_count"]
+        - text_metrics["unique_source_text_identity_count_across_requests"]
+    )
+    assert "topic_merge_policy" in result["r1_request_workload_audit"]
+    assert "source_text_identity_records" not in json.dumps(result)
+
+
+def test_config_migrate_cli_preserves_route_conflict_and_redacts_values(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    config_path = tmp_path / "legacy-route.ini"
+    original = (
+        "[Backup_Reader_API]\nmodel = backup-model\napi_key = backup-secret-placeholder\n"
+        "[Outline_GPT_API]\nmodel = old-model\napi_key = old-secret-placeholder\n"
+        "[OutlineModels]\nstructure_critic_model = Outline_GPT_API\n"
+    )
+    config_path.write_text(original, encoding="utf-8")
+
+    assert reviewctl_main([
+        "config-migrate",
+        "--config",
+        str(config_path),
+        "--dry-run",
+    ]) == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "error"
+    assert "model" in payload["error"]
+    assert "api_key" in payload["error"]
+    assert "backup-secret-placeholder" not in json.dumps(payload)
+    assert "old-secret-placeholder" not in json.dumps(payload)
+    assert config_path.read_text(encoding="utf-8") == original
+    assert list(tmp_path.glob("*.backup_before_*")) == []
 
 
 def test_reviewctl_run_domain_failure_is_machine_json(tmp_path: Path, capsys) -> None:

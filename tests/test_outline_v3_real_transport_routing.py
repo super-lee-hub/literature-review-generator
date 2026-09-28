@@ -33,7 +33,7 @@ from outline.provider_router import (
 from outline.v3_executor import OutlineV3Executor
 from outline.v3_models import OutlineQualityGate
 from runtime.provider_context import ProviderContextProfile
-from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry
+from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry, RegistryError
 from services.job_workspace import JobWorkspace
 
 from test_outline_v3_semantic_execution import (
@@ -142,6 +142,7 @@ def _build_router() -> tuple[OutlineProviderRouter, dict[str, SentinelTransport]
             ),
             transport=transport,
             api_base=f"https://{HOST_FOR_ROLE[role]}",
+            config_identity={"transport_retries": "0"},
         )
 
     return OutlineProviderRouter(routes=routes, diagnostics=collect_routing_diagnostics(routes)), transports
@@ -569,6 +570,10 @@ def test_transitive_dependency_tamper_rejects_reuse_and_reruns_descendants(
     # Leave the candidate output bytes unchanged; only a two-level registered
     # dependency beneath its Registry record is now invalid.
     leaf_path.write_bytes(leaf_path.read_bytes() + b"\n")
+    tampered_candidate_record = first.registry.get(candidate_record.artifact_id)
+    assert tampered_candidate_record is not None
+    with pytest.raises(RegistryError):
+        first.registry.verify_ready_artifact_closure(tampered_candidate_record)
 
     second_router, second_transports = _build_router()
     second = _executor(
@@ -591,10 +596,14 @@ def test_transitive_dependency_tamper_rejects_reuse_and_reruns_descendants(
     current_receipts = second._receipt_ledger.list_receipts()
     assert len(current_receipts) == 1
     assert current_receipts[0].attempt_id == "outline:candidate_1_provider_generation"
-    assert any(
-        "replay output Registry authority is invalid" in diagnostic
-        for diagnostic in second.replay_diagnostics
+    stability = json.loads(Path(result.artifacts["stability_audit"]).read_text(encoding="utf-8"))["payload"]
+    candidate_replay = next(
+        item for item in stability["replay_evidence"]
+        if item.get("node_id") == "candidate_1_provider_generation"
     )
+    assert candidate_replay["lookup_status"] == "miss"
+    assert candidate_replay["provider_invoked"] is True
+    assert candidate_replay["reused_receipt_ids"] == []
 
     closure_record = second.registry.get("outline-v3:provider_receipt_closure")
     assert closure_record is not None

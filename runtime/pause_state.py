@@ -74,6 +74,12 @@ class PauseStateStore:
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
         except FileNotFoundError:
+            if self.registry is not None:
+                self.registry.reload()
+                if self.registry.get(self.artifact_id) is not None:
+                    raise PauseRequestedError(
+                        "CONTROL_STATE_INVALID: registered pause marker is missing"
+                    )
             return None
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise PauseRequestedError(
@@ -90,6 +96,7 @@ class PauseStateStore:
         if state.state not in {RUNNABLE, PAUSED_BY_USER}:
             raise PauseRequestedError("CONTROL_STATE_INVALID: pause marker has an unsupported state")
         if self.registry is not None:
+            self.registry.reload()
             record = self.registry.get(self.artifact_id)
             if (
                 record is None

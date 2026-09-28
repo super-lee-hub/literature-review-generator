@@ -9,8 +9,10 @@ silently converted into a paper node or an exclusion.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections import defaultdict
+from dataclasses import replace
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from services.paper_identity import (
@@ -29,6 +31,7 @@ from outline.v3_models import (
     OutlineEvidenceView,
     OutlineEvidenceViews,
     ReviewIntent,
+    SourceFieldLedgerEntry,
     compute_v3_hash,
 )
 
@@ -54,6 +57,103 @@ _CLASSIFICATION_PRIORITY = {
     "support": 2,
     "core": 3,
 }
+
+_STUDY_COLLECTION_KEYS = {
+    "studies",
+    "research_units",
+    "researchunits",
+    "experiments",
+    "study_results",
+    "individual_studies",
+    "study_level_results",
+}
+_STUDY_RECORD_CONTENT_KEYS = {
+    "findings",
+    "finding",
+    "results",
+    "result",
+    "method",
+    "sample",
+    "hypotheses",
+    "research_question",
+    "research_questions",
+    "claims",
+    "conclusions",
+}
+_STUDY_ID_KEYS = ("study_id", "id", "study", "experiment_id")
+_INTERPRETATION_CANONICAL_FIELDS = {
+    "research_questions",
+    "theories",
+    "constructs",
+    "mechanisms",
+    "method",
+    "sample_or_context",
+    "findings",
+    "conclusions",
+    "limitations",
+    "research_gaps",
+    "future_directions",
+    "relevance",
+}
+_INTERPRETATION_PATH_TOKENS = (
+    "finding",
+    "result",
+    "boundary",
+    "condition",
+    "moderator",
+    "limitation",
+    "zero",
+    "null",
+    "non_significant",
+    "mechanism",
+    "research_gap",
+    "future_direction",
+)
+_STUDY_FIELD_ALIASES = {
+    "finding": "findings",
+    "findings": "findings",
+    "result": "findings",
+    "results": "findings",
+    "zero_results": "zero_results",
+    "null_results": "zero_results",
+    "null_findings": "zero_results",
+    "non_significant_results": "zero_results",
+    "moderator": "moderators_boundaries",
+    "moderators": "moderators_boundaries",
+    "boundaries": "moderators_boundaries",
+    "boundary_conditions": "moderators_boundaries",
+    "conditions": "moderators_boundaries",
+    "limitations": "limitations",
+    "mechanism": "mechanism_evidence",
+    "mechanisms": "mechanism_evidence",
+    "mediators": "mechanism_evidence",
+    "mediation": "mechanism_evidence",
+    "method": "method",
+    "methodology": "method",
+    "design": "method",
+    "analysis": "method",
+    "sample": "sample_or_context",
+    "context": "sample_or_context",
+    "sample_or_context": "sample_or_context",
+    "participants": "sample_or_context",
+    "data_source": "sample_or_context",
+    "research_question": "research_questions",
+    "research_questions": "research_questions",
+    "questions": "research_questions",
+    "hypothesis": "research_questions",
+    "hypotheses": "research_questions",
+}
+_DOSSIER_CONTEXT_SOURCE_PATHS = {
+    "ai_summary.core_analysis.zero_results": "zero_results",
+    "ai_summary.core_analysis.null_results": "zero_results",
+    "ai_summary.core_analysis.non_significant_results": "zero_results",
+    "ai_summary.core_analysis.theoretical_derivation": "theoretical_derivation",
+    "ai_summary.core_analysis.core_variables": "concept_definitions",
+    "ai_summary.core_analysis.key_constructs": "concept_definitions",
+    "ai_summary.reviewer_inference": "reviewer_inference",
+    "ai_summary.reviewer_inferences": "reviewer_inference",
+}
+_DOSSIER_CONTEXT_FIELDS = set(_DOSSIER_CONTEXT_SOURCE_PATHS.values())
 
 
 def _as_mapping(value: Any) -> Mapping[str, Any]:
@@ -93,6 +193,208 @@ def _text_values(value: Any) -> List[str]:
         return _stable_unique(items)
     text = _safe_text(value)
     return [text] if text else []
+
+
+def find_source_study_records(
+    value: Any,
+) -> List[Tuple[str, Mapping[str, Any], str, bool]]:
+    """Return structured study records and whether each has a source ID.
+
+    Unidentified records are returned for ledger scoping, but callers must not
+    promote them to source study units.  Their content remains unresolved.
+    """
+
+    records: List[Tuple[str, Mapping[str, Any], str, bool]] = []
+
+    def walk(node: Any, path: str = "") -> None:
+        if isinstance(node, Mapping):
+            for key in sorted(node, key=lambda item: str(item)):
+                child = node[key]
+                key_text = str(key)
+                child_path = f"{path}.{key_text}" if path else key_text
+                if (
+                    key_text.casefold().replace("-", "_") in _STUDY_COLLECTION_KEYS
+                    and isinstance(child, Sequence)
+                    and not isinstance(child, (str, bytes))
+                ):
+                    for index, item in enumerate(child):
+                        if not isinstance(item, Mapping):
+                            continue
+                        keys = {str(item_key).casefold() for item_key in item}
+                        if not keys.intersection(_STUDY_RECORD_CONTENT_KEYS):
+                            continue
+                        source_id = ""
+                        for id_key in _STUDY_ID_KEYS:
+                            candidate = _safe_text(item.get(id_key))
+                            if candidate:
+                                source_id = candidate
+                                break
+                        records.append((source_id, item, f"{child_path}[{index}]", bool(source_id)))
+                walk(child, child_path)
+        elif isinstance(node, Sequence) and not isinstance(node, (str, bytes)):
+            for index, item in enumerate(node):
+                walk(item, f"{path}[{index}]")
+
+    walk(value)
+    by_path = {path: (source_id, record, path, explicit) for source_id, record, path, explicit in records}
+    return [by_path[path] for path in sorted(by_path)]
+
+
+def _source_field_leaves(value: Any, path: str = "") -> List[Tuple[str, str]]:
+    """Flatten non-empty scalar source values while preserving raw text."""
+
+    if isinstance(value, Mapping):
+        result: List[Tuple[str, str]] = []
+        for key in sorted(value, key=lambda item: str(item)):
+            child_path = f"{path}.{key}" if path else str(key)
+            result.extend(_source_field_leaves(value[key], child_path))
+        return result
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        result = []
+        for index, child in enumerate(value):
+            result.extend(_source_field_leaves(child, f"{path}[{index}]"))
+        return result
+    if value is None or isinstance(value, Mapping) or (
+        isinstance(value, Sequence) and not isinstance(value, (str, bytes))
+    ):
+        return []
+    text = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value)
+    return [(path, text)] if text.strip() else []
+
+
+def _path_is_within(path: str, parent: str) -> bool:
+    return path == parent or path.startswith(parent + ".") or path.startswith(parent + "[")
+
+
+def _source_field_scope(
+    source_path: str,
+    study_records: Sequence[Tuple[str, Mapping[str, Any], str, bool]],
+) -> Tuple[str, str]:
+    matching = [record for record in study_records if _path_is_within(source_path, record[2])]
+    if not matching:
+        return "paper", ""
+    source_id, _record, _path, explicit = max(matching, key=lambda item: len(item[2]))
+    return ("explicit_study", source_id) if explicit else ("unresolved", "")
+
+
+def _source_path_context(source_path: str) -> bool:
+    return source_path.startswith((
+        "paper_info.",
+        "ai_summary.paper_metadata.",
+        "ai_summary.routing.",
+        "ai_summary.quality_audit.",
+        "paper_metadata.",
+        "routing.",
+        "quality_audit.",
+        "ai_summary.specialized_details.review.",
+        "specialized_details.review.",
+    )) or source_path in {"status", "ai_summary.schema_version", "ai_summary.core_analysis.summary"}
+
+
+def _source_path_requires_interpretation(source_path: str, canonical_field: str) -> bool:
+    if canonical_field in _INTERPRETATION_CANONICAL_FIELDS:
+        return True
+    token_path = source_path.casefold().replace("-", "_")
+    return any(token in token_path for token in _INTERPRETATION_PATH_TOKENS)
+
+
+def build_source_field_ledger(
+    summary: Mapping[str, Any],
+    view: OutlineEvidenceView,
+    source_summary_hash: str,
+) -> List[SourceFieldLedgerEntry]:
+    """Record every non-empty raw source field against the typed projection."""
+
+    canonical_paths: Dict[str, List[str]] = {
+        str(canonical): [str(path) for path in paths]
+        for canonical, paths in view.source_fields.items()
+    }
+    projected: Dict[str, List[str]] = {
+        canonical: _text_values(getattr(view, canonical, []))
+        for canonical in canonical_paths
+    }
+    study_records = find_source_study_records(summary)
+    entries: List[SourceFieldLedgerEntry] = []
+    for source_path, source_value in _source_field_leaves(summary):
+        canonical_source_paths = [source_path]
+        if not source_path.startswith("ai_summary."):
+            canonical_source_paths.append(f"ai_summary.{source_path}")
+        matches = [
+            canonical
+            for canonical, paths in canonical_paths.items()
+            if any(
+                _path_is_within(canonical_path, path)
+                for canonical_path in canonical_source_paths
+                for path in paths
+            )
+        ]
+        if not matches:
+            matches = sorted({
+                canonical
+                for canonical_path, canonical in _DOSSIER_CONTEXT_SOURCE_PATHS.items()
+                if any(_path_is_within(path, canonical_path) for path in canonical_source_paths)
+            })
+        if not matches:
+            key = re.sub(r"\[\d+\]$", "", source_path.rsplit(".", 1)[-1]).casefold()
+            alias = _STUDY_FIELD_ALIASES.get(key)
+            if alias and _source_field_scope(source_path, study_records)[0] == "explicit_study":
+                matches = [alias]
+        scope, study_id = _source_field_scope(source_path, study_records)
+        for canonical in sorted(set(matches)):
+            normalized = source_value.strip()
+            derived_match = next(
+                (value for value in projected.get(canonical, []) if value == normalized),
+                "",
+            )
+            if derived_match:
+                disposition = "exact" if source_value == derived_match else "rewritten"
+                derived_value = derived_match if disposition == "rewritten" else ""
+            elif canonical in _STUDY_FIELD_ALIASES.values() and scope == "explicit_study":
+                disposition = "context"
+                derived_value = ""
+            elif canonical in _DOSSIER_CONTEXT_FIELDS:
+                disposition = "context"
+                derived_value = ""
+            else:
+                disposition = "unmapped"
+                canonical = ""
+                derived_value = ""
+            required = _source_path_requires_interpretation(source_path, canonical)
+            field_id = "source-field:" + hashlib.sha256(
+                f"{source_summary_hash}|{source_path}|{source_value}|{canonical}".encode("utf-8")
+            ).hexdigest()
+            entries.append(SourceFieldLedgerEntry(
+                source_field_id=field_id,
+                source_path=source_path,
+                source_value=source_value,
+                disposition=disposition,
+                canonical_field=canonical,
+                scope=scope,
+                study_id=study_id,
+                interpretation_required=required,
+                source_summary_hash=source_summary_hash,
+                derived_value=derived_value,
+            ))
+        if matches:
+            continue
+        context = _source_path_context(source_path)
+        last_key = source_path.rsplit(".", 1)[-1].casefold()
+        required = _source_path_requires_interpretation(source_path, "")
+        field_id = "source-field:" + hashlib.sha256(
+            f"{source_summary_hash}|{source_path}|{source_value}|".encode("utf-8")
+        ).hexdigest()
+        entries.append(SourceFieldLedgerEntry(
+            source_field_id=field_id,
+            source_path=source_path,
+            source_value=source_value,
+            disposition="context" if context else "unmapped",
+            canonical_field="",
+            scope=scope,
+            study_id=study_id,
+            interpretation_required=required or any(token in last_key for token in _INTERPRETATION_PATH_TOKENS),
+            source_summary_hash=source_summary_hash,
+        ))
+    return sorted(entries, key=lambda item: item.source_field_id)
 
 
 def _safe_year(value: Any) -> Optional[int]:
@@ -476,6 +778,10 @@ def _extract_view(
         must_use=bool(metadata.get("must_use")) or classification == "core",
         diagnostics=_stable_unique(diagnostics),
     )
+    view = replace(
+        view,
+        source_field_ledger=build_source_field_ledger(summary, view, source_summary_hash),
+    )
     return view, blocking
 
 
@@ -568,6 +874,13 @@ def _merge_views(left: OutlineEvidenceView, right: OutlineEvidenceView) -> Tuple
         classification=classification,
         must_use=left.must_use or right.must_use or classification == "core",
         diagnostics=merged_fields["diagnostics"],
+        source_field_ledger=sorted(
+            {
+                entry.source_field_id: entry
+                for entry in (*left.source_field_ledger, *right.source_field_ledger)
+            }.values(),
+            key=lambda item: item.source_field_id,
+        ),
     )
     return merged, diagnostics
 
@@ -962,6 +1275,8 @@ def merge_outline_evidence_shards(shards: Sequence[OutlineEvidenceViews]) -> Out
 
 __all__ = [
     "MATRIX_DIMENSIONS",
+    "find_source_study_records",
+    "build_source_field_ledger",
     "build_outline_evidence_views",
     "build_global_corpus_ledger",
     "build_multi_view_matrix",

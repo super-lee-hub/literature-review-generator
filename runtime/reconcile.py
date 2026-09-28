@@ -245,6 +245,19 @@ def _validate_summary_source_manifest(record: ArtifactRecord, path: Path) -> Non
         artifact_type="summary_source_manifest",
         versions=("v2",),
     )
+    load_summary_source_manifest(path)
+
+
+def load_summary_source_manifest(path: str | Path) -> tuple[Mapping[str, Any], Path, list[Any]]:
+    """Load and validate a public summary-source manifest and its materialized array."""
+
+    target = Path(path).expanduser().resolve()
+    payload = _read_json_object(target)
+    if (
+        payload.get("artifact_type") != "summary_source_manifest"
+        or payload.get("artifact_version") != "v2"
+    ):
+        raise ReconcileValidationError("unsupported summary_source_manifest contract")
     _require_fields(
         payload,
         (
@@ -263,9 +276,7 @@ def _validate_summary_source_manifest(record: ArtifactRecord, path: Path) -> Non
     _require_nonempty_string(payload.get("project_name"), label="summary manifest project_name")
     _require_nonempty_string(payload.get("source_kind"), label="summary manifest source_kind")
     source_items = _require_list(payload.get("source_items"), label="summary manifest source_items")
-    rejected = _require_list(
-        payload.get("rejected_candidates"), label="summary manifest rejected_candidates"
-    )
+    rejected = _require_list(payload.get("rejected_candidates"), label="summary manifest rejected_candidates")
     if any(not isinstance(item, Mapping) for item in (*source_items, *rejected)):
         raise ReconcileValidationError("summary manifest candidates must be JSON objects")
     summary_path = Path(
@@ -275,19 +286,20 @@ def _validate_summary_source_manifest(record: ArtifactRecord, path: Path) -> Non
         )
     ).expanduser()
     if not summary_path.is_absolute():
-        summary_path = path.parent / summary_path
+        summary_path = target.parent / summary_path
     summary_path = summary_path.resolve()
     try:
         summaries = json.loads(summary_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ReconcileValidationError(f"summary manifest target is unavailable: {exc}") from exc
-    if not isinstance(summaries, list):
-        raise ReconcileValidationError("summary manifest target must be a JSON array")
+    if not isinstance(summaries, list) or any(not isinstance(item, Mapping) for item in summaries):
+        raise ReconcileValidationError("summary manifest target must be an array of objects")
     summary_count = payload.get("summary_count")
     if isinstance(summary_count, bool) or not isinstance(summary_count, int) or summary_count < 0:
         raise ReconcileValidationError("summary manifest summary_count must be a non-negative integer")
     if summary_count != len(summaries):
         raise ReconcileValidationError("summary manifest summary_count is inconsistent")
+    return payload, summary_path, summaries
 
 
 def _validate_stage1_reusable_summary_manifest(record: ArtifactRecord, path: Path) -> None:

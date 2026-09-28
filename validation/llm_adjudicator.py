@@ -7,7 +7,11 @@ from typing import Any, Dict, List, Mapping, Optional, cast
 
 from ai_interface import _call_ai_api
 from models import APIConfig
-from runtime.provider_runtime import ProviderBudgetExceeded, ProviderRuntime
+from runtime.provider_runtime import (
+    ProviderBudgetExceeded,
+    ProviderRuntime,
+    canonical_provider_request_payload,
+)
 from services.prompt_registry import PromptRegistry, PromptRegistryError
 
 
@@ -243,14 +247,14 @@ def run_adjudication_stage(
         "response_format": "json",
         "logger": getattr(service, "logger", None),
     }
-    request_payload: Dict[str, Any] = {
-        "system": system_prompt,
-        "user": prompt,
-        "user_content": None,
-        "response_format": "json",
-        "max_output_tokens": int(max_tokens),
-        "temperature": temperature,
-    }
+    request_payload: Dict[str, Any] = canonical_provider_request_payload(
+        prompt=prompt,
+        system_prompt=system_prompt,
+        user_content=None,
+        response_format="json",
+        max_output_tokens=int(max_tokens),
+        temperature=temperature,
+    )
     if provider_runtime is not None:
         call_kwargs["provider_runtime"] = provider_runtime
         bind_call = getattr(service, "bind_provider_call", None)

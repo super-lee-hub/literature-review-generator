@@ -33,23 +33,41 @@ from ai_interface import build_provider_transport_preflight, classify_provider_e
 from services.credential_provenance import is_template_credential, provenance_payload
 from models import APIConfig
 from runtime.job_spec import RuntimeJobSpec, load_runtime_job_spec
+from runtime.checkout_identity import CheckoutIdentityError, read_checkout_sha
 from runtime.outline_v3_dag import OutlineNodeStore
 from runtime.outline_v3_replay import ModelCallReplayStore
-from runtime.orchestrator import AgentRuntimeBridge
+from runtime.orchestrator import AgentRuntimeBridge, InternalStageExecutorRegistry
 from runtime.runner import AgentRuntimeRunner, RuntimeExecutionResult, RuntimeRunnerError
 from runtime.provider_runtime import (
+    AUTHORIZED_PROVIDER_CALL_LIMIT,
     AcceptanceExecutionContextV1,
+    ProviderAggregateBudgetV1,
     ProviderBudgetController,
     ProviderBudgetExceeded,
     ProviderRuntime,
     ProviderRuntimeLedger,
+    acceptance_execution_context_from_environment,
+    authorized_provider_call_limit,
     acceptance_context_environment,
     bind_acceptance_execution_context,
     current_acceptance_execution_context,
+    hash_json,
     is_process_alive,
     process_identity_for_pid,
+    provider_budget_controller_from_environment,
 )
+from services.stage1_reuse import (
+    Stage1ReusableSummaryBindingV1,
+    verify_stage1_typed_manifest_authority,
+)
+from runtime.reconcile import load_summary_source_manifest
 from runtime.provider_routes import build_reachable_provider_route_plan
+from runtime.stage_planning import (
+    ProviderStageRequestInventoryV1,
+    UnplannedProviderExposureV1,
+    build_full_stage_request_plan_v1,
+    build_stage_plan,
+)
 from runtime.trust_admission import (
     ExternalHostAdmissionError,
     acknowledgement_from_values,
@@ -555,6 +573,203 @@ class ReviewControlPlane:
             "read_only": True,
         }
 
+    def _full_stage_request_plan_for_spec(
+        self, spec: RuntimeJobSpec
+    ) -> dict[str, Any]:
+        """Expose reachable work before admission without inventing requests."""
+
+        requested = spec.metadata.get("requested_stages")
+        free_mode_enabled = bool(
+            spec.free_mode_profile
+            or spec.free_mode_idea
+            or spec.metadata.get("free_mode_input")
+        )
+        config = load_config(
+            spec.config,
+            action=spec.action,
+            requested_stages=requested,
+            free_mode_enabled=free_mode_enabled,
+            allow_template_credentials=False,
+        )
+        settings = ApplicationSettings.from_config(config)
+        stage_plan = build_stage_plan(
+            action=spec.action,
+            requested_stages=requested,
+            validation_enabled=settings.review_validation_enabled(),
+            validation_required=spec.metadata.get("validation_required"),
+            require_clean_validation=spec.metadata.get("require_clean_validation"),
+            allow_unvalidated_when_validation_optional=spec.metadata.get(
+                "allow_unvalidated_when_validation_optional"
+            ),
+        )
+        route_plan = build_reachable_provider_route_plan(
+            config,
+            action=spec.action,
+            requested_stages=stage_plan.requested_stages,
+            free_mode_enabled=free_mode_enabled,
+            stage_plan=stage_plan,
+        )
+        acceptance = current_acceptance_execution_context()
+        aggregate_budget = (
+            acceptance.provider_budget
+            if acceptance is not None
+            else ProviderAggregateBudgetV1(
+                max_provider_calls_total=authorized_provider_call_limit()
+            )
+        )
+        inventories: list[ProviderStageRequestInventoryV1] = []
+        if "analyze" in stage_plan.requested_stages:
+            reader_route = next(
+                (
+                    route for route in route_plan.routes
+                    if route.stage == "analyze"
+                    and route.semantic_role == "primary_reader"
+                ),
+                None,
+            )
+            if reader_route is not None:
+                inventories.append(
+                    ProviderStageRequestInventoryV1(
+                        stage_name="analyze",
+                        source_builder="Stage1 reader and typed-reuse admission",
+                        unknown_exposures=(
+                            UnplannedProviderExposureV1(
+                                stage_name="analyze",
+                                semantic_role="primary_reader",
+                                route_identity=reader_route.identity,
+                                reason="primary_reader_requests_require_source_pages_or_verified_typed_reuse",
+                            ),
+                            UnplannedProviderExposureV1(
+                                stage_name="analyze",
+                                semantic_role="primary_reader",
+                                route_identity=reader_route.identity,
+                                reason="summary_drift_recheck_requires_current_source_and_failed_authority",
+                                conditional_on="source_or_summary_drift_requires_recheck",
+                            ),
+                        ),
+                    )
+                )
+        if "outline" in stage_plan.requested_stages:
+            outline_route = next(
+                (
+                    route for route in route_plan.routes
+                    if route.stage == "outline"
+                    and route.semantic_role == "candidate_provider_generation"
+                ),
+                None,
+            )
+            if outline_route is not None:
+                inventories.append(
+                    ProviderStageRequestInventoryV1(
+                        stage_name="outline",
+                        source_builder="outline.v3_executor semantic and provider request builders",
+                        unknown_exposures=tuple(
+                            UnplannedProviderExposureV1(
+                                stage_name="outline",
+                                semantic_role="candidate_provider_generation",
+                                route_identity=outline_route.identity,
+                                reason=f"{phase}_request_requires_frozen_stage1_or_prior_provider_outputs",
+                                conditional_on={
+                                    "cross_group": "topic_synthesis_completed",
+                                    "global": "cross_group_completed",
+                                    "stability": "outline_stability_mode_enabled",
+                                    "semantic_revision": "critic_or_gate_requests_revision",
+                                    "semantic_recheck": "semantic_revision_completed",
+                                }.get(phase, ""),
+                            )
+                            for phase in (
+                                "candidate_generation", "topic", "cross_group", "global",
+                                *(
+                                    ("stability",)
+                                    if settings.outline_stability.mode != "off" else ()
+                                ),
+                                "semantic_revision", "semantic_recheck",
+                            )
+                        ),
+                    )
+                )
+        if "review" in stage_plan.requested_stages:
+            writer_route = next(
+                (
+                    route for route in route_plan.routes
+                    if route.stage == "review" and route.semantic_role == "writer"
+                ),
+                None,
+            )
+            if writer_route is not None:
+                inventories.append(
+                    ProviderStageRequestInventoryV1(
+                        stage_name="review",
+                        source_builder="services.review_generation_service writer packet builder",
+                        unknown_exposures=(
+                            UnplannedProviderExposureV1(
+                                stage_name="review", semantic_role="writer",
+                                route_identity=writer_route.identity,
+                                reason="writer_packets_require_adopted_outline_and_current_catalog",
+                            ),
+                            UnplannedProviderExposureV1(
+                                stage_name="review", semantic_role="writer",
+                                route_identity=writer_route.identity,
+                                reason="review_drift_rewrite_requires_approved_repair_scope",
+                                conditional_on="review_drift_requires_writer_regeneration",
+                            ),
+                        ),
+                    )
+                )
+        if "validate" in stage_plan.requested_stages:
+            validator_route = next(
+                (
+                    route for route in route_plan.routes
+                    if route.stage == "validate" and route.semantic_role == "validator"
+                ),
+                None,
+            )
+            if validator_route is not None:
+                inventories.append(
+                    ProviderStageRequestInventoryV1(
+                        stage_name="validate",
+                        source_builder="validation.llm_adjudicator request builder",
+                        unknown_exposures=(
+                            UnplannedProviderExposureV1(
+                                stage_name="validate",
+                                semantic_role="validator",
+                                route_identity=validator_route.identity,
+                                reason="primary_validation_requests_require_current_draft_manifest_and_source_binding",
+                            ),
+                            UnplannedProviderExposureV1(
+                                stage_name="validate",
+                                semantic_role="validator",
+                                route_identity=validator_route.identity,
+                                reason="validation_recheck_request_depends_on_current_draft_manifest_and_approved_repair",
+                                conditional_on="finding_and_approved_repair_requires_model_recheck",
+                            ),
+                        ),
+                    )
+                )
+        projection = build_full_stage_request_plan_v1(
+            stage_plan=stage_plan,
+            reachable_route_plan=route_plan,
+            stage_inventories=inventories,
+            aggregate_budget=aggregate_budget,
+            local_steps=(
+                "source_intake", "outline_adoption", "citation_assembly",
+                "docx_render", "current_artifact_set", "verified_export",
+            ),
+        )
+        projection["runtime_spec_hash"] = _canonical_hash(spec.to_dict())
+        projection["config_sha256"] = file_sha256(spec.config)
+        projection["aggregate_budget_source"] = (
+            "bound_acceptance_run" if acceptance is not None
+            else "application_call_cap_projection_without_bound_acceptance_run"
+        )
+        projection["unbound_aggregate_limits_are_unknown"] = acceptance is None
+        projection["stage1_reuse_authority_status"] = (
+            "not_verified_by_spec_alone"
+            if spec.to_job_request().reuse_stage1 else "not_requested"
+        )
+        projection["provider_calls"] = "not executed"
+        return projection
+
     def plan(self, spec_path: str | Path) -> dict[str, Any]:
         spec = _load_spec_path(spec_path)
         requested = AgentRuntimeRunner._requested_stages(spec)
@@ -572,6 +787,28 @@ class ReviewControlPlane:
             "plan_hash": _canonical_hash(spec.to_dict()),
             "read_only": True,
         }
+        try:
+            payload["full_stage_request_plan"] = self._full_stage_request_plan_for_spec(spec)
+        except Exception as exc:
+            payload["full_stage_request_plan"] = {
+                "schema_version": "full-stage-provider-request-plan-v1",
+                "status": "blocked_before_request_inventory",
+                "reason": str(exc),
+                "error_type": type(exc).__name__,
+                "provider_calls": "not executed",
+                "unknown_exposure": True,
+            }
+        full_stage = payload["full_stage_request_plan"]
+        budget_status = full_stage.get("budget_status")
+        payload["provider_admission_status"] = (
+            str(budget_status.get("admission") or "unknown")
+            if isinstance(budget_status, Mapping)
+            else "blocked_before_request_inventory"
+        )
+        payload["ready_for_provider_admission"] = bool(
+            payload["provider_admission_status"] == "within_budget"
+            and full_stage.get("aggregate_budget_source") == "bound_acceptance_run"
+        )
         return payload
 
     def chunk_plan(
@@ -579,11 +816,12 @@ class ReviewControlPlane:
         summary_files: Sequence[str | Path],
         *,
         job_id: str = "chunk-plan",
-        candidate_count: int = 3,
-        physical_call_limit: int = 24,
+        candidate_count: int | None = None,
+        physical_call_limit: int | None = None,
         output_path: str | Path | None = None,
+        config_path: str | Path | None = None,
     ) -> dict[str, Any]:
-        """Build the semantic plan from canonical summaries without provider calls."""
+        """Build navigation and route-bound semantic request plans without provider calls."""
 
         if not summary_files:
             raise ControlPlaneError("chunk-plan requires at least one --summary-file")
@@ -592,8 +830,199 @@ class ReviewControlPlane:
             if output_path
             else None
         )
+        loaded_config: dict[str, dict[str, str]] | None = None
+        configured_settings: ApplicationSettings | None = None
+        route_profile = None
+        role_router = None
+        role_route_summaries: dict[str, dict[str, Any]] = {}
+        reachable_outline = None
+        reachable_outline_roles: frozenset[str] | None = None
+        route_transport_retries: int | None = None
+        route_identity_hash = ""
+        route_plan_status = "not_planned_config_missing"
+        route_plan_diagnostic = ""
+        resolved_config_path = (
+            Path(config_path).expanduser().resolve()
+            if config_path
+            else (self.repo_root / "config.ini").resolve()
+        )
+        if resolved_config_path.is_file():
+            parser = configparser.ConfigParser(interpolation=None)
+            try:
+                parser.read(resolved_config_path, encoding="utf-8")
+                loaded_config = {
+                    section: {key: value for key, value in parser.items(section)}
+                    for section in parser.sections()
+                }
+                configured_settings = ApplicationSettings.from_config(loaded_config)
+                outline_models = loaded_config.get("OutlineModels", {})
+                route_section = str(outline_models.get("outline_model") or "Outline_API").strip()
+                from services.model_capabilities import resolve_model_capability
+                from services.model_selection import get_api_config_for_section
+                from runtime.provider_context import ProviderContextProfile
+
+                api_config = get_api_config_for_section(loaded_config, route_section)
+                model = str(api_config.get("model") or "").strip()
+                if not model:
+                    route_plan_status = "not_planned_route_missing"
+                    route_plan_diagnostic = f"configured semantic route [{route_section}] has no model"
+                else:
+                    capability = resolve_model_capability(api_config)
+                    runtime_retries = loaded_config.get("Runtime", {}).get(
+                        "transport_retries"
+                    )
+                    runtime_transport_retries = max(
+                        0, int(str(runtime_retries or "2"))
+                    )
+                    configured_retries = str(
+                        api_config.get("transport_retries") or ""
+                    ).strip()
+                    route_transport_retries = max(
+                        0,
+                        int(configured_retries) if configured_retries else runtime_transport_retries,
+                    )
+                    profile = ProviderContextProfile.conservative(
+                        provider=capability.provider_family,
+                        model=model,
+                        endpoint_type=capability.endpoint_type,
+                        model_context_limit=max(1, int(api_config.get("max_context_tokens") or 128_000)),
+                        max_output_tokens=max(1, int(api_config.get("max_output_tokens") or 4_096)),
+                        reasoning_reserve=max(0, int(api_config.get("reasoning_reserve_tokens") or 2_048)),
+                        safety_margin=max(0, int(api_config.get("safety_margin_tokens") or 1_024)),
+                    )
+                    route_profile = profile
+                    from outline.provider_router import OutlineRoleRoute, build_outline_provider_router
+
+                    reachable_outline = build_reachable_provider_route_plan(
+                        loaded_config,
+                        action="generate_outline",
+                        requested_stages=("outline",),
+                        free_mode_enabled=False,
+                    )
+                    reachable_outline_roles = frozenset(reachable_outline.semantic_roles)
+
+                    def reject_shadow_transport(_node_id: str, _request: Mapping[str, Any]) -> Any:
+                        raise ControlPlaneError("provider-free chunk-plan attempted transport")
+
+                    def resolve_shadow_route(role: str, section_name: str) -> OutlineRoleRoute | None:
+                        role_config = get_api_config_for_section(loaded_config, section_name)
+                        role_model = str(role_config.get("model") or "").strip()
+                        if not role_model:
+                            return None
+                        role_capability = resolve_model_capability(role_config)
+                        output_tokens = max(1, int(role_config.get("max_output_tokens") or 4_096))
+                        if role == "evidence_critique":
+                            output_tokens = min(output_tokens, 16_000)
+                        role_profile = ProviderContextProfile.conservative(
+                            provider=role_capability.provider_family,
+                            model=role_model,
+                            endpoint_type=role_capability.endpoint_type,
+                            model_context_limit=max(1, int(role_config.get("max_context_tokens") or 128_000)),
+                            max_output_tokens=output_tokens,
+                            reasoning_reserve=max(0, int(role_config.get("reasoning_reserve_tokens") or 2_048)),
+                            safety_margin=max(0, int(role_config.get("safety_margin_tokens") or 1_024)),
+                        )
+                        route_config = dict(role_config)
+                        if str(route_config.get("transport_retries") or "").strip() == "":
+                            route_config["transport_retries"] = runtime_transport_retries
+                        return OutlineRoleRoute(
+                            role=role,
+                            config_section=section_name,
+                            provider_name=role_capability.provider_family,
+                            model=role_model,
+                            endpoint_type=role_capability.endpoint_type,
+                            profile=role_profile,
+                            transport=reject_shadow_transport,
+                            api_base=str(role_config.get("api_base") or ""),
+                            config_identity=route_config,
+                        )
+
+                    role_router = build_outline_provider_router(
+                        settings=configured_settings,
+                        config=loaded_config,
+                        enabled_roles=reachable_outline_roles,
+                        route_resolver=resolve_shadow_route,
+                    )
+                    missing_roles = reachable_outline_roles - set(role_router.routes)
+                    if missing_roles:
+                        route_plan_status = "not_planned_route_missing"
+                        route_plan_diagnostic = "missing configured Outline roles: " + ", ".join(sorted(missing_roles))
+                    else:
+                        role_route_summaries = {
+                            role: {
+                                "config_section": route.config_section,
+                                "model": route.model,
+                                "transport_retry_reserve": int(route.config_identity.get("transport_retries") or 0),
+                                "profile_limits": {
+                                    "model_context_limit": route.profile.model_context_limit,
+                                    "input_budget": route.profile.input_budget,
+                                    "max_output_tokens": route.profile.max_output_tokens,
+                                    "reasoning_reserve": route.profile.reasoning_reserve,
+                                    "safety_margin": route.profile.safety_margin,
+                                },
+                                "route_fingerprint": route.safe_config_fingerprint(),
+                            }
+                            for role, route in sorted(role_router.routes.items())
+                        }
+                        route_identity_hash = hash_json({
+                            role: route.safe_config_fingerprint()
+                            for role, route in sorted(role_router.routes.items())
+                        })
+                        route_plan_status = "ready"
+            except (OSError, UnicodeError, configparser.Error, TypeError, ValueError) as exc:
+                if config_path:
+                    raise ControlPlaneError(f"cannot load chunk-plan route config: {exc}") from exc
+                route_plan_status = "not_planned_config_invalid"
+                route_plan_diagnostic = "the repository default config could not resolve an Outline route"
+        elif config_path:
+            raise ControlPlaneError(f"config file does not exist: {resolved_config_path}")
+
+        effective_candidate_count = int(
+            candidate_count
+            if candidate_count is not None
+            else configured_settings.outline.candidate_count
+            if configured_settings is not None
+            else 3
+        )
+        configured_call_limit = (
+            configured_settings.outline_stability.max_provider_calls
+            if configured_settings is not None
+            else AUTHORIZED_PROVIDER_CALL_LIMIT
+        )
+        requested_call_limit = (
+            int(physical_call_limit)
+            if physical_call_limit is not None
+            else int(configured_call_limit)
+        )
+        effective_call_limit = authorized_provider_call_limit(
+            min(requested_call_limit, int(configured_call_limit))
+        )
+        if loaded_config is not None:
+            effective_candidate_count = int(
+                candidate_count
+                if candidate_count is not None
+                else loaded_config.get("Outline", {}).get("candidate_count") or 3
+            )
+            if physical_call_limit is None:
+                effective_call_limit = authorized_provider_call_limit(
+                    int(
+                        loaded_config.get("OutlineStability", {}).get("max_provider_calls")
+                        or AUTHORIZED_PROVIDER_CALL_LIMIT
+                    )
+                )
+        semantic_request_plan: list[dict[str, Any]] = []
+        topic_request_plan_identity_hash = ""
+        semantic_preflight_status = "NOT_PLANNED"
+        semantic_preflight_diagnostic = route_plan_diagnostic
+        semantic_request_count = 0
+        semantic_reserved_call_count: int | None = None
+        semantic_request_input_tokens: int | None = None
+        semantic_request_output_tokens: int | None = None
+        semantic_request_budget_status = "NOT_PLANNED"
+        semantic_route_preflight_summary: dict[str, Any] = {}
         summaries: list[dict[str, Any]] = []
         source_paths: list[str] = []
+        typed_manifest_authorities: list[dict[str, str]] = []
         for raw_path in summary_files:
             path = Path(raw_path).expanduser().resolve()
             if not path.is_file():
@@ -603,63 +1032,52 @@ class ReviewControlPlane:
                     "chunk-plan output must differ from every read-only summary input"
                 )
             try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-                raise ControlPlaneError(f"unable to read summary file {path}: {exc}") from exc
-            # Accept the typed Stage 1 authority manifest without treating the
-            # manifest itself as a summary.  Its materialized payload is still
-            # verified and read through this same bounded path.
-            if isinstance(payload, Mapping) and str(payload.get("artifact_type") or "") in {
-                "stage1_reusable_summary_manifest",
-                "summary_source_manifest",
-            }:
-                referenced = (
-                    payload.get("materialized_summary_file")
-                    or payload.get("canonical_summary_file")
-                    or payload.get("summary_file")
-                )
-                if referenced:
-                    materialized = Path(str(referenced))
-                    if not materialized.is_absolute():
-                        materialized = path.parent / materialized
-                    materialized = materialized.expanduser().resolve()
-                    if output_resolved is not None and materialized == output_resolved:
+                root_payload = json.loads(path.read_text(encoding="utf-8"))
+                if (
+                    isinstance(root_payload, Mapping)
+                    and root_payload.get("artifact_type") == "summary_source_manifest"
+                ):
+                    _manifest, materialized_path, _raw_rows = load_summary_source_manifest(path)
+                    if output_resolved is not None and materialized_path == output_resolved:
                         raise ControlPlaneError(
                             "chunk-plan output must differ from the manifest materialized summary"
                         )
-                    if not materialized.is_file():
-                        raise ControlPlaneError(
-                            f"typed summary manifest references a missing materialized summary: {materialized}"
-                        )
-                    expected_hash = str(
-                        payload.get("materialized_summary_file_hash")
-                        or payload.get("summary_file_hash")
-                        or ""
-                    ).strip().lower()
-                    if expected_hash and file_sha256(materialized) != expected_hash:
-                        raise ControlPlaneError(
-                            f"typed summary manifest hash mismatch for {materialized}"
-                        )
-                    try:
-                        payload = json.loads(materialized.read_text(encoding="utf-8"))
-                    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-                        raise ControlPlaneError(
-                            f"unable to read materialized summary file {materialized}: {exc}"
-                        ) from exc
-                    source_paths.append(str(materialized))
+                    rows = InternalStageExecutorRegistry._summary_payloads_from_file(
+                        materialized_path
+                    )
+                    source_paths.append(str(materialized_path))
                 else:
-                    embedded = payload.get("summary_payload")
-                    if isinstance(embedded, Mapping):
-                        payload = dict(embedded)
-                    else:
-                        raise ControlPlaneError(
-                            "typed summary manifest must provide materialized_summary_file or summary_payload"
-                        )
-            rows = payload.get("summaries") if isinstance(payload, Mapping) else payload
-            if isinstance(rows, Mapping):
-                rows = [rows]
-            if not isinstance(rows, list) or not all(isinstance(item, Mapping) for item in rows):
-                raise ControlPlaneError(f"summary file must contain a JSON array or summaries array: {path}")
+                    rows = InternalStageExecutorRegistry._summary_payloads_from_file(path)
+            except ControlPlaneError:
+                raise
+            except (OSError, UnicodeError, json.JSONDecodeError, RuntimeError, TypeError, ValueError) as exc:
+                raise ControlPlaneError(f"cannot load canonical summary source {path}: {exc}") from exc
+            for row in rows:
+                reuse = row.get("stage1_reuse")
+                if not isinstance(reuse, Mapping) or str(reuse.get("authority_kind") or "") != "typed_manifest":
+                    continue
+                binding_payload = reuse.get("binding")
+                if not isinstance(binding_payload, Mapping) or not binding_payload:
+                    raise ControlPlaneError(
+                        f"typed Stage1 summary at {path} has no verified reuse binding"
+                    )
+                try:
+                    binding = Stage1ReusableSummaryBindingV1.from_mapping(binding_payload)
+                    authority, reason = verify_stage1_typed_manifest_authority(row, binding)
+                except (OSError, UnicodeError, TypeError, ValueError, RuntimeError) as exc:
+                    raise ControlPlaneError(
+                        f"typed Stage1 authority verification failed for {path}: {exc}"
+                    ) from exc
+                if authority is None:
+                    raise ControlPlaneError(
+                        f"typed Stage1 authority verification failed for {path}: {reason}"
+                    )
+                typed_manifest_authorities.append(
+                    {
+                        "manifest_file_hash": authority.manifest_file_hash,
+                        "source_summary_artifact_hash": authority.manifest.source_summary_artifact_hash,
+                    }
+                )
             summaries.extend(dict(item) for item in rows)
             if str(path) not in source_paths:
                 source_paths.append(str(path))
@@ -684,10 +1102,587 @@ class ReviewControlPlane:
         semantic_plan = build_semantic_chunk_plan(
             content_layers,
             relation_map,
-            candidate_count=int(candidate_count),
-            physical_call_limit=min(24, max(0, int(physical_call_limit))),
+            candidate_count=effective_candidate_count,
+            physical_call_limit=effective_call_limit,
             reuse_inventory=reuse_inventory,
         )
+        claim_keys: set[tuple[str, str]] = set()
+        source_claim_identity_hashes: set[str] = set()
+        unbound_source_claim_identity_hashes: set[str] = set()
+        paper_level_claim_keys: set[tuple[str, str]] = set()
+        study_level_claim_keys: set[tuple[str, str]] = set()
+        evidence_keys: set[tuple[str, str]] = set()
+        source_text_occurrences: list[tuple[str, str]] = []
+
+        def add_source_text(paper_id: str, value: Any) -> None:
+            if isinstance(value, str) and value.strip():
+                normalized = " ".join(value.split())
+                source_text_occurrences.append((paper_id, normalized))
+            elif isinstance(value, Mapping):
+                for child in value.values():
+                    add_source_text(paper_id, child)
+            elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+                for child in value:
+                    add_source_text(paper_id, child)
+
+        for dossier in content_layers.dossiers:
+            paper_id = str(dossier.paper_id)
+            nested_study_claim_ids = {
+                str(claim.claim_id)
+                for unit in dossier.research_units
+                for claim in unit.claims
+                if str(claim.claim_id)
+            }
+            for field_name in (
+                "overall_context",
+                "research_questions",
+                "concept_definitions",
+                "operationalizations",
+                "theoretical_derivation",
+                "findings",
+                "mechanism_evidence",
+                "moderators_boundaries",
+                "zero_results",
+                "limitations",
+            ):
+                add_source_text(paper_id, getattr(dossier, field_name, ()))
+            for claim in dossier.claims:
+                claim_id = str(claim.claim_id)
+                key = (paper_id, claim_id)
+                claim_keys.add(key)
+                source_claim_identity_hashes.add(
+                    hash_json({"paper_key": paper_id, "claim_id": claim_id})
+                )
+                if not claim.evidence_ids:
+                    unbound_source_claim_identity_hashes.add(
+                        hash_json({"paper_key": paper_id, "claim_id": claim_id})
+                    )
+                if str(claim.study_id or "") or claim_id in nested_study_claim_ids:
+                    study_level_claim_keys.add(key)
+                else:
+                    paper_level_claim_keys.add(key)
+                add_source_text(paper_id, claim.text)
+                evidence_keys.update((paper_id, str(value)) for value in claim.evidence_ids if str(value))
+            for unit in dossier.research_units:
+                for field_name in (
+                    "research_questions",
+                    "definitions_and_operationalizations",
+                    "theoretical_derivation",
+                    "method",
+                    "sample_or_context",
+                    "findings",
+                    "mechanisms",
+                    "moderators_or_boundaries",
+                    "zero_results",
+                    "limitations",
+                ):
+                    add_source_text(paper_id, getattr(unit, field_name, ()))
+                for claim in unit.claims:
+                    key = (paper_id, str(claim.claim_id))
+                    claim_keys.add(key)
+                    source_claim_identity_hashes.add(
+                        hash_json({"paper_key": paper_id, "claim_id": str(claim.claim_id)})
+                    )
+                    if not claim.evidence_ids:
+                        unbound_source_claim_identity_hashes.add(
+                            hash_json({"paper_key": paper_id, "claim_id": str(claim.claim_id)})
+                        )
+                    study_level_claim_keys.add(key)
+                    add_source_text(paper_id, claim.text)
+                    evidence_keys.update(
+                        (paper_id, str(value))
+                        for value in claim.evidence_ids
+                        if str(value)
+                    )
+                evidence_keys.update(
+                    (paper_id, str(value)) for value in unit.evidence_ids if str(value)
+                )
+            for values in dossier.evidence_ids_by_field.values():
+                evidence_keys.update((paper_id, str(value)) for value in values if str(value))
+            evidence_keys.update(
+                (paper_id, str(value))
+                for value in dossier.evidence_text_by_id
+                if str(value)
+            )
+            add_source_text(paper_id, list(dossier.evidence_text_by_id.values()))
+
+        unique_source_text_by_provenance = {
+            (paper_id, text_value.casefold()): text_value
+            for paper_id, text_value in source_text_occurrences
+        }
+        unique_source_texts = list(unique_source_text_by_provenance.values())
+        topic_membership_hashes = [
+            hash_json(sorted(topic.paper_ids)) for topic in semantic_plan.topics
+        ]
+        topic_task_hashes = [
+            hash_json(
+                {
+                    "dimensions": sorted(topic.dimensions),
+                    "question": " ".join(topic.question.split()).casefold(),
+                    "members": sorted(topic.paper_ids),
+                }
+            )
+            for topic in semantic_plan.topics
+        ]
+        topic_dimension_membership_hashes = [
+            hash_json(
+                {
+                    "dimensions": sorted(topic.dimensions),
+                    "members": sorted(topic.paper_ids),
+                }
+            )
+            for topic in semantic_plan.topics
+        ]
+        source_hashes = sorted(set(content_layers.source_summary_hashes))
+        workload_audit = {
+            "artifact_type": "r1_request_workload_audit",
+            "artifact_version": "v2",
+            "source_scope": "provider_free_typed_stage1_reuse_projection",
+            "paper_count": len(content_layers.index_cards),
+            "study_unit_count": sum(len(item.research_units) for item in content_layers.dossiers),
+            "paper_level_source_claim_count": len(paper_level_claim_keys),
+            "study_level_source_claim_count": len(study_level_claim_keys),
+            "source_claim_count_unique_by_paper": len(claim_keys),
+            "source_claim_identity_set_hash": hash_json(sorted(source_claim_identity_hashes)),
+            "unbound_source_claim_count": len(unbound_source_claim_identity_hashes),
+            "unbound_source_claim_identity_set_hash": hash_json(
+                sorted(unbound_source_claim_identity_hashes)
+            ),
+            "evidence_id_count_unique_by_paper": len(evidence_keys),
+            "evidence_identity_set_hash": hash_json(
+                sorted(
+                    hash_json({"paper_key": paper_id, "evidence_id": evidence_id})
+                    for paper_id, evidence_id in evidence_keys
+                )
+            ),
+            "source_summary_hash_count": len(source_hashes),
+            "source_summary_hashes": source_hashes,
+            "source_text_occurrence_count_across_dossier_fields": len(source_text_occurrences),
+            "source_text_unique_value_count_by_paper": len(unique_source_text_by_provenance),
+            "source_text_repeated_occurrence_count": (
+                len(source_text_occurrences) - len(unique_source_text_by_provenance)
+            ),
+            "source_text_total_character_count": sum(
+                len(value) for _paper, value in source_text_occurrences
+            ),
+            "source_text_unique_character_count_by_paper": sum(
+                len(value) for value in unique_source_texts
+            ),
+            "source_text_token_estimate": (
+                int(route_profile.estimate_tokens(unique_source_texts))
+                if route_profile is not None
+                else None
+            ),
+            "tokenizer_identity": (
+                str(route_profile.tokenizer_strategy)
+                if route_profile is not None
+                else "not_available_without_route_config"
+            ),
+            "token_estimate_uncertainty": "provider-specific estimate; serialized request plan is authoritative when present",
+            "topic_count": len(semantic_plan.topics),
+            "unique_topic_membership_set_count": len(set(topic_membership_hashes)),
+            "topics_sharing_membership_set_count": (
+                len(topic_membership_hashes) - len(set(topic_membership_hashes))
+            ),
+            "unique_topic_task_count": len(set(topic_task_hashes)),
+            "topics_sharing_same_task_count": len(topic_task_hashes) - len(set(topic_task_hashes)),
+            "unique_topic_dimension_membership_shape_count": len(
+                set(topic_dimension_membership_hashes)
+            ),
+            "topics_sharing_dimension_membership_shape_count": (
+                len(topic_dimension_membership_hashes)
+                - len(set(topic_dimension_membership_hashes))
+            ),
+            "topic_merge_policy": "keep dimension-distinct tasks separate; order same-paper tasks together for wire-unit reuse",
+            "topics": [
+                {
+                    "topic_id_hash": hash_json(topic.topic_id),
+                    "question_hash": hash_json(" ".join(topic.question.split())),
+                    "membership_hash": hash_json(sorted(topic.paper_ids)),
+                    "member_paper_count": len(topic.paper_ids),
+                    "source_dimensions": sorted(topic.dimensions),
+                    "required_evidence_id_count": len(topic.required_evidence_ids),
+                }
+                for topic in semantic_plan.topics
+            ],
+            "content_layers_hash": content_layers.content_hash,
+            "typed_manifest_authority_hashes": typed_manifest_authorities,
+            "provider_posts_emitted": 0,
+            "live_provider_requests_emitted": 0,
+            "private_source_text_written": False,
+        }
+        if (
+            route_profile is not None
+            and configured_settings is not None
+            and route_plan_status == "ready"
+            and reachable_outline is not None
+        ):
+            try:
+                from outline.v3_executor import OutlineV3Executor
+
+                outline_settings = loaded_config.get("Outline", {}) if loaded_config else {}
+                stability_settings = (
+                    loaded_config.get("OutlineStability", {}) if loaded_config else {}
+                )
+                parsed_stability = configured_settings.outline_stability_settings()
+                semantic_repair_enabled = str(
+                    stability_settings.get("semantic_repair_enabled") or ""
+                ).strip().lower() in {"1", "true", "yes", "on"}
+                opaque_alias_enabled = str(
+                    stability_settings.get("opaque_alias_enabled") or ""
+                ).strip().lower() in {"1", "true", "yes", "on"}
+                source_token_limit = int(
+                    stability_settings.get("max_source_prompt_tokens") or 0
+                )
+                technical_target = int(outline_settings.get("technical_shard_target_tokens") or 0)
+                with tempfile.TemporaryDirectory(prefix="reviewctl-semantic-plan-") as temp_root:
+                    workspace = JobWorkspace.create(
+                        temp_root,
+                        "chunk-plan",
+                        job_id=f"chunk-plan-{hashlib.sha256(str(job_id).encode()).hexdigest()[:12]}",
+                    )
+                    registry = ArtifactRegistry(
+                        workspace.paths.registry_path,
+                        workspace.job_id,
+                    )
+                    executor = OutlineV3Executor(
+                        job_id=workspace.job_id,
+                        summaries=summaries,
+                        workspace=workspace,
+                        artifact_registry=registry,
+                        provider_profile=route_profile,
+                        provider_router=role_router,
+                        enabled_semantic_roles=reachable_outline_roles,
+                        reachable_provider_route_plan=reachable_outline.to_dict(),
+                        candidate_count=effective_candidate_count,
+                        stability_mode=parsed_stability.mode,
+                        semantic_repair_enabled=semantic_repair_enabled,
+                        opaque_alias_enabled=opaque_alias_enabled,
+                        max_provider_calls=effective_call_limit,
+                        max_estimated_cost=parsed_stability.max_estimated_cost,
+                        max_estimated_total_tokens=parsed_stability.max_estimated_total_tokens,
+                        pricing_source=parsed_stability.pricing_source or None,
+                        pricing_provider=parsed_stability.pricing_provider or None,
+                        pricing_model=parsed_stability.pricing_model or None,
+                        pricing_version=parsed_stability.pricing_version or None,
+                        pricing_effective_date=parsed_stability.pricing_effective_date or None,
+                        estimated_cost_per_1k_tokens=parsed_stability.estimated_cost_per_1k_tokens,
+                        input_cost_per_1k_tokens=parsed_stability.input_cost_per_1k_tokens,
+                        output_cost_per_1k_tokens=parsed_stability.output_cost_per_1k_tokens,
+                        reasoning_cost_per_1k_tokens=parsed_stability.reasoning_cost_per_1k_tokens,
+                        cache_read_cost_per_1k_tokens=parsed_stability.cache_read_cost_per_1k_tokens,
+                        cache_write_cost_per_1k_tokens=parsed_stability.cache_write_cost_per_1k_tokens,
+                        max_smoke_overhead_ratio=parsed_stability.max_smoke_overhead_ratio,
+                        max_source_prompt_tokens=source_token_limit or None,
+                        semantic_transport_retries=route_transport_retries,
+                        technical_shard_target_tokens=technical_target,
+                    )
+                    if executor.semantic_provider_synthesis_enabled:
+                        preflight_error = ""
+                        try:
+                            executor._preflight_stability_budget()
+                        except RuntimeError as exc:
+                            # Admission rejection still has a useful, fully
+                            # materialized request plan. Preserve that plan for
+                            # review while keeping all provider posts at zero.
+                            preflight_error = str(exc)
+                        semantic_request_plan = [
+                            dict(item) for item in executor.semantic_request_plan
+                        ]
+                        topic_request_plan_identity_hash = (
+                            executor._compute_topic_provider_plan_identity_hash(
+                                semantic_request_plan
+                            )
+                        )
+                        generation_identity = role_route_summaries.get(
+                            "candidate_provider_generation", {}
+                        )
+                        for row in semantic_request_plan:
+                            if str(row.get("node_id") or "").startswith((
+                                "topic_synthesis_provider:",
+                                "cross_group_comparison_provider:",
+                                "global_synthesis_provider:",
+                            )) or str(row.get("node_id") or "") in {
+                                "cross_group_comparison_provider",
+                                "global_synthesis_provider",
+                            }:
+                                row["role"] = "candidate_provider_generation"
+                                row["route_identity"] = {
+                                    "config_section": generation_identity.get("config_section", ""),
+                                    "model": generation_identity.get("model", ""),
+                                }
+                        semantic_preflight_status = str(
+                            executor.stability_preflight.get("preflight_status")
+                            or ("rejected" if preflight_error else "planned")
+                        )
+                        semantic_route_preflight_summary = {
+                            "scope": "executor_preflight_admission_projection",
+                            "preflight_status": executor.stability_preflight.get(
+                                "preflight_status"
+                            ),
+                            "rejection_reason": executor.stability_preflight.get(
+                                "rejection_reason"
+                            ),
+                            "max_provider_calls": executor.max_provider_calls,
+                            "call_count_scope": "executor-wide provider-free projection using each configured Outline role profile",
+                            "role_routes": role_route_summaries,
+                            "route_annotations_are_projection_only": True,
+                            "relation_preflight_route": {
+                                "role": "relation_adjudication",
+                                "config_section": role_route_summaries.get("relation_adjudication", {}).get("config_section", ""),
+                                "model": role_route_summaries.get("relation_adjudication", {}).get("model", ""),
+                            },
+                            "stability_mode_in_shadow": executor.stability_mode,
+                            "semantic_repair_enabled_in_shadow": executor.semantic_repair_enabled,
+                            "opaque_alias_enabled_in_shadow": executor.opaque_alias_enabled,
+                            "estimated_provider_calls": executor.stability_preflight.get(
+                                "estimated_provider_calls"
+                            ),
+                            "estimated_provider_physical_attempts_upper_bound": executor.stability_preflight.get(
+                                "estimated_provider_physical_attempts_upper_bound"
+                            ),
+                            "hierarchical_relation_shard_calls": executor.stability_preflight.get(
+                                "hierarchical_relation_shard_calls"
+                            ),
+                            "hierarchical_candidate_shard_calls": executor.stability_preflight.get(
+                                "hierarchical_candidate_shard_calls"
+                            ),
+                            "hierarchical_critique_shard_calls": executor.stability_preflight.get(
+                                "hierarchical_critique_shard_calls"
+                            ),
+                            "semantic_synthesis_calls_reserved": executor.stability_preflight.get(
+                                "semantic_synthesis_calls_reserved"
+                            ),
+                            "semantic_conditional_reducer_call_reserve": executor.stability_preflight.get(
+                                "semantic_conditional_reducer_call_reserve"
+                            ),
+                            "semantic_input_tokens_single_attempt_upper_bound": executor.stability_preflight.get(
+                                "semantic_input_tokens_single_attempt_upper_bound"
+                            ),
+                            "semantic_output_tokens_single_attempt_upper_bound": executor.stability_preflight.get(
+                                "semantic_output_tokens_single_attempt_upper_bound"
+                            ),
+                            "semantic_input_tokens_all_attempts_upper_bound": executor.stability_preflight.get(
+                                "semantic_input_tokens_all_attempts_upper_bound"
+                            ),
+                            "semantic_output_tokens_all_attempts_upper_bound": executor.stability_preflight.get(
+                                "semantic_output_tokens_all_attempts_upper_bound"
+                            ),
+                            "semantic_reasoning_tokens_all_attempts_upper_bound": executor.stability_preflight.get(
+                                "semantic_reasoning_tokens_all_attempts_upper_bound"
+                            ),
+                            "semantic_physical_attempts_upper_bound": executor.stability_preflight.get(
+                                "semantic_physical_attempts_upper_bound"
+                            ),
+                            "semantic_transport_retry_reserve": executor.stability_preflight.get(
+                                "semantic_transport_retry_reserve"
+                            ),
+                            "semantic_output_token_limit": executor.stability_preflight.get(
+                                "semantic_output_token_limit"
+                            ),
+                            "estimated_total_tokens": executor.stability_preflight.get(
+                                "estimated_total_tokens"
+                            ),
+                            "estimated_cost": executor.stability_preflight.get("estimated_cost"),
+                            "physical_attempt_estimate_status": executor.stability_preflight.get(
+                                "physical_attempt_estimate_status"
+                            ),
+                        }
+                        semantic_preflight_diagnostic = preflight_error or str(
+                            executor.stability_preflight.get("diagnostic") or ""
+                        )
+                        semantic_request_count = len(semantic_request_plan)
+                        reserved_calls = executor.stability_preflight.get(
+                            "semantic_synthesis_calls_reserved"
+                        )
+                        if reserved_calls is None:
+                            semantic_request_budget_status = "BLOCKED_SEMANTIC_RESERVED_CALL_BOUND_UNKNOWN"
+                        else:
+                            semantic_reserved_call_count = int(reserved_calls)
+                            semantic_request_input_tokens = int(
+                                executor.stability_preflight.get(
+                                    "semantic_input_tokens_single_attempt_upper_bound"
+                                ) or 0
+                            )
+                            semantic_request_output_tokens = int(
+                                executor.stability_preflight.get(
+                                    "semantic_output_tokens_single_attempt_upper_bound"
+                                ) or 0
+                            )
+                            semantic_request_budget_status = (
+                                "SEMANTIC_RESERVED_CALL_BOUND_WITHIN_LIMIT"
+                                if semantic_reserved_call_count <= effective_call_limit
+                                else "BLOCKED_SEMANTIC_RESERVED_CALL_BOUND_EXCEEDS_LIMIT"
+                            )
+                        route_plan_status = (
+                            "planned_semantic_request_graph"
+                            if semantic_request_plan
+                            else "blocked_semantic_request_plan"
+                        )
+                    else:
+                        route_plan_status = "not_planned_non_provider_route"
+            except (OSError, TypeError, ValueError, RuntimeError) as exc:
+                semantic_preflight_status = "blocked"
+                semantic_preflight_diagnostic = str(exc)
+                semantic_request_budget_status = "BLOCKED_SEMANTIC_REQUEST_PLAN"
+                route_plan_status = "blocked_semantic_request_plan"
+        topic_request_rows = [
+            item
+            for item in semantic_request_plan
+            if str(item.get("node_id") or "").startswith(
+                "topic_synthesis_provider:batch:"
+            )
+        ]
+        workload_audit["topic_request_plan_identity_hash"] = (
+            topic_request_plan_identity_hash
+        )
+        topic_wire_text_identity_char_counts: dict[str, int] = {}
+        topic_wire_text_identity_batch_occurrences = 0
+        for item in topic_request_rows:
+            records = [
+                row
+                for row in item.get("source_text_identity_records") or ()
+                if isinstance(row, Mapping) and str(row.get("identity_hash") or "")
+            ]
+            topic_wire_text_identity_batch_occurrences += len(records)
+            for row in records:
+                identity_hash = str(row.get("identity_hash") or "")
+                character_count = max(0, int(row.get("character_count") or 0))
+                prior_count = topic_wire_text_identity_char_counts.get(identity_hash)
+                if prior_count is not None and prior_count != character_count:
+                    raise ControlPlaneError(
+                        "topic request plan has inconsistent lengths for one normalized text identity"
+                    )
+                topic_wire_text_identity_char_counts[identity_hash] = character_count
+        topic_wire_text_occurrences = sum(
+            int(item.get("source_text_occurrence_count") or 0)
+            for item in topic_request_rows
+        )
+        topic_wire_text_characters = sum(
+            int(item.get("source_text_character_count") or 0)
+            for item in topic_request_rows
+        )
+        topic_wire_unique_text_characters = sum(
+            topic_wire_text_identity_char_counts.values()
+        )
+        topic_wire_text_repeated_within_batches = sum(
+            int(item.get("repeated_source_text_occurrence_count") or 0)
+            for item in topic_request_rows
+        )
+        topic_wire_text_repeated_across_batches = max(
+            0,
+            topic_wire_text_identity_batch_occurrences
+            - len(topic_wire_text_identity_char_counts),
+        )
+        safe_semantic_request_plan = []
+        for item in semantic_request_plan:
+            safe_item = {
+                key: value
+                for key, value in item.items()
+                if key != "source_text_identity_records"
+            }
+            if "source_text_identity_records" in item:
+                safe_item["source_text_identity_unique_value_count"] = len(
+                    item.get("source_text_identity_records") or ()
+                )
+            safe_semantic_request_plan.append(safe_item)
+        workload_audit["topic_wire_text"] = {
+            "measurement": "casefolded_whitespace_normalized_source_text_identity",
+            "request_count": len(topic_request_rows),
+            "source_text_occurrence_count": topic_wire_text_occurrences,
+            "unique_source_text_identity_count_across_requests": len(
+                topic_wire_text_identity_char_counts
+            ),
+            "repeated_occurrence_count_within_requests": topic_wire_text_repeated_within_batches,
+            "repeated_occurrence_count_across_requests": topic_wire_text_repeated_across_batches,
+            "repeated_occurrence_count_total": max(
+                0,
+                topic_wire_text_occurrences - len(topic_wire_text_identity_char_counts),
+            ),
+            "normalized_character_count_total": topic_wire_text_characters,
+            "unique_normalized_character_count": topic_wire_unique_text_characters,
+            "repeated_normalized_character_count": max(
+                0,
+                topic_wire_text_characters - topic_wire_unique_text_characters,
+            ),
+            "unique_identity_set_hash": hash_json(
+                sorted(topic_wire_text_identity_char_counts)
+            ),
+        }
+        topic_wire_claim_hashes = {
+            str(value)
+            for item in topic_request_rows
+            for value in item.get("source_claim_identity_hashes") or ()
+            if str(value)
+        }
+        topic_wire_evidence_hashes = {
+            str(value)
+            for item in topic_request_rows
+            for value in item.get("evidence_identity_hashes") or ()
+            if str(value)
+        }
+        expected_claim_hashes = set(source_claim_identity_hashes)
+        expected_evidence_hashes = {
+            hash_json({"paper_key": paper_id, "evidence_id": evidence_id})
+            for paper_id, evidence_id in evidence_keys
+        }
+        claim_missing = expected_claim_hashes - topic_wire_claim_hashes
+        claim_extra = topic_wire_claim_hashes - expected_claim_hashes
+        evidence_missing = expected_evidence_hashes - topic_wire_evidence_hashes
+        evidence_extra = topic_wire_evidence_hashes - expected_evidence_hashes
+        workload_audit["topic_wire_coverage"] = {
+            "status": (
+                "NOT_PLANNED"
+                if not topic_request_rows
+                else "complete"
+                if not claim_missing
+                and not claim_extra
+                and not evidence_missing
+                and not evidence_extra
+                else "incomplete"
+            ),
+            "topic_batch_count": len(topic_request_rows),
+            "all_planned_unit_sets_equal_materialized_unit_sets": (
+                all(
+                    bool(item.get("planned_wire_ids_equal_materialized_ids"))
+                    for item in topic_request_rows
+                )
+                if topic_request_rows
+                else None
+            ),
+            "source_claim_identity_count": len(expected_claim_hashes),
+            "source_claim_identity_set_hash": hash_json(
+                sorted(expected_claim_hashes)
+            ),
+            "topic_wire_claim_identity_count": len(topic_wire_claim_hashes),
+            "topic_wire_claim_identity_set_hash": hash_json(
+                sorted(topic_wire_claim_hashes)
+            ),
+            "missing_source_claim_identity_count": len(claim_missing),
+            "missing_source_claim_identity_set_hash": hash_json(
+                sorted(claim_missing)
+            ),
+            "extra_topic_wire_claim_identity_count": len(claim_extra),
+            "extra_topic_wire_claim_identity_set_hash": hash_json(
+                sorted(claim_extra)
+            ),
+            "source_evidence_identity_count": len(expected_evidence_hashes),
+            "source_evidence_identity_set_hash": hash_json(
+                sorted(expected_evidence_hashes)
+            ),
+            "topic_wire_evidence_identity_count": len(topic_wire_evidence_hashes),
+            "topic_wire_evidence_identity_set_hash": hash_json(
+                sorted(topic_wire_evidence_hashes)
+            ),
+            "missing_source_evidence_identity_count": len(evidence_missing),
+            "missing_source_evidence_identity_set_hash": hash_json(
+                sorted(evidence_missing)
+            ),
+            "extra_topic_wire_evidence_identity_count": len(evidence_extra),
+            "extra_topic_wire_evidence_identity_set_hash": hash_json(
+                sorted(evidence_extra)
+            ),
+        }
         payload: dict[str, Any] = {
             "control_plane_version": CONTROL_PLANE_VERSION,
             "status": "planned" if semantic_plan.status == "ready" else "blocked",
@@ -702,13 +1697,74 @@ class ReviewControlPlane:
                 "dossier_count": len(content_layers.dossiers),
                 "blocking_diagnostics": list(content_layers.blocking_diagnostics),
             },
+            "typed_manifest_authority_hashes": typed_manifest_authorities,
             "semantic_chunk_plan": semantic_plan.to_dict(),
+            "r1_request_workload_audit": workload_audit,
+            "semantic_request_plan": safe_semantic_request_plan,
+            "semantic_request_plan_count": semantic_request_count,
+            "semantic_request_plan_count_kind": "materialized_rows_excludes_conditional_reducer_reserve",
+            "semantic_request_calls_reserved_upper_bound": semantic_reserved_call_count,
+            "semantic_topic_batch_count": sum(
+                str(item.get("node_id") or "").startswith("topic_synthesis_provider:batch:")
+                for item in semantic_request_plan
+            ),
+            "semantic_cross_materialized_request_count": sum(
+                str(item.get("node_id") or "").startswith("cross_group_comparison_provider")
+                for item in semantic_request_plan
+            ),
+            "semantic_cross_request_count_upper_bound": (
+                sum(
+                    str(item.get("node_id") or "").startswith("cross_group_comparison_provider")
+                    for item in semantic_request_plan
+                ) + int(semantic_route_preflight_summary.get("semantic_conditional_reducer_call_reserve") or 0)
+                if semantic_reserved_call_count is not None else None
+            ),
+            "semantic_global_request_count_upper_bound": (
+                sum(
+                    str(item.get("node_id") or "").startswith("global_synthesis_provider")
+                    for item in semantic_request_plan
+                ) if semantic_reserved_call_count is not None else None
+            ),
+            "semantic_request_input_token_upper_bound": semantic_request_input_tokens,
+            "semantic_request_output_token_reserve": semantic_request_output_tokens,
+            "semantic_request_output_tokens_all_attempts_upper_bound": (
+                semantic_route_preflight_summary.get("semantic_output_tokens_all_attempts_upper_bound")
+            ),
+            "semantic_request_reasoning_tokens_all_attempts_upper_bound": (
+                semantic_route_preflight_summary.get("semantic_reasoning_tokens_all_attempts_upper_bound")
+            ),
+            "semantic_request_retry_reserve": (
+                semantic_route_preflight_summary.get("semantic_transport_retry_reserve")
+            ),
+            "semantic_request_physical_attempts_upper_bound": (
+                semantic_route_preflight_summary.get("semantic_physical_attempts_upper_bound")
+            ),
+            "semantic_request_input_tokens_all_attempts_upper_bound": (
+                semantic_route_preflight_summary.get("semantic_input_tokens_all_attempts_upper_bound")
+            ),
+            "semantic_request_plan_status": route_plan_status,
+            "semantic_preflight_status": semantic_preflight_status,
+            "semantic_preflight_diagnostic": semantic_preflight_diagnostic,
+            "semantic_route_preflight_summary": semantic_route_preflight_summary,
+            "semantic_request_budget_status": semantic_request_budget_status,
+            "semantic_request_plan_scope": "outline_v3_topic_cross_global_only",
+            "semantic_route_identity_hash": route_identity_hash,
+            "topic_request_plan_identity_hash": topic_request_plan_identity_hash,
+            "semantic_physical_call_limit": effective_call_limit,
+            "end_to_end_provider_budget_status": "NOT_PLANNED",
             "relation_map": {
                 "content_hash": relation_map.content_hash,
                 "candidate_count": len(relation_map.relations),
                 "blocking_diagnostics": list(relation_map.blocking_diagnostics),
             },
             "provider_posts_emitted": 0,
+            "provider_call_budget_status": "NOT_PLANNED_END_TO_END",
+            "provider_request_plan_status": route_plan_status,
+            "provider_request_plan_scope": "outline_v3_topic_cross_global_only",
+            "provider_request_plan_note": (
+                "Topic requests use the same serializer and batching helper as the executor. "
+                "Cross/global reducer inputs use output upper bounds; Writer, Validator, repair, and DOCX budgets are outside this plan."
+            ),
             "read_only": True,
         }
         if output_path:
@@ -813,6 +1869,108 @@ class ReviewControlPlane:
             "policy": policy.to_dict(),
             "read_only": True,
         }
+
+    def _admit_direct_validator_execution(
+        self,
+        spec: RuntimeJobSpec,
+        *,
+        validator_host_acknowledgement: Mapping[str, Any] | None,
+        operation: str,
+    ) -> tuple[str, Mapping[str, Any] | None]:
+        """Bind the actual Validator route and shared budget for direct commands."""
+
+        if validator_host_acknowledgement is not None and not isinstance(
+            validator_host_acknowledgement, Mapping
+        ):
+            raise ControlPlaneError("Validator host acknowledgement must be a JSON object")
+        acknowledgement = (
+            validator_host_acknowledgement
+            if validator_host_acknowledgement is not None
+            else spec.metadata.get("external_host_acknowledgement")
+        )
+        from runtime.test_dependencies import current_runtime_test_dependencies
+        from services.model_selection import get_validator_api_config
+
+        test_dependencies = current_runtime_test_dependencies()
+        normalized_config = load_config(
+            str(spec.config),
+            action="validate_review",
+            requested_stages=["validate"],
+            free_mode_enabled=bool(
+                spec.free_mode_profile
+                or spec.free_mode_idea
+                or spec.metadata.get("free_mode_input")
+            ),
+            allow_template_credentials=bool(test_dependencies),
+        )
+        validator_config = get_validator_api_config({
+            "Validator_API": dict(normalized_config.get("Validator_API") or {})
+        })
+        validator_can_call = bool(
+            str(validator_config.get("api_key") or "").strip()
+            and str(validator_config.get("model") or "").strip()
+        )
+        if not validator_can_call:
+            return "", None
+
+        # These commands revalidate existing artifacts. Their only possible
+        # disclosure route is Validator; a saved review/ingest stage or a
+        # configured remote parser does not authorize or participate in it.
+        try:
+            route_plan = build_reachable_provider_route_plan(
+                normalized_config,
+                action="validate_review",
+                requested_stages=["validate"],
+            )
+            if not any(
+                route.semantic_role == "validator" and route.enabled and route.resolved
+                for route in route_plan.routes
+            ):
+                raise ControlPlaneError(f"{operation} has no reachable Validator route")
+            policy = build_external_host_policy(
+                normalized_config,
+                route_plan,
+                provider_sections={"Validator_API"},
+                include_mineru=False,
+            )
+            validate_external_host_acknowledgement(
+                policy,
+                acknowledgement,
+            )
+        except (ExternalHostAdmissionError, ValueError, TypeError) as exc:
+            raise ControlPlaneError(f"{operation} host admission failed: {exc}") from exc
+
+        acceptance = (
+            current_acceptance_execution_context()
+            or acceptance_execution_context_from_environment()
+        )
+        controller = provider_budget_controller_from_environment()
+        if (
+            acceptance is None
+            or not acceptance.owner_authorized
+            or not acceptance.provider_budget_state_started
+            or controller is None
+            or controller.budget != acceptance.provider_budget
+            or acceptance.absolute_deadline_epoch <= time.time()
+            or acceptance.provider_budget.max_provider_calls_total <= 0
+            or acceptance.provider_budget.max_output_tokens_total <= 0
+            or acceptance.provider_budget.max_wall_seconds <= 0
+        ):
+            raise ControlPlaneError(
+                f"{operation} requires a started, bounded aggregate acceptance run"
+            )
+        current_sha = read_checkout_sha(self.repo_root, require_clean=True)
+        if current_sha != acceptance.final_executable_sha:
+            raise ControlPlaneError(
+                f"{operation} executable SHA differs from the acceptance run"
+            )
+        controller.bind_state_path(
+            acceptance.provider_budget_state_path,
+            acceptance_run_id=acceptance.acceptance_run_id,
+            state_started=True,
+        )
+        controller.snapshot()
+        return policy.route_fingerprint, acknowledgement
 
     def acceptance_run(
         self,
@@ -926,20 +2084,11 @@ class ReviewControlPlane:
                 state_path,
                 state,
             )
-            if not execution_context_owner_authorized and state.provider_budget_state_path:
-                budget_path = Path(state.provider_budget_state_path)
-                budget_started = False
-                try:
-                    budget_payload = json.loads(budget_path.read_text(encoding="utf-8"))
-                    budget_started = any(
-                        int(budget_payload.get(field) or 0) > 0
-                        for field in ("calls_used", "output_tokens_used", "retry_attempts_used")
-                    ) or bool(budget_payload.get("reservations"))
-                except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
-                    budget_started = False
-                if not budget_started and budget_path.parent == run_dir.resolve():
-                    budget_path.unlink(missing_ok=True)
-                    state = replace(state, provider_budget_state_path="")
+            # An inspection is not allowed to decide that a persisted run is
+            # unstarted merely because its budget file is missing, unreadable,
+            # or has zero completed calls. Reservations and an unexpired wall
+            # window are also durable exposure. Preserve the run identity.
+            budget_state_was_bound = bool(state.provider_budget_state_path)
             state = replace(
                 state,
                 provider_budget_state_path=(
@@ -963,7 +2112,11 @@ class ReviewControlPlane:
             acceptance_spec.budget.to_provider_budget()
         )
         if execution_context_owner_authorized:
-            budget_controller.bind_state_path(state.provider_budget_state_path)
+            budget_controller.bind_state_path(
+                state.provider_budget_state_path,
+                acceptance_run_id=state.run_id,
+                state_started=budget_state_was_bound,
+            )
         budget_snapshot = budget_controller.snapshot()
         execution_context = AcceptanceExecutionContextV1(
             acceptance_run_id=state.run_id,
@@ -985,6 +2138,7 @@ class ReviewControlPlane:
             process_event_log=state.process_event_log,
             scenario_state_path=str(state_path),
             owner_authorized=execution_context_owner_authorized,
+            provider_budget_state_started=execution_context_owner_authorized,
         )
 
         route_plan: dict[str, Any] | None = None
@@ -1254,43 +2408,10 @@ class ReviewControlPlane:
 
     @staticmethod
     def _acceptance_checkout_sha(repo_root: Path, *, require_clean: bool = False) -> str:
-        if require_clean:
-            try:
-                status = subprocess.run(
-                    ["git", "status", "--porcelain=v1", "--untracked-files=all"],
-                    cwd=str(repo_root),
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-            except (OSError, subprocess.SubprocessError) as exc:
-                raise ControlPlaneError(
-                    f"acceptance cannot verify checkout cleanliness: {type(exc).__name__}"
-                ) from exc
-            if status.returncode != 0:
-                raise ControlPlaneError("acceptance cannot verify checkout cleanliness")
-            if str(status.stdout or "").strip():
-                raise ControlPlaneError(
-                    "acceptance requires a clean checkout; commit or isolate all worktree changes first"
-                )
         try:
-            completed = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=str(repo_root),
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise ControlPlaneError(
-                f"acceptance plan cannot read checkout SHA: {type(exc).__name__}"
-            ) from exc
-        sha = str(completed.stdout or "").strip().splitlines()[-1] if completed.returncode == 0 else ""
-        if not sha:
-            raise ControlPlaneError("acceptance plan cannot bind to the current checkout SHA")
-        return sha
+            return read_checkout_sha(repo_root, require_clean=require_clean)
+        except CheckoutIdentityError as exc:
+            raise ControlPlaneError(str(exc)) from exc
 
     @staticmethod
     def _bind_acceptance_evidence_root(
@@ -2763,29 +3884,10 @@ class ReviewControlPlane:
                 )
             if state is None:
                 raise ControlPlaneError("acceptance plan state could not be initialized")
-            # An unauthorised inspection must not start or inherit a live
-            # deadline.  If an older blocked state left an empty budget file,
-            # discard that unstarted deadline on the next authorised attempt;
-            # a state with actual usage/reservations remains resumable.
-            if not execution_context_owner_authorized and state.provider_budget_state_path:
-                budget_started = False
-                budget_path = Path(state.provider_budget_state_path)
-                try:
-                    budget_payload = json.loads(budget_path.read_text(encoding="utf-8"))
-                    budget_started = any(
-                        int(budget_payload.get(field) or 0) > 0
-                        for field in ("calls_used", "output_tokens_used", "retry_attempts_used")
-                    ) or bool(budget_payload.get("reservations"))
-                except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
-                    budget_started = False
-                if not budget_started:
-                    # This is an unstarted, run-owned budget snapshot. Remove
-                    # only that exact file so an older blocked attempt cannot
-                    # inject its expired wall-clock deadline into the first
-                    # authorised execution.
-                    if budget_path.parent == (state_path.parent / state.run_id).resolve():
-                        budget_path.unlink(missing_ok=True)
-                    state = replace(state, provider_budget_state_path="")
+            # A blocked/inspection path must not erase a previously bound
+            # budget identity. A zero-call snapshot can still have an active
+            # reservation or a running wall-clock deadline.
+            budget_state_was_bound = bool(state.provider_budget_state_path)
             run_dir, evidence_root = self._bind_acceptance_evidence_root(
                 state_path,
                 state,
@@ -2807,7 +3909,11 @@ class ReviewControlPlane:
             raise ControlPlaneError("acceptance plan state could not be initialized")
         budget_controller = ProviderBudgetController(plan.budget.to_provider_budget())
         if execution_context_owner_authorized:
-            budget_controller.bind_state_path(state.provider_budget_state_path)
+            budget_controller.bind_state_path(
+                state.provider_budget_state_path,
+                acceptance_run_id=state.run_id,
+                state_started=budget_state_was_bound,
+            )
         budget_snapshot = budget_controller.snapshot()
         execution_context = AcceptanceExecutionContextV1(
             acceptance_run_id=state.run_id,
@@ -2826,6 +3932,7 @@ class ReviewControlPlane:
             process_event_log=state.process_event_log,
             scenario_state_path=str(state_path),
             owner_authorized=execution_context_owner_authorized,
+            provider_budget_state_started=execution_context_owner_authorized,
         )
         child_states = dict(state.child_states)
         child_results: dict[str, dict[str, Any]] = {}
@@ -4513,7 +5620,21 @@ class ReviewControlPlane:
         job_id: str | None = None,
         workspace: str | Path | None = None,
         plan_id: str,
+        manual_proposal: Mapping[str, Any] | None = None,
+        actor: str = "",
+        reason: str = "",
     ) -> dict[str, Any]:
+        if manual_proposal is not None and (
+            not isinstance(manual_proposal, Mapping)
+            or not str(actor or "").strip()
+            or not str(reason or "").strip()
+        ):
+            return {
+                "status": "blocked",
+                "plan_id": plan_id,
+                "reason": "manual repair requires a typed proposal, actor, and reason",
+                "mutation_performed": False,
+            }
         inspection = self.inspect(job_id=job_id, workspace=workspace)
         plan = next(
             (
@@ -4536,7 +5657,15 @@ class ReviewControlPlane:
 
         workspace_obj, registry = AgentRuntimeRunner._open_workspace(inspection["workspace_path"])
         try:
-            return RepairTransactionService(workspace_obj, registry).apply_plan(plan_id)
+            service = RepairTransactionService(workspace_obj, registry)
+            if manual_proposal is not None:
+                return service.apply_manual_proposal(
+                    plan_id,
+                    manual_proposal,
+                    actor=str(actor).strip(),
+                    reason=str(reason).strip(),
+                )
+            return service.apply_plan(plan_id)
         except (OSError, RegistryError, ValueError, TypeError) as exc:
             return {
                 "status": "blocked",
@@ -4554,6 +5683,7 @@ class ReviewControlPlane:
         transaction_id: str,
         actor: str,
         reason: str,
+        validator_host_acknowledgement: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Revalidate a quarantined repair, then advance current pointers."""
 
@@ -4607,12 +5737,22 @@ class ReviewControlPlane:
             }
         try:
             spec = load_runtime_job_spec(spec_path)
-            bridge = AgentRuntimeBridge(spec)
+            admitted_validator_route, admitted_validator_ack = self._admit_direct_validator_execution(
+                spec,
+                validator_host_acknowledgement=validator_host_acknowledgement,
+                operation="external repair revalidation",
+            )
+            bridge = AgentRuntimeBridge(
+                spec,
+                direct_validation_route_fingerprint=admitted_validator_route,
+                direct_validation_host_acknowledgement=admitted_validator_ack,
+            )
             session = bridge.bootstrap(
                 resume_requested=True,
                 claim_latest_pointer=False,
                 publish_running_state=False,
             )
+            bridge.verify_direct_validation_route(session.stage_host.config)
             active_registry = session.context.registry
             active_registry.reload()
             active_derived_draft = active_registry.get(derived_draft.artifact_id)
@@ -4746,7 +5886,13 @@ class ReviewControlPlane:
             "read_only": True,
         }
 
-    def validate(self, *, job_id: str | None = None, workspace: str | Path | None = None) -> dict[str, Any]:
+    def validate(
+        self,
+        *,
+        job_id: str | None = None,
+        workspace: str | Path | None = None,
+        validator_host_acknowledgement: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Execute the current validation stage and persist its receipts/results.
 
         ``validation-status`` is the read-only projection.  The command named
@@ -4772,13 +5918,23 @@ class ReviewControlPlane:
                 raise ControlPlaneError(
                     "persisted runtime spec job_id does not match the resolved workspace"
                 )
-            bridge = AgentRuntimeBridge(spec)
+            admitted_validator_route, admitted_validator_ack = self._admit_direct_validator_execution(
+                spec,
+                validator_host_acknowledgement=validator_host_acknowledgement,
+                operation="external validation",
+            )
+            bridge = AgentRuntimeBridge(
+                spec,
+                direct_validation_route_fingerprint=admitted_validator_route,
+                direct_validation_host_acknowledgement=admitted_validator_ack,
+            )
             attempt_id = f"reviewctl-validation:{spec.job_id}:{time.time_ns()}"
             session = bridge.bootstrap(
                 resume_requested=True,
                 claim_latest_pointer=False,
                 publish_running_state=False,
             )
+            bridge.verify_direct_validation_route(session.stage_host.config)
             stage_result = bridge.run_validation(session, attempt_id=attempt_id)
             session.context.registry.reload()
             closure = ValidationClosureService(
@@ -5527,7 +6683,14 @@ class ReviewControlPlane:
                     else output_root / "_acceptance" / "provider_budget_state_v1.json"
                 )
                 acceptance_budget.bind_state_path(
-                    str(budget_state_path)
+                    str(budget_state_path),
+                    acceptance_run_id=(
+                        active_context.acceptance_run_id if active_context is not None else ""
+                    ),
+                    state_started=(
+                        active_context.provider_budget_state_started
+                        if active_context is not None else None
+                    ),
                 )
             ledger = ProviderRuntimeLedger(output_root / "_acceptance" / "provider_micro_probe.jsonl")
             from ai_interface import _call_ai_api_detailed

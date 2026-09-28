@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any, Iterable, Literal, Mapping, Sequence, cast
 import uuid
 
-from runtime.attempt_store import _write_json_exclusive
 from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRecord, ArtifactRegistry
 from services.job_workspace import publish_json_artifact, utc_now_iso
 from services.queue_service import LocalPublicationContext
@@ -28,6 +27,7 @@ _STAGE_OUTPUT_CONTRACTS: Mapping[str, tuple[frozenset[str], ...]] = {
         frozenset({"final_outline", "coverage_audit", "stability_audit", "outline_stage_health"}),
         frozenset({"adopted_outline"}),
     ),
+    "outline_topic_pilot": (frozenset({"outline_topic_pilot_checkpoint"}),),
     "review": (
         frozenset({"review_draft", "citation_manifest", "review_docx"}),
     ),

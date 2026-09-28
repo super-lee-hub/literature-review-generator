@@ -53,7 +53,7 @@ SETTING_ACCESSORS: dict[str, str] = {
     "arbitrator_model": "arbitrator_model",
 }
 
-_CANDIDATE_NODE_RE = re.compile(r"^candidate_\d+_provider_generation$")
+_CANDIDATE_NODE_RE = re.compile(r"^candidate_\d+_provider_generation(?:$|:)")
 
 GENERATION_ROLE = "candidate_provider_generation"
 ARBITRATION_ROLE = "arbitration"
@@ -178,6 +178,18 @@ def semantic_role(node_id: str) -> str:
     node = str(node_id or "").strip()
     if _CANDIDATE_NODE_RE.match(node):
         return "candidate_provider_generation"
+    if node.startswith((
+        "topic_synthesis_provider:",
+        "cross_group_comparison_provider:",
+        "global_synthesis_provider:",
+    )) or node in {
+        "topic_synthesis_provider",
+        "cross_group_comparison_provider",
+        "global_synthesis_provider",
+    }:
+        return "candidate_provider_generation"
+    if node.startswith("relation_adjudication:"):
+        return "relation_adjudication"
     return node
 
 

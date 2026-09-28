@@ -996,7 +996,10 @@ def test_mineru_allowlist_accepts_exact_official_https_host_and_rejects_other_sc
 
 
 def test_mineru_upload_rejects_untrusted_presigned_url(monkeypatch, tmp_path: Path) -> None:
-    manager = PreprocessManager(config={"Preprocess": {"enabled": "true"}}, logger=None)
+    manager = PreprocessManager(
+        config={"Preprocess": {"enabled": "true", "cache_dir": str(tmp_path / "cache")}},
+        logger=None,
+    )
     manager.mineru_base_url = "https://mineru.example/api/v4"
     manager.mineru_api_token = "token"
     pdf_path = tmp_path / "paper.pdf"

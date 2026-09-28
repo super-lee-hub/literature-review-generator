@@ -44,6 +44,20 @@ def _queue_json_value(raw: str, *, file_path: str = "") -> dict[str, Any]:
     return value
 
 
+def _validator_host_ack_from_file(path: str) -> dict[str, Any] | None:
+    if not path:
+        return None
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "Validator host acknowledgement file is unreadable or invalid JSON"
+        ) from exc
+    if not isinstance(value, dict):
+        raise ValueError("Validator host acknowledgement must be a JSON object")
+    return value
+
+
 def _queue_snapshot(service: PersistentQueueService) -> dict[str, Any]:
     jobs = service.list_jobs()
     return {
@@ -276,12 +290,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     chunk_plan = subparsers.add_parser(
         "chunk-plan",
-        help="Build the provider-free semantic chunk plan from Stage 1 summaries",
+        help=(
+            "Build a provider-free navigation plan and, when --config is supplied, "
+            "a route-bound Outline v3 semantic request plan (not an end-to-end Writer/Validator/DOCX budget)"
+        ),
     )
     chunk_plan.add_argument("--summary-file", "--summary-source", dest="summary_files", action="append", default=[])
     chunk_plan.add_argument("--job-id", default="chunk-plan")
-    chunk_plan.add_argument("--candidate-count", type=int, default=3)
-    chunk_plan.add_argument("--physical-call-limit", type=int, default=24)
+    chunk_plan.add_argument("--candidate-count", type=int, default=None)
+    chunk_plan.add_argument("--physical-call-limit", type=int, default=None)
     chunk_plan.add_argument("--output", default="")
     chunk_plan.add_argument("--json", action="store_true")
 
@@ -304,6 +321,8 @@ def build_parser() -> argparse.ArgumentParser:
             subparser.add_argument("--transaction", required=True)
             subparser.add_argument("--actor", required=True)
             subparser.add_argument("--reason", required=True)
+        if command in {"repair-promote", "validate"}:
+            subparser.add_argument("--validator-host-ack-file", default="")
         if command == "adopt":
             subparser.add_argument("--artifact", required=True)
             subparser.add_argument("--actor", required=True)
@@ -368,7 +387,9 @@ def _exit_code(command: str, payload: dict[str, Any]) -> int:
         return 0 if bool(payload.get("ok")) else 1
     if command == "acceptance-run":
         return 0 if bool(payload.get("ok")) else 1
-    if command in {"status", "inspect", "next-action", "reconcile", "repair-plan", "validate", "validation-status", "attest", "export", "queue-list"}:
+    if command == "validate":
+        return 1 if payload.get("status") == "blocked" else 0
+    if command in {"status", "inspect", "next-action", "reconcile", "repair-plan", "validation-status", "attest", "export", "queue-list"}:
         return 0
     if command == "chunk-plan":
         return 0 if payload.get("status") in {"planned", "complete", "available"} else 1
@@ -434,6 +455,7 @@ def main(argv: list[str] | None = None) -> int:
                 candidate_count=args.candidate_count,
                 physical_call_limit=args.physical_call_limit,
                 output_path=args.output or None,
+                config_path=args.config or None,
             )
         elif args.command == "run":
             payload = control.run(
@@ -478,9 +500,18 @@ def main(argv: list[str] | None = None) -> int:
                 transaction_id=args.transaction,
                 actor=args.actor,
                 reason=args.reason,
+                validator_host_acknowledgement=_validator_host_ack_from_file(
+                    args.validator_host_ack_file
+                ),
             )
         elif args.command == "validate":
-            payload = control.validate(job_id=args.job or None, workspace=args.workspace or None)
+            payload = control.validate(
+                job_id=args.job or None,
+                workspace=args.workspace or None,
+                validator_host_acknowledgement=_validator_host_ack_from_file(
+                    args.validator_host_ack_file
+                ),
+            )
         elif args.command == "validation-status":
             payload = control.validation_status(job_id=args.job or None, workspace=args.workspace or None)
         elif args.command == "cancel":

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import configparser
 import json
+import hashlib
 import re
 from pathlib import Path
 from typing import Any, Mapping
@@ -134,6 +135,207 @@ def _outline_provider_response(node_id: str, request: Mapping[str, Any]) -> dict
             }
         )
 
+    if node_id.startswith("topic_synthesis_provider"):
+        requested_topics = [
+            dict(item)
+            for item in request.get("topics") or ()
+            if isinstance(item, Mapping)
+        ]
+        return _provider_response(
+            {
+                "topics": [
+                    {
+                        "topic_id": str(item.get("topic_id") or ""),
+                        "fragment_id": str(item.get("fragment_id") or item.get("topic_id") or ""),
+                        "status": "completed",
+                        "conclusions": [],
+                        "unresolved_questions": [],
+                        "supporting_evidence_ids": list(item.get("planned_evidence_ids") or ()),
+                    }
+                    for item in requested_topics
+                ],
+                "processed_fragment_ids": [
+                    str(item.get("fragment_id") or item.get("topic_id") or "")
+                    for item in requested_topics
+                ],
+                "claims": [],
+                "unresolved_questions": [],
+            }
+        )
+
+    if node_id.startswith(("cross_group_comparison_provider", "global_synthesis_provider")):
+        topic_ids: set[str] = set()
+        fragment_ids: set[str] = set()
+        result_ids: set[str] = set()
+        relation_ids: set[str] = set()
+
+        def collect_identities(value: Any) -> None:
+            if isinstance(value, Mapping):
+                topic_id = str(value.get("topic_id") or "")
+                if topic_id:
+                    topic_ids.add(topic_id)
+                relation_id = str(value.get("relation_id") or "")
+                if relation_id:
+                    relation_ids.add(relation_id)
+                fragment_id = str(value.get("fragment_id") or "")
+                if fragment_id:
+                    fragment_ids.add(fragment_id)
+                for key in ("fragment_ids", "processed_fragment_ids"):
+                    fragment_ids.update(str(item) for item in value.get(key) or () if str(item))
+                for key in ("result_id", "batch_result_id"):
+                    result_id = str(value.get(key) or "")
+                    if result_id:
+                        result_ids.add(result_id)
+                for key in ("result_ids", "batch_result_ids", "processed_result_ids"):
+                    result_ids.update(str(item) for item in value.get(key) or () if str(item))
+                for key in ("topic_ids", "processed_topic_ids"):
+                    topic_ids.update(
+                        str(item) for item in value.get(key) or () if str(item)
+                    )
+                for key in ("relation_ids", "processed_relation_ids"):
+                    relation_ids.update(
+                        str(item) for item in value.get(key) or () if str(item)
+                    )
+                for child in value.values():
+                    collect_identities(child)
+            elif isinstance(value, list):
+                for child in value:
+                    collect_identities(child)
+
+        collect_identities(request.get("topic_synthesis"))
+        collect_identities(request.get("cross_group_comparison"))
+        collect_identities(request.get("relation_candidates"))
+        if node_id.startswith("cross_group_comparison_provider"):
+            supported_topic = next(
+                (
+                    item for item in request.get("topic_synthesis") or ()
+                    if isinstance(item, Mapping)
+                    and str(item.get("topic_id") or "")
+                    and list(item.get("paper_ids") or ())
+                    and list(item.get("supporting_evidence_ids") or ())
+                ),
+                None,
+            )
+            prior_claim = next(
+                (
+                    claim
+                    for item in request.get("topic_synthesis") or ()
+                    if isinstance(item, Mapping)
+                    for semantic_result in [item.get("semantic_result")]
+                    if isinstance(semantic_result, Mapping)
+                    for claim in semantic_result.get("bridge_claims") or ()
+                    if isinstance(claim, Mapping) and claim.get("topic_ids")
+                ),
+                None,
+            )
+            if supported_topic is not None:
+                supported_id = str(supported_topic["topic_id"])
+                bridge_claim_id = (
+                    "synthesis:cross_group_comparison:fixture-"
+                    + hashlib.sha256(supported_id.encode("utf-8")).hexdigest()[:12]
+                )
+                supporting_ids = [
+                    str(value) for value in supported_topic.get("supporting_evidence_ids") or ()
+                    if str(value)
+                ]
+                primary_evidence_id = supporting_ids[0]
+                interpretation_context = supported_topic.get("interpretation_context") or {}
+                dependencies = [
+                    dependency
+                    for dependency in interpretation_context.get("dependencies") or ()
+                    if isinstance(dependency, Mapping)
+                    and primary_evidence_id in dependency.get("primary_evidence_ids", ())
+                ] if isinstance(interpretation_context, Mapping) else []
+                bridge_claim = {
+                    "claim_id": bridge_claim_id,
+                    "topic_ids": [supported_id],
+                    "fragment_id": str(supported_topic.get("fragment_id") or ""),
+                    "paper_key": str((supported_topic.get("paper_ids") or [""])[0]),
+                    "text": "The supplied topic evidence supports this bounded comparison with its recorded conditions.",
+                    "evidence_ids": [
+                        primary_evidence_id,
+                        *sorted({
+                            str(evidence_id)
+                            for dependency in dependencies
+                            for evidence_id in dependency.get("required_evidence_ids") or ()
+                            if str(evidence_id)
+                        }),
+                    ],
+                }
+                if dependencies:
+                    bridge_claim["source_claim_ids"] = sorted({
+                        str(claim_id)
+                        for dependency in dependencies
+                        for claim_id in (
+                            dependency.get("primary_claim_id"),
+                            *list(dependency.get("required_source_claim_ids") or ()),
+                        )
+                        if str(claim_id)
+                    })
+                    bridge_claim["source_field_ids"] = sorted({
+                        str(field_id)
+                        for dependency in dependencies
+                        for field_id in dependency.get("required_source_field_ids") or ()
+                        if str(field_id)
+                    })
+                bridge_claims = [bridge_claim]
+            elif prior_claim is not None:
+                bridge_claims = [dict(prior_claim)]
+                supported_id = str((prior_claim.get("topic_ids") or [""])[0])
+                bridge_claim_id = str(prior_claim.get("claim_id") or "")
+            elif ":reduce:" in node_id:
+                bridge_claims = []
+                supported_id = ""
+                bridge_claim_id = ""
+            else:
+                raise AssertionError("local final cross fixture has no supported topic input")
+            return _provider_response(
+                {
+                    "comparisons": [],
+                    "bridge_claims": bridge_claims,
+                    "topic_dispositions": [
+                        {
+                            "topic_id": topic_id,
+                            "status": "integrated",
+                            "synthesis_claim_ids": [bridge_claim_id],
+                        } if topic_id == supported_id else {
+                            "topic_id": topic_id,
+                            "status": "unresolved",
+                            "reason": "The local fixture has no evidence-backed bridge claim for this topic.",
+                        }
+                        for topic_id in sorted(topic_ids)
+                    ],
+                    "processed_topic_ids": sorted(topic_ids),
+                    "processed_fragment_ids": sorted(fragment_ids),
+                    "processed_result_ids": sorted(result_ids),
+                    "processed_relation_ids": sorted(relation_ids),
+                    "unresolved_questions": [],
+                }
+            )
+        cross_output = request.get("cross_group_comparison") or {}
+        bridge_claims = cross_output.get("bridge_claims") or () if isinstance(cross_output, Mapping) else ()
+        if not bridge_claims:
+            raise AssertionError("local global fixture has no validated cross claim")
+        bridge_claim = bridge_claims[0]
+        return _provider_response(
+            {
+                "synthesis_claims": [{
+                    "claim_id": "synthesis:global_synthesis:fixture-supported-topic",
+                    "topic_ids": list(bridge_claim.get("topic_ids") or ()),
+                    "fragment_id": str(bridge_claim.get("fragment_id") or ""),
+                    "paper_key": str(bridge_claim.get("paper_key") or ""),
+                    "text": "The shared synthesis retains the evidence-backed topic condition.",
+                    "source_claim_ids": [str(bridge_claim.get("claim_id") or "")],
+                    "evidence_ids": list(bridge_claim.get("evidence_ids") or ()),
+                }],
+                "organizing_principles": ["Group the supported topic by mechanism and retain unresolved topics."],
+                "processed_topic_ids": sorted(topic_ids),
+                "processed_fragment_ids": sorted(fragment_ids),
+                "processed_result_ids": sorted(result_ids),
+                "unresolved_questions": [],
+            }
+        )
+
     if node_id.endswith("_provider_generation"):
         candidate_id = node_id.removesuffix("_provider_generation")
         paper_keys = [str(item) for item in request.get("paper_keys") or ()]
@@ -193,13 +395,25 @@ def _outline_provider_response(node_id: str, request: Mapping[str, Any]) -> dict
 
     if node_id == "arbitration":
         candidate_ids = [str(item) for item in request.get("candidate_ids") or ()]
-        return _provider_response(
-            {
-                "selected_candidate_id": sorted(candidate_ids)[0] if candidate_ids else "",
-                "accepted_recommendations": [],
-                "rejected_recommendations": [],
+        selected = sorted(candidate_ids)[0] if candidate_ids else ""
+        content: dict[str, Any] = {
+            "selected_candidate_id": selected,
+            "accepted_recommendations": [],
+            "rejected_recommendations": [],
+        }
+        contract = request.get("section_coordination_contract") or {}
+        if selected in (contract.get("required_if_selected_candidate_sharded") or ()):
+            candidate = (request.get("candidate_contents") or {}).get(selected) or {}
+            content["section_coordination"] = {
+                "candidate_id": selected,
+                "merge_groups": [],
+                "section_order": [
+                    str(section.get("section_id") or "")
+                    for section in candidate.get("sections") or ()
+                    if isinstance(section, Mapping)
+                ],
             }
-        )
+        return _provider_response(content)
 
     return _provider_response({"node_id": node_id, "accepted": True})
 
@@ -264,6 +478,10 @@ def _test_config(tmp_path: Path) -> Path:
     parser["Validator_API"]["model"] = "validator-test"
     parser["Outline"]["candidate_count"] = "2"
     parser["Outline"]["require_explicit_adoption"] = "true"
+    parser["Runtime"]["transport_retries"] = "0"
+    for route_section in set(parser["OutlineModels"].values()):
+        if parser.has_section(route_section):
+            parser[route_section]["transport_retries"] = "0"
     # This chain verifies the legacy deterministic provider fixture. Stability
     # smoke coverage is exercised by the dedicated Outline stability tests.
     parser["OutlineStability"]["mode"] = "off"
@@ -328,6 +546,24 @@ def test_current_three_pdf_runtime_chain_reaches_verified_export(
 
     def configured_writer(*args: Any, **kwargs: Any) -> Mapping[str, Any]:
         prompt = str(args[0] if args else kwargs.get("prompt") or "")
+        try:
+            envelope = json.loads(prompt)
+        except json.JSONDecodeError:
+            envelope = None
+        if isinstance(envelope, Mapping):
+            node_id = str(envelope.get("node_id") or "")
+            request = envelope.get("request")
+            if isinstance(request, Mapping) and (
+                node_id.startswith((
+                    "topic_synthesis_provider",
+                    "cross_group_comparison_provider",
+                    "global_synthesis_provider",
+                ))
+                or node_id == "relation_adjudication"
+                or node_id.endswith(("_provider_generation", "_critique"))
+                or node_id == "arbitration"
+            ):
+                return _outline_provider_response(node_id, request)
         ref_ids = re.findall(r"R\d{3,}", prompt)
         ref_id = ref_ids[0] if ref_ids else "R001"
         return _provider_response(
@@ -369,6 +605,16 @@ def test_current_three_pdf_runtime_chain_reaches_verified_export(
     assert "explicit adoption" in first.message, first
 
     _workspace, first_registry = AgentRuntimeRunner._open_workspace(first.workspace_path)
+    topic_synthesis_record = first_registry.get("outline-v3:topic_synthesis")
+    assert topic_synthesis_record is not None
+    topic_synthesis_envelope = json.loads(
+        Path(topic_synthesis_record.path).read_text(encoding="utf-8")
+    )
+    topic_synthesis_payload = topic_synthesis_envelope["payload"]
+    assert topic_synthesis_payload["execution_mode"] == "provider_synthesis"
+    assert topic_synthesis_payload["provider_request_plan_identity_hash"]
+    assert topic_synthesis_payload["topics"]
+
     persisted_spec_record = first_registry.get("runtime_job_spec")
     assert persisted_spec_record is not None
     persisted_spec_payload = json.loads(

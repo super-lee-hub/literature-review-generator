@@ -9,12 +9,13 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping
 
 from docx import Document
+from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
-from docx.shared import Cm, Inches, Pt
+from docx.shared import Cm, Pt
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 
-from services.citation_catalog import CitationCatalogEntry, format_in_text_citation, format_reference_entry
+from services.citation_catalog import CitationCatalogEntry
 from services.citation_ref_catalog import LEGAL_CITE_REF_TOKEN_PATTERN, extract_ref_ids_from_token
 from services.citation_style import CitationStyleEngine, ReferenceSegment, normalize_creators
 
@@ -124,6 +125,8 @@ def render_structured_citations(
     citation_manifest: Mapping[str, Any],
     *,
     section_number: int | None = None,
+    block_id: str | None = None,
+    occurrence_positions: dict[str, int] | None = None,
 ) -> tuple[str, List[str]]:
     del generator_instance
     lookup = _entry_lookup(citation_manifest)
@@ -136,14 +139,22 @@ def render_structured_citations(
             continue
         ref_id = str(occurrence.get("ref_id") or "").strip()
         if ref_id:
-            if section_number is None or int(occurrence.get("section_number") or 0) == section_number:
+            in_section = (
+                section_number is None
+                or int(occurrence.get("section_number") or 0) == section_number
+            )
+            in_block = (
+                block_id is None
+                or str(occurrence.get("block_id") or "") == block_id
+            )
+            if in_section and in_block:
                 occurrence_modes.setdefault(ref_id, []).append(
                     (
                         str(occurrence.get("mode") or "parenthetical"),
                         str(occurrence.get("locator")) if occurrence.get("locator") else None,
                     )
                 )
-    occurrence_positions: dict[str, int] = {}
+    used_occurrences = occurrence_positions if occurrence_positions is not None else {}
 
     rendered_text = raw
 
@@ -173,8 +184,8 @@ def render_structured_citations(
                 if entry is None:
                     unresolved.append(ref_id)
                     continue
-                position = occurrence_positions.get(ref_id, 0)
-                occurrence_positions[ref_id] = position + 1
+                position = used_occurrences.get(ref_id, 0)
+                used_occurrences[ref_id] = position + 1
                 occurrence_mode, occurrence_locator = (
                     occurrence_modes.get(ref_id, [("parenthetical", None)])[position]
                     if position < len(occurrence_modes.get(ref_id, []))
@@ -200,6 +211,193 @@ def render_structured_citations(
     rendered = re.sub(r"\[\[cite:(?!ref:)[^\]]+\]\]", record_legacy, rendered_text)
     rendered = re.sub(r"(?:\[\[cite_ref:[^\]]+\]\])+", replace, rendered)
     return rendered.replace("`", ""), unresolved
+
+
+def _split_pipe_table_row(line: str) -> list[str]:
+    """Split one Markdown pipe row, honoring escaped literal pipes."""
+
+    raw = str(line or "").strip()
+    cells: list[str] = []
+    current: list[str] = []
+    escaped = False
+    for character in raw:
+        if escaped:
+            if character == "|":
+                current.append("|")
+            else:
+                current.extend(("\\", character))
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif character == "|":
+            cells.append("".join(current).strip())
+            current.clear()
+        else:
+            current.append(character)
+    if escaped:
+        current.append("\\")
+    cells.append("".join(current).strip())
+    if raw.startswith("|") and cells and not cells[0]:
+        cells.pop(0)
+    if raw.endswith("|") and cells and not cells[-1]:
+        cells.pop()
+    return cells
+
+
+def _parse_pipe_table(text: str) -> tuple[list[str], list[str], list[list[str]]] | None:
+    """Parse a complete GitHub-style pipe table, not prose containing pipes.
+
+    The current Review v3 Writer schema carries block text and normalizes
+    ``block_kind`` to ``paragraph``.  An unambiguous Markdown table is therefore
+    the compatible table encoding until that upstream schema carries typed
+    rows.  Requiring the whole block to match prevents ordinary prose with a
+    pipe character from changing its DOCX representation.
+    """
+
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    if len(lines) < 3:
+        return None
+    header = _split_pipe_table_row(lines[0])
+    separator = _split_pipe_table_row(lines[1])
+    if not header or len(header) != len(separator) or any(not cell for cell in header):
+        return None
+    alignments: list[str] = []
+    for cell in separator:
+        if not re.fullmatch(r":?-{3,}:?", cell):
+            return None
+        alignments.append(
+            "center" if cell.startswith(":") and cell.endswith(":")
+            else "right" if cell.endswith(":")
+            else "left"
+        )
+    body: list[list[str]] = []
+    for line in lines[2:]:
+        row = _split_pipe_table_row(line)
+        if len(row) != len(header):
+            return None
+        body.append(row)
+    return (header, alignments, body) if body else None
+
+
+def _append_pipe_table(
+    doc: Any,
+    table_data: tuple[list[str], list[str], list[list[str]]],
+    *,
+    generator_instance: Any,
+    citation_manifest: Mapping[str, Any],
+    section_number: int,
+    block_id: str,
+) -> None:
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    header, alignments, body = table_data
+    table = doc.add_table(rows=1, cols=len(header))
+    table.style = "Table Grid"
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    table.autofit = True
+
+    header_row = table.rows[0]
+    header_row_properties = header_row._tr.get_or_add_trPr()
+    repeat_header = OxmlElement("w:tblHeader")
+    repeat_header.set(qn("w:val"), "true")
+    header_row_properties.append(repeat_header)
+
+    shared_occurrence_positions: dict[str, int] = {}
+    rows = [(header, True), *((row, False) for row in body)]
+    for values, is_header in rows:
+        cells = header_row.cells if is_header else table.add_row().cells
+        for index, (cell, value) in enumerate(zip(cells, values, strict=True)):
+            rendered, unresolved = render_structured_citations(
+                value,
+                generator_instance,
+                citation_manifest,
+                section_number=section_number,
+                block_id=block_id,
+                occurrence_positions=shared_occurrence_positions,
+            )
+            if unresolved:
+                raise ValueError(
+                    "unresolved table citation references: "
+                    + ", ".join(sorted(set(unresolved)))
+                )
+            paragraph = cell.paragraphs[0]
+            paragraph.paragraph_format.space_after = Pt(0)
+            paragraph.alignment = {
+                "left": WD_ALIGN_PARAGRAPH.LEFT,
+                "center": WD_ALIGN_PARAGRAPH.CENTER,
+                "right": WD_ALIGN_PARAGRAPH.RIGHT,
+            }[alignments[index]]
+            run = paragraph.add_run(rendered)
+            run.bold = is_header
+
+
+def append_review_section_blocks_to_word_document(
+    generator_instance: Any,
+    section_number: int,
+    section_title: str,
+    blocks: Iterable[Mapping[str, Any]],
+    word_file: str,
+    *,
+    citation_manifest: Mapping[str, Any],
+) -> bool:
+    """Append structured paragraphs and native Markdown pipe tables."""
+
+    try:
+        output = Path(word_file)
+        doc = Document(str(output)) if output.is_file() else Document()
+        if not output.is_file():
+            set_advanced_document_styles(doc)
+            add_header_and_footer(doc)
+        doc.add_heading(f"{section_number}. {section_title}", level=2)
+        for block in blocks:
+            if not isinstance(block, Mapping):
+                raise ValueError("review block must be an object")
+            text = str(block.get("text") or "").strip()
+            block_id = str(block.get("block_id") or "")
+            block_kind = str(block.get("block_kind") or "paragraph").casefold()
+            if not text:
+                if block_kind in {"table", "markdown_table"}:
+                    raise ValueError(
+                        f"review table block {block_id or '<unknown>'} is empty"
+                    )
+                continue
+            table_data = _parse_pipe_table(text)
+            if block_kind in {"table", "markdown_table"} and table_data is None:
+                raise ValueError(
+                    f"review table block {block_id or '<unknown>'} is not a complete pipe table"
+                )
+            if table_data is not None:
+                _append_pipe_table(
+                    doc,
+                    table_data,
+                    generator_instance=generator_instance,
+                    citation_manifest=citation_manifest,
+                    section_number=section_number,
+                    block_id=block_id,
+                )
+                continue
+
+            rendered, unresolved = render_structured_citations(
+                text,
+                generator_instance,
+                citation_manifest,
+                section_number=section_number,
+                block_id=block_id or None,
+            )
+            if unresolved:
+                raise ValueError(
+                    "unresolved citation references: "
+                    + ", ".join(sorted(set(unresolved)))
+                )
+            for paragraph_text in rendered.split("\n\n"):
+                if paragraph_text.strip():
+                    doc.add_paragraph(paragraph_text.strip())
+        output.parent.mkdir(parents=True, exist_ok=True)
+        doc.save(str(output))
+        return True
+    except Exception as exc:
+        _log(getattr(generator_instance, "logger", None), "error", str(exc))
+        return False
 
 
 def set_advanced_document_styles(
@@ -563,19 +761,44 @@ def rebuild_review_docx_from_structured_artifacts(
     if output.exists():
         output.unlink()
     for section in review_draft.get("content", {}).get("sections", []):
-        text = "\n\n".join(
-            str(block.get("text") or "").strip()
-            for block in section.get("blocks", [])
-            if isinstance(block, Mapping) and str(block.get("text") or "").strip()
+        blocks = section.get("blocks") or []
+        has_table_block = any(
+            isinstance(block, Mapping)
+            and (
+                str(block.get("block_kind") or "").casefold()
+                in {"table", "markdown_table"}
+                or _parse_pipe_table(str(block.get("text") or "")) is not None
+            )
+            for block in blocks
         )
-        if not append_section_to_word_document(
-            generator_instance,
-            int(section.get("section_number") or 0),
-            str(section.get("section_title") or ""),
-            text,
-            str(output),
-            citation_manifest=citation_manifest,
-        ):
+        if has_table_block:
+            appended = append_review_section_blocks_to_word_document(
+                generator_instance,
+                int(section.get("section_number") or 0),
+                str(section.get("section_title") or ""),
+                blocks,
+                str(output),
+                citation_manifest=citation_manifest,
+            )
+        else:
+            text = "\n\n".join(
+                str(block.get("text") or "").strip()
+                for block in blocks
+                if isinstance(block, Mapping) and str(block.get("text") or "").strip()
+            )
+            # Sections without tables keep the established renderer path and
+            # its section-wide citation occurrence ordering exactly.
+            if not blocks:
+                text = str(section.get("content") or "").strip()
+            appended = append_section_to_word_document(
+                generator_instance,
+                int(section.get("section_number") or 0),
+                str(section.get("section_title") or ""),
+                text,
+                str(output),
+                citation_manifest=citation_manifest,
+            )
+        if not appended:
             raise ValueError("section DOCX rendering failed")
     doc = Document(str(output))
     doc.add_heading("References", level=1)

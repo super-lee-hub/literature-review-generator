@@ -9,7 +9,7 @@ a receipt.
 """
 
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from dataclasses import asdict, dataclass, field, fields, replace
 import ctypes
 import hashlib
@@ -21,7 +21,7 @@ import re
 import socket
 import threading
 import time
-from typing import Any, Iterable, Literal, Mapping, cast
+from typing import Any, Callable, Iterable, Literal, Mapping, cast
 import uuid
 
 from services.durable_io import atomic_replace_with_retry, interprocess_file_lock
@@ -31,6 +31,14 @@ from services.job_workspace import atomic_write_json, utc_now_iso
 PROVIDER_RECEIPT_ARTIFACT_TYPE = "provider_call_receipt"
 PROVIDER_RECEIPT_ARTIFACT_VERSION = "v2"
 PROVIDER_RECEIPT_LEDGER_VERSION = "provider-receipt-ledger-v1"
+AUTHORIZED_PROVIDER_CALL_LIMIT = 24
+
+
+def authorized_provider_call_limit(configured_limit: int | None = None) -> int:
+    """Return the current hard admission cap without silently raising it."""
+
+    requested = AUTHORIZED_PROVIDER_CALL_LIMIT if configured_limit is None else int(configured_limit)
+    return min(AUTHORIZED_PROVIDER_CALL_LIMIT, max(0, requested))
 
 ProviderErrorKind = Literal[
     "quota_exhausted",
@@ -64,10 +72,10 @@ _ACTIVE_PAUSE_STATE_PATH: ContextVar[str] = ContextVar(
 )
 
 
-def bind_pause_state_path(path: str | Path) -> None:
+def bind_pause_state_path(path: str | Path) -> Token[str]:
     """Bind the current runtime context to its durable pause marker."""
 
-    _ACTIVE_PAUSE_STATE_PATH.set(str(Path(path).expanduser().resolve()))
+    return _ACTIVE_PAUSE_STATE_PATH.set(str(Path(path).expanduser().resolve()))
 
 
 def current_pause_state_path() -> str:
@@ -116,6 +124,210 @@ class ProviderBudgetExceeded(RuntimeError):
 
 class ProviderReceiptConflict(RuntimeError):
     """Raised when an append-only receipt ID is reused with different content."""
+
+
+@dataclass(frozen=True)
+class RuntimeControlIdentityV1:
+    """Typed identity for one job execution and its optional queue lease."""
+
+    job_id: str
+    workspace_path: str
+    acceptance_run_id: str = ""
+    lease_id: str = ""
+    lease_generation: int = 0
+    provider_budget_started: bool = False
+
+    def __post_init__(self) -> None:
+        job_id = str(self.job_id or "").strip()
+        workspace_path = str(self.workspace_path or "").strip()
+        acceptance_run_id = str(self.acceptance_run_id or "").strip()
+        lease_id = str(self.lease_id or "").strip()
+        if not job_id or not workspace_path:
+            raise ProviderRuntimeContractError(
+                "runtime control identity requires a job ID and workspace path"
+            )
+        if isinstance(self.lease_generation, bool) or not isinstance(self.lease_generation, int):
+            raise ProviderRuntimeContractError("runtime control lease generation must be an integer")
+        if self.lease_generation < 0 or bool(lease_id) != bool(self.lease_generation):
+            raise ProviderRuntimeContractError("runtime control lease identity is incomplete")
+        if not isinstance(self.provider_budget_started, bool):
+            raise ProviderRuntimeContractError("runtime control budget-started flag must be boolean")
+        if self.provider_budget_started and not acceptance_run_id:
+            raise ProviderRuntimeContractError(
+                "runtime control started provider budget requires an acceptance run ID"
+            )
+        object.__setattr__(self, "job_id", job_id)
+        object.__setattr__(self, "workspace_path", str(Path(workspace_path).expanduser().resolve()))
+        object.__setattr__(self, "acceptance_run_id", acceptance_run_id)
+        object.__setattr__(self, "lease_id", lease_id)
+
+
+@dataclass(frozen=True)
+class RuntimeControlContextV1:
+    identity: RuntimeControlIdentityV1
+    pause_state_store: Any
+    cancellation_store: Any
+    lease_validator: Callable[[], bool] | None = None
+    cancel_token: Any | None = None
+
+
+_ACTIVE_RUNTIME_CONTROL_CONTEXT: ContextVar[RuntimeControlContextV1 | None] = ContextVar(
+    "auto_generate_runtime_control_context",
+    default=None,
+)
+
+
+def current_runtime_control_context() -> RuntimeControlContextV1 | None:
+    return _ACTIVE_RUNTIME_CONTROL_CONTEXT.get()
+
+
+@contextmanager
+def runtime_control_lifecycle():
+    """Clear legacy job context at a run boundary and prevent same-thread leakage."""
+
+    previous_context = _ACTIVE_RUNTIME_CONTROL_CONTEXT.get()
+    context_token = _ACTIVE_RUNTIME_CONTROL_CONTEXT.set(None)
+    pause_token = _ACTIVE_PAUSE_STATE_PATH.set("")
+    try:
+        yield
+    finally:
+        if previous_context is None:
+            _ACTIVE_RUNTIME_CONTROL_CONTEXT.reset(context_token)
+            _ACTIVE_PAUSE_STATE_PATH.set("")
+        else:
+            _ACTIVE_RUNTIME_CONTROL_CONTEXT.reset(context_token)
+            _ACTIVE_PAUSE_STATE_PATH.reset(pause_token)
+
+
+@contextmanager
+def bind_runtime_control_context(
+    identity: RuntimeControlIdentityV1,
+    *,
+    workspace: Any,
+    registry: Any,
+    lease_validator: Callable[[], bool] | None = None,
+    cancel_token: Any | None = None,
+):
+    """Bind hash-verified pause/cancel authorities to one scoped job run."""
+
+    from runtime.cancellation import CancellationRequestStore
+    from runtime.pause_state import PauseStateStore
+
+    previous_context = _ACTIVE_RUNTIME_CONTROL_CONTEXT.get()
+    if previous_context is not None:
+        previous_identity = previous_context.identity
+        same_owner = (
+            previous_identity.job_id == identity.job_id
+            and previous_identity.workspace_path == identity.workspace_path
+        )
+        if same_owner:
+            if (
+                identity.lease_id
+                and previous_identity.lease_id
+                and (
+                    identity.lease_id != previous_identity.lease_id
+                    or identity.lease_generation != previous_identity.lease_generation
+                )
+            ):
+                raise ProviderRuntimeContractError(
+                    "nested runtime control context changed the owning queue lease"
+                )
+            if not identity.lease_id and previous_identity.lease_id:
+                identity = replace(
+                    identity,
+                    lease_id=previous_identity.lease_id,
+                    lease_generation=previous_identity.lease_generation,
+                )
+            if lease_validator is None:
+                lease_validator = previous_context.lease_validator
+            if cancel_token is None:
+                cancel_token = previous_context.cancel_token
+            if not identity.acceptance_run_id and previous_identity.acceptance_run_id:
+                identity = replace(
+                    identity,
+                    acceptance_run_id=previous_identity.acceptance_run_id,
+                    provider_budget_started=(
+                        identity.provider_budget_started
+                        or previous_identity.provider_budget_started
+                    ),
+                )
+            elif (
+                identity.acceptance_run_id
+                and identity.acceptance_run_id == previous_identity.acceptance_run_id
+                and previous_identity.provider_budget_started
+                and not identity.provider_budget_started
+            ):
+                identity = replace(identity, provider_budget_started=True)
+            elif (
+                identity.acceptance_run_id
+                and previous_identity.acceptance_run_id
+                and identity.acceptance_run_id != previous_identity.acceptance_run_id
+            ):
+                raise ProviderRuntimeContractError(
+                    "nested runtime control context changed the acceptance run identity"
+                )
+    workspace_job_id = str(getattr(workspace, "job_id", "") or "")
+    workspace_root = str(Path(getattr(getattr(workspace, "paths", None), "root_dir", "")).resolve())
+    if workspace_job_id != identity.job_id or workspace_root != identity.workspace_path:
+        raise ProviderRuntimeContractError(
+            "runtime control identity does not match its workspace"
+        )
+    if str(getattr(registry, "job_id", "") or "") != identity.job_id:
+        raise ProviderRuntimeContractError(
+            "runtime control identity does not match its Registry"
+        )
+    pause_store = PauseStateStore(workspace, registry)
+    cancellation_store = CancellationRequestStore(workspace, registry)
+    context = RuntimeControlContextV1(
+        identity=identity,
+        pause_state_store=pause_store,
+        cancellation_store=cancellation_store,
+        lease_validator=lease_validator,
+        cancel_token=cancel_token,
+    )
+    previous_context = _ACTIVE_RUNTIME_CONTROL_CONTEXT.get()
+    context_token = _ACTIVE_RUNTIME_CONTROL_CONTEXT.set(context)
+    pause_path_token = _ACTIVE_PAUSE_STATE_PATH.set(str(pause_store.path.resolve()))
+    try:
+        yield context
+    finally:
+        if previous_context is None:
+            _ACTIVE_PAUSE_STATE_PATH.set("")
+        else:
+            _ACTIVE_PAUSE_STATE_PATH.reset(pause_path_token)
+        _ACTIVE_RUNTIME_CONTROL_CONTEXT.reset(context_token)
+
+
+def _registered_pause_store_for_path(marker_path: str) -> Any | None:
+    """Resolve a legacy pause path back to its Registry when it has workspace shape."""
+
+    path = Path(marker_path).expanduser().resolve()
+    if path.parent.name != "pause_state" or path.suffix.lower() != ".json":
+        return None
+    workspace_root = path.parent.parent.parent
+    job_id = path.stem
+    marker = f"__{job_id}"
+    if not job_id or not workspace_root.name.endswith(marker):
+        return None
+    project_name = workspace_root.name[: -len(marker)]
+    if not project_name:
+        return None
+    try:
+        from runtime.pause_state import PauseStateStore
+        from services.artifact_registry import ArtifactRegistry
+        from services.job_workspace import JobWorkspace
+
+        workspace = JobWorkspace(str(workspace_root.parent), project_name, job_id)
+        if str(Path(workspace.paths.root_dir).resolve()) != str(workspace_root):
+            raise ProviderRuntimeContractError("pause marker workspace path is inconsistent")
+        registry = ArtifactRegistry(workspace.paths.registry_path, job_id)
+        return PauseStateStore(workspace, registry)
+    except ProviderRuntimeContractError:
+        raise
+    except Exception as exc:
+        raise ProviderRuntimeContractError(
+            f"CONTROL_STATE_INVALID: pause workspace cannot be verified: {type(exc).__name__}"
+        ) from exc
 
 
 ProcessLiveness = Literal["alive", "dead", "unknown"]
@@ -431,6 +643,7 @@ class AcceptanceExecutionContextV1:
     process_event_log: str
     scenario_state_path: str
     owner_authorized: bool
+    provider_budget_state_started: bool = False
 
     def __post_init__(self) -> None:
         if not str(self.acceptance_run_id).strip():
@@ -463,6 +676,10 @@ class AcceptanceExecutionContextV1:
             raise ProviderRuntimeContractError(
                 "acceptance execution context owner_authorized must be a boolean"
             )
+        if not isinstance(self.provider_budget_state_started, bool):
+            raise ProviderRuntimeContractError(
+                "acceptance execution context provider_budget_state_started must be a boolean"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -475,6 +692,7 @@ class AcceptanceExecutionContextV1:
             "process_event_log": self.process_event_log,
             "scenario_state_path": self.scenario_state_path,
             "owner_authorized": self.owner_authorized,
+            "provider_budget_state_started": self.provider_budget_state_started,
         }
 
     @classmethod
@@ -493,6 +711,7 @@ class AcceptanceExecutionContextV1:
             "process_event_log",
             "scenario_state_path",
             "owner_authorized",
+            "provider_budget_state_started",
         }
         unknown = sorted(str(key) for key in payload if str(key) not in allowed)
         if unknown:
@@ -509,6 +728,11 @@ class AcceptanceExecutionContextV1:
         if not isinstance(owner_authorized, bool):
             raise ProviderRuntimeContractError(
                 "acceptance execution context owner_authorized must be a boolean"
+            )
+        provider_budget_state_started = payload.get("provider_budget_state_started", False)
+        if not isinstance(provider_budget_state_started, bool):
+            raise ProviderRuntimeContractError(
+                "acceptance execution context provider_budget_state_started must be a boolean"
             )
         try:
             deadline = float(str(payload.get("absolute_deadline_epoch") or ""))
@@ -528,6 +752,7 @@ class AcceptanceExecutionContextV1:
             process_event_log=str(payload.get("process_event_log") or ""),
             scenario_state_path=str(payload.get("scenario_state_path") or ""),
             owner_authorized=owner_authorized,
+            provider_budget_state_started=provider_budget_state_started,
         )
 
 
@@ -571,6 +796,11 @@ def bind_acceptance_execution_context(
         raise ProviderRuntimeContractError(
             "acceptance execution context budget does not match its controller"
         )
+    controller.bind_state_path(
+        context.provider_budget_state_path,
+        acceptance_run_id=context.acceptance_run_id,
+        state_started=context.provider_budget_state_started,
+    )
     context_token = _ACTIVE_ACCEPTANCE_CONTEXT.set(context)
     controller_token = _ACTIVE_ACCEPTANCE_CONTROLLER.set(controller)
     try:
@@ -643,23 +873,79 @@ class ProviderBudgetController:
         self._output_tokens_reserved = 0
         self._retry_attempts_reserved = 0
         self._state_path: Path | None = None
+        self._identity_path: Path | None = None
+        self._acceptance_run_id = ""
+        self._loaded_run_id = ""
+        self._state_started = False
         self._ambiguous_reservation_ids: set[str] = set()
 
-    def bind_state_path(self, path: str | Path) -> None:
+    def bind_state_path(
+        self,
+        path: str | Path,
+        *,
+        acceptance_run_id: str = "",
+        state_started: bool | None = None,
+    ) -> None:
         """Bind aggregate usage to a job-owned durable state file."""
 
         target = Path(path).expanduser().resolve()
+        run_id = str(acceptance_run_id or "").strip()
+        if state_started is not None and not isinstance(state_started, bool):
+            raise ProviderRuntimeContractError("provider budget state-started flag must be boolean")
         with self._lock:
             if self._state_path is not None and self._state_path != target:
                 raise ProviderRuntimeContractError(
                     "provider aggregate budget cannot be rebound to a different state path"
                 )
             self._state_path = target
+            self._identity_path = target.with_name(target.name + ".identity.json")
+            previous_run_id = self._acceptance_run_id
+            if self._acceptance_run_id and run_id and self._acceptance_run_id != run_id:
+                raise ProviderRuntimeContractError(
+                    "provider aggregate budget acceptance run identity changed"
+                )
+            if run_id:
+                self._acceptance_run_id = run_id
+            if state_started is True:
+                self._state_started = True
             with interprocess_file_lock(target):
                 if not target.is_file():
+                    identity = self._read_state_identity_unlocked()
+                    if self._state_started or identity is not None:
+                        raise ProviderRuntimeContractError(
+                            "provider aggregate budget state is missing for a started run"
+                        )
                     self._persist_state_unlocked()
+                    self._persist_state_identity_unlocked()
+                    self._state_started = True
                     return
+                identity = self._read_state_identity_unlocked(validate_expected_run=False)
+                stored_run_id = str(identity.get("acceptance_run_id") or "") if identity else ""
+                if run_id and stored_run_id != run_id:
+                    may_adopt = (
+                        state_started is not True
+                        and not previous_run_id
+                        and not stored_run_id
+                        and self._state_payload_is_pristine_unlocked()
+                    )
+                    if not may_adopt:
+                        raise ProviderRuntimeContractError(
+                            "provider aggregate budget state belongs to a different acceptance run"
+                        )
+                    self._adopt_pristine_state_run_id_unlocked(run_id)
+                    identity = self._read_state_identity_unlocked()
+                if state_started is True and identity is None:
+                    raise ProviderRuntimeContractError(
+                        "started provider aggregate budget has no durable run identity"
+                    )
                 self._load_state_unlocked()
+                if run_id and self._loaded_run_id != run_id:
+                    raise ProviderRuntimeContractError(
+                        "provider aggregate budget state run ID does not match the active run"
+                    )
+                if identity is None:
+                    self._persist_state_identity_unlocked()
+                self._state_started = True
                 self._reconcile_dead_reservations_unlocked()
                 receipt_ledgers = tuple(
                     str(reservation.context.get("ledger_path") or "").strip()
@@ -671,13 +957,156 @@ class ProviderBudgetController:
                     self._reconcile_orphaned_unlocked(receipt_ledgers)
                 self._persist_state_unlocked()
 
+    def _read_state_identity_unlocked(
+        self,
+        *,
+        validate_expected_run: bool = True,
+    ) -> Mapping[str, Any] | None:
+        if self._identity_path is None or not self._identity_path.is_file():
+            return None
+        try:
+            payload = json.loads(self._identity_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ProviderRuntimeContractError(
+                "provider aggregate budget identity is unreadable"
+            ) from exc
+        if (
+            not isinstance(payload, Mapping)
+            or payload.get("schema_version") != "provider-aggregate-budget-identity-v1"
+            or str(payload.get("state_path") or "") != str(self._state_path)
+            or not str(payload.get("created_at") or "").strip()
+        ):
+            raise ProviderRuntimeContractError("provider aggregate budget identity is invalid")
+        stored_run_id = str(payload.get("acceptance_run_id") or "")
+        if validate_expected_run and self._acceptance_run_id and stored_run_id != self._acceptance_run_id:
+            raise ProviderRuntimeContractError(
+                "provider aggregate budget identity belongs to a different acceptance run"
+            )
+        if validate_expected_run and not self._acceptance_run_id and stored_run_id:
+            self._acceptance_run_id = stored_run_id
+        return payload
+
+    def _state_payload_is_pristine_unlocked(self) -> bool:
+        if self._state_path is None or not self._state_path.is_file():
+            return False
+        try:
+            payload = json.loads(self._state_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return False
+        if (
+            not isinstance(payload, Mapping)
+            or payload.get("budget") != self.budget.to_dict()
+            or str(payload.get("acceptance_run_id") or "")
+        ):
+            return False
+        if any(
+            payload.get(name, 0) != 0
+            for name in (
+                "calls_used",
+                "output_tokens_used",
+                "retry_attempts_used",
+                "calls_reserved",
+                "output_tokens_reserved",
+                "retry_attempts_reserved",
+            )
+        ):
+            return False
+        reservations = payload.get("reservations", [])
+        return reservations in (None, [])
+
+    def _adopt_pristine_state_run_id_unlocked(self, run_id: str) -> None:
+        if self._state_path is None or not self._state_payload_is_pristine_unlocked():
+            raise ProviderRuntimeContractError(
+                "provider aggregate budget run identity cannot change after use"
+            )
+        payload = json.loads(self._state_path.read_text(encoding="utf-8"))
+        payload["schema_version"] = "provider-aggregate-budget-v4"
+        payload["acceptance_run_id"] = run_id
+        atomic_write_json(str(self._state_path), payload)
+        self._acceptance_run_id = run_id
+        self._persist_state_identity_unlocked()
+
+    def _persist_state_identity_unlocked(self) -> None:
+        if self._identity_path is None or self._state_path is None:
+            return
+        atomic_write_json(
+            str(self._identity_path),
+            {
+                "schema_version": "provider-aggregate-budget-identity-v1",
+                "state_path": str(self._state_path),
+                "acceptance_run_id": self._acceptance_run_id,
+                "created_at": utc_now_iso(),
+            },
+        )
+
+    def assert_state_integrity(
+        self,
+        *,
+        acceptance_run_id: str,
+        state_started: bool,
+    ) -> None:
+        """Verify the expected run-owned aggregate state still exists and matches."""
+
+        if not state_started:
+            return
+        run_id = str(acceptance_run_id or "").strip()
+        with self._lock:
+            if self._state_path is None or self._identity_path is None:
+                raise ProviderRuntimeContractError(
+                    "started provider aggregate budget has no bound state path"
+                )
+            if not self._state_started:
+                raise ProviderRuntimeContractError(
+                    "provider aggregate budget state has not been initialized"
+                )
+            if self._acceptance_run_id != run_id:
+                raise ProviderRuntimeContractError(
+                    "provider aggregate budget does not match the active acceptance run"
+                )
+            with interprocess_file_lock(self._state_path):
+                identity = self._read_state_identity_unlocked()
+                if identity is None:
+                    raise ProviderRuntimeContractError(
+                        "started provider aggregate budget has no durable run identity"
+                    )
+                self._load_state_unlocked()
+                if self._loaded_run_id != run_id:
+                    raise ProviderRuntimeContractError(
+                        "provider aggregate budget state run ID does not match the active run"
+                    )
+
+    @property
+    def state_path(self) -> Path | None:
+        return self._state_path
+
+    @property
+    def acceptance_run_id(self) -> str:
+        return self._acceptance_run_id
+
+    @property
+    def state_started(self) -> bool:
+        return self._state_started
+
     @staticmethod
     def _pid_alive(pid: int) -> bool:
         return is_process_alive(process_identity_for_pid(pid))
 
     def _load_state_unlocked(self) -> None:
-        if self._state_path is None or not self._state_path.is_file():
+        if self._state_path is None:
             return
+        if not self._state_path.is_file():
+            if self._state_started or (
+                self._identity_path is not None and self._identity_path.exists()
+            ):
+                raise ProviderRuntimeContractError(
+                    "provider aggregate budget state is missing for a started run"
+                )
+            return
+        identity = self._read_state_identity_unlocked()
+        if self._state_started and identity is None:
+            raise ProviderRuntimeContractError(
+                "started provider aggregate budget has no durable run identity"
+            )
         try:
             payload = json.loads(self._state_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -689,6 +1118,7 @@ class ProviderBudgetController:
             "provider-aggregate-budget-v1",
             "provider-aggregate-budget-v2",
             "provider-aggregate-budget-v3",
+            "provider-aggregate-budget-v4",
         }:
             raise ProviderRuntimeContractError("provider aggregate budget state schema is invalid")
         if (
@@ -701,6 +1131,17 @@ class ProviderBudgetController:
             )
         if payload.get("budget") != self.budget.to_dict():
             raise ProviderRuntimeContractError("provider aggregate budget state limits changed")
+        self._loaded_run_id = str(payload.get("acceptance_run_id") or "")
+        if self._acceptance_run_id and self._loaded_run_id != self._acceptance_run_id:
+            raise ProviderRuntimeContractError(
+                "provider aggregate budget state run ID does not match the active run"
+            )
+        if identity is not None and str(identity.get("acceptance_run_id") or "") != self._loaded_run_id:
+            raise ProviderRuntimeContractError(
+                "provider aggregate budget state and identity run IDs differ"
+            )
+        if not self._acceptance_run_id and self._loaded_run_id:
+            self._acceptance_run_id = self._loaded_run_id
         for field_name, attribute in (
             ("calls_used", "_calls_used"),
             ("output_tokens_used", "_output_tokens_used"),
@@ -714,20 +1155,48 @@ class ProviderBudgetController:
             setattr(self, attribute, raw)
         raw_started = payload.get("first_started_epoch")
         raw_deadline = payload.get("absolute_deadline_epoch")
-        if raw_started is not None:
-            try:
-                self._first_started_epoch = float(raw_started)
-            except (TypeError, ValueError) as exc:
+        if (
+            raw_started is None
+            or raw_deadline is None
+            or isinstance(raw_started, bool)
+            or isinstance(raw_deadline, bool)
+        ):
+            raise ProviderRuntimeContractError(
+                "provider aggregate budget start/deadline state is missing or invalid"
+            )
+        try:
+            first_started_epoch = float(raw_started)
+            absolute_deadline_epoch = float(raw_deadline)
+        except (TypeError, ValueError) as exc:
+            raise ProviderRuntimeContractError(
+                "provider aggregate budget start/deadline state is invalid"
+            ) from exc
+        if (
+            not math.isfinite(first_started_epoch)
+            or first_started_epoch <= 0
+            or not math.isfinite(absolute_deadline_epoch)
+            or absolute_deadline_epoch < 0
+        ):
+            raise ProviderRuntimeContractError(
+                "provider aggregate budget start/deadline state must be finite and non-negative"
+            )
+        if self.budget.max_wall_seconds:
+            expected_deadline = first_started_epoch + self.budget.max_wall_seconds
+            if absolute_deadline_epoch <= 0 or not math.isclose(
+                absolute_deadline_epoch,
+                expected_deadline,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            ):
                 raise ProviderRuntimeContractError(
-                    "provider aggregate budget first_started_epoch is invalid"
-                ) from exc
-        if raw_deadline is not None:
-            try:
-                self._absolute_deadline_epoch = float(raw_deadline)
-            except (TypeError, ValueError) as exc:
-                raise ProviderRuntimeContractError(
-                    "provider aggregate budget absolute_deadline_epoch is invalid"
-                ) from exc
+                    "provider aggregate budget absolute deadline is missing or inconsistent"
+                )
+        elif absolute_deadline_epoch != 0:
+            raise ProviderRuntimeContractError(
+                "provider aggregate budget deadline is inconsistent with its wall-clock limit"
+            )
+        self._first_started_epoch = first_started_epoch
+        self._absolute_deadline_epoch = absolute_deadline_epoch
         reservations: dict[str, ProviderAggregateReservationV1] = {}
         raw_reservations = payload.get("reservations")
         if isinstance(raw_reservations, list):
@@ -870,8 +1339,9 @@ class ProviderBudgetController:
         atomic_write_json(
             str(self._state_path),
             {
-                "schema_version": "provider-aggregate-budget-v3",
+                "schema_version": "provider-aggregate-budget-v4",
                 "budget": self.budget.to_dict(),
+                "acceptance_run_id": self._acceptance_run_id,
                 "calls_used": self._calls_used,
                 "output_tokens_used": self._output_tokens_used,
                 "retry_attempts_used": self._retry_attempts_used,
@@ -1240,7 +1710,19 @@ def provider_budget_controller_from_environment() -> ProviderBudgetController | 
                 "acceptance execution context budget does not match its environment bridge"
             )
         if state_path:
-            controller.bind_state_path(state_path)
+            controller.bind_state_path(
+                state_path,
+                acceptance_run_id=(
+                    serialized_context.acceptance_run_id
+                    if serialized_context is not None
+                    else str(os.getenv("AUTO_GENERATE_ACCEPTANCE_RUN_ID", "")).strip()
+                ),
+                state_started=(
+                    serialized_context.provider_budget_state_started
+                    if serialized_context is not None
+                    else None
+                ),
+            )
         _ENV_BUDGET_RAW = cache_key
         _ENV_BUDGET_CONTROLLER = controller
         return controller
@@ -2358,29 +2840,131 @@ class ProviderRuntime:
             )
         return receipt
 
-    @staticmethod
-    def _assert_pause_state_before_admission() -> None:
-        marker_path = current_pause_state_path()
-        if not marker_path:
-            return
-        path = Path(marker_path)
-        if not path.exists():
-            return
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    def _assert_pause_state_before_admission(self) -> None:
+        context = current_runtime_control_context()
+        identity = context.identity if context is not None else None
+        if identity is not None and self.job_id and self.job_id != identity.job_id:
             raise ProviderRuntimeContractError(
-                "CONTROL_STATE_INVALID: pause marker cannot be read"
-            ) from exc
-        if not isinstance(payload, Mapping):
-            raise ProviderRuntimeContractError("CONTROL_STATE_INVALID: pause marker is not an object")
-        state = str(payload.get("state") or "")
-        if state == "PAUSED_BY_USER":
-            raise ProviderBudgetExceeded("PAUSED_BY_USER: provider admission is blocked")
-        if state != "RUNNABLE" or not str(payload.get("state_id") or "").strip():
-            raise ProviderRuntimeContractError("CONTROL_STATE_INVALID: pause marker identity or state is invalid")
+                "runtime control identity does not match ProviderRuntime job ID"
+            )
+        pause_store = context.pause_state_store if context is not None else None
+        marker_path = current_pause_state_path()
+        if context is not None and marker_path and str(Path(marker_path).resolve()) != str(
+            Path(context.pause_state_store.path).resolve()
+        ):
+            raise ProviderRuntimeContractError(
+                "runtime pause path does not match the bound job control context"
+            )
+        if pause_store is None and marker_path:
+            pause_store = _registered_pause_store_for_path(marker_path)
+            if pause_store is None:
+                raise ProviderRuntimeContractError(
+                    "CONTROL_STATE_INVALID: pause marker is not bound to a verifiable workspace"
+                )
+        if pause_store is not None:
+            try:
+                pause_state = pause_store.read()
+            except Exception as exc:
+                raise ProviderRuntimeContractError(
+                    f"CONTROL_STATE_INVALID: pause authority cannot be verified: {exc}"
+                ) from exc
+            if pause_state is not None and pause_state.paused:
+                raise ProviderBudgetExceeded("PAUSED_BY_USER: provider admission is blocked")
+
+        if context is not None:
+            if context.lease_validator is not None:
+                try:
+                    lease_current = bool(context.lease_validator())
+                except Exception as exc:
+                    raise ProviderRuntimeContractError(
+                        f"QUEUE_LEASE_INVALID: active lease cannot be verified: {type(exc).__name__}"
+                    ) from exc
+                if not lease_current:
+                    raise ProviderBudgetExceeded(
+                        "QUEUE_LEASE_LOST: provider admission is blocked for a stale queue lease"
+                    )
+            if context.cancel_token is not None:
+                try:
+                    cancelled = bool(context.cancel_token.is_cancelled())
+                except Exception as exc:
+                    raise ProviderRuntimeContractError(
+                        f"CANCEL_STATE_INVALID: cancellation token cannot be read: {type(exc).__name__}"
+                    ) from exc
+                if cancelled:
+                    raise ProviderBudgetExceeded(
+                        "CANCEL_REQUESTED: provider admission is blocked by the queue cancellation token"
+                    )
+            try:
+                cancellation = context.cancellation_store.read()
+            except Exception as exc:
+                raise ProviderRuntimeContractError(
+                    f"CONTROL_STATE_INVALID: cancellation authority cannot be verified: {exc}"
+                ) from exc
+            if cancellation is not None and cancellation.active:
+                raise ProviderBudgetExceeded(
+                    "CANCEL_REQUESTED: provider admission is blocked by the durable cancellation request"
+                )
+
+        acceptance_context = current_acceptance_execution_context()
+        environment_run_id = str(os.getenv("AUTO_GENERATE_ACCEPTANCE_RUN_ID", "")).strip()
+        if acceptance_context is not None and identity is not None:
+            if identity.acceptance_run_id != acceptance_context.acceptance_run_id:
+                raise ProviderRuntimeContractError(
+                    "runtime control identity does not match the active acceptance run"
+                )
+        if (
+            acceptance_context is not None
+            and environment_run_id
+            and environment_run_id != acceptance_context.acceptance_run_id
+        ):
+            raise ProviderRuntimeContractError(
+                "acceptance run environment ID does not match its typed context"
+            )
+        if (
+            identity is not None
+            and identity.acceptance_run_id
+            and environment_run_id
+            and identity.acceptance_run_id != environment_run_id
+        ):
+            raise ProviderRuntimeContractError(
+                "runtime control identity does not match the acceptance run environment"
+            )
+        expected_run_id = (
+            acceptance_context.acceptance_run_id
+            if acceptance_context is not None
+            else identity.acceptance_run_id
+            if identity is not None and identity.acceptance_run_id
+            else environment_run_id
+        )
+        require_budget_state = bool(
+            self.aggregate_budget is not None
+            and self.aggregate_budget.state_path is not None
+        ) or bool(
+            (identity is not None and (identity.acceptance_run_id or identity.provider_budget_started))
+            or (
+                acceptance_context is not None
+                and (
+                    acceptance_context.owner_authorized
+                    or acceptance_context.provider_budget_state_started
+                )
+            )
+        )
+        if require_budget_state:
+            if self.aggregate_budget is None:
+                raise ProviderRuntimeContractError(
+                    "started acceptance run has no aggregate provider budget controller"
+                )
+            if acceptance_context is not None and self.aggregate_budget.state_path is not None:
+                if self.aggregate_budget.state_path != Path(
+                    acceptance_context.provider_budget_state_path
+                ).expanduser().resolve():
+                    raise ProviderRuntimeContractError(
+                        "provider aggregate budget state path does not match the active acceptance run"
+                    )
+            self.aggregate_budget.assert_state_integrity(
+                acceptance_run_id=expected_run_id,
+                state_started=True,
+            )
 
     def _account_existing_receipt(self, receipt: ProviderCallReceiptV1, admission: ProviderCallAdmissionV1) -> None:
         if admission.sequence in self._accounted_sequences:
@@ -2649,6 +3233,7 @@ class ProviderRuntime:
     def mark_transport_started(self, admission: ProviderCallAdmissionV1) -> None:
         """Durably mark the boundary immediately before a transport call."""
 
+        self._assert_pause_state_before_admission()
         if self.aggregate_budget is None or admission.aggregate_reservation_id is None:
             return
         with self._lock:

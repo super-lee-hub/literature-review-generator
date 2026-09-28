@@ -26,7 +26,14 @@ from runtime.architecture_gates import ArchitectureGateScope, collect_scannable_
 from runtime.lifecycle import BootstrappedRuntimeContext, bootstrap_job_runtime, finalize_job_runtime
 from runtime.job_spec import RuntimeJobSpec
 from runtime.provider_context import ProviderContextProfile
-from runtime.provider_runtime import bind_pause_state_path, hash_json
+from runtime.provider_runtime import (
+    RuntimeControlIdentityV1,
+    acceptance_execution_context_from_environment,
+    bind_runtime_control_context,
+    current_acceptance_execution_context,
+    current_runtime_control_context,
+    hash_json,
+)
 from runtime.reconcile import ReconcileValidationError, validate_canonical_ai_summary
 from runtime.source_intake import build_source_bundle_for_request
 from runtime.stage_contracts import SourceBundle, StageArtifactRef, StageResult
@@ -242,6 +249,9 @@ class _RuntimeStageHost:
         self._checkpoint_failed_papers: set[str] = set()
 
     def check_cancelled(self) -> None:
+        context = current_runtime_control_context()
+        if context is not None and context.cancellation_store.is_requested():
+            self.cancel_token.request_cancel()
         self.cancel_token.check_cancelled()
 
     def bind_job_workspace(
@@ -254,7 +264,6 @@ class _RuntimeStageHost:
         resume_state_report: Any | None = None,
     ) -> None:
         self.job_workspace = workspace
-        bind_pause_state_path(workspace.artifact_path(f"pause_state/{workspace.job_id}.json"))
         self.workspace = workspace
         self.artifact_registry = artifact_registry
         self.settings = settings
@@ -675,6 +684,25 @@ class InternalStageExecutorRegistry:
             payload = json.loads(target.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"cannot load canonical summary source: {target}") from exc
+        if (
+            isinstance(payload, Mapping)
+            and payload.get("artifact_type") == "summary_source_manifest"
+        ):
+            from runtime.reconcile import load_summary_source_manifest
+
+            try:
+                _manifest, materialized_path, _materialized_rows = (
+                    load_summary_source_manifest(target)
+                )
+            except (OSError, UnicodeError, TypeError, ValueError, RuntimeError) as exc:
+                raise RuntimeError(
+                    f"cannot validate summary source manifest: {target}"
+                ) from exc
+            if materialized_path == target:
+                raise RuntimeError("summary source manifest cannot materialize itself")
+            return InternalStageExecutorRegistry._summary_payloads_from_file(
+                materialized_path
+            )
         if (
             isinstance(payload, Mapping)
             and payload.get("artifact_type") == "stage1_reusable_summary_manifest"
@@ -1139,6 +1167,12 @@ class InternalStageExecutorRegistry:
             reasoning_reserve=self._nonnegative_int(api_config.get("reasoning_reserve_tokens"), 2_048),
             safety_margin=self._nonnegative_int(api_config.get("safety_margin_tokens"), 1_024),
         )
+        route_config = dict(api_config)
+        if str(route_config.get("transport_retries") or "").strip() == "":
+            route_config["transport_retries"] = self._nonnegative_int(
+                None,
+                session.stage_host.settings.runtime.transport_retries,
+            )
         return OutlineRoleRoute(
             role=role,
             config_section=str(section_name).strip(),
@@ -1146,11 +1180,11 @@ class InternalStageExecutorRegistry:
             model=model,
             endpoint_type=capability.endpoint_type,
             profile=profile,
-            transport=self._outline_provider(session, profile, api_config),
+            transport=self._outline_provider(session, profile, route_config),
             # The route stores only an allow-listed, secret-free identity. The
             # closure still retains the private config for the actual transport.
             api_base=str(api_config.get("api_base") or "").strip(),
-            config_identity=dict(api_config),
+            config_identity=route_config,
         )
 
     def _execute_outline(
@@ -1277,8 +1311,30 @@ class InternalStageExecutorRegistry:
             max_smoke_overhead_ratio=stability.max_smoke_overhead_ratio,
             max_source_prompt_tokens=stability.max_source_prompt_tokens or None,
             technical_shard_target_tokens=settings.outline.technical_shard_target_tokens,
+            outline_pilot=self.bridge.job_spec.metadata.get("outline_pilot"),
         )
         execution = executor.run()
+        if execution.status == "topic_pilot_complete":
+            checkpoint = executor.artifact_records.get("topic_pilot_checkpoint")
+            if checkpoint is None or checkpoint.status != "ready":
+                raise RuntimeError("topic pilot completed without a ready Registry checkpoint")
+            return (
+                StageResult(
+                    stage_name="outline_topic_pilot",
+                    success=True,
+                    artifacts=[self.bridge._artifact_ref_from_record(checkpoint)],
+                    metadata={
+                        "outline_mode": "v3",
+                        "outline_v3_status": execution.status,
+                        "pilot_checkpoint_complete": True,
+                        "pilot_checkpoint_artifact_id": checkpoint.artifact_id,
+                        "pilot_checkpoint_hash": checkpoint.content_hash,
+                        "receipt_ids": list(execution.receipt_ids),
+                        "canonical_ready": False,
+                    },
+                ),
+                len(execution.receipt_ids),
+            )
         if not execution.ok:
             detail = "; ".join(execution.diagnostics) or "Outline v3 execution is blocked"
             raise RuntimeError(detail)
@@ -1484,13 +1540,28 @@ class InternalStageExecutorRegistry:
 class AgentRuntimeBridge:
     """Thin additive bridge used by the repo-local skill entrypoint."""
 
-    def __init__(self, job_spec: RuntimeJobSpec, publication_context: Any | None = None) -> None:
+    def __init__(
+        self,
+        job_spec: RuntimeJobSpec,
+        publication_context: Any | None = None,
+        *,
+        direct_validation_route_fingerprint: str = "",
+        direct_validation_host_acknowledgement: Mapping[str, Any] | None = None,
+    ) -> None:
         job_spec.validate()
         self._job_id_was_omitted = not bool(str(job_spec.job_id or "").strip())
         resolved_job_id = job_spec.job_id or JobWorkspace.generate_job_id()
         job_spec = replace(job_spec, job_id=resolved_job_id)
         self.job_spec = job_spec
         self.publication_context = publication_context
+        self._direct_validation_route_fingerprint = str(
+            direct_validation_route_fingerprint or ""
+        )
+        self._direct_validation_host_acknowledgement = (
+            dict(direct_validation_host_acknowledgement)
+            if direct_validation_host_acknowledgement is not None
+            else None
+        )
         self._admit_external_hosts()
         metadata = dict(job_spec.metadata or {})
         frozen_envelope = metadata.get("free_mode_input")
@@ -1504,6 +1575,37 @@ class AgentRuntimeBridge:
             )
         else:
             self.free_mode_envelope = None
+
+    @staticmethod
+    def _control_scope(session: AgentRuntimeSession):
+        """Bind one workspace's durable controls for direct bridge entrypoints."""
+
+        workspace = session.context.workspace
+        active = current_runtime_control_context()
+        if (
+            active is not None
+            and active.identity.job_id == workspace.job_id
+            and active.identity.workspace_path == str(Path(workspace.root_dir).resolve())
+        ):
+            identity = active.identity
+        else:
+            acceptance = (
+                current_acceptance_execution_context()
+                or acceptance_execution_context_from_environment()
+            )
+            identity = RuntimeControlIdentityV1(
+                job_id=workspace.job_id,
+                workspace_path=str(workspace.root_dir),
+                acceptance_run_id=acceptance.acceptance_run_id if acceptance else "",
+                provider_budget_started=bool(
+                    acceptance and acceptance.provider_budget_state_started
+                ),
+            )
+        return bind_runtime_control_context(
+            identity,
+            workspace=workspace,
+            registry=session.context.registry,
+        )
 
     def _admit_external_hosts(self) -> None:
         """Apply the same pre-transport admission used by run/resume."""
@@ -1519,6 +1621,23 @@ class AgentRuntimeBridge:
         test_dependencies = current_runtime_test_dependencies()
         if test_dependencies is not None:
             test_dependencies.validate()
+        if self._direct_validation_route_fingerprint:
+            config = load_config(
+                str(self.job_spec.config),
+                action="validate_review",
+                requested_stages=["validate"],
+                free_mode_enabled=bool(
+                    self.job_spec.free_mode_profile
+                    or self.job_spec.free_mode_idea
+                    or self.job_spec.metadata.get("free_mode_input")
+                ),
+                allow_template_credentials=bool(
+                    test_dependencies and test_dependencies.allow_template_credentials
+                ),
+            )
+            self.verify_direct_validation_route(config)
+            return
+        if test_dependencies is not None:
             # The pytest-only adapter is the explicit zero-external-transport
             # dependency boundary.  It is intentionally process-local and is
             # never selected from an ordinary environment variable.
@@ -1557,6 +1676,42 @@ class AgentRuntimeBridge:
                 policy,
                 self.job_spec.metadata.get("external_host_acknowledgement"),
             )
+
+    def verify_direct_validation_route(
+        self,
+        runtime_config: Mapping[str, Mapping[str, Any]],
+    ) -> None:
+        """Check that the runtime will use the admitted Validator route."""
+
+        if not self._direct_validation_route_fingerprint:
+            return
+        from runtime.trust_admission import (
+            build_external_host_policy,
+            validate_external_host_acknowledgement,
+        )
+
+        route_plan = build_reachable_provider_route_plan(
+            runtime_config,
+            action="validate_review",
+            requested_stages=["validate"],
+        )
+        if not any(
+            route.semantic_role == "validator" and route.enabled and route.resolved
+            for route in route_plan.routes
+        ):
+            raise ValueError("direct validation has no reachable Validator route")
+        policy = build_external_host_policy(
+            runtime_config,
+            route_plan,
+            provider_sections={"Validator_API"},
+            include_mineru=False,
+        )
+        if policy.route_fingerprint != self._direct_validation_route_fingerprint:
+            raise ValueError("direct validation route changed after admission")
+        validate_external_host_acknowledgement(
+            policy,
+            self._direct_validation_host_acknowledgement,
+        )
 
     def build_job_request(self) -> JobRunRequest:
         request = self.job_spec.to_job_request()
@@ -1761,15 +1916,16 @@ class AgentRuntimeBridge:
         attempt_id: str,
         external_registry_resolver: Callable[[str], Any | None] | None = None,
     ) -> tuple[StageResult, int]:
-        return self.stage_executor_registry().execute(
-            stage,
-            session=session,
-            spec=spec,
-            bundle=bundle,
-            results=results,
-            attempt_id=attempt_id,
-            external_registry_resolver=external_registry_resolver,
-        )
+        with self._control_scope(session):
+            return self.stage_executor_registry().execute(
+                stage,
+                session=session,
+                spec=spec,
+                bundle=bundle,
+                results=results,
+                attempt_id=attempt_id,
+                external_registry_resolver=external_registry_resolver,
+            )
 
     def stage_policies(self) -> Dict[str, Dict[str, Any]]:
         return {
@@ -2705,6 +2861,23 @@ class AgentRuntimeBridge:
         external_registry_resolver: Any | None = None,
         producer: str = "runtime.orchestrator.AgentRuntimeBridge.run_validation",
     ) -> StageResult:
+        with self._control_scope(session):
+            return self._run_validation_bound(
+                session,
+                attempt_id=attempt_id,
+                external_registry_resolver=external_registry_resolver,
+                producer=producer,
+            )
+
+    def _run_validation_bound(
+        self,
+        session: AgentRuntimeSession,
+        *,
+        attempt_id: str = "",
+        external_registry_resolver: Any | None = None,
+        producer: str = "runtime.orchestrator.AgentRuntimeBridge.run_validation",
+    ) -> StageResult:
+        self.verify_direct_validation_route(session.stage_host.config)
         validation_service = self.build_validation_service(
             session,
             attempt_id=attempt_id,
@@ -2949,9 +3122,15 @@ class AgentRuntimeBridge:
             artifact_refs.append(self._artifact_ref_from_record(record))
 
         if validation_success:
-            review_draft_record = session.context.registry.get("review_draft")
-            citation_manifest_record = session.context.registry.get("citation_manifest_v3")
-            review_docx_record = session.context.registry.get("review_docx")
+            # Validation reads the current repaired version when one has been
+            # promoted. Its publication must bind those same input artifacts;
+            # returning to the original IDs would silently undo a repair on
+            # resume while reporting the newer validation as clean.
+            review_draft_record = validation_service.review_draft_record
+            citation_manifest_record = validation_service.citation_manifest_record
+            review_docx_record = current_artifact_record(
+                session.context.registry, "review_docx"
+            )
             validation_closure_record = validation_provider_receipts.get("closure_record")
             if (
                 review_draft_record is None
@@ -2970,6 +3149,20 @@ class AgentRuntimeBridge:
                     "validation, and validation receipt closure artifacts"
                 )
             previous_set = session.context.registry.resolve_current_artifact_set()
+            if previous_set is not None and (
+                (review_draft_record.artifact_id, review_draft_record.content_hash)
+                != (previous_set.review_draft_artifact_id, previous_set.review_draft_artifact_hash)
+                or (citation_manifest_record.artifact_id, citation_manifest_record.content_hash)
+                != (
+                    previous_set.citation_manifest_artifact_id,
+                    previous_set.citation_manifest_artifact_hash,
+                )
+                or (review_docx_record.artifact_id, review_docx_record.content_hash)
+                != (previous_set.review_docx_artifact_id, previous_set.review_docx_artifact_hash)
+            ):
+                raise RuntimeError(
+                    "current artifact set changed during validation; refusing a stale promotion"
+                )
             promotion_id = f"runtime-validation:{validation_run_result.validation_run_id}"
             promotion = RepairPromotionTransaction(
                 transaction_id=promotion_id,
@@ -3050,19 +3243,17 @@ class AgentRuntimeBridge:
                 reason="validation completed and established the verified current artifact set",
                 previous_set_id=previous_set.set_id if previous_set is not None else "",
             )
-            current_set_pointer = session.context.registry.switch_current_artifact_set(
+            session.context.registry.switch_current_artifact_set(
                 current_set,
                 prepared_promotion_record=promotion_record,
             )
             current_set_record = session.context.registry.get(current_set.set_id)
             if current_set_record is None or current_set_record.status != "ready":
                 raise RuntimeError("current artifact set was not registered as ready")
-            artifact_refs.extend(
-                [
-                    self._artifact_ref_from_record(current_set_record),
-                    self._artifact_ref_from_record(current_set_pointer),
-                ]
-            )
+            # The pointer is a mutable latest-view alias. A durable stage
+            # terminal may depend on the immutable set record, never on the
+            # pointer whose path/hash must change after an approved repair.
+            artifact_refs.append(self._artifact_ref_from_record(current_set_record))
 
         self._append_stage_trace_entries(
             session,
