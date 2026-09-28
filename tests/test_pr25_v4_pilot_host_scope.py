@@ -37,7 +37,7 @@ def _fixture():
     }
     stage_plan = build_stage_plan(
         action="generate_outline",
-        requested_stages=("source_intake", "outline"),
+        requested_stages=("outline",),
         validation_enabled=False,
     )
     route_plan = ReachableProviderRoutePlan(

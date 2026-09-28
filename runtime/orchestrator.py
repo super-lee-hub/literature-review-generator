@@ -1614,7 +1614,7 @@ class AgentRuntimeBridge:
         from runtime.provider_routes import build_reachable_provider_route_plan
         from runtime.test_dependencies import current_runtime_test_dependencies
         from runtime.trust_admission import (
-            build_external_host_policy,
+            build_runtime_external_host_policy,
             validate_external_host_acknowledgement,
         )
 
@@ -1670,7 +1670,12 @@ class AgentRuntimeBridge:
             free_mode_enabled=free_mode_enabled,
             stage_plan=stage_plan,
         )
-        policy = build_external_host_policy(config, route_plan)
+        policy = build_runtime_external_host_policy(
+            config,
+            route_plan,
+            requested_stages=self.job_spec.metadata.get("requested_stages"),
+            outline_pilot=self.job_spec.metadata.get("outline_pilot"),
+        )
         if test_dependencies is None:
             validate_external_host_acknowledgement(
                 policy,

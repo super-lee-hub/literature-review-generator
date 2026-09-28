@@ -479,7 +479,7 @@ class AgentRuntimeRunner:
         from runtime.test_dependencies import current_runtime_test_dependencies
         from runtime.trust_admission import (
             ExternalHostAdmissionError,
-            build_external_host_policy,
+            build_runtime_external_host_policy,
             validate_external_host_acknowledgement,
         )
 
@@ -516,7 +516,7 @@ class AgentRuntimeRunner:
             # external-host acknowledgement.  Ordinary environment variables
             # are never an authority boundary for production run/resume.
             if test_dependencies is None:
-                policy = build_external_host_policy(
+                policy = build_runtime_external_host_policy(
                     resolved_config,
                     build_reachable_provider_route_plan(
                         resolved_config,
@@ -525,6 +525,8 @@ class AgentRuntimeRunner:
                         free_mode_enabled=free_mode_enabled,
                         stage_plan=plan,
                     ),
+                    requested_stages=requested_stages,
+                    outline_pilot=metadata.get("outline_pilot"),
                 )
                 validate_external_host_acknowledgement(
                     policy,
