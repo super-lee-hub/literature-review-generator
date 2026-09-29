@@ -208,6 +208,34 @@ def test_method_wire_has_required_interpretation_context_and_rejects_claim_only_
     assert "E2" in wire_text and "E3" in wire_text
     assert BOUNDARY in wire_text
     assert "interpretation_dependencies" in wire_text
+    topic = request["topics"][0]
+    topic_unit_ids = set(topic["planned_evidence_unit_ids"])
+    dependencies = [
+        dependency
+        for unit in request["evidence_units"]
+        if unit["evidence_unit_id"] in topic_unit_ids
+        for study in unit.get("study_units") or ()
+        for dependency in study.get("interpretation_dependencies") or ()
+    ]
+    assert dependencies
+    assert all(
+        dependency["required_for_synthesis_output"] is True
+        for dependency in dependencies
+    )
+    for contract_key in ("topics", "claims"):
+        contract = request["output_contract"][contract_key]
+        assert "required_for_synthesis_output" in contract
+        assert "source_claim_ids" in contract
+        assert "source_field_ids" in contract
+        assert "mark unresolved" in contract
+    assert "supporting_evidence_ids" in request["output_contract"]["topics"]
+    assert "evidence_ids" in request["output_contract"]["claims"]
+    assert "qualifier_dependency prose alone is not provenance" in (
+        request["output_contract"]["claims"]
+    )
+    assert request["output_contract"]["semantic_result_contract_version"] == (
+        "bounded-topic-synthesis/v4"
+    )
     assert error is not None and "interpretation" in str(error).lower()
 
 
@@ -217,6 +245,90 @@ def test_method_wire_accepts_scoped_conditional_claim_with_complete_source_links
     assert result is not None
     assert len(result["claims"]) == 1
     assert BOUNDARY in json.dumps(request, ensure_ascii=False)
+
+
+def test_topic_summary_must_carry_required_qualifier_provenance(tmp_path: Path) -> None:
+    _summary_row, views, layers, _plan, route, topic = _typed_case()
+    executor = _executor(tmp_path, stability_mode="off")
+    request = executor._build_topic_provider_request(
+        [topic], topic_routes={route.topic_id: route}, evidence_model=views,
+        content_layers_model=layers, batch_index=1,
+    )
+    topic_row = request["topics"][0]
+    topic_unit_ids = set(topic_row["planned_evidence_unit_ids"])
+    dependencies = [
+        {
+            **dependency,
+            "paper_key": unit["paper_key"],
+            "study_id": study["study_id"],
+        }
+        for unit in request["evidence_units"]
+        if unit["evidence_unit_id"] in topic_unit_ids
+        for study in unit.get("study_units") or ()
+        for dependency in study.get("interpretation_dependencies") or ()
+    ]
+    assert dependencies and all(
+        dependency["required_for_synthesis_output"] is True
+        for dependency in dependencies
+    )
+    primary_evidence_ids = {
+        str(evidence_id)
+        for unit in request["evidence_units"]
+        for study in unit.get("study_units") or ()
+        for claim in study.get("claims") or ()
+        if any(
+            claim.get("claim_id") == dependency["primary_claim_id"]
+            and unit["paper_key"] == dependency["paper_key"]
+            and study["study_id"] == dependency["study_id"]
+            for dependency in dependencies
+        )
+        for evidence_id in claim.get("evidence_ids") or ()
+    }
+    assert dependencies and primary_evidence_ids
+    fragment_id = topic_row["fragment_id"]
+    topic_result = {
+        "topic_id": topic_row["topic_id"],
+        "fragment_id": fragment_id,
+        "status": "completed",
+        "conclusions": ["The effect holds under the stated condition."],
+        "supporting_evidence_ids": sorted(primary_evidence_ids),
+        "unresolved_questions": [],
+    }
+    result = {
+        "topics": [topic_result],
+        "processed_fragment_ids": [fragment_id],
+        "claims": [],
+        "unresolved_questions": [],
+    }
+    with pytest.raises(OutlineV3ExecutionError, match="omits required qualifiers"):
+        executor._validate_semantic_provider_output(
+            "topic_synthesis_provider:batch:1", request, result
+        )
+
+    topic_result["source_claim_ids"] = sorted({
+        dependency["primary_claim_id"]
+        for dependency in dependencies
+    } | {
+        source_claim_id
+        for dependency in dependencies
+        for source_claim_id in dependency["required_source_claim_ids"]
+    })
+    topic_result["supporting_evidence_ids"] = sorted(
+        primary_evidence_ids
+        | {
+            evidence_id
+            for dependency in dependencies
+            for evidence_id in dependency["required_evidence_ids"]
+        }
+    )
+    topic_result["source_field_ids"] = sorted({
+        field_id
+        for dependency in dependencies
+        for field_id in dependency["required_source_field_ids"]
+    })
+    executor._validate_semantic_provider_output(
+        "topic_synthesis_provider:batch:1", request, result
+    )
 
 
 def test_paper_level_gap_cannot_inherit_an_internal_study_id(tmp_path: Path) -> None:

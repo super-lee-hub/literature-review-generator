@@ -2771,6 +2771,18 @@ class OutlineV3Executor:
                     )
                 units_by_id.setdefault(unit_id, unit)
         evidence_units = [units_by_id[key] for key in sorted(units_by_id)]
+        for unit in evidence_units:
+            for study in unit.get("study_units") or ():
+                if not isinstance(study, dict):
+                    raise OutlineV3ExecutionError(
+                        "topic evidence unit has a malformed interpretation study"
+                    )
+                for dependency in study.get("interpretation_dependencies") or ():
+                    if not isinstance(dependency, dict):
+                        raise OutlineV3ExecutionError(
+                            "topic evidence unit has a malformed interpretation dependency"
+                        )
+                    dependency["required_for_synthesis_output"] = True
         materialized_unit_ids = {str(unit.get("evidence_unit_id") or "") for unit in evidence_units}
         if materialized_unit_ids != expected_unit_ids:
             missing = sorted(expected_unit_ids - materialized_unit_ids)
@@ -2873,7 +2885,7 @@ class OutlineV3Executor:
                 "content_layers_hash": getattr(content_layers_model, "content_hash", ""),
             },
             "output_contract": {
-                "semantic_result_contract_version": "bounded-topic-synthesis/v3",
+                "semantic_result_contract_version": "bounded-topic-synthesis/v4",
                 "max_output_tokens": self._semantic_output_token_limit(
                     self._node_route("candidate_1_provider_generation").profile
                 ),
@@ -2882,9 +2894,9 @@ class OutlineV3Executor:
                     "topics", "processed_fragment_ids", "claims", "unresolved_questions"
                 ],
                 "termination_rule": "Finish the complete JSON object before the output limit. If the supported synthesis will not fit, return a complete unresolved fragment with an explicit reason rather than a partial claim or unclosed JSON.",
-                "topics": "array of topic synthesis objects; return every requested fragment_id exactly once with topic_id, status, concise conclusions, unresolved_questions, and supporting_evidence_ids for any factual conclusion. Conclusions summarize the claims without repeating their evidence-specific text.",
+                "topics": "array of topic synthesis objects; return every requested fragment_id exactly once with topic_id, status, concise conclusions, unresolved_questions, and supporting_evidence_ids for any factual conclusion. For a conclusion using a primary claim whose interpretation_dependencies entry has required_for_synthesis_output=true, set source_claim_ids to primary plus all required_source_claim_ids, supporting_evidence_ids to primary plus all required_evidence_ids, and source_field_ids to all required_source_field_ids. Preserve the qualifier in the conclusion text or omit it and mark unresolved. Conclusions summarize claims without repeating their evidence-specific text.",
                 "processed_fragment_ids": "array containing every requested fragment_id exactly once",
-                "claims": "array of distinct evidence-bound synthesis claims, not a one-to-one restatement of every source claim or evidence ID. Combine findings only when direction, conditions, population and horizon align; keep conflicts, conditional effects, null/zero results and material exceptions distinct or unresolved. Each claim has claim_id='synthesis:topic_synthesis:<local-id>', fragment_id, claim_type, paper_key or paper_keys, and evidence_ids. Include source_claim_ids/source_field_ids when needed for source lineage or interpretation dependencies; an interpretation-dependent finding must cite every required qualifier claim, evidence ID and source field ID.",
+                "claims": "array of distinct evidence-bound synthesis claims, not a one-to-one restatement of every source claim or evidence ID. Combine findings only when direction, conditions, population and horizon align; keep conflicts, conditional effects, null/zero results and material exceptions distinct or unresolved. Each claim has claim_id='synthesis:topic_synthesis:<local-id>', fragment_id, claim_type, paper_key or paper_keys, and evidence_ids. For any claim using a primary claim whose interpretation_dependencies entry has required_for_synthesis_output=true, set source_claim_ids to primary plus required_source_claim_ids, evidence_ids to primary plus required_evidence_ids, and source_field_ids to required_source_field_ids. Preserve the condition or boundary in claim text; qualifier_dependency prose alone is not provenance. Otherwise omit the factual claim and mark unresolved.",
                 "source_locator_policy": "Do not echo source_locators in claims. Full exact locators remain bound to evidence IDs in the local Registry and are resolved downstream.",
                 "source_claim_ids": "must exactly reference supplied source claim IDs; do not relabel source IDs as generated synthesis claims",
                 "conciseness_policy": "Return the smallest complete synthesis that preserves distinct supported conclusions, direction, conditions, conflicts, null/zero findings, unresolved items and evidence support. Do not duplicate the same narrative in topics[].conclusions and claims[].text.",

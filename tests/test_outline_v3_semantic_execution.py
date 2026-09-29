@@ -794,7 +794,7 @@ def test_topic_provider_request_materializes_complete_dossier_unit(
         content_layers_model=content_layers,
         batch_index=1,
     )
-    assert request["output_contract"]["semantic_result_contract_version"] == "bounded-topic-synthesis/v3"
+    assert request["output_contract"]["semantic_result_contract_version"] == "bounded-topic-synthesis/v4"
     assert request["output_contract"]["response_root_type"].startswith("single JSON object")
     assert "Do not echo source_locators" in request["output_contract"]["source_locator_policy"]
     assert "null/zero findings" in request["output_contract"]["conciseness_policy"]
