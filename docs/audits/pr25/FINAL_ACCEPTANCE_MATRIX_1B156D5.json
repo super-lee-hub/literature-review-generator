@@ -144,7 +144,7 @@
       "hosted_ci_current_sha": "NOT_RUN",
       "docx_visual": "NOT_VERIFIED_NO_FINAL_ADOPTED_R1_DOCX",
       "F1": "UNACCEPTED",
-      "source_recovery": "current bundle pending"
+      "source_recovery": "final local source patch/ZIP will be generated from the current docs commit; no push"
     }
   },
   "V4": {
@@ -288,8 +288,6 @@
   },
   "V8_canary": {
     "card_path": "D:\\tmp\\pr25-v8-opus55-output-proposal-20260930-1b156d5\\OWNER_PERMISSION_CARD_V8.md",
-    "card_sha256": "f89efdc113f73574467b4eb22810f67383e5d4024475d6ef362c8b920528b690",
-    "proposal_sha256": "636fcb7ae9b9ac8cd4e4ade7f5e909113c6145d7194a38ff5ccd1bd945c348ba",
     "run_id": "R1_Opus55_Output12288_V8_20260930_1b156d5",
     "model": "claude-opus-5-5",
     "host": "api.yhlxj.ai",
@@ -304,7 +302,9 @@
     "wall_seconds": 3600,
     "deadline_utc": "2026-10-01T00:00:00Z",
     "provider_posts": 0,
-    "approval_record": false
+    "approval_record": false,
+    "status": "AWAITING_EXACT_OWNER_APPROVAL",
+    "checkout_binding_note": "The current card will be rebound to the final documentation-only audit commit; the tested product-code SHA remains 1b156d5d5de4408645af324ee2e02bdc3e2b670f."
   },
   "historical_paid_attempt": {
     "status": "FAILED_INVALID_RESPONSE",
@@ -317,7 +317,7 @@
   },
   "hosted_ci_current_sha": "NOT_RUN",
   "docx_visual": "NOT_VERIFIED",
-  "source_recovery": "CURRENT_SOURCE_RECOVERY_ZIP_TO_BE_CREATED",
+  "source_recovery": "pending final docs commit and companion source ZIP; no push/merge",
   "subagent_ledger": {
     "path": "SUBAGENT_LEDGER_1B156D5.json",
     "status": "PARTIAL_RUNTIME_MODEL_EFFORT_NOT_VERIFIED",
