@@ -101,6 +101,7 @@ from outline.v3_relations import build_global_relation_map
 
 
 CONTROL_PLANE_VERSION = "reviewctl-v1"
+PROVIDER_FREE_SHADOW_CALL_LIMITS = (24, 48, 64, 80)
 FORBIDDEN_ACTIONS = (
     "edit_registry",
     "edit_stage_health",
@@ -108,6 +109,45 @@ FORBIDDEN_ACTIONS = (
     "disable_quality_gate",
     "delete_workspace",
 )
+
+
+def _provider_free_shadow_capacity_comparisons(
+    *,
+    topic_call_lower_bound: int,
+    logical_call_upper_bound: int | None,
+    physical_attempt_upper_bound: int | None,
+    actual_runtime_call_limit: int,
+    actual_preflight_status: str,
+) -> list[dict[str, Any]]:
+    """Compare planning bounds without changing provider admission authority."""
+
+    comparisons: list[dict[str, Any]] = []
+    for limit in PROVIDER_FREE_SHADOW_CALL_LIMITS:
+        if topic_call_lower_bound > limit:
+            status = "blocked_known_topic_call_lower_bound"
+        elif logical_call_upper_bound is None or physical_attempt_upper_bound is None:
+            status = "incomplete_upper_bound"
+        elif logical_call_upper_bound > limit or physical_attempt_upper_bound > limit:
+            status = "blocked_estimated_upper_bound"
+        else:
+            status = "within_shadow_capacity"
+        comparisons.append(
+            {
+                "shadow_physical_call_limit": limit,
+                "known_topic_call_lower_bound": topic_call_lower_bound,
+                "logical_call_upper_bound": logical_call_upper_bound,
+                "physical_attempt_upper_bound": physical_attempt_upper_bound,
+                "status": status,
+                "planning_only": True,
+                "actual_runtime_call_limit": actual_runtime_call_limit,
+                "actual_preflight_status": actual_preflight_status,
+                "provider_admission_authorized": False,
+                "provider_posts_emitted": 0,
+            }
+        )
+    return comparisons
+
+
 _API_SECTIONS = (
     "Primary_Reader_API",
     "Backup_Reader_API",
@@ -610,6 +650,68 @@ class ReviewControlPlane:
             free_mode_enabled=free_mode_enabled,
             stage_plan=stage_plan,
         )
+        from runtime.provider_context import ProviderContextProfile
+        from services.model_selection import get_api_config_for_section
+
+        runtime_retries = max(
+            0,
+            int(str(config.get("Runtime", {}).get("transport_retries") or "2")),
+        )
+
+        def unplanned_exposure(
+            *,
+            stage_name: str,
+            semantic_role: str,
+            route: Any,
+            reason: str,
+            conditional_on: str = "",
+        ) -> UnplannedProviderExposureV1:
+            """Bound each reachable request while keeping its call count unknown."""
+
+            api_config = get_api_config_for_section(config, route.section_name)
+            model = str(api_config.get("model") or route.model or "").strip()
+            profile: ProviderContextProfile | None = None
+            if model:
+                capability = resolve_model_capability(api_config)
+                output_tokens = max(1, int(api_config.get("max_output_tokens") or 4_096))
+                if semantic_role == "evidence_critique":
+                    output_tokens = min(output_tokens, 16_000)
+                profile = ProviderContextProfile.conservative(
+                    provider=capability.provider_family,
+                    model=model,
+                    endpoint_type=capability.endpoint_type,
+                    model_context_limit=max(
+                        1, int(api_config.get("max_context_tokens") or 128_000),
+                    ),
+                    max_output_tokens=output_tokens,
+                    reasoning_reserve=max(
+                        0, int(api_config.get("reasoning_reserve_tokens") or 2_048),
+                    ),
+                    safety_margin=max(
+                        0, int(api_config.get("safety_margin_tokens") or 1_024),
+                    ),
+                )
+            retry_text = str(api_config.get("transport_retries") or "").strip()
+            retry_bound = max(0, int(retry_text)) if retry_text else runtime_retries
+            return UnplannedProviderExposureV1(
+                stage_name=stage_name,
+                semantic_role=semantic_role,
+                reason=reason,
+                route_identity=tuple(route.identity),
+                conditional_on=conditional_on,
+                logical_calls_upper_bound=None,
+                input_tokens_per_call_upper_bound=(
+                    int(profile.input_budget) if profile is not None else None
+                ),
+                output_tokens_per_call_upper_bound=(
+                    int(profile.max_output_tokens) if profile is not None else None
+                ),
+                reasoning_tokens_per_call_upper_bound=(
+                    int(profile.reasoning_reserve) if profile is not None else None
+                ),
+                retry_attempts_per_call_upper_bound=retry_bound,
+            )
+
         acceptance = current_acceptance_execution_context()
         aggregate_budget = (
             acceptance.provider_budget
@@ -634,16 +736,16 @@ class ReviewControlPlane:
                         stage_name="analyze",
                         source_builder="Stage1 reader and typed-reuse admission",
                         unknown_exposures=(
-                            UnplannedProviderExposureV1(
+                            unplanned_exposure(
                                 stage_name="analyze",
                                 semantic_role="primary_reader",
-                                route_identity=reader_route.identity,
+                                route=reader_route,
                                 reason="primary_reader_requests_require_source_pages_or_verified_typed_reuse",
                             ),
-                            UnplannedProviderExposureV1(
+                            unplanned_exposure(
                                 stage_name="analyze",
                                 semantic_role="primary_reader",
-                                route_identity=reader_route.identity,
+                                route=reader_route,
                                 reason="summary_drift_recheck_requires_current_source_and_failed_authority",
                                 conditional_on="source_or_summary_drift_requires_recheck",
                             ),
@@ -665,10 +767,10 @@ class ReviewControlPlane:
                         stage_name="outline",
                         source_builder="outline.v3_executor semantic and provider request builders",
                         unknown_exposures=tuple(
-                            UnplannedProviderExposureV1(
+                            unplanned_exposure(
                                 stage_name="outline",
                                 semantic_role="candidate_provider_generation",
-                                route_identity=outline_route.identity,
+                                route=outline_route,
                                 reason=f"{phase}_request_requires_frozen_stage1_or_prior_provider_outputs",
                                 conditional_on={
                                     "cross_group": "topic_synthesis_completed",
@@ -703,14 +805,14 @@ class ReviewControlPlane:
                         stage_name="review",
                         source_builder="services.review_generation_service writer packet builder",
                         unknown_exposures=(
-                            UnplannedProviderExposureV1(
+                            unplanned_exposure(
                                 stage_name="review", semantic_role="writer",
-                                route_identity=writer_route.identity,
+                                route=writer_route,
                                 reason="writer_packets_require_adopted_outline_and_current_catalog",
                             ),
-                            UnplannedProviderExposureV1(
+                            unplanned_exposure(
                                 stage_name="review", semantic_role="writer",
-                                route_identity=writer_route.identity,
+                                route=writer_route,
                                 reason="review_drift_rewrite_requires_approved_repair_scope",
                                 conditional_on="review_drift_requires_writer_regeneration",
                             ),
@@ -731,16 +833,16 @@ class ReviewControlPlane:
                         stage_name="validate",
                         source_builder="validation.llm_adjudicator request builder",
                         unknown_exposures=(
-                            UnplannedProviderExposureV1(
+                            unplanned_exposure(
                                 stage_name="validate",
                                 semantic_role="validator",
-                                route_identity=validator_route.identity,
+                                route=validator_route,
                                 reason="primary_validation_requests_require_current_draft_manifest_and_source_binding",
                             ),
-                            UnplannedProviderExposureV1(
+                            unplanned_exposure(
                                 stage_name="validate",
                                 semantic_role="validator",
-                                route_identity=validator_route.identity,
+                                route=validator_route,
                                 reason="validation_recheck_request_depends_on_current_draft_manifest_and_approved_repair",
                                 conditional_on="finding_and_approved_repair_requires_model_recheck",
                             ),
@@ -1538,6 +1640,17 @@ class ReviewControlPlane:
                 "topic_synthesis_provider:batch:"
             )
         ]
+        provider_free_shadow_capacity_comparison = _provider_free_shadow_capacity_comparisons(
+            topic_call_lower_bound=len(topic_request_rows),
+            logical_call_upper_bound=semantic_reserved_call_count,
+            physical_attempt_upper_bound=(
+                semantic_route_preflight_summary.get(
+                    "semantic_physical_attempts_upper_bound"
+                )
+            ),
+            actual_runtime_call_limit=effective_call_limit,
+            actual_preflight_status=semantic_preflight_status,
+        )
         workload_audit["topic_request_plan_identity_hash"] = (
             topic_request_plan_identity_hash
         )
@@ -1752,6 +1865,7 @@ class ReviewControlPlane:
             "semantic_preflight_diagnostic": semantic_preflight_diagnostic,
             "semantic_route_preflight_summary": semantic_route_preflight_summary,
             "semantic_request_budget_status": semantic_request_budget_status,
+            "provider_free_shadow_capacity_comparison": provider_free_shadow_capacity_comparison,
             "semantic_request_plan_scope": "outline_v3_topic_cross_global_only",
             "semantic_route_identity_hash": route_identity_hash,
             "topic_request_plan_identity_hash": topic_request_plan_identity_hash,

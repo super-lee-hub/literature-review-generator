@@ -77,6 +77,13 @@ def test_reviewctl_plan_projects_all_reachable_provider_work_without_posting(
     assert projection["totals"]["unknown_exposure_count"] >= 1
     assert projection["budget_status"]["admission"] == "incomplete_unknown_exposure"
     assert projection["boundary"]["no_provider_posts"] is True
+    exposure = projection["unknown_exposures"][0]
+    assert exposure["logical_calls_upper_bound"] is None
+    assert exposure["input_tokens_per_call_upper_bound"] > 0
+    assert exposure["output_tokens_per_call_upper_bound"] > 0
+    assert exposure["reasoning_tokens_per_call_upper_bound"] >= 0
+    assert exposure["retry_attempts_per_call_upper_bound"] >= 0
+    assert projection["totals"]["estimated_output_tokens_all_attempts"] is None
     assert projection["aggregate_budget_source"] == (
         "application_call_cap_projection_without_bound_acceptance_run"
     )

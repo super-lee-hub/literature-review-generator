@@ -5,7 +5,10 @@ import json
 from pathlib import Path
 from typing import Any
 
-from runtime.control_plane import ReviewControlPlane
+from runtime.control_plane import (
+    ReviewControlPlane,
+    _provider_free_shadow_capacity_comparisons,
+)
 from tests.test_outline_v3_semantic_execution import _summary
 
 
@@ -80,6 +83,46 @@ def _profile_limits(route: dict[str, Any]) -> dict[str, int]:
         key: int(route["profile_limits"][key])
         for key in ("model_context_limit", "input_budget", "max_output_tokens")
     }
+
+
+def test_provider_free_capacity_comparison_keeps_runtime_limit_and_unknowns_explicit() -> None:
+    comparison = _provider_free_shadow_capacity_comparisons(
+        topic_call_lower_bound=33,
+        logical_call_upper_bound=None,
+        physical_attempt_upper_bound=None,
+        actual_runtime_call_limit=24,
+        actual_preflight_status="rejected",
+    )
+
+    assert [item["shadow_physical_call_limit"] for item in comparison] == [
+        24, 48, 64, 80,
+    ]
+    assert comparison[0]["status"] == "blocked_known_topic_call_lower_bound"
+    assert [item["status"] for item in comparison[1:]] == [
+        "incomplete_upper_bound", "incomplete_upper_bound", "incomplete_upper_bound",
+    ]
+    assert all(item["actual_runtime_call_limit"] == 24 for item in comparison)
+    assert all(item["provider_admission_authorized"] is False for item in comparison)
+    assert all(item["provider_posts_emitted"] == 0 for item in comparison)
+
+
+def test_provider_free_capacity_comparison_labels_64_call_scenario_as_shadow_only() -> None:
+    comparison = _provider_free_shadow_capacity_comparisons(
+        topic_call_lower_bound=33,
+        logical_call_upper_bound=59,
+        physical_attempt_upper_bound=59,
+        actual_runtime_call_limit=24,
+        actual_preflight_status="rejected",
+    )
+
+    assert [item["status"] for item in comparison] == [
+        "blocked_known_topic_call_lower_bound",
+        "blocked_estimated_upper_bound",
+        "within_shadow_capacity",
+        "within_shadow_capacity",
+    ]
+    assert all(item["actual_runtime_call_limit"] == 24 for item in comparison)
+    assert all(item["provider_admission_authorized"] is False for item in comparison)
 
 
 def test_chunk_plan_uses_distinct_outline_role_routes_without_transport(tmp_path: Path) -> None:

@@ -12118,6 +12118,20 @@ class OutlineV3Executor:
             if not section_id or section_id in seen_sections:
                 raise OutlineV3ExecutionError(f"{candidate_id} provider output has duplicate or missing section ids")
             seen_sections.add(section_id)
+            support_by_claim_id: dict[str, dict[str, Any]] = {}
+            for raw_support in section.get("claim_support") or ():
+                if not isinstance(raw_support, Mapping):
+                    continue
+                claim_id = str(raw_support.get("claim_id") or "").strip()
+                if not claim_id:
+                    continue
+                support_row = dict(raw_support)
+                prior_support = support_by_claim_id.get(claim_id)
+                if prior_support is not None and prior_support != support_row:
+                    raise OutlineV3ExecutionError(
+                        f"{candidate_id} section {section_id} has conflicting claim_id {claim_id} support provenance"
+                    )
+                support_by_claim_id[claim_id] = support_row
             paper_keys = {str(item) for item in section.get("paper_keys") or ()}
             if not paper_keys or not paper_keys.issubset(allowed_papers):
                 raise OutlineV3ExecutionError(f"{candidate_id} provider output has paper keys outside its evidence contract")

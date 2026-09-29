@@ -250,6 +250,101 @@ def test_v3_01_automatic_packing_enforces_exact_hard_input_boundary(
         assert profile.estimate_request(batches[0][1])["estimated_input_tokens"] == 32_000
 
 
+def test_v3_01_production_compact_relation_packer_splits_at_effective_cap(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor = _executor(
+        tmp_path,
+        stability_mode="off",
+        technical_shard_target_tokens=50_000,
+        max_source_prompt_tokens=32_000,
+    )
+    monkeypatch.setattr(
+        executor,
+        "_attach_prompt_authority",
+        lambda _node_id, request: dict(request),
+    )
+    candidate_rows = [
+        {"relation_id": "R1", "paper_keys": ["A"]},
+        {"relation_id": "R2", "paper_keys": ["B"]},
+    ]
+    bundle_rows = [
+        {"relation_id": "R1", "evidence_ids": ["EA"]},
+        {"relation_id": "R2", "evidence_ids": ["EB"]},
+    ]
+    profile = SimpleNamespace(
+        input_budget=100_000,
+        estimate_request=lambda request: {
+            "estimated_input_tokens": 20_000 * len(request["relation_candidates"]),
+            "within_budget": True,
+        },
+    )
+
+    batches = executor._relation_compact_batch_requests(
+        base_request={
+            "relation_candidates": candidate_rows,
+            "relation_evidence_bundles": bundle_rows,
+            "relation_adjudication_contract": {},
+        },
+        relation_ids=["R1", "R2"],
+        profile=profile,
+    )
+
+    assert len(batches) == 2
+    assert set().union(*(relation_ids for _node_id, _request, relation_ids in batches)) == {
+        "R1", "R2",
+    }
+    for _node_id, request, relation_ids in batches:
+        assert profile.estimate_request(request)["estimated_input_tokens"] <= 32_000
+        assert [item["relation_id"] for item in request["relation_candidates"]] == sorted(relation_ids)
+        assert [item["relation_id"] for item in request["relation_evidence_bundles"]] == sorted(relation_ids)
+
+
+@pytest.mark.parametrize(("estimate", "blocked"), [(32_000, False), (32_001, True)])
+def test_v3_01_production_compact_relation_packer_enforces_exact_boundary(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, estimate: int, blocked: bool,
+) -> None:
+    executor = _executor(
+        tmp_path,
+        stability_mode="off",
+        technical_shard_target_tokens=50_000,
+        max_source_prompt_tokens=32_000,
+    )
+    monkeypatch.setattr(
+        executor,
+        "_attach_prompt_authority",
+        lambda _node_id, request: dict(request),
+    )
+    profile = SimpleNamespace(
+        input_budget=100_000,
+        estimate_request=lambda _request: {
+            "estimated_input_tokens": estimate,
+            "within_budget": estimate <= 100_000,
+        },
+    )
+    request = {
+        "relation_candidates": [{"relation_id": "R1", "paper_keys": ["A"]}],
+        "relation_evidence_bundles": [{"relation_id": "R1", "evidence_ids": ["EA"]}],
+        "relation_adjudication_contract": {},
+    }
+
+    if blocked:
+        with pytest.raises(OutlineV3ExecutionError, match="indivisible complete relation request"):
+            executor._relation_compact_batch_requests(
+                base_request=request,
+                relation_ids=["R1"],
+                profile=profile,
+            )
+    else:
+        batches = executor._relation_compact_batch_requests(
+            base_request=request,
+            relation_ids=["R1"],
+            profile=profile,
+        )
+        assert len(batches) == 1
+        assert profile.estimate_request(batches[0][1])["estimated_input_tokens"] == 32_000
+
+
 @pytest.mark.parametrize(
     ("target_tokens", "variant_name"),
     [
@@ -716,6 +811,47 @@ def test_v3_03_same_claim_id_with_conflicting_support_provenance_is_rejected(
         )
 
 
+def test_v3_03_same_section_claim_id_with_conflicting_support_fails_closed(
+    tmp_path,
+) -> None:
+    executor = _executor(tmp_path, stability_mode="off")
+    claim = "The reported pattern is directly compared."
+    supports = [
+        {
+            "claim_id": "claim:shared",
+            "claim": claim,
+            "paper_key": "A",
+            "study_id": "A:study:1",
+            "source_claim_ids": ["source:A:claim"],
+            "evidence_ids": ["evidence:A"],
+        },
+        {
+            "claim_id": "claim:shared",
+            "claim": claim,
+            "paper_key": "B",
+            "study_id": "B:study:1",
+            "source_claim_ids": ["source:B:claim"],
+            "evidence_ids": ["evidence:B"],
+        },
+    ]
+
+    with pytest.raises(OutlineV3ExecutionError, match="conflicting claim_id claim:shared support provenance"):
+        executor._validate_candidate_payload(
+            "candidate:test",
+            {
+                "sections": [{
+                    "section_id": "section:comparison",
+                    "paper_keys": ["A", "B"],
+                    "relation_ids": [],
+                    "claims": [claim],
+                    "claim_support": supports,
+                }],
+            },
+            allowed_paper_keys=["A", "B"],
+            allowed_relation_ids=[],
+        )
+
+
 def test_v3_04_study_number_is_scoped_to_claim_paper_before_support_validation(
     tmp_path,
 ) -> None:
@@ -814,6 +950,41 @@ def test_v3_04_missing_required_condition_support_still_fails_closed(tmp_path) -
             allowed_relation_ids=[],
             alias_map={"papers_reverse": {"P001": "A"}},
         )
+
+
+def test_v3_05_missing_relation_selection_metadata_keeps_legacy_all_selection(
+    tmp_path,
+) -> None:
+    executor = _executor(tmp_path, stability_mode="off")
+    candidates = [
+        {"relation_id": "R1", "paper_keys": ["A"]},
+        {"relation_id": "R2", "paper_keys": ["B"]},
+    ]
+    bundles = [
+        SimpleNamespace(
+            relation_id=relation_id,
+            to_dict=lambda relation_id=relation_id: {
+                "relation_id": relation_id,
+                "paper_keys": ["A" if relation_id == "R1" else "B"],
+                "findings": [f"finding:{relation_id}"],
+            },
+        )
+        for relation_id in ("R1", "R2")
+    ]
+
+    _request, selected, excluded = executor._relation_provider_request(
+        relation_candidates=candidates,
+        content_layers=SimpleNamespace(content_hash="layers-hash", dossiers=[]),
+        semantic_plan=SimpleNamespace(
+            coverage={},
+            relation_bundles=bundles,
+            content_hash="semantic-plan-hash",
+        ),
+        shard_plan={"schema_version": "fixture", "target_tokens": 0, "shard_count": 0},
+    )
+
+    assert [item["relation_id"] for item in selected] == ["R1", "R2"]
+    assert excluded == []
 
 
 def test_v3_05_explicit_empty_relation_selection_selects_no_candidates(
