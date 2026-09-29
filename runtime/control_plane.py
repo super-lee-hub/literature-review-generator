@@ -1426,7 +1426,14 @@ class ReviewControlPlane:
         workload_audit = {
             "artifact_type": "r1_request_workload_audit",
             "artifact_version": "v2",
-            "source_scope": "provider_free_typed_stage1_reuse_projection",
+            "source_scope": (
+                "provider_free_typed_stage1_reuse_projection"
+                if summaries and len(typed_manifest_authorities) == len(summaries)
+                else "provider_free_mixed_stage1_summary_projection"
+                if typed_manifest_authorities
+                else "provider_free_materialized_summary_projection"
+            ),
+            "typed_manifest_authority_count": len(typed_manifest_authorities),
             "paper_count": len(content_layers.index_cards),
             "study_unit_count": sum(len(item.research_units) for item in content_layers.dossiers),
             "study_unit_count_kind": "explicit_study_units_plus_paper_level_fallbacks",

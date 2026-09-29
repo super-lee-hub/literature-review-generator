@@ -139,6 +139,10 @@ def test_chunk_plan_loads_summary_source_manifest_and_marks_navigation_scope(
     assert result["provider_call_budget_status"] == "NOT_PLANNED_END_TO_END"
     assert result["provider_request_plan_status"] == "not_planned_config_missing"
     assert result["semantic_chunk_plan"]["budgets"]["within_physical_call_limit"] is None
+    assert result["r1_request_workload_audit"]["source_scope"] == (
+        "provider_free_materialized_summary_projection"
+    )
+    assert result["r1_request_workload_audit"]["typed_manifest_authority_count"] == 0
     workload = result["r1_request_workload_audit"]
     assert workload["study_unit_count"] == 2
     assert workload["study_unit_count_kind"] == "explicit_study_units_plus_paper_level_fallbacks"
