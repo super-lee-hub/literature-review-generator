@@ -99,6 +99,7 @@ _ROUTE_CONFIG_KEYS = frozenset(
         "safety_margin_tokens",
         "force_highest_reasoning",
         "omit_temperature_when_reasoning",
+        "provider_stream",
         "transport_retries",
     }
 )
@@ -139,10 +140,20 @@ def safe_config_identity(config: Mapping[str, Any] | None) -> dict[str, str]:
         if key not in source:
             continue
         value = source.get(key)
+        if key == "provider_stream":
+            if isinstance(value, bool):
+                enabled = value
+            else:
+                enabled = str(value if value is not None else "").strip().casefold() in {
+                    "1", "true", "yes", "y", "on", "enabled", "enable",
+                }
+            if enabled:
+                identity[key] = "true"
+            continue
         if key == "api_base":
-            normalized = safe_endpoint(str(value or ""))
+            normalized = safe_endpoint(str(value if value is not None else ""))
         else:
-            normalized = str(value or "").strip()
+            normalized = str(value).strip() if value is not None else ""
         if normalized:
             identity[key] = normalized
     return identity
