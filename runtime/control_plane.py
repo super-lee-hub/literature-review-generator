@@ -139,6 +139,7 @@ def _provider_free_shadow_capacity_comparisons(
                 "physical_attempt_upper_bound": physical_attempt_upper_bound,
                 "status": status,
                 "planning_only": True,
+                "comparison_scope": "outline_v3_provider_call_plan",
                 "actual_runtime_call_limit": actual_runtime_call_limit,
                 "actual_preflight_status": actual_preflight_status,
                 "provider_admission_authorized": False,
@@ -1246,6 +1247,12 @@ class ReviewControlPlane:
         unbound_source_claim_identity_hashes: set[str] = set()
         paper_level_claim_keys: set[tuple[str, str]] = set()
         study_level_claim_keys: set[tuple[str, str]] = set()
+        unresolved_scope_claim_keys: set[tuple[str, str]] = set()
+        paper_level_fallback_unit_keys: set[tuple[str, str]] = set()
+        explicit_study_unit_keys: set[tuple[str, str]] = set()
+        unresolved_study_unit_keys: set[tuple[str, str]] = set()
+        multi_study_mapping_unresolved_papers: set[str] = set()
+        source_field_ledger_scope_counts: dict[str, int] = {}
         evidence_keys: set[tuple[str, str]] = set()
         source_text_occurrences: list[tuple[str, str]] = []
 
@@ -1262,12 +1269,45 @@ class ReviewControlPlane:
 
         for dossier in content_layers.dossiers:
             paper_id = str(dossier.paper_id)
-            nested_study_claim_ids = {
-                str(claim.claim_id)
-                for unit in dossier.research_units
-                for claim in unit.claims
-                if str(claim.claim_id)
-            }
+            explicit_study_unit_ids: set[str] = set()
+            explicit_study_claim_ids: set[str] = set()
+            paper_level_unit_ids: set[str] = set()
+            explicit_units: set[str] = set()
+            paper_fallback_units: set[str] = set()
+            unresolved_units: set[str] = set()
+            for unit in dossier.research_units:
+                unit_id = str(unit.study_id or "")
+                source_study_id = str(unit.source_study_id or "")
+                locators = unit.source_locators if isinstance(unit.source_locators, Mapping) else {}
+                has_study_locator = bool(locators.get("study"))
+                explicit_unit = bool(source_study_id) or bool(
+                    has_study_locator
+                    and unit_id
+                    and not unit_id.endswith(":study:paper_level")
+                )
+                if explicit_unit:
+                    explicit_units.add(unit_id or source_study_id)
+                    explicit_study_unit_ids.update(
+                        value for value in (unit_id, source_study_id) if value
+                    )
+                    explicit_study_claim_ids.update(
+                        str(claim.claim_id) for claim in unit.claims if str(claim.claim_id)
+                    )
+                elif unit_id.endswith(":study:paper_level"):
+                    paper_fallback_units.add(unit_id)
+                    paper_level_unit_ids.add(unit_id)
+                else:
+                    unresolved_units.add(unit_id or f"unidentified:{paper_id}")
+            explicit_study_unit_keys.update((paper_id, unit_id) for unit_id in explicit_units)
+            paper_level_fallback_unit_keys.update((paper_id, unit_id) for unit_id in paper_fallback_units)
+            unresolved_study_unit_keys.update((paper_id, unit_id) for unit_id in unresolved_units)
+            if "multi_study_mapping_unresolved" in set(dossier.diagnostics):
+                multi_study_mapping_unresolved_papers.add(paper_id)
+            for entry in dossier.source_field_ledger:
+                scope = str(entry.scope or "unresolved")
+                source_field_ledger_scope_counts[scope] = (
+                    source_field_ledger_scope_counts.get(scope, 0) + 1
+                )
             for field_name in (
                 "overall_context",
                 "research_questions",
@@ -1292,8 +1332,11 @@ class ReviewControlPlane:
                     unbound_source_claim_identity_hashes.add(
                         hash_json({"paper_key": paper_id, "claim_id": claim_id})
                     )
-                if str(claim.study_id or "") or claim_id in nested_study_claim_ids:
+                claim_study_id = str(claim.study_id or "")
+                if claim_study_id in explicit_study_unit_ids or claim_id in explicit_study_claim_ids:
                     study_level_claim_keys.add(key)
+                elif claim_study_id and claim_study_id not in paper_level_unit_ids:
+                    unresolved_scope_claim_keys.add(key)
                 else:
                     paper_level_claim_keys.add(key)
                 add_source_text(paper_id, claim.text)
@@ -1313,16 +1356,22 @@ class ReviewControlPlane:
                 ):
                     add_source_text(paper_id, getattr(unit, field_name, ()))
                 for claim in unit.claims:
-                    key = (paper_id, str(claim.claim_id))
+                    claim_id = str(claim.claim_id)
+                    key = (paper_id, claim_id)
                     claim_keys.add(key)
                     source_claim_identity_hashes.add(
-                        hash_json({"paper_key": paper_id, "claim_id": str(claim.claim_id)})
+                        hash_json({"paper_key": paper_id, "claim_id": claim_id})
                     )
                     if not claim.evidence_ids:
                         unbound_source_claim_identity_hashes.add(
-                            hash_json({"paper_key": paper_id, "claim_id": str(claim.claim_id)})
+                            hash_json({"paper_key": paper_id, "claim_id": claim_id})
                         )
-                    study_level_claim_keys.add(key)
+                    if claim_id in explicit_study_claim_ids:
+                        study_level_claim_keys.add(key)
+                    elif unit.study_id in paper_level_unit_ids:
+                        paper_level_claim_keys.add(key)
+                    else:
+                        unresolved_scope_claim_keys.add(key)
                     add_source_text(paper_id, claim.text)
                     evidence_keys.update(
                         (paper_id, str(value))
@@ -1340,6 +1389,11 @@ class ReviewControlPlane:
                 if str(value)
             )
             add_source_text(paper_id, list(dossier.evidence_text_by_id.values()))
+
+        study_level_claim_keys.difference_update(unresolved_scope_claim_keys)
+        paper_level_claim_keys.difference_update(
+            study_level_claim_keys | unresolved_scope_claim_keys
+        )
 
         unique_source_text_by_provenance = {
             (paper_id, text_value.casefold()): text_value
@@ -1375,8 +1429,18 @@ class ReviewControlPlane:
             "source_scope": "provider_free_typed_stage1_reuse_projection",
             "paper_count": len(content_layers.index_cards),
             "study_unit_count": sum(len(item.research_units) for item in content_layers.dossiers),
+            "study_unit_count_kind": "explicit_study_units_plus_paper_level_fallbacks",
+            "explicit_study_unit_count": len(explicit_study_unit_keys),
+            "paper_level_fallback_unit_count": len(paper_level_fallback_unit_keys),
+            "unresolved_study_unit_count": len(unresolved_study_unit_keys),
+            "multi_study_mapping_unresolved_dossier_count": len(multi_study_mapping_unresolved_papers),
             "paper_level_source_claim_count": len(paper_level_claim_keys),
             "study_level_source_claim_count": len(study_level_claim_keys),
+            "explicit_study_source_claim_count": len(study_level_claim_keys),
+            "unresolved_scope_source_claim_count": len(unresolved_scope_claim_keys),
+            "source_field_ledger_scope_counts": dict(sorted(source_field_ledger_scope_counts.items())),
+            "source_field_ledger_total": sum(source_field_ledger_scope_counts.values()),
+            "unresolved_source_field_count": source_field_ledger_scope_counts.get("unresolved", 0),
             "source_claim_count_unique_by_paper": len(claim_keys),
             "source_claim_identity_set_hash": hash_json(sorted(source_claim_identity_hashes)),
             "unbound_source_claim_count": len(unbound_source_claim_identity_hashes),
@@ -1674,10 +1738,12 @@ class ReviewControlPlane:
         ]
         provider_free_shadow_capacity_comparison = _provider_free_shadow_capacity_comparisons(
             topic_call_lower_bound=len(topic_request_rows),
-            logical_call_upper_bound=semantic_reserved_call_count,
+            logical_call_upper_bound=semantic_route_preflight_summary.get(
+                "estimated_provider_calls"
+            ),
             physical_attempt_upper_bound=(
                 semantic_route_preflight_summary.get(
-                    "semantic_physical_attempts_upper_bound"
+                    "estimated_provider_physical_attempts_upper_bound"
                 )
             ),
             actual_runtime_call_limit=effective_call_limit,

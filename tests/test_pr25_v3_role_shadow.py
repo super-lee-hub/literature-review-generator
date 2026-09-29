@@ -218,6 +218,18 @@ def test_chunk_plan_uses_distinct_outline_role_routes_without_transport(tmp_path
     assert result["semantic_request_input_tokens_all_attempts_upper_bound"] == (
         preflight["semantic_input_tokens_all_attempts_upper_bound"]
     )
+    shadow_rows = result["provider_free_shadow_capacity_comparison"]
+    assert [item["shadow_physical_call_limit"] for item in shadow_rows] == [
+        24, 48, 64, 80,
+    ]
+    assert all(
+        item["logical_call_upper_bound"] == preflight["estimated_provider_calls"]
+        and item["physical_attempt_upper_bound"]
+        == preflight["estimated_provider_physical_attempts_upper_bound"]
+        and item["comparison_scope"] == "outline_v3_provider_call_plan"
+        and item["provider_admission_authorized"] is False
+        for item in shadow_rows
+    )
     assert "local-fixture-only" not in json.dumps(result)
     assert "api_base" not in json.dumps(result)
 

@@ -139,6 +139,45 @@ def test_chunk_plan_loads_summary_source_manifest_and_marks_navigation_scope(
     assert result["provider_call_budget_status"] == "NOT_PLANNED_END_TO_END"
     assert result["provider_request_plan_status"] == "not_planned_config_missing"
     assert result["semantic_chunk_plan"]["budgets"]["within_physical_call_limit"] is None
+    workload = result["r1_request_workload_audit"]
+    assert workload["study_unit_count"] == 2
+    assert workload["study_unit_count_kind"] == "explicit_study_units_plus_paper_level_fallbacks"
+    assert workload["paper_level_fallback_unit_count"] == 2
+    assert workload["explicit_study_unit_count"] == 0
+    assert workload["study_level_source_claim_count"] == 0
+    assert workload["paper_level_source_claim_count"] == workload["source_claim_count_unique_by_paper"]
+    assert workload["source_field_ledger_total"] == sum(
+        workload["source_field_ledger_scope_counts"].values()
+    )
+    assert workload["unresolved_source_field_count"] == workload[
+        "source_field_ledger_scope_counts"
+    ].get("unresolved", 0)
+
+
+def test_chunk_plan_distinguishes_an_explicit_study_from_paper_fallback(
+    tmp_path: Path,
+) -> None:
+    explicit = _summary("paper-b", "B", "A within-study finding.")
+    explicit["specialized_details"]["empirical"]["study_results"] = [{
+        "study_id": "study:1",
+        "findings": "A within-study finding.",
+        "method": "A controlled comparison.",
+    }]
+    summary_path = tmp_path / "summaries.json"
+    summary_path.write_text(
+        json.dumps([
+            _summary("paper-a", "A", "A paper-level finding."),
+            explicit,
+        ]),
+        encoding="utf-8",
+    )
+
+    result = ReviewControlPlane(repo_root=tmp_path).chunk_plan([summary_path])
+
+    workload = result["r1_request_workload_audit"]
+    assert workload["study_unit_count"] == 2
+    assert workload["paper_level_fallback_unit_count"] == 1
+    assert workload["explicit_study_unit_count"] == 1
 
 
 def test_chunk_plan_builds_route_bound_semantic_request_plan_without_posts(
