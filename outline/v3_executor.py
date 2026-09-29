@@ -6128,11 +6128,11 @@ class OutlineV3Executor:
             self.topic_request_plan_identity_hash = self._compute_topic_provider_plan_identity_hash(
                 semantic_stage_plan
             )
-            cross_reducer_calls_planned = max(0, len(cross_plan_rows) - 1)
-            semantic_conditional_reducer_call_reserve = (
-                max(0, MAX_SEMANTIC_REDUCER_CALLS_PER_STAGE - cross_reducer_calls_planned)
-                if cross_reducer_calls_planned else 0
-            )
+            # The bounded stage plan already materializes every reducer level
+            # from runtime-fragment input bounds and the provider output cap.
+            # Reserving every unused stage slot on top of that graph double
+            # counts reducer capacity and can reject small, fully planned jobs.
+            semantic_conditional_reducer_call_reserve = 0
             semantic_synthesis_calls = (
                 semantic_topic_batches + len(cross_plan_rows) + len(global_plan_rows)
                 + semantic_conditional_reducer_call_reserve

@@ -255,6 +255,48 @@ def test_chunk_plan_uses_distinct_outline_role_routes_without_transport(tmp_path
     assert "api_base" not in json.dumps(result)
 
 
+def test_three_paper_plan_does_not_reserve_unused_reducer_stage_capacity(
+    tmp_path: Path,
+) -> None:
+    summary_path = tmp_path / "summaries.json"
+    summary_path.write_text(
+        json.dumps(
+            [
+                _summary(
+                    f"paper-{index}",
+                    f"Paper {index}",
+                    f"Treatment improved outcome in context {index}.",
+                )
+                for index in range(3)
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "config.ini"
+    _write_role_config(config_path)
+
+    result = ReviewControlPlane(repo_root=tmp_path).chunk_plan(
+        [summary_path],
+        job_id="three-paper-reducer-budget",
+        candidate_count=2,
+        physical_call_limit=24,
+        config_path=config_path,
+    )
+
+    assert result["provider_posts_emitted"] == 0
+    assert result["semantic_physical_call_limit"] == 24
+    assert result["semantic_preflight_status"] == "accepted"
+    preflight = result["semantic_route_preflight_summary"]
+    assert preflight["semantic_conditional_reducer_call_reserve"] == 0
+    assert preflight["semantic_synthesis_calls_reserved"] == (
+        result["semantic_topic_batch_count"]
+        + result["semantic_cross_materialized_request_count"]
+        + result["semantic_global_request_count_upper_bound"]
+    )
+    assert result["semantic_request_calls_reserved_upper_bound"] <= 24
+
+
 def test_chunk_plan_uses_runtime_smoke_default_when_mode_is_omitted(tmp_path: Path) -> None:
     summary_path = tmp_path / "summaries.json"
     summary_path.write_text(
