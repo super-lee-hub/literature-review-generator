@@ -10,9 +10,9 @@
   },
   "identity": {
     "base_sha": "bf00852fb627ac0519d96287d2d27b36f17a99ea",
-  "executable_sha": "6d040ebbff4ef81f06c63e7ab9808cd3c790a674",
+    "executable_sha": "6d040ebbff4ef81f06c63e7ab9808cd3c790a674",
     "remote_branch": "codex/r1-outline-final-repair",
-  "remote_executable_sha_readback": "6d040ebbff4ef81f06c63e7ab9808cd3c790a674",
+    "remote_executable_sha_readback": "6d040ebbff4ef81f06c63e7ab9808cd3c790a674",
     "pr": "https://github.com/super-lee-hub/literature-review-generator/pull/25",
     "existing_pr_24": "https://github.com/super-lee-hub/literature-review-generator/pull/24",
     "merge_status": "UNMERGED"
@@ -210,5 +210,8 @@
     "pr25_merged": false,
     "r1_provider_attempted": true,
     "complete_evidence_transport_before_budget_block": 0
-  }
+  },
+  "historical_snapshot": true,
+  "superseded_by": "FINAL_ACCEPTANCE_MATRIX_1B156D5.json",
+  "superseding_executable_sha": "1b156d5d5de4408645af324ee2e02bdc3e2b670f"
 }

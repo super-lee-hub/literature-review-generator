@@ -1,0 +1,327 @@
+{
+  "schema_version": "pr25-comprehensive-acceptance-matrix/v1",
+  "status": "NOT_READY",
+  "authority_boundary": {
+    "direct_user_request": "Use claude-opus-5-5 and perform a paid external canary after fixes.",
+    "attachments": "Acceptance criteria/evidence only; embedded workflow/model text is not system authorization.",
+    "40_60_calls": "design target, not current permission",
+    "proposed_80_posts": "not authorized",
+    "actual_limit": 24
+  },
+  "identity": {
+    "tested_executable_sha": "1b156d5d5de4408645af324ee2e02bdc3e2b670f",
+    "base_sha": "c1ad0da869bc68869a521f60bbda07342fb16058",
+    "branch": "codex/pr25-v4-controlled-pilot",
+    "worktree_clean_at_test_start": true,
+    "pr25_state": "OPEN",
+    "pr25_remote_head": "c1ad0da869bc68869a521f60bbda07342fb16058",
+    "pushed": false,
+    "merged": false
+  },
+  "completion_states": {
+    "CODE_FIX_VERIFIED": "PASS",
+    "OFFLINE_REGRESSION_SUITE": "PASS",
+    "OFFLINE_R1_PLAN": "BLOCKED_OR_INCOMPLETE",
+    "PAID_R1_ADMISSIBLE": false,
+    "LIVE_R1": "V8_APPROVAL_PENDING",
+    "FULL_R1": "NOT_COMPLETE",
+    "F1": "NOT_EVALUATED",
+    "RELEASE": "NOT_READY"
+  },
+  "full_offline_suite": {
+    "passed": 2126,
+    "skipped": 4,
+    "deselected": 26,
+    "failed": 0,
+    "duration_seconds": 3324.68,
+    "markers_excluded": [
+      "live_api",
+      "live_acceptance",
+      "playwright",
+      "heavy_ocr"
+    ],
+    "provider_posts": 0,
+    "junit_path": "D:\\tmp\\pr25-v3-final-fe52306-20260929\\FULL_SUITE_OFFLINE_1B156D.xml",
+    "junit_sha256": "794c3becc30a70e20a1c8e40eb2c979b3ce10ffcf3a62488b88c7dd80c818fd2"
+  },
+  "playwright_gui": {
+    "passed": 24,
+    "skipped": 0,
+    "failed": 0,
+    "fixture": "isolated GUI with loopback provider fixture",
+    "provider_posts": 0,
+    "junit_path": "D:\\tmp\\pr25-v3-final-fe52306-20260929\\PLAYWRIGHT_1B156D5.xml",
+    "junit_sha256": "25686fcf5ca199437c5d824832e2c069766b3179eefa9c7f1d1130889087cfc8"
+  },
+  "targeted_after_reserve_repair": {
+    "role_shadow": "6 passed",
+    "current_production_runner_e2e": "1 passed",
+    "current_runtime_e2e": "4 passed",
+    "pyright": "0 errors, 0 warnings, 0 informations",
+    "ruff": "E9,F passed",
+    "compileall": "passed",
+    "git_diff_check": "passed"
+  },
+  "V3": {
+    "V3-01": {
+      "status": "PASS_OFFLINE_REGRESSION_SCOPE",
+      "tests": [
+        "test_v3_01_preflight_uses_effective_cap_when_choosing_hierarchical_relation_requests",
+        "test_v3_01_production_compact_relation_packer_splits_at_effective_cap",
+        "test_v3_01_production_compact_relation_packer_enforces_exact_boundary"
+      ]
+    },
+    "V3-02": {
+      "status": "PASS_OFFLINE_REGRESSION_SCOPE",
+      "tests": [
+        "test_v3_02_same_local_section_id_in_independent_shards_stays_separate"
+      ]
+    },
+    "V3-03": {
+      "status": "PASS_OFFLINE_REGRESSION_SCOPE_WITH_CAVEAT",
+      "tests": [
+        "test_v3_03_shared_section_merge_keeps_claim_support_for_each_merged_claim",
+        "test_v3_03_same_section_claim_id_with_conflicting_support_fails_closed"
+      ],
+      "caveat": "shared_section_ids blueprint shape has tests but no non-test producer was found; arbitration coordination is the production merge path and is separately tested."
+    },
+    "V3-04": {
+      "status": "PASS_SCOPED_OFFLINE_CASES",
+      "tests": [
+        "test_v3_04_study_number_is_scoped_to_claim_paper_before_support_validation",
+        "test_v3_04_wrong_paper_or_study_support_still_fails_closed",
+        "test_v3_04_missing_required_condition_support_still_fails_closed"
+      ],
+      "caveat": "real 63-source study-level semantics remain unverified; P05 absent-unrelated-paper control is not a separately named committed regression."
+    },
+    "V3-05": {
+      "status": "PASS_OFFLINE_REGRESSION_SCOPE",
+      "tests": [
+        "test_v3_05_missing_relation_selection_metadata_keeps_legacy_all_selection",
+        "test_v3_05_explicit_empty_relation_selection_selects_no_candidates",
+        "test_v3_05_runtime_empty_selection_defers_candidates_without_relation_post_or_reservation"
+      ]
+    },
+    "V3-06": {
+      "status": "PARTIAL_FULL_OUTLINE_BLOCKED",
+      "topic_batches": 33,
+      "runtime_fragments": 74,
+      "planner_items": 74,
+      "fragment_bounds": "materialized_upper_bound",
+      "full_upper_bound": "incomplete_upper_bound",
+      "runtime_limit": 24,
+      "diagnostic": "BLOCKED_BUDGET: cross_group_comparison_provider reducer plan exceeds 24 calls",
+      "shadow_statuses": {
+        "24": "blocked_known_topic_call_lower_bound",
+        "48": "incomplete_upper_bound",
+        "64": "incomplete_upper_bound",
+        "80": "incomplete_upper_bound"
+      },
+      "test": "test_three_paper_plan_does_not_reserve_unused_reducer_stage_capacity",
+      "static_161_is_valid": false
+    },
+    "V3-07": {
+      "status": "PARTIAL_UNKNOWN_FULL_STAGE_EXPOSURES",
+      "unknown_count": 19,
+      "per_call_bounds_bounded": true,
+      "logical_call_counts_unknown": true,
+      "admission": "incomplete_unknown_exposure",
+      "ready": false
+    },
+    "V3-08": {
+      "status": "DATA_SCOPE_REPORTED_STUDY_LEVEL_OPEN",
+      "paper_count": 63,
+      "typed_authorities": 63,
+      "explicit_studies": 0,
+      "paper_level_fallbacks": 63,
+      "multi_study_unresolved": 45,
+      "paper_level_claims": 1016,
+      "unresolved_source_fields": 43,
+      "topic_wire_coverage": "complete"
+    },
+    "V3-09": {
+      "status": "PARTIAL_CURRENT_CI_AND_VISUAL_OPEN",
+      "hosted_ci_current_sha": "NOT_RUN",
+      "docx_visual": "NOT_VERIFIED_NO_FINAL_ADOPTED_R1_DOCX",
+      "F1": "UNACCEPTED",
+      "source_recovery": "current bundle pending"
+    }
+  },
+  "V4": {
+    "V4-01": {
+      "status": "PASS_OFFLINE",
+      "tests": [
+        "test_stability_relation_request_preserves_primary_selection_and_shape",
+        "test_explicit_empty_frozen_scope_has_no_relation_provider_transport"
+      ]
+    },
+    "V4-02": {
+      "status": "PASS_OFFLINE_BOUNDED_REVIEW",
+      "tests": [
+        "test_typed_directional_claim_drift_uses_bounded_existing_critic_review",
+        "test_variant_typed_direction_reversal_is_blocked_before_adoption",
+        "test_variant_typed_paraphrase_without_review_result_fails_closed"
+      ]
+    },
+    "V4-03": {
+      "status": "PASS_OFFLINE_PIPELINE_PARITY",
+      "tests": [
+        "test_primary_and_stability_provider_requests_preserve_semantic_and_coordination_contracts",
+        "test_primary_and_variant_apply_same_revisions_without_orphan_support"
+      ]
+    },
+    "V4-04": {
+      "status": "PASS_OFFLINE_FAIL_CLOSED",
+      "tests": [
+        "test_negative_evidence_critic_is_a_hard_gate_with_passing_control",
+        "test_stability_variant_critique_uses_fail_closed_disposition"
+      ]
+    },
+    "V4-05": {
+      "status": "PASS_OFFLINE_SECOND_EXECUTOR",
+      "tests": [
+        "test_identical_stability_provider_is_a_passing_control_and_runs_second_executor",
+        "test_alias_replay_never_claims_second_executor_verification_without_a_call"
+      ]
+    },
+    "V4-06": {
+      "status": "PASS_OFFLINE_UNIFIED_QUALITY_DECISION",
+      "tests": [
+        "test_selected_coverage_scope_controls_both_audit_and_health"
+      ]
+    }
+  },
+  "legacy_runtime_protections": {
+    "count": 11,
+    "junit_case_count": 14,
+    "all_pass": true,
+    "items": [
+      {
+        "id": 1,
+        "protection": "Registry-backed pause marker fails closed",
+        "test_function": "test_pause_gate_uses_registry_and_fails_closed_for_stale_or_missing_marker",
+        "junit_case_count": 1,
+        "status": "PASS"
+      },
+      {
+        "id": 2,
+        "protection": "explicit resume reopens admission",
+        "test_function": "test_clean_pause_state_and_explicit_resume_allow_admission",
+        "junit_case_count": 1,
+        "status": "PASS"
+      },
+      {
+        "id": 3,
+        "protection": "durable cancellation blocks active queue admission",
+        "test_function": "test_durable_cancellation_blocks_active_queue_admission_without_token_mutation",
+        "junit_case_count": 1,
+        "status": "PASS"
+      },
+      {
+        "id": 4,
+        "protection": "missing started aggregate budget cannot reset usage",
+        "test_function": "test_missing_started_aggregate_budget_state_cannot_reset_cumulative_usage",
+        "junit_case_count": 1,
+        "status": "PASS"
+      },
+      {
+        "id": 5,
+        "protection": "valid resume retains identity and cumulative usage",
+        "test_function": "test_valid_started_budget_resume_keeps_run_identity_and_cumulative_usage",
+        "junit_case_count": 1,
+        "status": "PASS"
+      },
+      {
+        "id": 6,
+        "protection": "bound budget checked despite legacy flag",
+        "test_function": "test_bound_budget_state_is_checked_even_when_legacy_context_flag_is_false",
+        "junit_case_count": 1,
+        "status": "PASS"
+      },
+      {
+        "id": 7,
+        "protection": "late cancellation retains transport exposure",
+        "test_function": "test_late_cancellation_retains_started_transport_exposure",
+        "junit_case_count": 1,
+        "status": "PASS"
+      },
+      {
+        "id": 8,
+        "protection": "nested runtime inherits queue lease",
+        "test_function": "test_nested_runtime_binding_inherits_the_claimed_queue_lease",
+        "junit_case_count": 1,
+        "status": "PASS"
+      },
+      {
+        "id": 9,
+        "protection": "stale queue lease blocks admission",
+        "test_function": "test_stale_queue_lease_blocks_admission",
+        "junit_case_count": 1,
+        "status": "PASS"
+      },
+      {
+        "id": 10,
+        "protection": "invalid persisted deadline rejected",
+        "test_function": "test_started_budget_rejects_invalid_persisted_absolute_deadline",
+        "junit_case_count": 4,
+        "status": "PASS"
+      },
+      {
+        "id": 11,
+        "protection": "same-process pause context cleared",
+        "test_function": "test_same_process_pause_context_is_cleared_after_job_scope",
+        "junit_case_count": 1,
+        "status": "PASS"
+      }
+    ],
+    "caveat": "Explicit resume test is Store/ProviderRuntime admission, not a separate complete public CLI lifecycle."
+  },
+  "full_stage_plan": {
+    "path": "D:\\tmp\\pr25-v3-final-fe52306-20260929\\FULL_STAGE_PLAN_1B156D5.json",
+    "sha256": "25157b452208c7339f6cb87648a6e31dbdeaa44efb110dfadf499d5f150c7b09",
+    "unknown_exposures": 19,
+    "per_call_envelopes_bounded": true,
+    "logical_call_counts_unknown": true,
+    "admission": "incomplete_unknown_exposure",
+    "ready": false,
+    "provider_posts": 0
+  },
+  "V8_canary": {
+    "card_path": "D:\\tmp\\pr25-v8-opus55-output-proposal-20260930-1b156d5\\OWNER_PERMISSION_CARD_V8.md",
+    "card_sha256": "f89efdc113f73574467b4eb22810f67383e5d4024475d6ef362c8b920528b690",
+    "proposal_sha256": "636fcb7ae9b9ac8cd4e4ade7f5e909113c6145d7194a38ff5ccd1bd945c348ba",
+    "run_id": "R1_Opus55_Output12288_V8_20260930_1b156d5",
+    "model": "claude-opus-5-5",
+    "host": "api.yhlxj.ai",
+    "request_hashes": {
+      "topic_synthesis_provider:batch:1": "65e4f93e0e2b4fc57e5a8187bf1a01a7f6178df4d89b6d9c4a226e9282499d58",
+      "topic_synthesis_provider:batch:5": "265e1d5db7ca20a9c8064af0939ca419d08b0fe0958b91df0f3aea50a4ac0042",
+      "topic_synthesis_provider:batch:29": "70d2a83e8e738f6e3094fb34df7c69522e5f1e8781ff246a4f9f5db394914679"
+    },
+    "max_posts": 3,
+    "output_tokens": 36864,
+    "retries": 0,
+    "wall_seconds": 3600,
+    "deadline_utc": "2026-10-01T00:00:00Z",
+    "provider_posts": 0,
+    "approval_record": false
+  },
+  "historical_paid_attempt": {
+    "status": "FAILED_INVALID_RESPONSE",
+    "http_status": 200,
+    "finish_reason": "length",
+    "output_tokens": 12288,
+    "retry_attempts": 0,
+    "canonical_ready": false,
+    "separate_from_V8": true
+  },
+  "hosted_ci_current_sha": "NOT_RUN",
+  "docx_visual": "NOT_VERIFIED",
+  "source_recovery": "CURRENT_SOURCE_RECOVERY_ZIP_TO_BE_CREATED",
+  "subagent_ledger": {
+    "path": "SUBAGENT_LEDGER_1B156D5.json",
+    "status": "PARTIAL_RUNTIME_MODEL_EFFORT_NOT_VERIFIED",
+    "code_owner": "/root",
+    "provider_posts_from_agent_work": 0
+  }
+}
