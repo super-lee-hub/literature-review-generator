@@ -2873,7 +2873,7 @@ class OutlineV3Executor:
                 "content_layers_hash": getattr(content_layers_model, "content_hash", ""),
             },
             "output_contract": {
-                "semantic_result_contract_version": "bounded-topic-synthesis/v2",
+                "semantic_result_contract_version": "bounded-topic-synthesis/v3",
                 "max_output_tokens": self._semantic_output_token_limit(
                     self._node_route("candidate_1_provider_generation").profile
                 ),
@@ -2882,10 +2882,12 @@ class OutlineV3Executor:
                     "topics", "processed_fragment_ids", "claims", "unresolved_questions"
                 ],
                 "termination_rule": "Finish the complete JSON object before the output limit. If the supported synthesis will not fit, return a complete unresolved fragment with an explicit reason rather than a partial claim or unclosed JSON.",
-                "topics": "array of topic synthesis objects; return every requested fragment_id exactly once with topic_id, status, conclusions, unresolved_questions, and supporting_evidence_ids for any factual conclusion",
+                "topics": "array of topic synthesis objects; return every requested fragment_id exactly once with topic_id, status, concise conclusions, unresolved_questions, and supporting_evidence_ids for any factual conclusion. Conclusions summarize the claims without repeating their evidence-specific text.",
                 "processed_fragment_ids": "array containing every requested fragment_id exactly once",
-                "claims": "array of evidence-bound claims; each claim has claim_id='synthesis:topic_synthesis:<local-id>', fragment_id, claim_type, paper_key or paper_keys, evidence_ids, and optional source_claim_ids/source_field_ids/source_locators; claims using an interpretation-dependent finding must cite every required qualifier claim, evidence ID, and source field ID",
+                "claims": "array of distinct evidence-bound synthesis claims, not a one-to-one restatement of every source claim or evidence ID. Combine findings only when direction, conditions, population and horizon align; keep conflicts, conditional effects, null/zero results and material exceptions distinct or unresolved. Each claim has claim_id='synthesis:topic_synthesis:<local-id>', fragment_id, claim_type, paper_key or paper_keys, and evidence_ids. Include source_claim_ids/source_field_ids when needed for source lineage or interpretation dependencies; an interpretation-dependent finding must cite every required qualifier claim, evidence ID and source field ID.",
+                "source_locator_policy": "Do not echo source_locators in claims. Full exact locators remain bound to evidence IDs in the local Registry and are resolved downstream.",
                 "source_claim_ids": "must exactly reference supplied source claim IDs; do not relabel source IDs as generated synthesis claims",
+                "conciseness_policy": "Return the smallest complete synthesis that preserves distinct supported conclusions, direction, conditions, conflicts, null/zero findings, unresolved items and evidence support. Do not duplicate the same narrative in topics[].conclusions and claims[].text.",
                 "unresolved_questions": "array of questions that remain unresolved",
                 "no_external_evidence": "do not infer a finding, boundary or consensus from a missing field; emit an unresolved or insufficient-evidence record instead",
                 "overflow_policy": "If material conclusions and exceptions cannot fit, mark the affected fragment unresolved with an explicit reason; never truncate a supported claim or silently omit a requested fragment",
