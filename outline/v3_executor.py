@@ -2980,6 +2980,12 @@ class OutlineV3Executor:
         if current:
             batches.append(current)
 
+        bridge_paper_ids_by_topic: dict[str, set[str]] = {}
+        for topic in expanded:
+            bridge_paper_ids_by_topic.setdefault(str(topic.topic_id), set()).update(
+                str(value) for value in topic.bridge_paper_ids if str(value)
+            )
+
         plans: list[dict[str, Any]] = []
         semantic_retries = self._semantic_transport_retry_count()
         for batch_index, batch in enumerate(batches, start=1):
@@ -3103,6 +3109,64 @@ class OutlineV3Executor:
             attached_request = self._attach_prompt_authority(topic_node_id, request)
             request_body_bytes = len(json.dumps(request, ensure_ascii=False, sort_keys=True).encode("utf-8"))
             attached_request_bytes = len(json.dumps(attached_request, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+            cross_group_fragment_plans: list[dict[str, Any]] = []
+            batch_id = str((request.get("hierarchy") or {}).get("batch_id") or "")
+            output_upper_bound = self._semantic_output_token_limit(profile)
+            for fragment in request.get("topics") or ():
+                if not isinstance(fragment, Mapping):
+                    continue
+                planned_unit_ids_for_fragment = [
+                    str(value)
+                    for value in fragment.get("planned_evidence_unit_ids") or ()
+                    if str(value)
+                ]
+                interpretation_context = self._interpretation_context_for_units(
+                    evidence_units,
+                    planned_unit_ids_for_fragment,
+                )
+                runtime_fragment_metadata = {
+                    "topic_id": str(fragment.get("topic_id") or ""),
+                    "fragment_id": str(fragment.get("fragment_id") or ""),
+                    "question": str(fragment.get("question") or ""),
+                    "paper_ids": [str(value) for value in fragment.get("paper_ids") or () if str(value)],
+                    "bridge_paper_ids": sorted(
+                        bridge_paper_ids_by_topic.get(str(fragment.get("topic_id") or ""), set())
+                    ),
+                    # Runtime derives this list from provider output. Its
+                    # serialized size is bounded separately below.
+                    "supporting_evidence_ids": [],
+                    "provider_batch_ids": [batch_id] if batch_id else [],
+                    "provider_outputs": [],
+                    "result_ids": ["fragment-result:" + ("0" * 24)],
+                    "interpretation_context": interpretation_context,
+                }
+                metadata_upper_bound = int(
+                    profile.estimate_tokens(runtime_fragment_metadata)
+                )
+                cross_group_fragment_plans.append({
+                    "topic_id": str(fragment.get("topic_id") or ""),
+                    "fragment_id": str(fragment.get("fragment_id") or ""),
+                    "paper_ids": sorted({
+                        str(value) for value in (
+                            *list(fragment.get("paper_ids") or ()),
+                            *list(fragment.get("bridge_paper_ids") or ()),
+                        ) if str(value)
+                    }),
+                    "interpretation_source_field_count": len(
+                        interpretation_context.get("fields") or ()
+                    ),
+                    "interpretation_dependency_count": len(
+                        interpretation_context.get("dependencies") or ()
+                    ),
+                    "interpretation_context_tokens_upper_bound": metadata_upper_bound,
+                    "provider_output_tokens_upper_bound": output_upper_bound,
+                    # Runtime carries each provider output and projects its
+                    # supporting IDs into a second field on the fragment row.
+                    "supporting_id_projection_tokens_upper_bound": output_upper_bound,
+                    "cross_group_item_tokens_upper_bound": (
+                        metadata_upper_bound + (2 * output_upper_bound) + 128
+                    ),
+                })
             identity_projection = {
                 "planned_evidence_unit_ids": planned_unit_ids,
                 "topics": [
@@ -3127,6 +3191,7 @@ class OutlineV3Executor:
                         for item in request.get("topics") or ()
                         if isinstance(item, Mapping)
                     ],
+                    "cross_group_fragment_plans": cross_group_fragment_plans,
                     "planned_evidence_unit_count": len(planned_unit_ids),
                     "materialized_evidence_unit_count": len(materialized_unit_ids),
                     "planned_evidence_unit_ids_hash": hash_json(planned_unit_ids),
@@ -5151,6 +5216,14 @@ class OutlineV3Executor:
             "transport_posts_emitted": 0,
             "content_projection": "complete_dossier_study_claim_unit_v1",
         }
+        for key in (
+            "semantic_cross_group_runtime_fragment_count",
+            "semantic_cross_group_planner_item_count",
+            "semantic_cross_group_fragment_bounds_status",
+            "semantic_request_upper_bound_status",
+        ):
+            if key in self.stability_preflight:
+                payload[key] = self.stability_preflight[key]
         self.stability_preflight = payload
         path = self._path(
             f"outline_v3/stability/stability_preflight_{self.closure_epoch_id[:24]}.json"
@@ -5650,6 +5723,14 @@ class OutlineV3Executor:
 
     def _preflight_stability_budget(self) -> None:
         core_calls = len(self._provider_node_ids())
+        self.stability_preflight.update(
+            {
+                "semantic_cross_group_runtime_fragment_count": None,
+                "semantic_cross_group_planner_item_count": None,
+                "semantic_cross_group_fragment_bounds_status": "incomplete_upper_bound",
+                "semantic_request_upper_bound_status": "incomplete_upper_bound",
+            }
+        )
         try:
             self.provider_call_plans = self._build_provider_call_plans()
         except OutlineV3ExecutionError as exc:
@@ -5755,6 +5836,9 @@ class OutlineV3Executor:
         semantic_input_tokens = 0
         semantic_output_tokens = 0
         semantic_reasoning_tokens = 0
+        cross_group_runtime_fragment_count: int | None = None
+        cross_group_planner_item_count: int | None = None
+        cross_group_fragment_bounds_status = "incomplete_upper_bound"
         if self.semantic_provider_synthesis_enabled:
             semantic_route = self._role_route("candidate_1_provider_generation")
             # Count the exact complete-evidence topic batches used by ``run``.
@@ -5780,26 +5864,69 @@ class OutlineV3Executor:
                 int(item.get("estimated_input_tokens") or 0)
                 for item in self.semantic_request_plan
             )
+            cross_group_fragment_plans = [
+                dict(fragment)
+                for batch in self.semantic_request_plan
+                for fragment in batch.get("cross_group_fragment_plans") or ()
+                if isinstance(fragment, Mapping)
+            ]
             semantic_context_plan = [
                 {
                     "topic_id": str(fragment.get("topic_id") or ""),
                     "fragment_id": str(fragment.get("fragment_id") or ""),
                     "paper_ids": list(fragment.get("paper_ids") or []),
+                    "cross_group_item_tokens_upper_bound": int(
+                        fragment.get("cross_group_item_tokens_upper_bound") or 0
+                    ),
                 }
+                for fragment in cross_group_fragment_plans
+            ]
+            cross_group_runtime_item_count = len(semantic_context_plan)
+            runtime_fragment_rows = [
+                fragment
                 for batch in self.semantic_request_plan
                 for fragment in batch.get("topic_fragments") or ()
                 if isinstance(fragment, Mapping)
             ]
-            topic_batch_output_bounds = [
-                semantic_output
-                + sum(
-                    int(semantic_route.profile.estimate_tokens(fragment))
-                    for fragment in batch.get("topic_fragments") or ()
-                    if isinstance(fragment, Mapping)
-                )
-                for batch in self.semantic_request_plan
+            runtime_fragment_keys = [
+                (str(fragment.get("topic_id") or ""), str(fragment.get("fragment_id") or ""))
+                for fragment in runtime_fragment_rows
+            ]
+            planner_fragment_keys = [
+                (str(fragment.get("topic_id") or ""), str(fragment.get("fragment_id") or ""))
+                for fragment in cross_group_fragment_plans
+            ]
+            cross_group_runtime_fragment_count = len(runtime_fragment_rows)
+            cross_group_planner_item_count = cross_group_runtime_item_count
+            cross_group_item_output_bounds = [
+                int(item.get("cross_group_item_tokens_upper_bound") or 0)
+                for item in semantic_context_plan
             ]
             topic_batch_count = len(self.semantic_request_plan)
+            fragment_bounds_materialized = (
+                runtime_fragment_keys == planner_fragment_keys
+                and len(set(runtime_fragment_keys)) == len(runtime_fragment_keys)
+                and len(set(planner_fragment_keys)) == len(planner_fragment_keys)
+                and len(cross_group_item_output_bounds) == cross_group_runtime_fragment_count
+                and all(value > 0 for value in cross_group_item_output_bounds)
+            )
+            cross_group_fragment_bounds_status = (
+                "materialized_upper_bound"
+                if fragment_bounds_materialized
+                else "incomplete_upper_bound"
+            )
+            self.stability_preflight.update(
+                {
+                    "semantic_cross_group_runtime_fragment_count": cross_group_runtime_fragment_count,
+                    "semantic_cross_group_planner_item_count": cross_group_planner_item_count,
+                    "semantic_cross_group_fragment_bounds_status": cross_group_fragment_bounds_status,
+                }
+            )
+            if topic_batch_count and not fragment_bounds_materialized:
+                raise OutlineV3ExecutionError(
+                    "BLOCKED_BUDGET: cross-group reducer input bounds are missing "
+                    "runtime fragment metadata or interpretation source context"
+                )
             cross_request = {
                 "task": "substantive_cross_group_comparison",
                 "node_id": "cross_group_comparison",
@@ -5827,10 +5954,7 @@ class OutlineV3Executor:
                 cross_budget.get("estimated_input_tokens")
                 or semantic_route.profile.estimate_tokens(cross_shell_request)
             )
-            cross_item_tokens = max(
-                topic_batch_output_bounds,
-                default=semantic_output,
-            )
+            cross_item_tokens = max(cross_group_item_output_bounds, default=semantic_output)
             global_request = {
                 "task": "substantive_global_synthesis",
                 "node_id": "global_synthesis",
@@ -5967,7 +6091,7 @@ class OutlineV3Executor:
                     # fixed input context, not additional upstream result
                     # items; the shell request above accounts for their full
                     # serialized token cost.
-                    item_count=max(1, topic_batch_count),
+                    item_count=max(1, cross_group_runtime_item_count),
                     item_output_tokens=cross_item_tokens,
                     wrapper_tokens=cross_wrapper_tokens,
                 )
@@ -6280,6 +6404,12 @@ class OutlineV3Executor:
             and critique_extra_attempt_upper is not None
             else None
         )
+        semantic_request_upper_bound_status = (
+            "materialized_upper_bound"
+            if cross_group_fragment_bounds_status == "materialized_upper_bound"
+            and estimated_provider_physical_attempts_upper_bound is not None
+            else "incomplete_upper_bound"
+        )
         variants = self._stability_variant_plan()
         self.stability_preflight = {
             "artifact_type": "outline_provider_call_plan",
@@ -6323,6 +6453,10 @@ class OutlineV3Executor:
             "semantic_transport_retry_reserve": semantic_retry_reserve,
             "semantic_attempt_reserve_status": semantic_attempt_reserve_status,
             "semantic_request_plan": list(self.semantic_request_plan),
+            "semantic_cross_group_runtime_fragment_count": cross_group_runtime_fragment_count,
+            "semantic_cross_group_planner_item_count": cross_group_planner_item_count,
+            "semantic_cross_group_fragment_bounds_status": cross_group_fragment_bounds_status,
+            "semantic_request_upper_bound_status": semantic_request_upper_bound_status,
             "semantic_output_token_limit": semantic_output_token_limit,
             "semantic_input_plan_kind": (
                 "exact_topic_requests_plus_cross_global_output_upper_bounds"

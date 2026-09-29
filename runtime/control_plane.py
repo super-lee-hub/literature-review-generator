@@ -137,6 +137,12 @@ def _provider_free_shadow_capacity_comparisons(
                 "known_topic_call_lower_bound": topic_call_lower_bound,
                 "logical_call_upper_bound": logical_call_upper_bound,
                 "physical_attempt_upper_bound": physical_attempt_upper_bound,
+                "upper_bound_completeness_status": (
+                    "materialized_upper_bound"
+                    if logical_call_upper_bound is not None
+                    and physical_attempt_upper_bound is not None
+                    else "incomplete_upper_bound"
+                ),
                 "status": status,
                 "planning_only": True,
                 "comparison_scope": "outline_v3_provider_call_plan",
@@ -1681,6 +1687,18 @@ class ReviewControlPlane:
                             "estimated_provider_physical_attempts_upper_bound": executor.stability_preflight.get(
                                 "estimated_provider_physical_attempts_upper_bound"
                             ),
+                            "semantic_cross_group_runtime_fragment_count": executor.stability_preflight.get(
+                                "semantic_cross_group_runtime_fragment_count"
+                            ),
+                            "semantic_cross_group_planner_item_count": executor.stability_preflight.get(
+                                "semantic_cross_group_planner_item_count"
+                            ),
+                            "semantic_cross_group_fragment_bounds_status": executor.stability_preflight.get(
+                                "semantic_cross_group_fragment_bounds_status"
+                            ),
+                            "semantic_request_upper_bound_status": executor.stability_preflight.get(
+                                "semantic_request_upper_bound_status"
+                            ),
                             "hierarchical_relation_shard_calls": executor.stability_preflight.get(
                                 "hierarchical_relation_shard_calls"
                             ),
@@ -1773,15 +1791,21 @@ class ReviewControlPlane:
                 "topic_synthesis_provider:batch:"
             )
         ]
+        shadow_upper_bound_materialized = (
+            semantic_route_preflight_summary.get("semantic_request_upper_bound_status")
+            == "materialized_upper_bound"
+        )
         provider_free_shadow_capacity_comparison = _provider_free_shadow_capacity_comparisons(
             topic_call_lower_bound=len(topic_request_rows),
-            logical_call_upper_bound=semantic_route_preflight_summary.get(
-                "estimated_provider_calls"
+            logical_call_upper_bound=(
+                semantic_route_preflight_summary.get("estimated_provider_calls")
+                if shadow_upper_bound_materialized else None
             ),
             physical_attempt_upper_bound=(
                 semantic_route_preflight_summary.get(
                     "estimated_provider_physical_attempts_upper_bound"
                 )
+                if shadow_upper_bound_materialized else None
             ),
             actual_runtime_call_limit=effective_call_limit,
             actual_preflight_status=semantic_preflight_status,
@@ -1991,6 +2015,26 @@ class ReviewControlPlane:
             ),
             "semantic_request_physical_attempts_upper_bound": (
                 semantic_route_preflight_summary.get("semantic_physical_attempts_upper_bound")
+            ),
+            "semantic_cross_group_runtime_fragment_count": (
+                semantic_route_preflight_summary.get(
+                    "semantic_cross_group_runtime_fragment_count"
+                )
+            ),
+            "semantic_cross_group_planner_item_count": (
+                semantic_route_preflight_summary.get(
+                    "semantic_cross_group_planner_item_count"
+                )
+            ),
+            "semantic_cross_group_fragment_bounds_status": (
+                semantic_route_preflight_summary.get(
+                    "semantic_cross_group_fragment_bounds_status"
+                ) or "incomplete_upper_bound"
+            ),
+            "semantic_request_upper_bound_status": (
+                semantic_route_preflight_summary.get(
+                    "semantic_request_upper_bound_status"
+                ) or "incomplete_upper_bound"
             ),
             "semantic_request_input_tokens_all_attempts_upper_bound": (
                 semantic_route_preflight_summary.get("semantic_input_tokens_all_attempts_upper_bound")

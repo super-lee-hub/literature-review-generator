@@ -101,6 +101,10 @@ def test_provider_free_capacity_comparison_keeps_runtime_limit_and_unknowns_expl
     assert [item["status"] for item in comparison[1:]] == [
         "incomplete_upper_bound", "incomplete_upper_bound", "incomplete_upper_bound",
     ]
+    assert all(
+        item["upper_bound_completeness_status"] == "incomplete_upper_bound"
+        for item in comparison[1:]
+    )
     assert all(item["actual_runtime_call_limit"] == 24 for item in comparison)
     assert all(item["provider_admission_authorized"] is False for item in comparison)
     assert all(item["provider_posts_emitted"] == 0 for item in comparison)
@@ -123,6 +127,10 @@ def test_provider_free_capacity_comparison_labels_64_call_scenario_as_shadow_onl
     ]
     assert all(item["actual_runtime_call_limit"] == 24 for item in comparison)
     assert all(item["provider_admission_authorized"] is False for item in comparison)
+    assert all(
+        item["upper_bound_completeness_status"] == "materialized_upper_bound"
+        for item in comparison
+    )
 
 
 def test_chunk_plan_uses_distinct_outline_role_routes_without_transport(tmp_path: Path) -> None:
@@ -215,6 +223,19 @@ def test_chunk_plan_uses_distinct_outline_role_routes_without_transport(tmp_path
     assert result["semantic_request_physical_attempts_upper_bound"] == (
         preflight["semantic_physical_attempts_upper_bound"]
     )
+    topic_rows = [
+        row
+        for row in result["semantic_request_plan"]
+        if str(row.get("node_id") or "").startswith("topic_synthesis_provider:batch:")
+    ]
+    runtime_fragment_count = sum(len(row.get("topic_fragments") or ()) for row in topic_rows)
+    planner_item_count = sum(len(row.get("cross_group_fragment_plans") or ()) for row in topic_rows)
+    assert runtime_fragment_count == 5
+    assert result["semantic_cross_group_runtime_fragment_count"] == runtime_fragment_count
+    assert result["semantic_cross_group_planner_item_count"] == planner_item_count
+    assert planner_item_count == runtime_fragment_count
+    assert result["semantic_cross_group_fragment_bounds_status"] == "materialized_upper_bound"
+    assert result["semantic_request_upper_bound_status"] == "materialized_upper_bound"
     assert result["semantic_request_input_tokens_all_attempts_upper_bound"] == (
         preflight["semantic_input_tokens_all_attempts_upper_bound"]
     )
