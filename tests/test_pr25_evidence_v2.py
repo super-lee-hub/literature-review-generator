@@ -383,4 +383,3 @@ def test_actual_r1_raw_summary_pdf_authority_reaches_current_evidence_builder(ro
     assert not any(dependency.study_id for dependency in dependencies)
     assert any(dependency.scope == "unresolved" for dependency in dependencies)
     assert len(summaries_sha256) == 64
-
