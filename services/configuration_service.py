@@ -168,7 +168,7 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
         },
         "Outline_API": {
             "api_key": "loaded_from_.env_file",
-            "model": "claude-opus-5",
+            "model": "claude-opus-5-5",
             "api_base": "https://chat.178266.xyz",
             "proxy_mode": "environment",
             "endpoint_type": "anthropic",
@@ -181,7 +181,7 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
             #
             # force_highest_reasoning must stay false here. Left true, it
             # overrides the reasoning_effort above and silently requests the
-            # model's top level -- "max" for Opus 5 -- so the shipped default
+            # model's top level -- "max" for Opus 5.5 -- so the shipped default
             # would read "high" while paying for, and being truncated by, "max".
             # An operator who wants max sets it explicitly and raises
             # max_output_tokens with it.

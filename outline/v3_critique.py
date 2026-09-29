@@ -619,7 +619,14 @@ def _parse_candidate_shards(
     seen_issue_ids: set[str],
 ) -> tuple[set[str], bool, bool]:
     if raw_shards is None:
-        return set(), False, False
+        _append_synthetic_issue(
+            issues,
+            seen_issue_ids,
+            source_critic=critic_id,
+            locator="candidate_shard_results:null",
+            message="trusted candidate_shard_results cannot be null",
+        )
+        return set(), True, False
     if isinstance(raw_shards, Mapping):
         rows = list(raw_shards.items())
     elif isinstance(raw_shards, Sequence) and not isinstance(raw_shards, (str, bytes)):
@@ -738,6 +745,21 @@ def _parse_candidate_shards(
                 message="candidate shard reviewed_section_ids are missing or outside its candidate",
             )
         else:
+            overlapping_sections = sorted(
+                covered_sections[candidate_id].intersection(reviewed_sections)
+            )
+            if overlapping_sections:
+                malformed = True
+                _append_synthetic_issue(
+                    issues,
+                    seen_issue_ids,
+                    source_critic=critic_id,
+                    locator=f"{locator}:section_overlap",
+                    message=(
+                        "candidate shard results assign sections to more than one shard: "
+                        + ", ".join(overlapping_sections)
+                    ),
+                )
             covered_sections[candidate_id].update(reviewed_sections)
 
         row_parent_hash = raw_row.get("parent_candidate_hash")

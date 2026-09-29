@@ -37,7 +37,7 @@ Concept Mode is currently disabled. A stale request fails validation at the
 current boundary and is not converted into a provider call.
 
 Outline v3 routes candidate generation and arbitration to the configured Claude
-Opus 5 route, structure/evidence critique to the configured GPT-5.6-sol
+Opus 5.5 route, structure/evidence critique to the configured GPT-5.6-sol
 Responses route, and relation/coverage critique to the configured DeepSeek V4
 Pro route. A third-party gateway host is recorded as transport identity and is
 not treated as proof of official upstream access.

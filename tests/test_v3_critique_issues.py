@@ -290,6 +290,48 @@ def test_candidate_shard_typed_issue_must_match_trusted_local_candidate() -> Non
     assert result["eligible_candidate_ids"] == []
 
 
+def test_trusted_candidate_shard_results_null_is_a_global_blocker() -> None:
+    result = _derive(
+        {
+            "coverage_critique": {
+                "passed": True,
+                "candidate_shard_results": None,
+            }
+        },
+        trusted_shard_critic_ids=("coverage_critique",),
+    )
+
+    assert result["global_blocker"] is True
+    assert result["blocked_candidate_ids"] == ["candidate_1", "candidate_10"]
+    assert result["eligible_candidate_ids"] == []
+    assert any("cannot be null" in issue["message"] for issue in result["issues"])
+
+
+def test_trusted_candidate_shards_cannot_claim_the_same_section_twice() -> None:
+    rows = {
+        "candidate_1:shard:1": _shard_row("candidate_1", passed=True, shard_index=1),
+        "candidate_1:shard:2": _shard_row("candidate_1", passed=True, shard_index=2),
+        "candidate_10:shard:1": _shard_row("candidate_10", passed=True, shard_index=1),
+    }
+    result = _derive(
+        {
+            "coverage_critique": {
+                "passed": True,
+                "candidate_shard_results": rows,
+            }
+        },
+        trusted_shard_critic_ids=("coverage_critique",),
+    )
+
+    assert result["global_blocker"] is True
+    assert result["blocked_candidate_ids"] == ["candidate_1", "candidate_10"]
+    assert result["eligible_candidate_ids"] == []
+    assert any(
+        "assign sections to more than one shard" in issue["message"]
+        for issue in result["issues"]
+    )
+
+
 def test_candidate_shard_collision_or_missing_candidate_coverage_is_global() -> None:
     duplicate_row = _shard_row("candidate_1", passed=True, shard_index=1)
     collision = _derive({

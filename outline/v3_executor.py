@@ -3946,44 +3946,376 @@ class OutlineV3Executor:
                     }))
                     continue
                 for row in matching:
-                    direction = str(
-                        row.get("effect_direction") or row.get("direction") or ""
-                    ).strip().casefold()
-                    claim_kind = str(row.get("claim_kind") or "").strip().casefold()
-                    source_claim_ids = sorted(
-                        str(item) for item in row.get("source_claim_ids") or () if str(item)
-                    )
-                    evidence_ids = sorted(
-                        str(item) for item in row.get("evidence_ids") or () if str(item)
-                    )
-                    typed_semantics = bool(
-                        row.get("paper_key") and source_claim_ids and evidence_ids
-                        and direction and claim_kind
+                    identity, typed_semantics = OutlineV3Executor._stability_typed_claim_identity(
+                        row, section
                     )
                     if not typed_semantics:
                         untyped_claim_count += 1
                     fact_hashes.append(hash_json({
                         "claim_text_when_untyped": "" if typed_semantics else claim,
-                        "paper_key": str(row.get("paper_key") or ""),
-                        "study_id": str(row.get("study_id") or ""),
-                        "source_claim_ids": source_claim_ids,
-                        "evidence_ids": evidence_ids,
-                        "source_field_ids": sorted(
-                            str(item) for item in row.get("source_field_ids") or () if str(item)
-                        ),
-                        "condition_ids": sorted(
-                            str(item) for item in (
-                                row.get("condition_ids") or row.get("dependency_ids") or ()
-                            ) if str(item)
-                        ),
-                        "direction": direction,
-                        "claim_kind": claim_kind,
-                        "paper_keys": paper_keys,
-                        "relation_ids": relation_ids,
+                        **identity,
                     }))
         return {
             "fact_hashes": sorted(fact_hashes),
             "untyped_claim_count": untyped_claim_count,
+        }
+
+    @staticmethod
+    def _stability_typed_claim_identity(
+        row: Mapping[str, Any],
+        section: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        """Return the typed evidence identity used for stability comparisons."""
+
+        direction = str(row.get("effect_direction") or row.get("direction") or "").strip().casefold()
+        claim_kind = str(row.get("claim_kind") or "").strip().casefold()
+        source_claim_ids = sorted(
+            str(item) for item in row.get("source_claim_ids") or () if str(item)
+        )
+        evidence_ids = sorted(
+            str(item) for item in row.get("evidence_ids") or () if str(item)
+        )
+        identity = {
+            "paper_key": str(row.get("paper_key") or ""),
+            "study_id": str(row.get("study_id") or ""),
+            "source_claim_ids": source_claim_ids,
+            "evidence_ids": evidence_ids,
+            "source_field_ids": sorted(
+                str(item) for item in row.get("source_field_ids") or () if str(item)
+            ),
+            "condition_ids": sorted(
+                str(item) for item in (
+                    row.get("condition_ids") or row.get("dependency_ids") or ()
+                ) if str(item)
+            ),
+            "direction": direction,
+            "claim_kind": claim_kind,
+            "paper_keys": sorted(
+                str(item) for item in section.get("paper_keys") or () if str(item)
+            ),
+            "relation_ids": sorted(
+                str(item) for item in section.get("relation_ids") or () if str(item)
+            ),
+        }
+        typed = bool(
+            identity["paper_key"]
+            and source_claim_ids
+            and evidence_ids
+            and direction
+            and claim_kind
+        )
+        return identity, typed
+
+    @staticmethod
+    def _stability_claim_text_key(value: str) -> str:
+        """Ignore sentence punctuation without erasing numeric meaning."""
+
+        normalized = unicodedata.normalize("NFC", str(value).strip()).casefold()
+        characters = list(normalized)
+        previous_nonspace = [""] * len(characters)
+        next_nonspace = [""] * len(characters)
+        neighbor = ""
+        for index, character in enumerate(characters):
+            previous_nonspace[index] = neighbor
+            if not character.isspace():
+                neighbor = character
+        neighbor = ""
+        for index in range(len(characters) - 1, -1, -1):
+            next_nonspace[index] = neighbor
+            if not characters[index].isspace():
+                neighbor = characters[index]
+        key: list[str] = []
+        for index, character in enumerate(characters):
+            if character.isspace():
+                if key and key[-1] != " ":
+                    key.append(" ")
+                continue
+            if not unicodedata.category(character).startswith("P"):
+                key.append(character)
+                continue
+            previous = previous_nonspace[index]
+            following = next_nonspace[index]
+            numeric_separator = previous.isdigit() and following.isdigit()
+            signed_number = character in {"+", "-"} and following.isdigit()
+            percent_marker = character in {"%", "‰"} and previous.isdigit()
+            decimal_leading_zero = character == "." and following.isdigit() and (
+                not previous or previous in "<>≤≥=~"
+            )
+            if numeric_separator or signed_number or percent_marker or decimal_leading_zero:
+                key.append(character)
+            elif key and key[-1] != " ":
+                # Treat ordinary punctuation as a word boundary instead of
+                # deleting it, so punctuation cannot join distinct tokens.
+                key.append(" ")
+        return " ".join("".join(key).split())
+
+    @classmethod
+    def _stability_claim_review_material(
+        cls,
+        baseline_sections: Sequence[Mapping[str, Any]],
+        variant_sections: Sequence[Mapping[str, Any]],
+        *,
+        candidate_id: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Build bounded references for typed claims whose wording materially changed.
+
+        Claim prose is intentionally not part of the typed fact hash because
+        ordinary paraphrases must remain comparable. Materially changed prose
+        is sent to the already-planned evidence critic with its exact typed
+        provenance, avoiding a new provider call.
+        """
+
+        def collect(
+            sections: Sequence[Mapping[str, Any]],
+        ) -> dict[str, dict[str, Any]]:
+            facts: dict[str, dict[str, Any]] = {}
+            for section_index, section in enumerate(sections):
+                section_id = str(section.get("section_id") or "")
+                stable_section_id = re.sub(
+                    r"^candidate_[^_]+_",
+                    "candidate_",
+                    section_id,
+                    flags=re.IGNORECASE,
+                )
+                claims = [
+                    unicodedata.normalize("NFC", str(item).strip())
+                    for item in section.get("claims") or ()
+                    if str(item).strip()
+                ]
+                support_rows = [
+                    row for row in section.get("claim_support") or ()
+                    if isinstance(row, Mapping)
+                ]
+                for claim_index, claim in enumerate(claims):
+                    matching = [
+                        row for row in support_rows
+                        if str(row.get("claim") or "").strip() == claim
+                    ]
+                    if not matching:
+                        continue
+                    identities: list[dict[str, Any]] = []
+                    for row in matching:
+                        identity, typed = cls._stability_typed_claim_identity(row, section)
+                        if not typed:
+                            identities = []
+                            break
+                        identities.append(identity)
+                    # Untyped claims keep their exact text in the existing
+                    # fact hash and therefore already fail closed on drift.
+                    if not identities:
+                        continue
+                    support_identity = {
+                        "section_id": stable_section_id,
+                        "section_index": section_index,
+                        "support_rows": sorted(identities, key=hash_json),
+                    }
+                    fact_id = hash_json(support_identity)[:24]
+                    record = facts.setdefault(
+                        fact_id,
+                        {"fact_id": fact_id, "support": support_identity, "claims": {}},
+                    )
+                    text_key = cls._stability_claim_text_key(claim)
+                    if text_key:
+                        record["claims"].setdefault(text_key, []).append({
+                            "claim": claim,
+                            "section_id": section_id,
+                            "claim_index": claim_index,
+                        })
+            return facts
+
+        baseline_facts = collect(baseline_sections)
+        variant_facts = collect(variant_sections)
+        catalog: list[dict[str, Any]] = []
+        comparisons: list[dict[str, Any]] = []
+        for fact_id in sorted(set(baseline_facts) & set(variant_facts)):
+            baseline_fact = baseline_facts[fact_id]
+            variant_fact = variant_facts[fact_id]
+            baseline_claims = baseline_fact["claims"]
+            variant_claims = variant_fact["claims"]
+            if set(baseline_claims) == set(variant_claims):
+                continue
+            catalog.append({
+                "fact_id": fact_id,
+                "support": baseline_fact["support"],
+                "claims": [
+                    {
+                        "claim": row["claim"],
+                        "section_id": row["section_id"],
+                        "claim_index": row["claim_index"],
+                    }
+                    for key in sorted(baseline_claims)
+                    for row in sorted(
+                        baseline_claims[key],
+                        key=lambda item: (item["section_id"], item["claim_index"]),
+                    )
+                ],
+            })
+            pair_id = hash_json({
+                "candidate_id": candidate_id,
+                "fact_id": fact_id,
+                "baseline_text_keys": sorted(baseline_claims),
+                "variant_text_keys": sorted(variant_claims),
+            })[:24]
+            comparisons.append({
+                "pair_id": pair_id,
+                "fact_id": fact_id,
+                "variant_claim_refs": [
+                    {
+                        "section_id": row["section_id"],
+                        "claim_index": row["claim_index"],
+                    }
+                    for key in sorted(variant_claims)
+                    for row in sorted(
+                        variant_claims[key],
+                        key=lambda item: (item["section_id"], item["claim_index"]),
+                    )
+                ],
+                "evidence_refs": sorted({
+                    str(evidence_id)
+                    for identity in baseline_fact["support"]["support_rows"]
+                    for evidence_id in identity["evidence_ids"]
+                    if str(evidence_id)
+                }),
+            })
+        return catalog, comparisons
+
+    @staticmethod
+    def _enforce_stability_claim_reviews(
+        critique: dict[str, Any],
+        *,
+        comparisons: Mapping[str, Sequence[Mapping[str, Any]]],
+        candidate_hashes: Mapping[str, str],
+    ) -> dict[str, Any]:
+        """Turn missing, malformed, or non-equivalent pair reviews into blockers."""
+
+        expected_by_pair = {
+            str(pair.get("pair_id") or ""): (candidate_id, pair)
+            for candidate_id, pairs in comparisons.items()
+            for pair in pairs
+            if str(pair.get("pair_id") or "")
+        }
+        if not expected_by_pair:
+            return {"status": "not_required", "pair_count": 0, "decisions": {}}
+
+        raw_reviews = critique.get("stability_claim_reviews")
+        rows = (
+            list(raw_reviews)
+            if isinstance(raw_reviews, Sequence) and not isinstance(raw_reviews, (str, bytes))
+            else []
+        )
+        if "stability_claim_reviews" not in critique:
+            rows = [
+                row
+                for shard in (critique.get("candidate_shard_results") or {}).values()
+                if isinstance(shard, Mapping)
+                for row in shard.get("stability_claim_reviews") or ()
+                if isinstance(row, Mapping)
+            ] if isinstance(critique.get("candidate_shard_results"), Mapping) else []
+
+        reviews_by_pair: dict[str, list[Mapping[str, Any]]] = {}
+        unknown_candidates: set[str] = set()
+        for row in rows:
+            if not isinstance(row, Mapping):
+                unknown_candidates.update(comparisons)
+                continue
+            pair_id = str(row.get("pair_id") or "")
+            candidate_id = str(row.get("candidate_id") or "")
+            if pair_id not in expected_by_pair:
+                if candidate_id in candidate_hashes:
+                    unknown_candidates.add(candidate_id)
+                else:
+                    unknown_candidates.update(comparisons)
+                continue
+            expected_candidate, _pair = expected_by_pair[pair_id]
+            if candidate_id != expected_candidate:
+                unknown_candidates.add(expected_candidate)
+                continue
+            reviews_by_pair.setdefault(pair_id, []).append(row)
+
+        issue_rows = critique.get("issues")
+        if "issues" in critique and (
+            not isinstance(issue_rows, Sequence)
+            or isinstance(issue_rows, (str, bytes))
+        ):
+            # Preserve malformed provider data for the shared disposition
+            # parser, which emits a global fail-closed blocker for it.
+            critique["passed"] = False
+            return {
+                "status": "malformed_critique_issues",
+                "pair_count": len(expected_by_pair),
+                "decisions": {},
+                "blocked_candidate_ids": sorted(set(comparisons)),
+            }
+        issues = list(issue_rows) if isinstance(issue_rows, Sequence) else []
+        decisions: dict[str, str] = {}
+        blocked_candidates = set(unknown_candidates)
+        for pair_id, (candidate_id, pair) in expected_by_pair.items():
+            matches = reviews_by_pair.get(pair_id, [])
+            reason = ""
+            if len(matches) != 1:
+                reason = "missing or duplicate pair review"
+            else:
+                review = matches[0]
+                decision = str(review.get("decision") or "").casefold()
+                if decision in {"equivalent", "material_change", "uncertain"}:
+                    decisions[pair_id] = decision
+                evidence_refs = review.get("evidence_refs")
+                valid_refs = (
+                    isinstance(evidence_refs, Sequence)
+                    and not isinstance(evidence_refs, (str, bytes))
+                    and bool(evidence_refs)
+                    and all(isinstance(item, str) and item for item in evidence_refs)
+                    and len(evidence_refs) == len(set(evidence_refs))
+                    and set(evidence_refs).issubset(set(pair.get("evidence_refs") or ()))
+                )
+                if decision != "equivalent":
+                    reason = "review did not establish equivalent meaning"
+                elif not valid_refs:
+                    reason = "equivalence review lacks in-scope evidence references"
+                elif not str(review.get("rationale") or "").strip():
+                    reason = "equivalence review lacks a rationale"
+            if reason:
+                blocked_candidates.add(candidate_id)
+                issues.append({
+                    "issue_id": f"stability-claim-review:{pair_id}",
+                    "scope": "candidate",
+                    "target_ids": [candidate_id],
+                    "severity": "blocking",
+                    "evidence_refs": list(pair.get("evidence_refs") or ()),
+                    "resolution_status": "unresolved",
+                    "parent_candidate_hash": str(candidate_hashes.get(candidate_id) or ""),
+                    "candidate_id": candidate_id,
+                    "source": "typed",
+                    "message": reason,
+                })
+        for candidate_id in sorted(unknown_candidates):
+            pair_id = hash_json({"unknown_stability_claim_review": candidate_id})[:24]
+            issues.append({
+                "issue_id": f"stability-claim-review:{pair_id}",
+                "scope": "candidate",
+                "target_ids": [candidate_id],
+                "severity": "blocking",
+                "evidence_refs": [],
+                "resolution_status": "unresolved",
+                "parent_candidate_hash": str(candidate_hashes.get(candidate_id) or ""),
+                "candidate_id": candidate_id,
+                "source": "typed",
+                "message": "unexpected stability claim review identity",
+            })
+        critique["issues"] = issues
+        candidate_statuses = {
+            str(candidate_id): (
+                "blocked" if str(candidate_id) in blocked_candidates else "equivalent"
+            )
+            for candidate_id, pairs in comparisons.items()
+            if pairs
+        }
+        return {
+            "status": "candidate_blocks" if blocked_candidates else "equivalent",
+            "pair_count": len(expected_by_pair),
+            "decisions": decisions,
+            "blocked_candidate_ids": sorted(blocked_candidates),
+            "candidate_statuses": candidate_statuses,
         }
 
     def _canonical_stability_relation_scope(self) -> dict[str, Any]:
@@ -4012,11 +4344,19 @@ class OutlineV3Executor:
         bundles = {item.relation_id: item for item in plan.relation_bundles}
         if not set(selected_ids).issubset(bundles):
             raise OutlineV3ExecutionError("canonical relation selection lacks a source-bearing bundle")
+        selected_candidate_rows = sorted(
+            (
+                self._relation_scope_value(item.to_dict())
+                for item in candidates.relations
+                if item.relation_id in set(selected_ids)
+            ),
+            key=hash_json,
+        )
         scope = {
-            "schema_version": "same-task-selected-relations/v1",
+            "schema_version": "same-task-selected-relations/v2",
             "selected_relation_ids": selected_ids,
             "source_summary_hashes": sorted(evidence.source_summary_hashes),
-            "relation_candidate_map_hash": candidates.content_hash,
+            "selected_relation_candidates_hash": hash_json(selected_candidate_rows),
             "content_layers_hash": layers.content_hash,
             "semantic_chunk_plan_hash": plan.content_hash,
             "selected_bundle_hashes": {
@@ -4053,6 +4393,20 @@ class OutlineV3Executor:
         if not selected.issubset(available):
             raise OutlineV3ExecutionError(
                 "stability variant is missing a frozen selected relation ID"
+            )
+        selected_candidate_rows = sorted(
+            (
+                self._relation_scope_value(dict(item))
+                for item in relation_candidates
+                if str(item.get("relation_id") or "") in selected
+            ),
+            key=hash_json,
+        )
+        if hash_json(selected_candidate_rows) != scope[
+            "selected_relation_candidates_hash"
+        ]:
+            raise OutlineV3ExecutionError(
+                "stability variant changed selected relation candidate content"
             )
         bundles = {item.relation_id: item for item in semantic_plan.relation_bundles}
         if not selected.issubset(bundles):
@@ -4101,9 +4455,17 @@ class OutlineV3Executor:
             raise OutlineV3ExecutionError(
                 "stability relation request differs from the frozen selected scope"
             )
+        selected_candidate_rows = sorted(
+            (
+                self._relation_scope_value(dict(item))
+                for item in selected
+            ),
+            key=hash_json,
+        )
         scope_hash = str((relation_scope or {}).get("scope_hash") or "") or hash_json({
-            "schema_version": "same-task-selected-relations/v1",
+            "schema_version": "same-task-selected-relations/v2",
             "selected_relation_ids": selected_ids,
+            "selected_relation_candidates_hash": hash_json(selected_candidate_rows),
             "semantic_chunk_plan_hash": semantic_plan.content_hash,
         })
         request["stability_variant"] = {
@@ -4111,7 +4473,7 @@ class OutlineV3Executor:
             "shard_size": shard_size,
             "shard_order": shard_order,
             "source_view_hashes": [str(view.view_hash) for view in evidence_views],
-            "scope_schema_version": "same-task-selected-relations/v1",
+            "scope_schema_version": "same-task-selected-relations/v2",
             "selected_relation_ids": selected_ids,
             "scope_hash": scope_hash,
         }
@@ -4630,6 +4992,20 @@ class OutlineV3Executor:
                     critic_input_upper_bound = candidate_output_upper_bound
                 elif node_id == "arbitration":
                     critic_input_upper_bound = candidate_output_upper_bound + 3 * estimated_output
+                stability_claim_review_reserve = 0
+                if (
+                    node_id == "evidence_critique"
+                    and variant_name not in {"baseline", "canonical"}
+                    and self.stability_mode != "off"
+                ):
+                    # The existing variant evidence-critique call also
+                    # compares changed typed claims with the primary output.
+                    # Reserve one bounded primary candidate for that catalog;
+                    # no additional provider call is introduced.
+                    stability_claim_review_reserve = candidate_output_cap
+                    critic_input_upper_bound += stability_claim_review_reserve
+                    if candidate_shard_multiplier > 1:
+                        estimated_input = critic_input_upper_bound + 8_192
                 if critic_input_upper_bound and not (
                     node_id in {"structure_critique", "coverage_critique", "evidence_critique", "arbitration"}
                     and candidate_shard_multiplier > 1
@@ -4676,6 +5052,10 @@ class OutlineV3Executor:
                 if critic_input_upper_bound:
                     assumptions.append(
                         "critic/arbitration input upper bound includes candidate outputs at configured max_output_tokens"
+                    )
+                if stability_claim_review_reserve:
+                    assumptions.append(
+                        "variant evidence-critique input reserves one primary candidate output for claim-equivalence review"
                     )
                     if node_id == "arbitration":
                         assumptions.append(
@@ -8019,6 +8399,31 @@ class OutlineV3Executor:
                         candidate_id: [dict(section) for section in local_request["section_evidence"].get(candidate_id) or ()
                                        if isinstance(section, Mapping) and str(section.get("section_id") or "") in section_ids]
                     }
+                if isinstance(local_request.get("stability_claim_comparisons"), Mapping):
+                    candidate_pairs = [
+                        dict(pair)
+                        for pair in local_request["stability_claim_comparisons"].get(candidate_id) or ()
+                        if isinstance(pair, Mapping)
+                        and any(
+                            str(reference.get("section_id") or "") in section_ids
+                            for reference in pair.get("variant_claim_refs") or ()
+                            if isinstance(reference, Mapping)
+                        )
+                    ]
+                    local_request["stability_claim_comparisons"] = {
+                        candidate_id: candidate_pairs
+                    }
+                    pair_fact_ids = {
+                        str(pair.get("fact_id") or "") for pair in candidate_pairs
+                        if str(pair.get("fact_id") or "")
+                    }
+                    if isinstance(local_request.get("stability_primary_claim_catalog"), list):
+                        local_request["stability_primary_claim_catalog"] = [
+                            dict(item)
+                            for item in local_request["stability_primary_claim_catalog"]
+                            if isinstance(item, Mapping)
+                            and str(item.get("fact_id") or "") in pair_fact_ids
+                        ]
                 if isinstance(local_request.get("corpus_ledger"), Mapping):
                     ledger = dict(local_request["corpus_ledger"])
                     entries = []
@@ -8104,6 +8509,12 @@ class OutlineV3Executor:
                 f"{result['candidate_id']}:shard:{result['shard_index']}": result
                 for result in shard_results
             },
+            "stability_claim_reviews": [
+                dict(review)
+                for result in shard_results
+                for review in result.get("stability_claim_reviews") or ()
+                if isinstance(review, Mapping)
+            ],
         }
         return merged
 
@@ -10545,8 +10956,7 @@ class OutlineV3Executor:
             request_base_node in {"structure_critique", "coverage_critique", "evidence_critique"}
             and not isinstance(request.get("output_contract"), Mapping)
         ):
-            request = {**dict(request), "output_contract": {
-                "output_fields": {
+            output_fields = {
                     "node_id": "string; echo the node_id from this request verbatim",
                     "passed": "boolean; true only if every check in the checks list passes",
                     "blocking_diagnostics": (
@@ -10562,8 +10972,29 @@ class OutlineV3Executor:
                     ),
                     "score": "number between 0 and 1 summarizing how many checks passed",
                     "recommendations": "array of strings with concrete repair suggestions",
-                },
-                "must_include": ["node_id", "passed", "issues", "blocking_diagnostics"],
+                }
+            must_include = ["node_id", "passed", "issues", "blocking_diagnostics"]
+            claim_comparisons = request.get("stability_claim_comparisons")
+            if (
+                isinstance(claim_comparisons, Mapping)
+                and any(
+                    isinstance(rows, Sequence)
+                    and not isinstance(rows, (str, bytes))
+                    and bool(rows)
+                    for rows in claim_comparisons.values()
+                )
+            ):
+                output_fields["stability_claim_reviews"] = (
+                    "array with exactly one row for every requested pair_id; each row has candidate_id, pair_id, "
+                    "decision (equivalent, material_change, or uncertain), evidence_refs (non-empty IDs copied "
+                    "from that pair's allowed evidence_refs), and a concise rationale. Return equivalent only "
+                    "when both statements preserve the same factual meaning, direction, population, conditions, "
+                    "and limitations. Missing, duplicate, or extra pair results are invalid."
+                )
+                must_include.append("stability_claim_reviews")
+            request = {**dict(request), "output_contract": {
+                "output_fields": output_fields,
+                "must_include": must_include,
                 "critique_disposition_version": CRITIQUE_DISPOSITION_VERSION,
             }}
         if (
@@ -14801,6 +15232,29 @@ class OutlineV3Executor:
                     candidate_id: hash_json(content)
                     for candidate_id, content in variant_contents.items()
                 }
+                baseline_sections_for_review = [
+                    dict(section)
+                    for section in final.get("sections") or ()
+                    if isinstance(section, Mapping)
+                ]
+                stability_primary_claim_catalog: dict[str, dict[str, Any]] = {}
+                stability_claim_comparisons: dict[str, list[dict[str, Any]]] = {}
+                for candidate_id, content in variant_contents.items():
+                    catalog, pairs = self._stability_claim_review_material(
+                        baseline_sections_for_review,
+                        [
+                            dict(section)
+                            for section in content.get("sections") or ()
+                            if isinstance(section, Mapping)
+                        ],
+                        candidate_id=candidate_id,
+                    )
+                    for item in catalog:
+                        fact_id = str(item.get("fact_id") or "")
+                        if fact_id:
+                            stability_primary_claim_catalog[fact_id] = item
+                    if pairs:
+                        stability_claim_comparisons[candidate_id] = pairs
                 variant_critique_requests = {
                     "structure_critique": {
                         "node_id": "structure_critique",
@@ -14842,6 +15296,29 @@ class OutlineV3Executor:
                         "relation_evidence": [item.to_dict() for item in variant_relation_map.relations],
                     },
                 }
+                if stability_claim_comparisons:
+                    variant_critique_requests["evidence_critique"].update({
+                        "stability_primary_claim_catalog": [
+                            stability_primary_claim_catalog[fact_id]
+                            for fact_id in sorted(stability_primary_claim_catalog)
+                        ],
+                        "stability_claim_comparisons": stability_claim_comparisons,
+                        "stability_claim_review_contract": {
+                            "version": "stability-claim-equivalence/v1",
+                            "purpose": (
+                                "Review materially changed claim wording against the same typed source facts. "
+                                "The baseline catalog provides the primary wording and provenance; each "
+                                "candidate's section claim references identify its variant wording."
+                            ),
+                            "equivalent_only_if": [
+                                "same factual proposition and effect direction",
+                                "same population, study, condition and qualifier scope",
+                                "same limitation and uncertainty strength",
+                            ],
+                            "decisions": ["equivalent", "material_change", "uncertain"],
+                            "fail_closed_on_missing_duplicate_or_extra_pair_id": True,
+                        },
+                    })
                 variant_critiques: dict[str, dict[str, Any]] = {}
                 variant_trusted_shard_ids: set[str] = set()
                 for critique_name, critique_request in variant_critique_requests.items():
@@ -14878,8 +15355,18 @@ class OutlineV3Executor:
                             expect_json=True,
                             input_artifact_hashes=tuple(critique_deps.values()),
                             transport_node_id=critique_name,
+                            output_tokens=min(
+                                int(critique_route.profile.max_output_tokens),
+                                2_048,
+                            ),
                         )
                     variant_critiques[critique_name] = critique
+                claim_review_audit = self._enforce_stability_claim_reviews(
+                    variant_critiques["evidence_critique"],
+                    comparisons=stability_claim_comparisons,
+                    candidate_hashes=variant_generation_hashes,
+                )
+                variant_claim_review_results[variant_name] = claim_review_audit
                 variant_critique_disposition = derive_critique_disposition(
                     variant_critiques,
                     candidate_hashes=variant_generation_hashes,
@@ -14959,6 +15446,10 @@ class OutlineV3Executor:
                         variant_contract.content_hash,
                         *(hash_json(variant_contents[item]) for item in variant_contents),
                     ),
+                    output_tokens=min(
+                        int(self._node_route("arbitration").profile.max_output_tokens),
+                        2_048,
+                    ),
                     transport_node_id="arbitration",
                 )
                 selected_variant_id = str(
@@ -15014,6 +15505,29 @@ class OutlineV3Executor:
                     allowed_relation_ids=[item.relation_id for item in variant_relation_map.relations],
                     alias_map=critique_alias_map,
                 )
+                _final_review_catalog, final_claim_review_pairs = (
+                    self._stability_claim_review_material(
+                        baseline_sections_for_review,
+                        revised_variant_sections,
+                        candidate_id=selected_variant_id,
+                    )
+                )
+                reviewed_equivalent_pair_ids = {
+                    pair_id
+                    for pair_id, decision in claim_review_audit.get("decisions", {}).items()
+                    if decision == "equivalent"
+                }
+                unreviewed_final_pair_ids = sorted({
+                    str(pair.get("pair_id") or "")
+                    for pair in final_claim_review_pairs
+                    if str(pair.get("pair_id") or "")
+                    and str(pair.get("pair_id") or "") not in reviewed_equivalent_pair_ids
+                })
+                if unreviewed_final_pair_ids:
+                    raise OutlineV3ExecutionError(
+                        f"stability {variant_name} changed a factual claim after equivalence review: "
+                        + ",".join(unreviewed_final_pair_ids)
+                    )
                 variant_relations = {item.relation_id: item for item in variant_relation_map.relations}
                 variant_packets: list[dict[str, Any]] = []
                 for section in revised_variant_sections:
@@ -15052,6 +15566,13 @@ class OutlineV3Executor:
                 variant_fact_inventory = self._stability_fact_inventory(
                     revised_variant_sections
                 )
+                selected_claim_review_status = claim_review_audit.get(
+                    "candidate_statuses", {}
+                ).get(selected_variant_id, "not_required")
+                if selected_claim_review_status == "blocked":
+                    raise OutlineV3ExecutionError(
+                        f"stability {variant_name} selected a candidate with unresolved claim equivalence review"
+                    )
                 signature = {
                     "paper_keys": sorted(variant_final["paper_keys"]),
                     "corpus_paper_keys": sorted(variant_contract.corpus_paper_keys),
@@ -15065,6 +15586,14 @@ class OutlineV3Executor:
                     "claims": sorted(claim for packet in variant_packets for claim in packet["claims"]),
                     "semantic_fact_hashes": variant_fact_inventory["fact_hashes"],
                     "untyped_claim_count": variant_fact_inventory["untyped_claim_count"],
+                    "claim_equivalence_review": selected_claim_review_status in {
+                        "equivalent", "not_required"
+                    },
+                    "claim_review_pair_ids": sorted(
+                        str(pair.get("pair_id") or "")
+                        for pair in final_claim_review_pairs
+                        if str(pair.get("pair_id") or "")
+                    ),
                     "revision_record_hashes": sorted(
                         hash_json(item) for item in variant_revision["revision_records"]
                     ),
@@ -15113,6 +15642,8 @@ class OutlineV3Executor:
                 "claims": sorted(str(claim) for packet in packets for claim in packet.get("planned_claims") or () if str(claim).strip()),
                 "semantic_fact_hashes": primary_fact_inventory["fact_hashes"],
                 "untyped_claim_count": primary_fact_inventory["untyped_claim_count"],
+                "claim_equivalence_review": True,
+                "claim_review_pair_ids": [],
                 "revision_record_hashes": sorted(
                     hash_json(item) for item in revision_records
                 ),
@@ -15138,6 +15669,7 @@ class OutlineV3Executor:
             variant_output_hashes: dict[str, str] = {}
             variant_definitions: dict[str, dict[str, Any]] = {}
             variant_errors: dict[str, str] = {}
+            variant_claim_review_results: dict[str, dict[str, Any]] = {}
             rerun_replay_node_ids: dict[str, list[str]] = {}
             projection_signatures: dict[str, dict[str, Any]] = {}
             exact_replay_verification: dict[str, Any] = {
@@ -15232,6 +15764,7 @@ class OutlineV3Executor:
                 "paper_keys", "corpus_paper_keys", "must_use_paper_keys",
                 "relation_ids", "semantic_fact_hashes", "contradictions",
                 "gaps", "methods", "contexts", "unsupported_claims",
+                "claim_equivalence_review",
             )
             organization_fields = (
                 "selected_candidate_id", "section_count", "section_identity",
@@ -15253,6 +15786,9 @@ class OutlineV3Executor:
                     signature.get("claims") == baseline_signature.get("claims")
                 )
                 comparison["semantic_review_required"] = not comparison["semantic_fact_hashes"]
+                comparison["claim_review_pair_count"] = len(
+                    signature.get("claim_review_pair_ids") or ()
+                )
                 # A new model response may phrase an unchanged section title
                 # or goal differently. Text equality remains diagnostic; the
                 # evidence, coverage, relation and claim checks decide whether
@@ -15363,6 +15899,7 @@ class OutlineV3Executor:
                 "replay_evidence": list(self._replay_evidence),
                 "exact_replay_verification": exact_replay_verification,
                 "primary_critique_disposition": critique_disposition,
+                "claim_equivalence_reviews": variant_claim_review_results,
                 "variant_errors": variant_errors,
                 "baseline_final_outline_metrics": baseline_signature,
                 "comparisons": comparisons,

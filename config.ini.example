@@ -74,7 +74,7 @@ omit_temperature_when_reasoning = true
 
 [Outline_API]
 api_key = YOUR_OUTLINE_API_KEY_HERE
-model = claude-opus-5
+model = claude-opus-5-5
 api_base = https://chat.178266.xyz
 proxy_mode = environment
 endpoint_type = anthropic
@@ -83,7 +83,7 @@ anthropic_path = /v1/messages
 anthropic_version = 2023-06-01
 # "high" is the documented default and the level that is actually sent. Leave
 # force_highest_reasoning false: setting it true overrides the line above and
-# silently asks for the model's top level ("max" on Opus 5), which needs a much
+# silently asks for the model's top level ("max" on Opus 5.5), which needs a much
 # larger max_output_tokens than the 16000 below.
 reasoning_effort = high
 force_highest_reasoning = false

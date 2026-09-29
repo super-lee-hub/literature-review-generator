@@ -22,7 +22,7 @@ uses it; `RuntimeJobSpec` is the public durable run specification.
 ## Current contracts
 
 - Outline Intelligence v3 is the only production Outline path.
-- Outline v3 routes candidate generation/arbitration to Claude Opus 5,
+- Outline v3 routes candidate generation/arbitration to Claude Opus 5.5,
   structure/evidence critique to GPT-5.6-sol, and relation/coverage critique to
   DeepSeek V4 Pro according to `[OutlineModels]`; each route has its own
   transport, budget, binding, receipt, and replay identity.

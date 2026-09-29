@@ -68,7 +68,7 @@ pipeline stage。Writer 接收每个有 evidence binding 的已 adoption outline
 带 citation token 的结构化 blocks，bridge 再把这些调用组装为 canonical review draft、
 citation manifest 和 DOCX。
 
-Outline v3 的角色由 `outline/provider_router.py` 解析：Claude Opus 5 负责候选生成与最终
+Outline v3 的角色由 `outline/provider_router.py` 解析：Claude Opus 5.5 负责候选生成与最终
 仲裁，GPT-5.6-sol 负责结构/证据审查，DeepSeek V4 Pro 负责关系/覆盖度审查。配置中的
 gateway host 只是传输身份，不是官方上游连接的证明。
 

@@ -179,7 +179,12 @@ def test_title_only_stability_drift_keeps_adoption_when_facts_are_unchanged(
     assert all(
         value
         for key, value in comparison.items()
-        if key not in {"title_goal_similarity", "stable", "semantic_review_required"}
+        if key not in {
+            "title_goal_similarity",
+            "stable",
+            "semantic_review_required",
+            "claim_review_pair_count",
+        }
     )
 
 
@@ -219,10 +224,12 @@ def test_alias_replay_never_claims_second_executor_verification_without_a_call(
 
 
 def test_primary_and_stability_provider_requests_preserve_semantic_and_coordination_contracts(
-    tmp_path,
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     candidate_requests: list[tuple[str, dict[str, Any]]] = []
     arbitration_requests: list[tuple[str, dict[str, Any]]] = []
+    arbitration_output_caps: list[int | None] = []
+    critique_output_caps: list[tuple[str, str, int | None]] = []
 
     def provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
         concrete_id = str((request.get("_prompt_authority") or {}).get("node_id") or node_id)
@@ -232,11 +239,27 @@ def test_primary_and_stability_provider_requests_preserve_semantic_and_coordinat
             arbitration_requests.append((concrete_id, dict(request)))
         return _configured_test_provider(node_id, request)
 
-    result = _executor(
+    executor = _executor(
         tmp_path,
         provider=provider,
         stability_mode="smoke",
-    ).run()
+    )
+    original_provider_call = executor._provider_call
+
+    def capture_provider_call(
+        node_id: str,
+        request: Mapping[str, Any],
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        if node_id == "arbitration" or kwargs.get("transport_node_id") == "arbitration":
+            arbitration_output_caps.append(kwargs.get("output_tokens"))
+        critique_role = str(kwargs.get("transport_node_id") or node_id).rsplit(":", 1)[-1]
+        if critique_role in {"structure_critique", "coverage_critique", "evidence_critique"}:
+            critique_output_caps.append((node_id, critique_role, kwargs.get("output_tokens")))
+        return original_provider_call(node_id, request, **kwargs)
+
+    monkeypatch.setattr(executor, "_provider_call", capture_provider_call)
+    result = executor.run()
 
     primary_candidates = [
         request for node_id, request in candidate_requests
@@ -258,6 +281,20 @@ def test_primary_and_stability_provider_requests_preserve_semantic_and_coordinat
     assert result.ok is True, result.diagnostics
     assert primary_candidates and variant_candidates
     assert primary_arbitrations and variant_arbitrations
+    expected_output_cap = min(
+        int(executor._node_route("arbitration").profile.max_output_tokens),
+        2_048,
+    )
+    assert len(arbitration_output_caps) == 2
+    assert arbitration_output_caps == [expected_output_cap, expected_output_cap]
+    assert critique_output_caps
+    for node_id, role, cap in critique_output_caps:
+        expected_critique_cap = min(
+            int(executor._node_route(role).profile.max_output_tokens),
+            2_048,
+        )
+        assert cap == expected_critique_cap, (node_id, role, cap, expected_critique_cap)
+    assert any(node_id.startswith("stability:") for node_id, _role, _cap in critique_output_caps)
     primary_candidate = primary_candidates[0]
     variant_candidate = variant_candidates[0]
     assert "shared_semantic_context" in primary_candidate

@@ -71,6 +71,81 @@ def test_changed_selected_bundle_blocks_variant_before_transport(tmp_path) -> No
         )
 
 
+def test_changed_selected_relation_candidate_blocks_variant_before_transport(
+    tmp_path,
+) -> None:
+    executor = _executor(tmp_path)
+    evidence, candidates, plan = _relation_inputs(executor)
+    scope = executor._canonical_stability_relation_scope()
+    selected_id = scope["selected_relation_ids"][0]
+    changed_candidates = [dict(item) for item in candidates]
+    selected_row = next(
+        item for item in changed_candidates
+        if item["relation_id"] == selected_id
+    )
+    selected_row["candidate_scope_probe"] = "changed selected relation content"
+
+    with pytest.raises(
+        OutlineV3ExecutionError,
+        match="changed selected relation candidate content",
+    ):
+        executor._apply_stability_relation_scope(
+            evidence=evidence,
+            relation_candidates=changed_candidates,
+            semantic_plan=plan,
+        )
+
+
+def test_changed_unselected_relation_candidate_does_not_expand_frozen_task(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor = _executor(tmp_path)
+    evidence, candidates, plan = _relation_inputs(executor)
+    scope = executor._canonical_stability_relation_scope()
+    selected_id = str(candidates[0]["relation_id"])
+    selected = {selected_id}
+    selected_row = next(
+        item for item in candidates if item["relation_id"] == selected_id
+    )
+    selected_bundle = next(
+        item for item in plan.relation_bundles
+        if item.relation_id == selected_id
+    )
+    scope["selected_relation_ids"] = [selected_id]
+    scope["selected_relation_candidates_hash"] = executor_module.hash_json([
+        executor._relation_scope_value(dict(selected_row))
+    ])
+    scope["selected_bundle_hashes"] = {
+        selected_id: executor_module.hash_json(
+            executor._relation_scope_value(selected_bundle.to_dict())
+        )
+    }
+    scope.pop("scope_hash", None)
+    scope["scope_hash"] = executor_module.hash_json(scope)
+    monkeypatch.setattr(
+        executor,
+        "_canonical_stability_relation_scope",
+        lambda: scope,
+    )
+    plan = replace(
+        plan,
+        coverage={**dict(plan.coverage), "selected_relation_ids": [selected_id]},
+    )
+    changed_candidates = [dict(item) for item in candidates]
+    unselected_row = next(
+        item for item in changed_candidates
+        if item["relation_id"] not in selected
+    )
+    unselected_row["candidate_scope_probe"] = "changed outside selected task"
+
+    result = executor._apply_stability_relation_scope(
+        evidence=evidence,
+        relation_candidates=changed_candidates,
+        semantic_plan=plan,
+    )
+    assert set(result.coverage["selected_relation_ids"]) == selected
+
+
 def test_explicit_empty_frozen_scope_has_no_relation_provider_transport(
     tmp_path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
