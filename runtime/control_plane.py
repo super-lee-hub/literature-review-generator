@@ -1253,6 +1253,7 @@ class ReviewControlPlane:
         unresolved_study_unit_keys: set[tuple[str, str]] = set()
         multi_study_mapping_unresolved_papers: set[str] = set()
         source_field_ledger_scope_counts: dict[str, int] = {}
+        source_field_ledger_top_level_path_counts: dict[str, int] = {}
         evidence_keys: set[tuple[str, str]] = set()
         source_text_occurrences: list[tuple[str, str]] = []
 
@@ -1307,6 +1308,10 @@ class ReviewControlPlane:
                 scope = str(entry.scope or "unresolved")
                 source_field_ledger_scope_counts[scope] = (
                     source_field_ledger_scope_counts.get(scope, 0) + 1
+                )
+                top_level_path = str(entry.source_path or "").split(".", 1)[0]
+                source_field_ledger_top_level_path_counts[top_level_path] = (
+                    source_field_ledger_top_level_path_counts.get(top_level_path, 0) + 1
                 )
             for field_name in (
                 "overall_context",
@@ -1423,6 +1428,18 @@ class ReviewControlPlane:
             for topic in semantic_plan.topics
         ]
         source_hashes = sorted(set(content_layers.source_summary_hashes))
+        source_field_ledger_total = sum(source_field_ledger_scope_counts.values())
+        audit_metadata_paths = {"stage1_reuse", "status", "source_mode", "provider"}
+        source_field_ledger_audit_metadata_count = sum(
+            source_field_ledger_top_level_path_counts.get(path, 0)
+            for path in audit_metadata_paths
+        )
+        source_field_ledger_bibliographic_count = source_field_ledger_top_level_path_counts.get(
+            "paper_info", 0
+        )
+        source_field_ledger_summary_content_count = source_field_ledger_top_level_path_counts.get(
+            "ai_summary", 0
+        )
         workload_audit = {
             "artifact_type": "r1_request_workload_audit",
             "artifact_version": "v2",
@@ -1446,8 +1463,21 @@ class ReviewControlPlane:
             "explicit_study_source_claim_count": len(study_level_claim_keys),
             "unresolved_scope_source_claim_count": len(unresolved_scope_claim_keys),
             "source_field_ledger_scope_counts": dict(sorted(source_field_ledger_scope_counts.items())),
-            "source_field_ledger_total": sum(source_field_ledger_scope_counts.values()),
+            "source_field_ledger_top_level_path_counts": dict(
+                sorted(source_field_ledger_top_level_path_counts.items())
+            ),
+            "source_field_ledger_total": source_field_ledger_total,
             "unresolved_source_field_count": source_field_ledger_scope_counts.get("unresolved", 0),
+            "source_field_ledger_audit_metadata_count": source_field_ledger_audit_metadata_count,
+            "source_field_ledger_bibliographic_count": source_field_ledger_bibliographic_count,
+            "source_field_ledger_summary_content_count": source_field_ledger_summary_content_count,
+            "source_field_ledger_other_origin_count": max(
+                0,
+                source_field_ledger_total
+                - source_field_ledger_audit_metadata_count
+                - source_field_ledger_bibliographic_count
+                - source_field_ledger_summary_content_count,
+            ),
             "source_claim_count_unique_by_paper": len(claim_keys),
             "source_claim_identity_set_hash": hash_json(sorted(source_claim_identity_hashes)),
             "unbound_source_claim_count": len(unbound_source_claim_identity_hashes),

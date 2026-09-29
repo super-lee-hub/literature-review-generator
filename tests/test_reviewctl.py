@@ -153,6 +153,18 @@ def test_chunk_plan_loads_summary_source_manifest_and_marks_navigation_scope(
     assert workload["source_field_ledger_total"] == sum(
         workload["source_field_ledger_scope_counts"].values()
     )
+    assert workload["source_field_ledger_total"] == sum(
+        workload["source_field_ledger_top_level_path_counts"].values()
+    )
+    assert workload["source_field_ledger_total"] == sum(
+        workload[key]
+        for key in (
+            "source_field_ledger_audit_metadata_count",
+            "source_field_ledger_bibliographic_count",
+            "source_field_ledger_summary_content_count",
+            "source_field_ledger_other_origin_count",
+        )
+    )
     assert workload["unresolved_source_field_count"] == workload[
         "source_field_ledger_scope_counts"
     ].get("unresolved", 0)
