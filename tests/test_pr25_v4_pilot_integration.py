@@ -965,6 +965,11 @@ def test_three_batch_topic_pilot_reserves_nine_attempts_before_first_call(
         acceptance_run_id=acceptance_run_id,
         max_physical_attempts=9,
         max_output_tokens_all_attempts=36_864,
+        selected_topic_batch_ids=[
+            "topic_synthesis_provider:batch:1",
+            "topic_synthesis_provider:batch:2",
+            "topic_synthesis_provider:batch:3",
+        ],
     )
     executor, registry = _executor(
         tmp_path,
@@ -973,7 +978,6 @@ def test_three_batch_topic_pilot_reserves_nine_attempts_before_first_call(
         pilot=pilot,
         summaries=summaries,
         max_source_prompt_tokens=30_000,
-        auto_select_materialized_batches=True,
     )
     assert pilot["selected_topic_batch_ids"] == [
         "topic_synthesis_provider:batch:1",
