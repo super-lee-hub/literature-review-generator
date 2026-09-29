@@ -859,6 +859,38 @@ class ReviewControlPlane:
                 "docx_render", "current_artifact_set", "verified_export",
             ),
         )
+        route_by_stage_role = {
+            (route.stage, route.semantic_role): route for route in route_plan.routes
+        }
+        for exposure in projection.get("unknown_exposures") or ():
+            if not isinstance(exposure, dict) or str(exposure.get("reason") or "") not in {
+                "reachable_route_has_no_request_builder_inventory",
+                "reachable_required_route_is_unresolved",
+            }:
+                continue
+            route = route_by_stage_role.get(
+                (str(exposure.get("stage_name") or ""), str(exposure.get("semantic_role") or ""))
+            )
+            if route is None:
+                continue
+            bounded = unplanned_exposure(
+                stage_name=route.stage,
+                semantic_role=route.semantic_role,
+                route=route,
+                reason=str(exposure.get("reason") or ""),
+                conditional_on=str(exposure.get("conditional_on") or ""),
+            )
+            exposure.update(bounded.to_dict())
+        projection["projection_identity_hash"] = hash_json(
+            {
+                "action": stage_plan.action,
+                "stage_plan": stage_plan.to_dict(),
+                "reachable_route_plan": route_plan.to_dict(),
+                "provider_requests": projection.get("provider_requests") or [],
+                "unknown_exposures": projection.get("unknown_exposures") or [],
+                "aggregate_budget": aggregate_budget.to_dict(),
+            }
+        )
         projection["runtime_spec_hash"] = _canonical_hash(spec.to_dict())
         projection["config_sha256"] = file_sha256(spec.config)
         projection["aggregate_budget_source"] = (

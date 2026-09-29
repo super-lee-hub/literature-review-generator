@@ -84,6 +84,14 @@ def test_reviewctl_plan_projects_all_reachable_provider_work_without_posting(
     assert exposure["reasoning_tokens_per_call_upper_bound"] >= 0
     assert exposure["retry_attempts_per_call_upper_bound"] >= 0
     assert projection["totals"]["estimated_output_tokens_all_attempts"] is None
+    assert all(
+        item["logical_calls_upper_bound"] is None
+        and isinstance(item["input_tokens_per_call_upper_bound"], int)
+        and isinstance(item["output_tokens_per_call_upper_bound"], int)
+        and isinstance(item["reasoning_tokens_per_call_upper_bound"], int)
+        and isinstance(item["retry_attempts_per_call_upper_bound"], int)
+        for item in projection["unknown_exposures"]
+    )
     assert projection["aggregate_budget_source"] == (
         "application_call_cap_projection_without_bound_acceptance_run"
     )
