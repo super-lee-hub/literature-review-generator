@@ -144,7 +144,18 @@
       "hosted_ci_current_sha": "NOT_RUN",
       "docx_visual": "NOT_VERIFIED_NO_FINAL_ADOPTED_R1_DOCX",
       "F1": "UNACCEPTED",
-      "source_recovery": "final local source patch/ZIP will be generated from the current docs commit; no push"
+      "source_recovery": {
+        "status": "PASS_LOCAL_ONLY",
+        "artifact": "PR25_SOURCE_RECOVERY_E6C986D.zip",
+        "base_sha": "c1ad0da869bc68869a521f60bbda07342fb16058",
+        "head_sha": "e6c986dff6846d84a4f3236a94c6221fd9a1b445",
+        "local_commits": 21,
+        "changed_tracked_files": 109,
+        "reverse_check": "PASS",
+        "high_confidence_secret_scan": "0 matches",
+        "pushed": false,
+        "merged": false
+      }
     }
   },
   "V4": {
@@ -317,7 +328,11 @@
   },
   "hosted_ci_current_sha": "NOT_RUN",
   "docx_visual": "NOT_VERIFIED",
-  "source_recovery": "pending final docs commit and companion source ZIP; no push/merge",
+  "source_recovery": {
+    "status": "AVAILABLE_LOCAL_ZIP",
+    "artifact": "PR25_SOURCE_RECOVERY_E6C986D.zip",
+    "no_push_or_merge": true
+  },
   "subagent_ledger": {
     "path": "SUBAGENT_LEDGER_1B156D5.json",
     "status": "PARTIAL_RUNTIME_MODEL_EFFORT_NOT_VERIFIED",
