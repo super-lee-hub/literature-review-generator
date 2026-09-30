@@ -26,9 +26,11 @@ from urllib.parse import urlsplit
 
 from runtime.f1_corpus import F1CorpusManifestError, F1CorpusManifestV1
 from runtime.provider_runtime import (
-    AUTHORIZED_PROVIDER_CALL_LIMIT,
+    DEFAULT_PROVIDER_CALL_BUDGET,
     AcceptanceExecutionContextV1,
+    ProviderAggregateBudget,
     ProviderAggregateBudgetV1,
+    ProviderAggregateBudgetV2,
     ProviderBudgetController,
     ProviderReceiptConflict,
     ProviderRuntime,
@@ -37,6 +39,7 @@ from runtime.provider_runtime import (
     acceptance_context_environment,
     is_process_alive,
     process_identity_for_pid,
+    provider_aggregate_budget_from_mapping,
 )
 from runtime.trust_admission import (
     ACK_CLOCK_SKEW,
@@ -53,6 +56,7 @@ class ReleaseAcceptanceSpecError(ValueError):
 
 _BUDGET_FIELDS = frozenset(
     {
+        "schema_version",
         "max_provider_calls_total",
         "max_output_tokens_total",
         "max_retry_attempts_total",
@@ -294,19 +298,27 @@ def _integer(value: Any, *, field_name: str, positive: bool = True) -> int:
 
 @dataclass(frozen=True)
 class ReleaseAcceptanceBudget:
-    max_provider_calls_total: int = AUTHORIZED_PROVIDER_CALL_LIMIT
+    max_provider_calls_total: int = DEFAULT_PROVIDER_CALL_BUDGET
     max_output_tokens_total: int = 5_000_000
     max_retry_attempts_total: int = 2
     max_wall_seconds: int = 900
+    # New in-memory budgets default to strict V2. Missing schema_version while
+    # decoding a persisted mapping is interpreted as legacy V1 below.
+    schema_version: str = ProviderAggregateBudgetV2.SCHEMA_VERSION
 
     def __post_init__(self) -> None:
+        if self.schema_version not in {
+            "provider-aggregate-budget-v1",
+            ProviderAggregateBudgetV2.SCHEMA_VERSION,
+        }:
+            raise ReleaseAcceptanceSpecError("unsupported provider budget schema_version")
         for name in (
             "max_provider_calls_total",
             "max_output_tokens_total",
             "max_retry_attempts_total",
             "max_wall_seconds",
         ):
-            _integer(getattr(self, name), field_name=name)
+            _integer(getattr(self, name), field_name=name, positive=False)
 
     @classmethod
     def from_mapping(
@@ -319,7 +331,38 @@ class ReleaseAcceptanceBudget:
         if not isinstance(source, Mapping):
             raise ReleaseAcceptanceSpecError("acceptance budget must be a JSON object")
         _reject_unknown(source, _BUDGET_FIELDS, "acceptance budget")
-        base = defaults or cls()
+        raw_schema = source.get("schema_version")
+        if raw_schema is not None:
+            if raw_schema not in {
+                "provider-aggregate-budget-v1",
+                ProviderAggregateBudgetV2.SCHEMA_VERSION,
+            }:
+                raise ReleaseAcceptanceSpecError("unsupported provider budget schema_version")
+            schema_version = str(raw_schema)
+        else:
+            # An absent marker is the persisted V1 wire format, even when a
+            # caller supplies defaults for the numeric dimensions. Fresh
+            # in-memory budgets serialize V2 explicitly from the dataclass
+            # default below.
+            schema_version = "provider-aggregate-budget-v1"
+        aliases_for_required = {
+            "max_provider_calls_total": ("max_provider_calls_total", "max_provider_calls"),
+            "max_output_tokens_total": ("max_output_tokens_total", "max_output_tokens"),
+            "max_retry_attempts_total": ("max_retry_attempts_total", "max_retry_attempts"),
+            "max_wall_seconds": ("max_wall_seconds", "timeout_seconds"),
+        }
+        if schema_version == ProviderAggregateBudgetV2.SCHEMA_VERSION:
+            missing_dimensions = [
+                canonical
+                for canonical, aliases in aliases_for_required.items()
+                if not any(alias in source for alias in aliases)
+            ]
+            if missing_dimensions:
+                raise ReleaseAcceptanceSpecError(
+                    "strict V2 acceptance budget requires explicit dimensions: "
+                    + ", ".join(missing_dimensions)
+                )
+        base = defaults or cls(schema_version=schema_version)
         aliases = {
             "max_provider_calls_total": ("max_provider_calls_total", "max_provider_calls"),
             "max_output_tokens_total": ("max_output_tokens_total", "max_output_tokens"),
@@ -332,24 +375,42 @@ class ReleaseAcceptanceBudget:
             if not present:
                 values[canonical] = int(getattr(base, canonical))
                 continue
-            parsed = [_integer(source[key], field_name=key) for key in present]
+            parsed = [
+                _integer(
+                    source[key],
+                    field_name=key,
+                    positive=False,
+                )
+                for key in present
+            ]
             if len(set(parsed)) != 1:
                 raise ReleaseAcceptanceSpecError(
                     f"acceptance budget aliases disagree for {canonical}"
                 )
             values[canonical] = parsed[0]
-        return cls(**values)
+        return cls(**values, schema_version=schema_version)
 
-    def to_dict(self) -> dict[str, int]:
-        return {
+    def to_dict(self) -> dict[str, int | str]:
+        result: dict[str, int | str] = {
             "max_provider_calls_total": self.max_provider_calls_total,
             "max_output_tokens_total": self.max_output_tokens_total,
             "max_retry_attempts_total": self.max_retry_attempts_total,
             "max_wall_seconds": self.max_wall_seconds,
         }
+        if self.schema_version != "provider-aggregate-budget-v1":
+            result["schema_version"] = self.schema_version
+        return result
 
-    def to_provider_budget(self) -> ProviderAggregateBudgetV1:
-        return ProviderAggregateBudgetV1(**self.to_dict())
+    def to_provider_budget(self) -> ProviderAggregateBudget:
+        limits = {
+            "max_provider_calls_total": self.max_provider_calls_total,
+            "max_output_tokens_total": self.max_output_tokens_total,
+            "max_retry_attempts_total": self.max_retry_attempts_total,
+            "max_wall_seconds": self.max_wall_seconds,
+        }
+        if self.schema_version == ProviderAggregateBudgetV2.SCHEMA_VERSION:
+            return ProviderAggregateBudgetV2(**limits)
+        return ProviderAggregateBudgetV1(**limits)
 
 
 @dataclass(frozen=True)
@@ -2173,7 +2234,7 @@ def _scenario_context_environment(context: AcceptanceScenarioContextV1) -> dict[
         acceptance_run_id=context.acceptance_run_id,
         final_executable_sha=context.final_executable_sha,
         absolute_deadline_epoch=float(context.absolute_deadline_epoch or 0.0),
-        provider_budget=ProviderAggregateBudgetV1.from_mapping(context.provider_budget),
+        provider_budget=provider_aggregate_budget_from_mapping(context.provider_budget),
         provider_budget_state_path=context.provider_budget_state_path,
         evidence_root=context.evidence_root,
         process_event_log=context.process_event_log,
@@ -2698,7 +2759,7 @@ class GateKScenario(AcceptanceScenario):
                     project_name="release-acceptance",
                 )
             )
-        budget = ProviderAggregateBudgetV1.from_mapping(context.provider_budget)
+        budget = provider_aggregate_budget_from_mapping(context.provider_budget)
         controller = ProviderBudgetController(budget)
         controller.bind_state_path(offline_budget_state_path)
         worker_environment = os.environ.copy()

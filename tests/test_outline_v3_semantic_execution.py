@@ -817,6 +817,84 @@ def test_topic_provider_request_materializes_complete_dossier_unit(
         assert unit["study_units"][0]["shared_context"]["method"]
 
 
+def test_topic_provider_wire_carries_keyed_mapping_source_fields(tmp_path: Path) -> None:
+    """Structured source statistics retain their keys and raw values on the wire."""
+
+    executor = _executor(tmp_path, stability_mode="off")
+    executor.summaries[0]["core_analysis"]["findings"] = {
+        "effect": 0,
+        "p": 0.04,
+        "direction": "negative",
+    }
+    executor.summaries[0]["core_analysis"]["zero_results"] = 0
+    evidence = build_outline_evidence_views(executor.summaries, executor.job_id)
+    ledger = build_global_corpus_ledger(evidence)
+    matrix = build_multi_view_matrix(evidence)
+    relation_map = build_global_relation_map(evidence, matrix, ledger)
+    content_layers = build_paper_content_layers(
+        executor.summaries,
+        evidence,
+        job_id=executor.job_id,
+    )
+    semantic_plan = build_semantic_chunk_plan(
+        content_layers,
+        relation_map,
+        candidate_count=executor.candidate_count,
+        physical_call_limit=24,
+    )
+    topic_plan = build_topic_synthesis_plan(semantic_plan)
+    routes = {topic.topic_id: topic for topic in semantic_plan.topics}
+    topic = next(
+        topic
+        for topic in topic_plan
+        if "paper-a" in topic.paper_ids
+        and "context" in routes[topic.topic_id].dimensions
+    )
+    request = executor._build_topic_provider_request(
+        [topic],
+        topic_routes=routes,
+        evidence_model=evidence,
+        content_layers_model=content_layers,
+        batch_index=1,
+    )
+    unit = next(
+        item for item in request["evidence_units"] if item["paper_key"] == "paper-a"
+    )
+    fields = unit.get("source_field_ledger") or []
+    effect_row = next(
+        row for row in fields if row.get("source_path", "").endswith("findings.effect")
+    )
+    assert effect_row["source_field_id"]
+    assert effect_row["source_summary_hash"]
+    assert effect_row["projected_fields"] == ["findings"]
+    assert effect_row["disposition"] == "unmapped"
+    field_values = {
+        row["source_path"].split(".")[-1]: row["source_value"]
+        for row in fields
+        if row.get("source_path", "").endswith(("findings.effect", "findings.p", "findings.direction", "zero_results"))
+    }
+    source_rows = {
+        row["source_path"].split(".")[-1]: row
+        for row in fields
+        if row.get("source_path", "").endswith(("findings.effect", "findings.p", "findings.direction", "zero_results"))
+    }
+
+    assert field_values["effect"] == "0"
+    assert field_values["p"] == "0.04"
+    assert field_values["direction"] == "negative"
+    assert field_values["zero_results"] == "0"
+    for field_name, (projected, disposition) in {
+        "effect": (["findings"], "unmapped"),
+        "p": (["findings"], "unmapped"),
+        "direction": (["findings"], "unmapped"),
+        "zero_results": (["zero_results"], "context"),
+    }.items():
+        assert source_rows[field_name]["source_field_id"]
+        assert source_rows[field_name]["source_summary_hash"]
+        assert source_rows[field_name]["projected_fields"] == projected
+        assert source_rows[field_name]["disposition"] == disposition
+
+
 def test_complete_topic_request_preserves_long_bilingual_qualifier_tail(
     tmp_path: Path,
 ) -> None:

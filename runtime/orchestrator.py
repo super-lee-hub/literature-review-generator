@@ -547,6 +547,169 @@ class _RuntimeStageHost:
     def _stage2_validation_enabled(self) -> bool:
         return self.settings.review_validation_enabled()
 
+    @staticmethod
+    def _read_ready_artifact_payload(record: Any, label: str) -> dict[str, Any]:
+        if record is None or str(getattr(record, "status", "")) != "ready":
+            raise RuntimeError(f"{label} is not a ready registered artifact")
+        path = Path(str(getattr(record, "path", "") or ""))
+        if not path.is_file():
+            raise RuntimeError(f"{label} artifact file is missing")
+        try:
+            if file_sha256(path) != str(getattr(record, "content_hash", "") or ""):
+                raise RuntimeError(f"{label} artifact bytes do not match its Registry hash")
+            value: Any = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"{label} artifact cannot be read") from exc
+        # publish_json_artifact adds an envelope, while some typed artifacts
+        # have their own nested payload object inside that envelope.
+        for _ in range(3):
+            if not isinstance(value, Mapping) or not isinstance(value.get("payload"), Mapping):
+                break
+            value = value["payload"]
+        if not isinstance(value, Mapping):
+            raise RuntimeError(f"{label} artifact payload is not an object")
+        return dict(value)
+
+    def _outline_v3_review_lineage(
+        self,
+        *,
+        outline_file: str,
+        review_sections: Sequence[Mapping[str, Any]],
+    ) -> tuple[Any, Any, Any, Any, list[Any], list[dict[str, str]]]:
+        _workspace, registry = self._require_workspace()
+        outline_record = registry.get("outline-v3:final_outline")
+        if outline_record is None or outline_record.status != "ready":
+            raise RuntimeError("Outline v3 review requires a ready final outline")
+        if Path(outline_file).resolve() != Path(outline_record.path).resolve():
+            raise RuntimeError("Outline v3 review input path does not identify the current final outline")
+        outline_payload = self._read_ready_artifact_payload(outline_record, "final outline")
+        outline_sections = outline_payload.get("sections")
+        if not isinstance(outline_sections, list) or not outline_sections:
+            raise RuntimeError("current final outline has no sections")
+        outline_section_ids = [
+            str(section.get("section_id") or "").strip()
+            for section in outline_sections
+            if isinstance(section, Mapping)
+        ]
+        if (
+            len(outline_section_ids) != len(outline_sections)
+            or any(not section_id for section_id in outline_section_ids)
+            or len(set(outline_section_ids)) != len(outline_section_ids)
+        ):
+            raise RuntimeError("current final outline has missing or duplicate section identities")
+
+        adoption_record = current_adoption_record(registry)
+        if adoption_record is None or adoption_record.status != "ready":
+            raise RuntimeError("Outline v3 review requires a ready current adoption")
+        if (
+            adoption_record.artifact_type != "adopted_outline"
+            or adoption_record.artifact_version != "v3"
+        ):
+            raise RuntimeError("current adoption has an unsupported artifact identity")
+        adoption_payload = self._read_ready_artifact_payload(adoption_record, "current adoption")
+        if str(adoption_payload.get("final_outline_hash") or "") != outline_record.content_hash:
+            raise RuntimeError("current adoption is bound to a different final outline")
+        adoption_pointer = registry.get("outline-v3:adoption:current")
+        if (
+            adoption_pointer is None
+            or adoption_pointer.status != "ready"
+            or adoption_pointer.artifact_type != "outline_adoption_pointer"
+            or adoption_pointer.artifact_version != "v1"
+        ):
+            raise RuntimeError("current Outline v3 adoption pointer is not ready")
+        adoption_pointer_payload = self._read_ready_artifact_payload(
+            adoption_pointer,
+            "current adoption pointer",
+        )
+        if (
+            str(adoption_pointer_payload.get("current_adoption_artifact_id") or "")
+            != adoption_record.artifact_id
+            or str(adoption_pointer_payload.get("current_adoption_hash") or "")
+            != adoption_record.content_hash
+        ):
+            raise RuntimeError("current adoption pointer selects a different adoption artifact")
+
+        if len(review_sections) != len(outline_section_ids):
+            raise RuntimeError("Writer section count does not match the current final outline")
+        writer_section_ids = [
+            str(section.get("evidence_packet_id") or "").strip()
+            for section in review_sections
+            if isinstance(section, Mapping)
+        ]
+        if (
+            len(writer_section_ids) != len(review_sections)
+            or writer_section_ids != outline_section_ids
+        ):
+            raise RuntimeError("Writer sections do not match the current final outline section order")
+
+        immutable_records: list[Any] = []
+        section_artifact_refs: list[dict[str, str]] = []
+        for section_id, provided_section in zip(writer_section_ids, review_sections):
+            pointer = registry.get(f"review-section:{section_id}")
+            if (
+                pointer is None
+                or pointer.status != "ready"
+                or pointer.artifact_type != "review_section"
+                or pointer.artifact_version != "v3"
+                or str(pointer.metadata.get("pointer_role") or "") != "current"
+            ):
+                raise RuntimeError(f"Writer section {section_id} has no ready current Registry pointer")
+            pointer_payload = self._read_ready_artifact_payload(
+                pointer,
+                f"Writer section {section_id} current pointer",
+            )
+            immutable_id = str(pointer.metadata.get("current_version_artifact_id") or "").strip()
+            immutable_record = registry.get(immutable_id) if immutable_id else None
+            if (
+                immutable_record is None
+                or immutable_record.status != "ready"
+                or immutable_record.artifact_type != "review_section"
+                or immutable_record.artifact_version != "v3"
+                or not bool(immutable_record.metadata.get("immutable"))
+            ):
+                raise RuntimeError(f"Writer section {section_id} has no ready immutable Registry artifact")
+            if not any(
+                dependency.artifact_id == immutable_record.artifact_id
+                and dependency.content_hash == immutable_record.content_hash
+                for dependency in pointer.depends_on
+            ):
+                raise RuntimeError(f"Writer section {section_id} current pointer does not bind its immutable artifact")
+            section_payload = self._read_ready_artifact_payload(
+                immutable_record,
+                f"Writer section {section_id}",
+            )
+            persisted_section = section_payload.get("section")
+            if (
+                str(pointer_payload.get("section_id") or "") != section_id
+                or str(pointer_payload.get("content_hash") or "")
+                != str(section_payload.get("content_hash") or "")
+                or section_payload.get("artifact_type") != "review_section"
+                or section_payload.get("artifact_version") != "v3"
+                or str(section_payload.get("section_id") or "") != section_id
+                or not isinstance(persisted_section, Mapping)
+                or hash_json(dict(persisted_section)) != hash_json(dict(provided_section))
+                or str(section_payload.get("content_hash") or "")
+                != hash_json(dict(provided_section))
+            ):
+                raise RuntimeError(f"Writer section {section_id} bytes do not match the supplied review section")
+            immutable_records.append(immutable_record)
+            section_artifact_refs.append({
+                "artifact_id": str(immutable_record.artifact_id),
+                "content_hash": str(immutable_record.content_hash),
+            })
+
+        catalog_record = registry.get("citation_ref_catalog")
+        if catalog_record is None or catalog_record.status != "ready":
+            raise RuntimeError("Outline v3 review requires a ready citation reference catalog")
+        return (
+            outline_record,
+            adoption_record,
+            adoption_pointer,
+            catalog_record,
+            immutable_records,
+            section_artifact_refs,
+        )
+
     def _persist_review_draft(
         self,
         *,
@@ -562,6 +725,22 @@ class _RuntimeStageHost:
         from services.review_draft import build_review_draft
 
         _workspace, registry = self._require_workspace()
+        outline_record = adoption_record = adoption_pointer = None
+        catalog_record = registry.get("citation_ref_catalog")
+        immutable_section_records: list[Any] = []
+        writer_section_artifacts: list[dict[str, str]] = []
+        if generation_mode == "outline_v3":
+            (
+                outline_record,
+                adoption_record,
+                adoption_pointer,
+                catalog_record,
+                immutable_section_records,
+                writer_section_artifacts,
+            ) = self._outline_v3_review_lineage(
+                outline_file=outline_file,
+                review_sections=review_sections,
+            )
         draft = build_review_draft(
             job_id=registry.job_id,
             project_name=self.project_name,
@@ -577,21 +756,25 @@ class _RuntimeStageHost:
             citation_ref_catalog=citation_ref_catalog,
             citation_ref_catalog_path=citation_ref_catalog_path,
             citation_ref_catalog_hash=citation_ref_catalog_hash,
+            outline_artifact_hash=(str(outline_record.content_hash) if outline_record else ""),
+            adoption_artifact_id=(str(adoption_record.artifact_id) if adoption_record else ""),
+            adoption_artifact_hash=(str(adoption_record.content_hash) if adoption_record else ""),
+            writer_section_artifacts=writer_section_artifacts,
         )
         path = self._review_draft_path()
         dependencies: list[ArtifactDependencyRefV2] = []
-        catalog_record = registry.get("citation_ref_catalog")
         if catalog_record is not None and catalog_record.status == "ready":
-            dependencies.append(
-                ArtifactDependencyRefV2(
-                    dependency_kind="local_job",
-                    job_id=catalog_record.job_id,
-                    artifact_id=catalog_record.artifact_id,
-                    artifact_type=catalog_record.artifact_type,
-                    path=catalog_record.path,
-                    content_hash=catalog_record.content_hash,
-                )
-            )
+            dependencies.append(ArtifactDependencyRefV2.from_record(catalog_record))
+        if outline_record is not None and adoption_record is not None and adoption_pointer is not None:
+            dependencies.extend((
+                ArtifactDependencyRefV2.from_record(outline_record),
+                ArtifactDependencyRefV2.from_record(adoption_record),
+                ArtifactDependencyRefV2.from_record(adoption_pointer),
+                *(
+                    ArtifactDependencyRefV2.from_record(record)
+                    for record in immutable_section_records
+                ),
+            ))
         publish_json_artifact(
             self._publication_context(registry),
             registry,

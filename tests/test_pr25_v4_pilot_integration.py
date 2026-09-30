@@ -208,16 +208,18 @@ def _executor(
 
         def capture_materialized_hashes(**kwargs: Any) -> Any:
             if auto_select_materialized_batches:
-                batch_ids = [
+                materialized_batch_ids = [
                     f"topic_synthesis_provider:batch:{index}"
                     for index, _batch in enumerate(kwargs["topic_batches"], start=1)
                 ]
+                # The plan's explicit selection remains the pilot scope. This
+                # helper only aligns its IDs with the materialized plan; it
+                # must not silently turn a selected subset into all batches.
+                batch_ids = [item for item in materialized_batch_ids if item in selected_scope]
                 probe.outline_pilot["selected_topic_batch_ids"] = batch_ids
                 probe.outline_pilot["selected_request_hashes"] = {
                     batch_id: "0" * 64 for batch_id in batch_ids
                 }
-                selected_scope.clear()
-                selected_scope.update(batch_ids)
             original_contract = probe._semantic_request_contract
 
             def capture_contract(node_id: str, request: Mapping[str, Any]) -> None:

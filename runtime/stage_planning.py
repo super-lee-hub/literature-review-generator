@@ -282,12 +282,15 @@ class UnplannedProviderExposureV1:
     reasoning_tokens_per_call_upper_bound: int | None = None
     retry_attempts_per_call_upper_bound: int | None = None
     wall_seconds_per_call_upper_bound: float | None = None
+    request_builder_id: str = ""
 
     def __post_init__(self) -> None:
         if not str(self.stage_name).strip() or not str(self.semantic_role).strip():
             raise StagePlanError("unplanned provider exposure stage and semantic role are required")
         if not str(self.reason).strip():
             raise StagePlanError("unplanned provider exposure requires a reason")
+        if self.request_builder_id and not str(self.request_builder_id).strip():
+            raise StagePlanError("request builder id must be non-empty when provided")
         for name in (
             "logical_calls_upper_bound",
             "input_tokens_per_call_upper_bound",
@@ -315,6 +318,7 @@ class UnplannedProviderExposureV1:
             "stage_name": self.stage_name,
             "semantic_role": self.semantic_role,
             "reason": self.reason,
+            "request_builder_id": self.request_builder_id or None,
             "route_identity": list(self.route_identity),
             "conditional_on": self.conditional_on or None,
             "logical_calls_upper_bound": self.logical_calls_upper_bound,
@@ -507,14 +511,16 @@ def build_full_stage_request_plan_v1(
     """
 
     from runtime.provider_runtime import (
-        AUTHORIZED_PROVIDER_CALL_LIMIT,
+        DEFAULT_PROVIDER_CALL_BUDGET,
         ProviderAggregateBudgetV1,
+        ProviderAggregateBudgetV2,
         authorized_provider_call_limit,
         hash_json,
     )
 
-    if not isinstance(aggregate_budget, ProviderAggregateBudgetV1):
-        raise StagePlanError("full-stage projection requires ProviderAggregateBudgetV1")
+    if not isinstance(aggregate_budget, (ProviderAggregateBudgetV1, ProviderAggregateBudgetV2)):
+        raise StagePlanError("full-stage projection requires a typed provider aggregate budget")
+    strict_budget = isinstance(aggregate_budget, ProviderAggregateBudgetV2)
     stage_payload = _plan_payload(stage_plan)
     route_payload = _plan_payload(reachable_route_plan)
     requested = tuple(str(item) for item in stage_payload.get("requested_stages") or ())
@@ -605,6 +611,12 @@ def build_full_stage_request_plan_v1(
         if item.logical_calls_upper_bound is not None
     )
     logical_upper = None if unknown_count else known_logical + exposure_logical_upper
+    bounded_logical_call_exposure_count = sum(
+        item.logical_calls_upper_bound is not None for item in active_exposures
+    )
+    unbounded_logical_call_exposure_count = sum(
+        item.logical_calls_upper_bound is None for item in active_exposures
+    )
 
     row_attempts = [item.physical_attempt_upper_bound for item in fresh_rows]
     exposure_attempts = [item.physical_attempt_upper_bound for item in active_exposures]
@@ -632,6 +644,11 @@ def build_full_stage_request_plan_v1(
             * int(item.retry_attempts_per_call_upper_bound or 0)
             for item in active_exposures
         )
+    )
+    retry_lower = sum(
+        int(item.retry_attempts or 0)
+        for item in definite_rows
+        if item.retry_attempts is not None
     )
 
     def total_or_unknown(values: Sequence[int | None], exposure_values: Sequence[int | None]) -> int | None:
@@ -723,21 +740,30 @@ def build_full_stage_request_plan_v1(
         )
     )
 
-    authorized_limit = authorized_provider_call_limit(
-        aggregate_budget.max_provider_calls_total or None
+    calls_unbounded = (
+        not strict_budget and not aggregate_budget.max_provider_calls_total
     )
-    call_status = (
-        "exceeded"
-        if physical_lower > authorized_limit
-        else "exceeded"
-        if physical_upper is not None and physical_upper > authorized_limit
-        else "unknown"
-        if physical_upper is None
-        else "within_limit"
-    )
+    if calls_unbounded:
+        authorized_limit: int | None = None
+        call_status = "unbounded"
+    else:
+        authorized_limit = authorized_provider_call_limit(
+            aggregate_budget.max_provider_calls_total
+        )
+        call_status = (
+            "exceeded"
+            if physical_lower > authorized_limit
+            else "exceeded"
+            if physical_upper is not None and physical_upper > authorized_limit
+            else "unknown"
+            if physical_upper is None
+            else "within_limit"
+        )
     retry_status = (
         "unbounded"
-        if not aggregate_budget.max_retry_attempts_total
+        if not strict_budget and not aggregate_budget.max_retry_attempts_total
+        else "exceeded"
+        if retry_lower > aggregate_budget.max_retry_attempts_total
         else "unknown"
         if retry_upper is None
         else "exceeded"
@@ -746,7 +772,7 @@ def build_full_stage_request_plan_v1(
     )
     output_status = (
         "unbounded"
-        if not aggregate_budget.max_output_tokens_total
+        if not strict_budget and not aggregate_budget.max_output_tokens_total
         else "exceeded"
         if output_reserved_lower > aggregate_budget.max_output_tokens_total
         else "exceeded"
@@ -760,7 +786,11 @@ def build_full_stage_request_plan_v1(
     )
     wall_status = (
         "unbounded"
-        if not aggregate_budget.max_wall_seconds
+        if not strict_budget and not aggregate_budget.max_wall_seconds
+        else "exceeded"
+        if strict_budget
+        and not aggregate_budget.max_wall_seconds
+        and physical_lower > 0
         else "unknown"
         if wall_upper is None
         else "exceeded"
@@ -821,7 +851,7 @@ def build_full_stage_request_plan_v1(
         "local_steps_provider_calls": 0,
         "aggregate_budget": aggregate_budget.to_dict(),
         "limits": {
-            "authorized_provider_call_limit": AUTHORIZED_PROVIDER_CALL_LIMIT,
+            "authorized_provider_call_limit": authorized_limit,
             "effective_provider_call_limit": authorized_limit,
         },
         "totals": {
@@ -840,6 +870,8 @@ def build_full_stage_request_plan_v1(
             "estimated_reasoning_tokens_all_attempts": reasoning_all_attempts,
             "verified_reuse_calls": sum(item.verified_reuse for item in rows),
             "unknown_exposure_count": len(exposures),
+            "bounded_logical_call_exposure_count": bounded_logical_call_exposure_count,
+            "unbounded_logical_call_exposure_count": unbounded_logical_call_exposure_count,
             "wall_seconds_upper_bound": wall_upper,
             "wall_budget_seconds": aggregate_budget.max_wall_seconds or None,
             "price_status": cost_status,

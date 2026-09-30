@@ -1280,6 +1280,7 @@ class OutlineV3Executor:
                         "method",
                         "sample_or_context",
                         "findings",
+                        "zero_results",
                         "conclusions",
                         "limitations",
                         "research_gaps",
@@ -1294,6 +1295,7 @@ class OutlineV3Executor:
                         "method",
                         "sample_or_context",
                         "findings",
+                        "zero_results",
                         "conclusions",
                         "limitations",
                     )
@@ -1307,6 +1309,7 @@ class OutlineV3Executor:
                         "method",
                         "sample_or_context",
                         "findings",
+                        "zero_results",
                         "conclusions",
                         "limitations",
                     )
@@ -1319,6 +1322,7 @@ class OutlineV3Executor:
                         "method",
                         "sample_or_context",
                         "findings",
+                        "zero_results",
                         "conclusions",
                         "limitations",
                     )
@@ -1333,6 +1337,7 @@ class OutlineV3Executor:
                         "method",
                         "sample_or_context",
                         "findings",
+                        "zero_results",
                         "conclusions",
                         "limitations",
                         "research_gaps",
@@ -1449,6 +1454,62 @@ class OutlineV3Executor:
             for claim in unit.get("claims") or ()
             if isinstance(claim, Mapping) and str(claim.get("claim_id") or "")
         }
+        declared_source_paths = payload.get("source_fields") or {}
+        source_field_ids_by_field = dossier_payload.get("evidence_ids_by_field") or {}
+        source_text_by_id = dossier_payload.get("evidence_text_by_id") or {}
+        projected_source_fields: dict[str, dict[str, Any]] = {}
+        for raw_entry in dossier_payload.get("source_field_ledger") or ():
+            try:
+                entry = (
+                    raw_entry
+                    if isinstance(raw_entry, SourceFieldLedgerEntry)
+                    else SourceFieldLedgerEntry.from_dict(raw_entry)
+                )
+            except (TypeError, ValueError) as exc:
+                raise OutlineV3ExecutionError(
+                    "evidence dossier contains an invalid source-field ledger entry"
+                ) from exc
+            source_path = entry.source_path.strip()
+            path_candidates = {source_path}
+            if source_path and not source_path.startswith("ai_summary."):
+                path_candidates.add(f"ai_summary.{source_path}")
+            elif source_path.startswith("ai_summary."):
+                path_candidates.add(source_path[len("ai_summary.") :])
+            projected_fields = {
+                str(field_name)
+                for field_name in fields
+                if str(field_name)
+                and (
+                    entry.canonical_field == str(field_name)
+                    or any(
+                        candidate == str(root)
+                        or candidate.startswith(str(root) + ".")
+                        or candidate.startswith(str(root) + "[")
+                        for candidate in path_candidates
+                        for root in (
+                            declared_source_paths.get(str(field_name), ())
+                            if isinstance(declared_source_paths, Mapping)
+                            else ()
+                        )
+                    )
+                )
+            }
+            if not projected_fields:
+                continue
+            evidence_refs = sorted(
+                {
+                    str(evidence_id)
+                    for field_name in projected_fields
+                    for evidence_field, evidence_ids in source_field_ids_by_field.items()
+                    if evidence_field == field_name or evidence_field.endswith(f":{field_name}")
+                    for evidence_id in evidence_ids or ()
+                    if str(source_text_by_id.get(str(evidence_id)) or "") == entry.source_value
+                }
+            )
+            row = entry.to_dict()
+            row["projected_fields"] = sorted(projected_fields)
+            row["evidence_ids"] = evidence_refs
+            projected_source_fields[entry.source_field_id] = row
         return {
             "paper_key": str(payload.get("paper_key") or payload.get("canonical_paper_key") or ""),
             "source_summary_hash": str(payload.get("source_summary_hash") or ""),
@@ -1464,6 +1525,9 @@ class OutlineV3Executor:
             "evidence_ids_by_field": dict(dossier_payload.get("evidence_ids_by_field") or {}),
             "evidence_text_by_id": dict(dossier_payload.get("evidence_text_by_id") or {}),
             "source_locators": dict(dossier_payload.get("source_locators") or {}),
+            "source_field_ledger": [
+                projected_source_fields[key] for key in sorted(projected_source_fields)
+            ],
             "semantic_fields": {
                 str(field_name): payload.get(field_name)
                 for field_name in fields
@@ -1471,7 +1535,7 @@ class OutlineV3Executor:
             },
             "dossier_status": str(dossier_payload.get("status") or ""),
             "dossier_diagnostics": list(dossier_payload.get("diagnostics") or []),
-            "projection": "complete_dossier_study_claim_unit_v1",
+            "projection": "complete_dossier_study_claim_source_fields_unit_v2",
         }
 
     @classmethod
@@ -1501,6 +1565,7 @@ class OutlineV3Executor:
                 "semantic topic request is missing its Registry-backed evidence dossier"
             )
         complete = cls._complete_topic_evidence_unit(view, dossier, fields=fields)
+        complete_source_fields = list(complete.get("source_field_ledger") or [])
         dossier_payload = dossier.to_dict()
         view_payload = view.to_dict() if hasattr(view, "to_dict") else dict(view)
         text_by_id = {
@@ -2124,8 +2189,17 @@ class OutlineV3Executor:
                         "study_units": [study_record],
                         "evidence_ids_by_field": selected_field_ids(selected_ids),
                         "evidence_text_by_id": selected_evidence_text(selected_ids, claim_chunk),
+                        "source_field_ledger": [
+                            row
+                            for row in complete_source_fields
+                            if isinstance(row, Mapping)
+                            and (
+                                str(row.get("scope") or "") != "explicit_study"
+                                or str(row.get("study_id") or "") == source_study_id
+                            )
+                        ],
                         "source_locators": dict(unit.get("source_locators") or {}),
-                        "projection": "scoped_study_claim_fragment_v3",
+                        "projection": "scoped_study_claim_source_fields_fragment_v4",
                         "chunk_complete_for_claim": claim_chunk_complete,
                         "chunk_complete_for_study": study_chunk_complete,
                         "coverage_status": chunk_coverage_status,
@@ -2197,6 +2271,7 @@ class OutlineV3Executor:
                     "semantic_fields": selected_field_values,
                     "evidence_ids_by_field": selected_field_ids(selected_ids),
                     "evidence_text_by_id": selected_evidence_text(selected_ids, claim_chunk),
+                    "source_field_ledger": complete_source_fields,
                     "source_locators": {
                         "paper_claims": sorted(
                             {
@@ -2207,7 +2282,7 @@ class OutlineV3Executor:
                         ),
                         "dossier": source_locators if local_index == 1 else {},
                     },
-                    "projection": "scoped_paper_claims_v2",
+                    "projection": "scoped_paper_claim_source_fields_v3",
                     "chunk_complete_for_claim": bool(claim_chunk) and all(
                         bool(claim_evidence_ids([claim]))
                         and claim_evidence_ids([claim]).issubset(selected_ids)
@@ -2879,9 +2954,14 @@ class OutlineV3Executor:
             "evidence_units": evidence_units,
             "planned_evidence_unit_ids": sorted(expected_unit_ids),
             "evidence_projection": {
-                "projection": "complete_field_values_plus_registry_refs_v1",
+                "projection": "complete_field_values_plus_registry_refs_v2",
                 "fields_in_prompt": list(fields),
                 "omitted_fields_are_registry_bound": True,
+                "source_field_policy": (
+                    "Include selected raw source fields with exact path, value, scope, "
+                    "study identity, disposition, and source_field_id. An unmapped or "
+                    "unresolved row is provenance only, not a validated interpretation."
+                ),
                 "content_layers_hash": getattr(content_layers_model, "content_hash", ""),
             },
             "output_contract": {
@@ -2899,6 +2979,7 @@ class OutlineV3Executor:
                 "claims": "array of distinct evidence-bound synthesis claims, not a one-to-one restatement of every source claim or evidence ID. Combine findings only when direction, conditions, population and horizon align; keep conflicts, conditional effects, null/zero results and material exceptions distinct or unresolved. Each claim has claim_id='synthesis:topic_synthesis:<local-id>', fragment_id, claim_type, paper_key or paper_keys, and evidence_ids. For any claim using a primary claim whose interpretation_dependencies entry has required_for_synthesis_output=true, set source_claim_ids to primary plus required_source_claim_ids, evidence_ids to primary plus required_evidence_ids, and source_field_ids to required_source_field_ids. Preserve the condition or boundary in claim text; qualifier_dependency prose alone is not provenance. Otherwise omit the factual claim and mark unresolved.",
                 "source_locator_policy": "Do not echo source_locators in claims. Full exact locators remain bound to evidence IDs in the local Registry and are resolved downstream.",
                 "source_claim_ids": "must exactly reference supplied source claim IDs; do not relabel source IDs as generated synthesis claims",
+                "source_field_policy": "When a factual synthesis uses a supplied source_field_ledger row, cite its exact source_field_id. Preserve the raw field path and study scope; an unmapped or unresolved row alone does not validate a statistical interpretation.",
                 "conciseness_policy": "Return the smallest complete synthesis that preserves distinct supported conclusions, direction, conditions, conflicts, null/zero findings, unresolved items and evidence support. Do not duplicate the same narrative in topics[].conclusions and claims[].text.",
                 "unresolved_questions": "array of questions that remain unresolved",
                 "no_external_evidence": "do not infer a finding, boundary or consensus from a missing field; emit an unresolved or insufficient-evidence record instead",
@@ -6223,10 +6304,7 @@ class OutlineV3Executor:
                 if candidate_attempt_multiplier is None:
                     estimated_cost = None
                 reserve_attempts = candidate_attempt_multiplier or 1
-                candidate_input = min(
-                    int(candidate_route.profile.input_budget),
-                    int(self.max_source_prompt_tokens or 32_000),
-                )
+                candidate_input = self._effective_input_cap(candidate_route.profile)
                 candidate_output = min(max(1, int(candidate_route.profile.max_output_tokens)), 1024)
                 candidate_reasoning = max(0, int(candidate_route.profile.reasoning_reserve))
                 estimated_provider_calls += hierarchical_candidate_shard_calls
@@ -6277,10 +6355,7 @@ class OutlineV3Executor:
                 if relation_attempt_multiplier is None:
                     estimated_cost = None
                 reserve_attempts = relation_attempt_multiplier or 1
-                relation_input = min(
-                    int(relation_route.profile.input_budget),
-                    int(self.max_source_prompt_tokens or 32_000),
-                )
+                relation_input = self._effective_input_cap(relation_route.profile)
                 relation_output = max(1, int(relation_route.profile.max_output_tokens))
                 relation_reasoning = max(0, int(relation_route.profile.reasoning_reserve))
                 estimated_provider_calls += hierarchical_relation_shard_calls
@@ -6378,11 +6453,6 @@ class OutlineV3Executor:
                         + repair_output / 1000.0 * float(self.output_cost_per_1k_tokens or 0.0)
                         + repair_reasoning / 1000.0 * float(self.reasoning_cost_per_1k_tokens or 0.0)
                     )
-        estimated_input_per_call = max(
-            1,
-            max((item.estimated_input_tokens for item in transport_plans), default=0),
-            semantic_repair_input,
-        )
         nonsemantic_retry_unknown = retry_reserve_unknown_call_count > 0
         if hierarchical_critique_shard_calls:
             # Their current dynamic input/retry estimates are not a complete
@@ -6534,17 +6604,17 @@ class OutlineV3Executor:
             self.stability_preflight["rejection_reason"] = "max_estimated_total_tokens_exceeded"
         elif any(
             item.estimated_input_tokens
-            > self._role_route(item.node_id).profile.input_budget
+            > self._effective_input_cap(self._role_route(item.node_id).profile)
             for item in transport_plans
+        ) or (
+            semantic_repair_calls_reserved
+            and semantic_repair_input
+            > self._effective_input_cap(
+                self._role_route("candidate_1_provider_generation").profile
+            )
         ):
             self.stability_preflight["preflight_status"] = "rejected"
-            self.stability_preflight["rejection_reason"] = "source_prompt_exceeds_input_budget"
-        elif (
-            self.max_source_prompt_tokens is not None
-            and estimated_input_per_call > self.max_source_prompt_tokens
-        ):
-            self.stability_preflight["preflight_status"] = "rejected"
-            self.stability_preflight["rejection_reason"] = "source_prompt_exceeds_configured_limit"
+            self.stability_preflight["rejection_reason"] = "source_prompt_exceeds_effective_input_cap"
         elif (
             self.max_smoke_overhead_ratio is not None
             and self.stability_mode == "smoke"
@@ -8874,7 +8944,7 @@ class OutlineV3Executor:
             node_prefix=node_prefix,
         )
         profile = self._node_route(generation_node_id).profile
-        effective_cap = min(int(profile.input_budget), int(self.max_source_prompt_tokens or 32_000))
+        effective_cap = self._effective_input_cap(profile)
         if (
             self.max_provider_calls is not None
             and self._provider_call_count + len(shard_requests) > self.max_provider_calls
@@ -11411,6 +11481,30 @@ class OutlineV3Executor:
         configured_retries = max(0, int(api_config.get("transport_retries") or 0))
         requested_attempts = configured_retries + 1
         effective_attempts = runtime.max_attempts_for_call(requested_attempts)
+        # Reject local and route-level pre-transport conditions before taking
+        # a durable aggregate reservation. An unstarted reservation is safe to
+        # release, but this path has no reason to create one in the first place.
+        if self.max_provider_calls is not None and self._provider_call_count >= self.max_provider_calls:
+            self._finish_request_payload_audit(
+                audit_index,
+                status="blocked_provider_call_budget",
+            )
+            raise OutlineV3ExecutionError(
+                f"outline provider call budget exhausted before {node_id}"
+            )
+        if node_id.startswith("stability:") and transport_for_audit is None:
+            self._finish_request_payload_audit(
+                audit_index,
+                status="blocked_stability_transport",
+            )
+            raise OutlineV3ExecutionError(
+                "stability audit requires a configured provider; fixture responses are not admissible"
+            )
+        fixture_response = None
+        if transport_for_audit is None:
+            # Validate the local fixture before taking a durable budget slot.
+            # A malformed/missing fixture is not a provider attempt.
+            fixture_response = self._fixture_response(node_id, request)
         admission = runtime.admit(
             estimated_tokens=int(budget["estimated_input_tokens"]),
             # The Outline transport reports usage summed across physical
@@ -11420,26 +11514,10 @@ class OutlineV3Executor:
             ),
             requested_retry_attempts=max(0, effective_attempts - 1),
         )
-        if self.max_provider_calls is not None and self._provider_call_count >= self.max_provider_calls:
-            self._finish_request_payload_audit(
-                audit_index,
-                status="blocked_provider_call_budget",
-            )
-            raise OutlineV3ExecutionError(
-                f"outline provider call budget exhausted before {node_id}"
-            )
         self._provider_call_count += 1
         transport = transport_for_audit
         if transport is None:
-            if node_id.startswith("stability:"):
-                self._finish_request_payload_audit(
-                    audit_index,
-                    status="blocked_stability_transport",
-                )
-                raise OutlineV3ExecutionError(
-                    "stability audit requires a configured provider; fixture responses are not admissible"
-                )
-            raw = self._fixture_response(node_id, request)
+            raw = fixture_response
         else:
             self._transport_call_count += 1
             runtime.mark_transport_started(admission)
@@ -12014,7 +12092,7 @@ class OutlineV3Executor:
                 relation_bundles=relation_bundles,
                 node_prefix=node_prefix,
             )
-        effective_cap = min(int(profile.input_budget), int(self.max_source_prompt_tokens or 32_000))
+        effective_cap = self._effective_input_cap(profile)
         if (
             self.max_provider_calls is not None
             and self._provider_call_count + len(local_requests) + len(relation_batch_requests)

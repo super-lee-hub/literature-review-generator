@@ -203,6 +203,38 @@ def test_real_local_http_524_preserves_external_timeout_evidence(tmp_path) -> No
 
 
 @pytest.mark.integration
+def test_real_local_http_524_with_zero_retries_closes_budget_without_retry(tmp_path) -> None:
+    html = b"<html><title>524: A timeout occurred</title></html>"
+    with _LocalProvider([("http_raw", (524, html))]) as provider:
+        runtime, aggregate, ledger = _runtime(tmp_path, max_calls=3, max_output_tokens=24)
+        result = ai_interface._call_ai_api_detailed(
+            "zero-retry gateway timeout budget test",
+            {**_config(provider.base_url), "raw_response_dir": str(tmp_path / "raw")},
+            "system",
+            max_tokens=8,
+            retry_attempts=0,
+            provider_runtime=runtime,
+        )
+
+    assert len(provider.requests) == 1
+    assert result["status"] == "failed"
+    assert result["error_kind"] == "retryable_http"
+    assert result["http_status"] == 524
+    assert result["attempts"] == 1
+    receipt = ledger.list_receipts()[0]
+    assert receipt.status == "failed"
+    assert receipt.http_status == 524
+    assert receipt.attempts == 1
+    snapshot = aggregate.snapshot()
+    assert snapshot["calls_used"] == 1
+    assert snapshot["calls_reserved"] == 0
+    assert snapshot["retry_attempts_used"] == 0
+    assert snapshot["retry_attempts_reserved"] == 0
+    assert snapshot["output_tokens_used"] == 8
+    assert snapshot["output_tokens_reserved"] == 0
+
+
+@pytest.mark.integration
 def test_real_local_http_error_preserves_request_id_and_bounded_error_body(tmp_path) -> None:
     body = {
         "error": {

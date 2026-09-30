@@ -280,6 +280,10 @@ def build_review_draft(
     citation_ref_catalog: Optional[Mapping[str, Any]] = None,
     citation_ref_catalog_path: str = "",
     citation_ref_catalog_hash: str = "",
+    outline_artifact_hash: str = "",
+    adoption_artifact_id: str = "",
+    adoption_artifact_hash: str = "",
+    writer_section_artifacts: Sequence[Mapping[str, str]] = (),
 ) -> ReviewDraft:
     normalized_sections: List[ReviewSection] = []
     for section in sections:
@@ -343,6 +347,29 @@ def build_review_draft(
 
     normalized_references = [str(reference).strip() for reference in references if str(reference).strip()]
 
+    generation_context = {
+        "generation_mode": generation_mode,
+        "outline_artifact_id": outline_artifact_id,
+        "outline_source_path": outline_source_path,
+        "summary_file": summary_file,
+        "section_count": len(normalized_sections),
+        "citation_ref_catalog_path": citation_ref_catalog_path,
+        "citation_ref_catalog_hash": citation_ref_catalog_hash,
+    }
+    if generation_mode == "outline_v3":
+        generation_context.update({
+            "outline_artifact_hash": outline_artifact_hash,
+            "adoption_artifact_id": adoption_artifact_id,
+            "adoption_artifact_hash": adoption_artifact_hash,
+            "writer_section_artifacts": [
+                {
+                    "artifact_id": str(item.get("artifact_id") or ""),
+                    "content_hash": str(item.get("content_hash") or ""),
+                }
+                for item in writer_section_artifacts
+            ],
+        })
+
     return ReviewDraft(
         artifact_type="review_draft",
         artifact_version="v3",
@@ -353,15 +380,7 @@ def build_review_draft(
             "project_name": project_name,
             "scope": "full_review",
         },
-        generation_context={
-            "generation_mode": generation_mode,
-            "outline_artifact_id": outline_artifact_id,
-            "outline_source_path": outline_source_path,
-            "summary_file": summary_file,
-            "section_count": len(normalized_sections),
-            "citation_ref_catalog_path": citation_ref_catalog_path,
-            "citation_ref_catalog_hash": citation_ref_catalog_hash,
-        },
+        generation_context=generation_context,
         content={
             "sections": normalized_sections,
             "references": normalized_references,

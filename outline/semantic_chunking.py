@@ -33,7 +33,7 @@ from outline.v3_models import (
     compute_v3_hash,
 )
 from runtime.provider_runtime import (
-    AUTHORIZED_PROVIDER_CALL_LIMIT,
+    DEFAULT_PROVIDER_CALL_BUDGET,
     authorized_provider_call_limit,
 )
 from summary_schema import get_ai_summary
@@ -41,7 +41,7 @@ from summary_schema import get_ai_summary
 SEMANTIC_CHUNK_PLAN_ARTIFACT_TYPE = "semantic_chunk_plan"
 SEMANTIC_CHUNK_PLAN_ARTIFACT_VERSION = "v1"
 SEMANTIC_CHUNK_PLAN_SCHEMA_VERSION = "semantic-chunk-plan-v1"
-_TOPIC_FAMILY_GROUPING_VERSION = "method-theory-paper-pairs-v2"
+_TOPIC_FAMILY_GROUPING_VERSION = "method-theory-paper-pairs-v3"
 
 _METHOD_TOPIC_FAMILIES: Tuple[Tuple[str, str, Tuple[str, ...]], ...] = (
     ("mixed_methods", "mixed-method designs", ("mixed method", "mixed-method")),
@@ -153,7 +153,7 @@ _MULTI_STUDY_SIGNAL = re.compile(
 
 
 def _safe_text(value: Any) -> str:
-    return str(value or "").strip()
+    return "" if value is None else str(value).strip()
 
 
 def _stable_unique(values: Iterable[Any]) -> List[str]:
@@ -1357,11 +1357,14 @@ def _topic_candidates(content_layers: PaperContentLayers) -> Tuple[Dict[str, Dic
         if dimensions.get("method") and dimensions.get("theory")
     }
 
-    residual_occurrences = {
-        (dimension, label): paper_ids - paired_papers
-        for (dimension, label), paper_ids in occurrences.items()
-        if paper_ids - paired_papers
-    }
+    residual_occurrences: Dict[Tuple[str, str], set[str]] = {}
+    for (dimension, label), paper_ids in occurrences.items():
+        # Pairing method and theory creates one paper-local task for those two
+        # dimensions. It must not remove the same papers from independent
+        # construct, mechanism, or context tasks.
+        residual_papers = paper_ids - paired_papers if dimension in {"method", "theory"} else paper_ids
+        if residual_papers:
+            residual_occurrences[(dimension, label)] = residual_papers
     residual_family_labels: Dict[Tuple[str, str], Dict[str, set[str]]] = {}
     for (dimension, label), paper_ids in residual_occurrences.items():
         family = _method_theory_topic_family(dimension, label)
@@ -1989,7 +1992,7 @@ def build_semantic_chunk_plan(
     relation_map: GlobalRelationMap | None = None,
     *,
     candidate_count: int = 3,
-    physical_call_limit: int = AUTHORIZED_PROVIDER_CALL_LIMIT,
+    physical_call_limit: int = DEFAULT_PROVIDER_CALL_BUDGET,
     retry_fallback_reserve: int = 3,
     reuse_inventory: Sequence[ReuseInventoryItem | Mapping[str, Any]] = (),
 ) -> SemanticChunkPlan:

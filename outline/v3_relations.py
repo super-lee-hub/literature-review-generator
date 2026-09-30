@@ -93,7 +93,7 @@ _AXIS_SPECS = (
 
 
 def _safe_text(value: Any) -> str:
-    return str(value or "").strip()
+    return "" if value is None else str(value).strip()
 
 
 def _stable_unique(values: Iterable[Any]) -> List[str]:

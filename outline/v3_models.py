@@ -147,14 +147,18 @@ class SourceFieldLedgerEntry:
         return cls(
             source_field_id=str(data.get("source_field_id") or ""),
             source_path=str(data.get("source_path") or ""),
-            source_value=str(data.get("source_value") or ""),
+            source_value=(
+                "" if data.get("source_value") is None else str(data.get("source_value"))
+            ),
             disposition=str(data.get("disposition") or ""),
             canonical_field=str(data.get("canonical_field") or ""),
             scope=str(data.get("scope") or "paper"),
             study_id=str(data.get("study_id") or ""),
             interpretation_required=bool(data.get("interpretation_required", False)),
             source_summary_hash=str(data.get("source_summary_hash") or ""),
-            derived_value=str(data.get("derived_value") or ""),
+            derived_value=(
+                "" if data.get("derived_value") is None else str(data.get("derived_value"))
+            ),
         )
 
 

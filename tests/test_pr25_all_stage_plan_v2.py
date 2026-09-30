@@ -257,7 +257,7 @@ def test_method_theory_pairing_shares_per_paper_reads_and_keeps_family_metadata(
         assert topic.comparison_questions[1].startswith("THEORY QUESTION")
         assert "answer the two dimensions separately" in topic.question
     family_groups = plan.coverage["topic_family_grouping"]["groups"]
-    assert plan.coverage["topic_family_grouping"]["version"] == "method-theory-paper-pairs-v2"
+    assert plan.coverage["topic_family_grouping"]["version"] == "method-theory-paper-pairs-v3"
     assert plan.coverage["topic_family_grouping"]["method_family_group_count"] == 1
     assert plan.coverage["topic_family_grouping"]["theory_family_group_count"] == 1
     assert plan.coverage["topic_family_grouping"]["source_label_occurrence_count"] == 4

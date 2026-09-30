@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 from typing import Any, Mapping
 import zipfile
+import reviewctl
 
 import fitz  # type: ignore
 import pytest
@@ -513,6 +514,7 @@ def _test_config(tmp_path: Path) -> Path:
 def test_current_three_pdf_runtime_chain_reaches_verified_export(
     tmp_path: Path,
     monkeypatch: Any,
+    capsys: Any,
     adjudicator: Any,
     expected_disposition: str,
     expected_completion: str,
@@ -651,11 +653,18 @@ def test_current_three_pdf_runtime_chain_reaches_verified_export(
     assert adoption["status"] == "succeeded", adoption
     assert adoption["mutation_performed"] is True
 
-    completed = control.resume(workspace=first.workspace_path)
+    capsys.readouterr()  # discard expected OCR output from the prior direct runner setup
+    cli_exit = reviewctl.main([
+        "--repo-root", str(Path(__file__).resolve().parents[1]),
+        "resume", "--workspace", first.workspace_path,
+    ])
+    cli_output = capsys.readouterr()
+    completed = json.loads(cli_output.out)
+    assert cli_exit == (0 if expected_completion == "complete" else 1), cli_output
     assert completed["job_status"] == "completed", completed
     assert completed["completion_status"] == expected_completion, completed
     assert completed["canonical_ready"] is (expected_completion == "complete"), completed
-    assert completed["completed_stages"] == (
+    assert tuple(completed["completed_stages"]) == (
         "source_intake",
         "analyze",
         "outline",

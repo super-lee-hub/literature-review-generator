@@ -90,7 +90,7 @@ def test_candidate_count_only_changes_organization_budget_not_shared_plan_hash()
     assert plan_three.budgets["provider_posts_emitted"] == 0
 
 
-def test_semantic_chunk_plan_clamps_requested_provider_calls_to_shared_authority():
+def test_semantic_chunk_plan_preserves_explicit_per_run_provider_call_budget():
     summaries = [_summary("paper-a", "A", "A result"), _summary("paper-b", "B", "B result")]
     layers, relations = _layers(summaries)
     plan = build_semantic_chunk_plan(
@@ -100,7 +100,7 @@ def test_semantic_chunk_plan_clamps_requested_provider_calls_to_shared_authority
         physical_call_limit=100,
     )
 
-    assert plan.budgets["physical_call_limit"] == 24
+    assert plan.budgets["physical_call_limit"] == 100
 
 
 def test_topic_candidates_use_typed_labels_and_ignore_generic_navigation_tokens():

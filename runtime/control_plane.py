@@ -39,7 +39,7 @@ from runtime.outline_v3_replay import ModelCallReplayStore
 from runtime.orchestrator import AgentRuntimeBridge, InternalStageExecutorRegistry
 from runtime.runner import AgentRuntimeRunner, RuntimeExecutionResult, RuntimeRunnerError
 from runtime.provider_runtime import (
-    AUTHORIZED_PROVIDER_CALL_LIMIT,
+    DEFAULT_PROVIDER_CALL_BUDGET,
     AcceptanceExecutionContextV1,
     ProviderAggregateBudgetV1,
     ProviderBudgetController,
@@ -62,6 +62,7 @@ from services.stage1_reuse import (
 )
 from runtime.reconcile import load_summary_source_manifest
 from runtime.provider_routes import build_reachable_provider_route_plan
+from runtime.source_intake import build_source_bundle_for_request
 from runtime.stage_planning import (
     ProviderStageRequestInventoryV1,
     UnplannedProviderExposureV1,
@@ -102,6 +103,36 @@ from outline.v3_relations import build_global_relation_map
 
 CONTROL_PLANE_VERSION = "reviewctl-v1"
 PROVIDER_FREE_SHADOW_CALL_LIMITS = (24, 48, 64, 80)
+_FULL_STAGE_REQUEST_BUILDER_IDS = {
+    ("analyze", "backup_reader"): "services.stage1_analysis_service.Stage1AnalysisService._call_reader",
+    ("outline", "relation_adjudication"): "outline.v3_executor.OutlineV3Executor._run_hierarchical_relation_adjudication",
+    ("outline", "structure_critique"): "outline.v3_executor.OutlineV3Executor._run_hierarchical_critique:structure_critique",
+    ("outline", "coverage_critique"): "outline.v3_executor.OutlineV3Executor._run_hierarchical_critique:coverage_critique",
+    ("outline", "evidence_critique"): "outline.v3_executor.OutlineV3Executor._run_hierarchical_critique:evidence_critique",
+    ("outline", "arbitration"): "outline.v3_executor.OutlineV3Executor._run_provider_node:arbitration",
+}
+_FULL_STAGE_BUILDER_EXPOSURE = {
+    ("analyze", "backup_reader"): (
+        "backup_reader_calls_depend_on_primary_reader_failure_or_correction",
+        "primary_reader_failed_or_semantic_correction_required",
+    ),
+    ("outline", "relation_adjudication"): (
+        "relation_builder_requires_materialized_candidate_scope_and_shards",
+        "",
+    ),
+    ("outline", "structure_critique"): ("critique_builder_requires_materialized_candidate_outputs", ""),
+    ("outline", "coverage_critique"): ("critique_builder_requires_materialized_candidate_outputs", ""),
+    ("outline", "evidence_critique"): ("critique_builder_requires_materialized_candidate_outputs", ""),
+    ("outline", "arbitration"): (
+        "arbitration_builder_requires_materialized_candidate_and_critique_outputs",
+        "eligible_candidate_and_critique_outputs_materialized",
+    ),
+}
+_FULL_STAGE_LOGICAL_CALL_UPPER_BOUNDS = {
+    # The canonical Outline path invokes arbitration once after candidate and
+    # critique closure; absence of eligible candidates fails before transport.
+    ("outline", "arbitration"): 1,
+}
 FORBIDDEN_ACTIONS = (
     "edit_registry",
     "edit_stage_health",
@@ -650,6 +681,7 @@ class ReviewControlPlane:
                 "allow_unvalidated_when_validation_optional"
             ),
         )
+        stage1_reuse_projection = self._verified_typed_reuse_only_stage1_input(spec)
         route_plan = build_reachable_provider_route_plan(
             config,
             action=spec.action,
@@ -657,6 +689,28 @@ class ReviewControlPlane:
             free_mode_enabled=free_mode_enabled,
             stage_plan=stage_plan,
         )
+        from outline.v3_executor import MAX_SEMANTIC_REDUCER_CALLS_PER_STAGE
+        suppressed_provider_routes: list[dict[str, str]] = []
+        if stage1_reuse_projection is not None:
+            suppressed_provider_routes = [
+                {
+                    "stage": route.stage,
+                    "semantic_role": route.semantic_role,
+                    "reason": "verified typed reuse-only source has no Stage 1 paper work items",
+                }
+                for route in route_plan.routes
+                if route.stage == "analyze"
+            ]
+            route_plan = replace(
+                route_plan,
+                routes=tuple(
+                    route for route in route_plan.routes if route.stage != "analyze"
+                ),
+                diagnostics=(
+                    *route_plan.diagnostics,
+                    "Analyze provider routes are unreachable for verified typed reuse-only input",
+                ),
+            )
         from runtime.provider_context import ProviderContextProfile
         from services.model_selection import get_api_config_for_section
 
@@ -671,7 +725,10 @@ class ReviewControlPlane:
             semantic_role: str,
             route: Any,
             reason: str,
+            request_builder_id: str = "",
             conditional_on: str = "",
+            logical_calls_upper_bound: int | None = None,
+            output_tokens_upper_bound: int | None = None,
         ) -> UnplannedProviderExposureV1:
             """Bound each reachable request while keeping its call count unknown."""
 
@@ -682,7 +739,11 @@ class ReviewControlPlane:
                 capability = resolve_model_capability(api_config)
                 output_tokens = max(1, int(api_config.get("max_output_tokens") or 4_096))
                 if semantic_role == "evidence_critique":
-                    output_tokens = min(output_tokens, 16_000)
+                    output_tokens = min(output_tokens, 2_048)
+                elif semantic_role in {"structure_critique", "coverage_critique"}:
+                    output_tokens = min(output_tokens, 2_048)
+                if output_tokens_upper_bound is not None:
+                    output_tokens = min(output_tokens, max(1, int(output_tokens_upper_bound)))
                 profile = ProviderContextProfile.conservative(
                     provider=capability.provider_family,
                     model=model,
@@ -698,18 +759,29 @@ class ReviewControlPlane:
                         0, int(api_config.get("safety_margin_tokens") or 1_024),
                     ),
                 )
+            input_tokens_upper_bound = (
+                int(profile.input_budget) if profile is not None else None
+            )
+            if profile is not None and stage_name == "outline":
+                configured_source_cap = int(
+                    settings.outline_stability.max_source_prompt_tokens or 32_000
+                )
+                input_tokens_upper_bound = min(
+                    int(profile.input_budget),
+                    32_000,
+                    configured_source_cap,
+                )
             retry_text = str(api_config.get("transport_retries") or "").strip()
             retry_bound = max(0, int(retry_text)) if retry_text else runtime_retries
             return UnplannedProviderExposureV1(
                 stage_name=stage_name,
                 semantic_role=semantic_role,
                 reason=reason,
+                request_builder_id=request_builder_id,
                 route_identity=tuple(route.identity),
                 conditional_on=conditional_on,
-                logical_calls_upper_bound=None,
-                input_tokens_per_call_upper_bound=(
-                    int(profile.input_budget) if profile is not None else None
-                ),
+                logical_calls_upper_bound=logical_calls_upper_bound,
+                input_tokens_per_call_upper_bound=input_tokens_upper_bound,
                 output_tokens_per_call_upper_bound=(
                     int(profile.max_output_tokens) if profile is not None else None
                 ),
@@ -729,37 +801,74 @@ class ReviewControlPlane:
         )
         inventories: list[ProviderStageRequestInventoryV1] = []
         if "analyze" in stage_plan.requested_stages:
-            reader_route = next(
-                (
-                    route for route in route_plan.routes
-                    if route.stage == "analyze"
-                    and route.semantic_role == "primary_reader"
-                ),
-                None,
-            )
-            if reader_route is not None:
+            if stage1_reuse_projection is not None:
                 inventories.append(
                     ProviderStageRequestInventoryV1(
                         stage_name="analyze",
-                        source_builder="Stage1 reader and typed-reuse admission",
-                        unknown_exposures=(
-                            unplanned_exposure(
-                                stage_name="analyze",
-                                semantic_role="primary_reader",
-                                route=reader_route,
-                                reason="primary_reader_requests_require_source_pages_or_verified_typed_reuse",
-                            ),
-                            unplanned_exposure(
-                                stage_name="analyze",
-                                semantic_role="primary_reader",
-                                route=reader_route,
-                                reason="summary_drift_recheck_requires_current_source_and_failed_authority",
-                                conditional_on="source_or_summary_drift_requires_recheck",
-                            ),
+                        source_builder=(
+                            "runtime.orchestrator.AgentRuntimeBridge._execute_analyze "
+                            "verified typed reuse-only path"
                         ),
                     )
                 )
+            else:
+                analyze_exposures: list[UnplannedProviderExposureV1] = []
+                for route in route_plan.routes:
+                    if (
+                        route.stage != "analyze"
+                        or not route.enabled
+                        or not route.required
+                        or not route.resolved
+                    ):
+                        continue
+                    if route.semantic_role == "primary_reader":
+                        analyze_exposures.extend((
+                            unplanned_exposure(
+                                stage_name="analyze",
+                                semantic_role="primary_reader",
+                                route=route,
+                                reason="primary_reader_requests_require_source_pages_or_verified_typed_reuse",
+                                request_builder_id="services.stage1_analysis_service.Stage1AnalysisService._call_reader",
+                            ),
+                            unplanned_exposure(
+                                stage_name="analyze",
+                                semantic_role="primary_reader",
+                                route=route,
+                                reason="summary_drift_recheck_requires_current_source_and_failed_authority",
+                                request_builder_id="services.stage1_analysis_service.Stage1AnalysisService._call_reader",
+                                conditional_on="source_or_summary_drift_requires_recheck",
+                            ),
+                        ))
+                    elif route.semantic_role == "backup_reader":
+                        analyze_exposures.append(
+                            unplanned_exposure(
+                                stage_name="analyze",
+                                semantic_role="backup_reader",
+                                route=route,
+                                reason="backup_reader_calls_depend_on_primary_reader_failure_or_correction",
+                                request_builder_id="services.stage1_analysis_service.Stage1AnalysisService._call_reader",
+                                conditional_on="primary_reader_failed_or_semantic_correction_required",
+                            )
+                        )
+                if analyze_exposures:
+                    inventories.append(
+                        ProviderStageRequestInventoryV1(
+                            stage_name="analyze",
+                            source_builder="Stage1 reader and typed-reuse admission",
+                            unknown_exposures=tuple(analyze_exposures),
+                        )
+                    )
         if "outline" in stage_plan.requested_stages:
+            semantic_reducer_call_upper_bound = (
+                MAX_SEMANTIC_REDUCER_CALLS_PER_STAGE + 1
+            )
+            semantic_builder_by_phase = {
+                "candidate_generation": "outline.v3_executor.OutlineV3Executor._run_hierarchical_candidate_generation",
+                "topic": "outline.v3_executor.OutlineV3Executor._build_topic_provider_request",
+                "cross_group": "outline.v3_executor.OutlineV3Executor._run_bounded_semantic_provider_call:cross_group_comparison",
+                "global": "outline.v3_executor.OutlineV3Executor._run_bounded_semantic_provider_call:global_synthesis",
+                "stability": "outline.v3_executor.OutlineV3Executor._run_stability_variant",
+            }
             outline_route = next(
                 (
                     route for route in route_plan.routes
@@ -768,34 +877,94 @@ class ReviewControlPlane:
                 ),
                 None,
             )
+            outline_exposures: list[UnplannedProviderExposureV1] = []
             if outline_route is not None:
-                inventories.append(
-                    ProviderStageRequestInventoryV1(
-                        stage_name="outline",
-                        source_builder="outline.v3_executor semantic and provider request builders",
-                        unknown_exposures=tuple(
+                semantic_output_cap = max(
+                    1, int(settings.outline.semantic_output_max_tokens or 4_096)
+                )
+                if outline_route.enabled and outline_route.required and outline_route.resolved:
+                    for phase in (
+                        "candidate_generation", "topic", "cross_group", "global",
+                        *(
+                            ("stability",)
+                            if settings.outline_stability.mode != "off" else ()
+                        ),
+                    ):
+                        outline_exposures.append(
                             unplanned_exposure(
                                 stage_name="outline",
                                 semantic_role="candidate_provider_generation",
                                 route=outline_route,
                                 reason=f"{phase}_request_requires_frozen_stage1_or_prior_provider_outputs",
+                                request_builder_id=semantic_builder_by_phase[phase],
                                 conditional_on={
                                     "cross_group": "topic_synthesis_completed",
                                     "global": "cross_group_completed",
                                     "stability": "outline_stability_mode_enabled",
-                                    "semantic_revision": "critic_or_gate_requests_revision",
-                                    "semantic_recheck": "semantic_revision_completed",
                                 }.get(phase, ""),
-                            )
-                            for phase in (
-                                "candidate_generation", "topic", "cross_group", "global",
-                                *(
-                                    ("stability",)
-                                    if settings.outline_stability.mode != "off" else ()
+                                logical_calls_upper_bound=(
+                                    semantic_reducer_call_upper_bound
+                                    if phase in {"cross_group", "global"}
+                                    else None
                                 ),
-                                "semantic_revision", "semantic_recheck",
+                                output_tokens_upper_bound=(
+                                    4_096
+                                    if phase in {"candidate_generation", "stability"}
+                                    else semantic_output_cap
+                                ),
                             )
+                        )
+                    semantic_repair_enabled = str(
+                        config.get("OutlineStability", {}).get("semantic_repair_enabled") or ""
+                    ).strip().lower() in {"1", "true", "yes", "on"}
+                    if semantic_repair_enabled:
+                        outline_exposures.append(
+                            unplanned_exposure(
+                                stage_name="outline",
+                                semantic_role="candidate_provider_generation",
+                                route=outline_route,
+                                reason="primary_candidate_semantic_repair_requires_structural_validation_failure",
+                                request_builder_id="outline.v3_executor.OutlineV3Executor._semantic_repair_candidate",
+                                conditional_on="candidate_contract_validation_failed",
+                                logical_calls_upper_bound=max(0, int(settings.outline.candidate_count)),
+                            )
+                        )
+            role_reasons = {
+                role: values
+                for (stage, role), values in _FULL_STAGE_BUILDER_EXPOSURE.items()
+                if stage == "outline"
+            }
+            for role, (reason, conditional_on) in role_reasons.items():
+                route = next(
+                    (
+                        item for item in route_plan.routes
+                        if item.stage == "outline" and item.semantic_role == role
+                    ),
+                    None,
+                )
+                if route is None or not route.enabled or not route.required or not route.resolved:
+                    continue
+                outline_exposures.append(
+                    unplanned_exposure(
+                        stage_name="outline",
+                        semantic_role=role,
+                        route=route,
+                        reason=reason,
+                        request_builder_id=_FULL_STAGE_REQUEST_BUILDER_IDS.get(
+                            ("outline", role), ""
                         ),
+                        conditional_on=conditional_on,
+                        logical_calls_upper_bound=_FULL_STAGE_LOGICAL_CALL_UPPER_BOUNDS.get(
+                            ("outline", role)
+                        ),
+                    )
+                )
+            if outline_exposures:
+                inventories.append(
+                    ProviderStageRequestInventoryV1(
+                        stage_name="outline",
+                        source_builder="outline.v3_executor semantic and provider request builders",
+                        unknown_exposures=tuple(outline_exposures),
                     )
                 )
         if "review" in stage_plan.requested_stages:
@@ -806,7 +975,7 @@ class ReviewControlPlane:
                 ),
                 None,
             )
-            if writer_route is not None:
+            if writer_route is not None and writer_route.enabled and writer_route.required and writer_route.resolved:
                 inventories.append(
                     ProviderStageRequestInventoryV1(
                         stage_name="review",
@@ -834,7 +1003,7 @@ class ReviewControlPlane:
                 ),
                 None,
             )
-            if validator_route is not None:
+            if validator_route is not None and validator_route.enabled and validator_route.required and validator_route.resolved:
                 inventories.append(
                     ProviderStageRequestInventoryV1(
                         stage_name="validate",
@@ -866,28 +1035,6 @@ class ReviewControlPlane:
                 "docx_render", "current_artifact_set", "verified_export",
             ),
         )
-        route_by_stage_role = {
-            (route.stage, route.semantic_role): route for route in route_plan.routes
-        }
-        for exposure in projection.get("unknown_exposures") or ():
-            if not isinstance(exposure, dict) or str(exposure.get("reason") or "") not in {
-                "reachable_route_has_no_request_builder_inventory",
-                "reachable_required_route_is_unresolved",
-            }:
-                continue
-            route = route_by_stage_role.get(
-                (str(exposure.get("stage_name") or ""), str(exposure.get("semantic_role") or ""))
-            )
-            if route is None:
-                continue
-            bounded = unplanned_exposure(
-                stage_name=route.stage,
-                semantic_role=route.semantic_role,
-                route=route,
-                reason=str(exposure.get("reason") or ""),
-                conditional_on=str(exposure.get("conditional_on") or ""),
-            )
-            exposure.update(bounded.to_dict())
         projection["projection_identity_hash"] = hash_json(
             {
                 "action": stage_plan.action,
@@ -895,6 +1042,8 @@ class ReviewControlPlane:
                 "reachable_route_plan": route_plan.to_dict(),
                 "provider_requests": projection.get("provider_requests") or [],
                 "unknown_exposures": projection.get("unknown_exposures") or [],
+                "stage1_reuse_authority": stage1_reuse_projection,
+                "suppressed_provider_routes": suppressed_provider_routes,
                 "aggregate_budget": aggregate_budget.to_dict(),
             }
         )
@@ -906,11 +1055,98 @@ class ReviewControlPlane:
         )
         projection["unbound_aggregate_limits_are_unknown"] = acceptance is None
         projection["stage1_reuse_authority_status"] = (
-            "not_verified_by_spec_alone"
-            if spec.to_job_request().reuse_stage1 else "not_requested"
+            "verified_typed_manifest_summary_only_input"
+            if stage1_reuse_projection is not None
+            else "not_verified_by_spec_alone"
+            if spec.to_job_request().reuse_stage1
+            else "not_requested"
         )
+        if stage1_reuse_projection is not None:
+            projection["stage1_reuse_authority"] = stage1_reuse_projection
+            projection["suppressed_provider_routes"] = suppressed_provider_routes
         projection["provider_calls"] = "not executed"
         return projection
+
+    def _verified_typed_reuse_only_stage1_input(
+        self, spec: RuntimeJobSpec
+    ) -> dict[str, Any] | None:
+        """Verify Stage 1 authorities for a summary-only run with no PDF work items."""
+
+        request = spec.to_job_request()
+        if (
+            str(spec.action) not in {"analyze", "run_all", "retry_failed"}
+            or str(spec.source.mode or "").strip().lower() != "direct"
+            or not request.reuse_summary_files
+            or request.summary_file
+            or request.summary_sources
+        ):
+            return None
+        source_bundle = build_source_bundle_for_request(
+            request,
+            project_name=spec.project_name,
+        )
+        if source_bundle.paper_work_items:
+            return None
+
+        summaries: list[dict[str, Any]] = []
+        for path in request.reuse_summary_files:
+            summaries.extend(
+                InternalStageExecutorRegistry._summary_payloads_from_file(path)
+            )
+        if not summaries:
+            return None
+
+        typed_flags = [
+            isinstance(item.get("stage1_reuse"), Mapping)
+            and str(item["stage1_reuse"].get("authority_kind") or "").strip()
+            == "typed_manifest"
+            for item in summaries
+        ]
+        if not any(typed_flags):
+            return None
+        if not all(typed_flags):
+            raise ControlPlaneError(
+                "reuse-only Analyze input mixes typed and non-typed Stage 1 authorities"
+            )
+
+        authorities: list[dict[str, str]] = []
+        for index, summary in enumerate(summaries):
+            reuse = summary["stage1_reuse"]
+            raw_binding = reuse.get("binding")
+            binding = Stage1ReusableSummaryBindingV1.from_mapping(
+                raw_binding if isinstance(raw_binding, Mapping) else None
+            )
+            authority, reason = verify_stage1_typed_manifest_authority(
+                summary,
+                binding,
+            )
+            if authority is None:
+                raise ControlPlaneError(
+                    f"reuse-only Stage 1 typed authority failed at summary {index}: {reason}"
+                )
+            authorities.append(
+                {
+                    "canonical_paper_key": authority.manifest.canonical_paper_key,
+                    "manifest_file_hash": authority.manifest_file_hash,
+                    "source_summary_artifact_hash": authority.manifest.source_summary_artifact_hash,
+                }
+            )
+        paper_keys = [item["canonical_paper_key"] for item in authorities]
+        if len(paper_keys) != len(set(paper_keys)):
+            raise ControlPlaneError(
+                "reuse-only Stage 1 typed authorities contain duplicate paper identities"
+            )
+        return {
+            "reuse_manifest_file_count": len(request.reuse_summary_files),
+            "canonical_summary_count": len(summaries),
+            "typed_manifest_authority_count": len(authorities),
+            "authority_set_hash": hash_json(
+                sorted(authorities, key=lambda item: item["canonical_paper_key"])
+            ),
+            "paper_work_item_count": 0,
+            "provider_calls_upper_bound": 0,
+            "current_binding_comparison": "not_run_no_stage1_paper_work_items",
+        }
 
     def plan(self, spec_path: str | Path) -> dict[str, Any]:
         spec = _load_spec_path(spec_path)
@@ -1129,7 +1365,7 @@ class ReviewControlPlane:
         configured_call_limit = (
             configured_settings.outline_stability.max_provider_calls
             if configured_settings is not None
-            else AUTHORIZED_PROVIDER_CALL_LIMIT
+            else DEFAULT_PROVIDER_CALL_BUDGET
         )
         requested_call_limit = (
             int(physical_call_limit)
@@ -1149,7 +1385,7 @@ class ReviewControlPlane:
                 effective_call_limit = authorized_provider_call_limit(
                     int(
                         loaded_config.get("OutlineStability", {}).get("max_provider_calls")
-                        or AUTHORIZED_PROVIDER_CALL_LIMIT
+                        or DEFAULT_PROVIDER_CALL_BUDGET
                     )
                 )
         semantic_request_plan: list[dict[str, Any]] = []

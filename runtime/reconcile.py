@@ -763,6 +763,12 @@ def _validate_review_draft(record: ArtifactRecord, path: Path) -> None:
             _require_nonempty_string(block_data.get("block_id"), label="review block_id")
             _require_nonempty_string(block_data.get("text"), label="review block text")
 
+    if draft.generation_context.get("generation_mode") == "outline_v3":
+        # The focused compatibility checks above predate Outline v3 lineage.
+        # Reuse the Registry's strict validator for this production mode so
+        # reconciliation applies the same lineage contract as publication.
+        _validate_current_production_artifact(record, path)
+
 
 def _validate_citation_manifest(record: ArtifactRecord, path: Path) -> None:
     from services.citation_manifest import CitationManifestV3

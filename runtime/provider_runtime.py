@@ -21,7 +21,7 @@ import re
 import socket
 import threading
 import time
-from typing import Any, Callable, Iterable, Literal, Mapping, cast
+from typing import Any, Callable, ClassVar, Iterable, Literal, Mapping, cast
 import uuid
 
 from services.durable_io import atomic_replace_with_retry, interprocess_file_lock
@@ -31,14 +31,21 @@ from services.job_workspace import atomic_write_json, utc_now_iso
 PROVIDER_RECEIPT_ARTIFACT_TYPE = "provider_call_receipt"
 PROVIDER_RECEIPT_ARTIFACT_VERSION = "v2"
 PROVIDER_RECEIPT_LEDGER_VERSION = "provider-receipt-ledger-v1"
-AUTHORIZED_PROVIDER_CALL_LIMIT = 24
+# Compatibility/default run budget only. Explicit per-run budgets are not
+# truncated to this value; the aggregate budget controller enforces the run's
+# actual approved envelope.
+DEFAULT_PROVIDER_CALL_BUDGET = 24
 
 
 def authorized_provider_call_limit(configured_limit: int | None = None) -> int:
-    """Return the current hard admission cap without silently raising it."""
+    """Normalize a per-run call budget without applying a product-wide ceiling."""
 
-    requested = AUTHORIZED_PROVIDER_CALL_LIMIT if configured_limit is None else int(configured_limit)
-    return min(AUTHORIZED_PROVIDER_CALL_LIMIT, max(0, requested))
+    if configured_limit is None:
+        return DEFAULT_PROVIDER_CALL_BUDGET
+    if isinstance(configured_limit, bool):
+        raise ValueError("provider call budget must be an integer, not a boolean")
+    requested = int(configured_limit)
+    return max(0, requested)
 
 ProviderErrorKind = Literal[
     "quota_exhausted",
@@ -631,13 +638,113 @@ class ProviderAggregateBudgetV1:
 
 
 @dataclass(frozen=True)
+class ProviderAggregateBudgetV2:
+    """Strict finite run budget: zero is a real zero allowance.
+
+    V1 state files keep their historical zero-as-unbounded interpretation.
+    New approved runs use this nested budget schema and must provide every
+    limit explicitly, including an explicit retry allowance of zero.
+    """
+
+    SCHEMA_VERSION: ClassVar[str] = "provider-aggregate-budget-contract-v2"
+
+    max_provider_calls_total: int
+    max_output_tokens_total: int
+    max_retry_attempts_total: int
+    max_wall_seconds: float
+
+    def __post_init__(self) -> None:
+        for name in (
+            "max_provider_calls_total",
+            "max_output_tokens_total",
+            "max_retry_attempts_total",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ProviderRuntimeContractError(f"{name} must be a non-negative integer")
+        if (
+            isinstance(self.max_wall_seconds, bool)
+            or not math.isfinite(float(self.max_wall_seconds))
+            or float(self.max_wall_seconds) < 0
+        ):
+            raise ProviderRuntimeContractError("max_wall_seconds must be non-negative")
+        object.__setattr__(self, "max_wall_seconds", float(self.max_wall_seconds))
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "ProviderAggregateBudgetV2":
+        if not isinstance(value, Mapping) or value.get("schema_version") != cls.SCHEMA_VERSION:
+            raise ProviderRuntimeContractError(
+                "strict provider aggregate budget schema is missing or unsupported"
+            )
+        required = (
+            "max_provider_calls_total",
+            "max_output_tokens_total",
+            "max_retry_attempts_total",
+            "max_wall_seconds",
+        )
+        allowed = {"schema_version", *required}
+        unknown = sorted(str(key) for key in value if str(key) not in allowed)
+        if unknown:
+            raise ProviderRuntimeContractError(
+                "strict provider aggregate budget contains unknown fields: "
+                + ", ".join(unknown)
+            )
+        missing = [name for name in required if name not in value]
+        if missing:
+            raise ProviderRuntimeContractError(
+                "strict provider aggregate budget is missing limits: " + ", ".join(missing)
+            )
+
+        integers: dict[str, int] = {}
+        for name in required[:3]:
+            raw = value[name]
+            if isinstance(raw, bool):
+                raise ProviderRuntimeContractError(f"{name} must be an integer")
+            try:
+                parsed = int(str(raw).strip())
+            except (TypeError, ValueError) as exc:
+                raise ProviderRuntimeContractError(f"{name} must be an integer") from exc
+            if parsed < 0:
+                raise ProviderRuntimeContractError(f"{name} must be non-negative")
+            integers[name] = parsed
+        try:
+            wall = float(str(value["max_wall_seconds"]).strip())
+        except (TypeError, ValueError) as exc:
+            raise ProviderRuntimeContractError("max_wall_seconds must be numeric") from exc
+        return cls(**integers, max_wall_seconds=wall)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.SCHEMA_VERSION,
+            "max_provider_calls_total": self.max_provider_calls_total,
+            "max_output_tokens_total": self.max_output_tokens_total,
+            "max_retry_attempts_total": self.max_retry_attempts_total,
+            "max_wall_seconds": self.max_wall_seconds,
+        }
+
+
+ProviderAggregateBudget = ProviderAggregateBudgetV1 | ProviderAggregateBudgetV2
+
+
+def provider_aggregate_budget_from_mapping(value: Mapping[str, Any]) -> ProviderAggregateBudget:
+    """Decode an explicitly versioned strict budget or a legacy V1 budget."""
+
+    schema_version = value.get("schema_version") if isinstance(value, Mapping) else None
+    if schema_version == ProviderAggregateBudgetV2.SCHEMA_VERSION:
+        return ProviderAggregateBudgetV2.from_mapping(value)
+    if schema_version is not None:
+        raise ProviderRuntimeContractError("provider aggregate budget schema is unsupported")
+    return ProviderAggregateBudgetV1.from_mapping(value)
+
+
+@dataclass(frozen=True)
 class AcceptanceExecutionContextV1:
     """Run-scoped acceptance authority propagated to provider runtimes."""
 
     acceptance_run_id: str
     final_executable_sha: str
     absolute_deadline_epoch: float
-    provider_budget: ProviderAggregateBudgetV1
+    provider_budget: ProviderAggregateBudget
     provider_budget_state_path: str
     evidence_root: str
     process_event_log: str
@@ -744,7 +851,7 @@ class AcceptanceExecutionContextV1:
             acceptance_run_id=str(payload.get("acceptance_run_id") or ""),
             final_executable_sha=str(payload.get("final_executable_sha") or ""),
             absolute_deadline_epoch=deadline,
-            provider_budget=ProviderAggregateBudgetV1.from_mapping(raw_budget),
+            provider_budget=provider_aggregate_budget_from_mapping(raw_budget),
             provider_budget_state_path=str(
                 payload.get("provider_budget_state_path") or ""
             ),
@@ -849,7 +956,7 @@ class ProviderBudgetController:
 
     def __init__(
         self,
-        budget: ProviderAggregateBudgetV1,
+        budget: ProviderAggregateBudget,
         *,
         monotonic: Any = time.monotonic,
     ) -> None:
@@ -859,7 +966,7 @@ class ProviderBudgetController:
         self._first_started_epoch = float(time.time())
         self._absolute_deadline_epoch = (
             self._first_started_epoch + float(budget.max_wall_seconds)
-            if budget.max_wall_seconds
+            if budget.max_wall_seconds or isinstance(budget, ProviderAggregateBudgetV2)
             else 0.0
         )
         self._owner_id = uuid.uuid4().hex
@@ -1020,7 +1127,7 @@ class ProviderBudgetController:
                 "provider aggregate budget run identity cannot change after use"
             )
         payload = json.loads(self._state_path.read_text(encoding="utf-8"))
-        payload["schema_version"] = "provider-aggregate-budget-v4"
+        payload["schema_version"] = self._state_schema_version
         payload["acceptance_run_id"] = run_id
         atomic_write_json(str(self._state_path), payload)
         self._acceptance_run_id = run_id
@@ -1087,6 +1194,14 @@ class ProviderBudgetController:
     def state_started(self) -> bool:
         return self._state_started
 
+    @property
+    def _state_schema_version(self) -> str:
+        return (
+            "provider-aggregate-budget-v5"
+            if isinstance(self.budget, ProviderAggregateBudgetV2)
+            else "provider-aggregate-budget-v4"
+        )
+
     @staticmethod
     def _pid_alive(pid: int) -> bool:
         return is_process_alive(process_identity_for_pid(pid))
@@ -1119,8 +1234,14 @@ class ProviderBudgetController:
             "provider-aggregate-budget-v2",
             "provider-aggregate-budget-v3",
             "provider-aggregate-budget-v4",
+            "provider-aggregate-budget-v5",
         }:
             raise ProviderRuntimeContractError("provider aggregate budget state schema is invalid")
+        strict_budget = isinstance(self.budget, ProviderAggregateBudgetV2)
+        if strict_budget != (state_schema == "provider-aggregate-budget-v5"):
+            raise ProviderRuntimeContractError(
+                "provider aggregate budget state semantics do not match the active run"
+            )
         if (
             state_schema == "provider-aggregate-budget-v1"
             and self.budget.max_wall_seconds
@@ -1180,7 +1301,7 @@ class ProviderBudgetController:
             raise ProviderRuntimeContractError(
                 "provider aggregate budget start/deadline state must be finite and non-negative"
             )
-        if self.budget.max_wall_seconds:
+        if self.budget.max_wall_seconds or strict_budget:
             expected_deadline = first_started_epoch + self.budget.max_wall_seconds
             if absolute_deadline_epoch <= 0 or not math.isclose(
                 absolute_deadline_epoch,
@@ -1291,7 +1412,7 @@ class ProviderBudgetController:
                 "provider retries",
             ),
         ):
-            if limit and used + reserved > limit:
+            if (strict_budget or limit) and used + reserved > limit:
                 raise ProviderRuntimeContractError(
                     f"provider aggregate budget state exceeds its {label} limit"
                 )
@@ -1339,7 +1460,7 @@ class ProviderBudgetController:
         atomic_write_json(
             str(self._state_path),
             {
-                "schema_version": "provider-aggregate-budget-v4",
+                "schema_version": self._state_schema_version,
                 "budget": self.budget.to_dict(),
                 "acceptance_run_id": self._acceptance_run_id,
                 "calls_used": self._calls_used,
@@ -1371,10 +1492,11 @@ class ProviderBudgetController:
         )
 
     def _check_wall(self) -> None:
-        if self.budget.max_wall_seconds and self._absolute_deadline_epoch:
+        strict_budget = isinstance(self.budget, ProviderAggregateBudgetV2)
+        if (self.budget.max_wall_seconds or strict_budget) and self._absolute_deadline_epoch:
             if float(time.time()) >= self._absolute_deadline_epoch:
                 raise ProviderBudgetExceeded("aggregate provider wall-clock budget exhausted")
-        elif self.budget.max_wall_seconds and (
+        elif (self.budget.max_wall_seconds or strict_budget) and (
             float(self._monotonic()) - self._started_monotonic
         ) >= self.budget.max_wall_seconds:
             raise ProviderBudgetExceeded("aggregate provider wall-clock budget exhausted")
@@ -1421,20 +1543,21 @@ class ProviderBudgetController:
             raise ProviderBudgetExceeded(
                 "provider aggregate budget has ambiguous reservations requiring durable receipt reconciliation"
             )
+        strict_budget = isinstance(self.budget, ProviderAggregateBudgetV2)
         if (
-                self.budget.max_provider_calls_total
+                (strict_budget or self.budget.max_provider_calls_total)
                 and self._calls_used + self._calls_reserved + provider_calls
                 > self.budget.max_provider_calls_total
         ):
             raise ProviderBudgetExceeded("aggregate provider call budget exhausted")
         if (
-                self.budget.max_output_tokens_total
+                (strict_budget or self.budget.max_output_tokens_total)
                 and self._output_tokens_used + self._output_tokens_reserved + output_tokens
                 > self.budget.max_output_tokens_total
         ):
             raise ProviderBudgetExceeded("aggregate provider output-token budget exhausted")
         if (
-                self.budget.max_retry_attempts_total
+                (strict_budget or self.budget.max_retry_attempts_total)
                 and self._retry_attempts_used + self._retry_attempts_reserved + retry_attempts
                 > self.budget.max_retry_attempts_total
         ):
@@ -1703,7 +1826,7 @@ def provider_budget_controller_from_environment() -> ProviderBudgetController | 
                 "AUTO_GENERATE_ACCEPTANCE_BUDGET_JSON must be a JSON object"
             )
         controller = ProviderBudgetController(
-            ProviderAggregateBudgetV1.from_mapping(payload)
+            provider_aggregate_budget_from_mapping(payload)
         )
         if serialized_context is not None and controller.budget != serialized_context.provider_budget:
             raise ProviderRuntimeContractError(
@@ -3292,6 +3415,7 @@ __all__ = [
     "acceptance_execution_context_from_environment",
     "ProviderBudgetExceeded",
     "ProviderAggregateBudgetV1",
+    "ProviderAggregateBudgetV2",
     "ProviderAggregateReservationV1",
     "ProviderBudgetController",
     "ProviderBudgetV1",
@@ -3314,6 +3438,7 @@ __all__ = [
     "process_identity_for_pid",
     "process_liveness",
     "provider_budget_controller_from_environment",
+    "provider_aggregate_budget_from_mapping",
     "provider_request_input_hash",
     "stable_provider_hash",
 ]

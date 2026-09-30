@@ -113,6 +113,78 @@ def test_v3_01_effective_cap_never_exceeds_transport_hard_ceiling(tmp_path) -> N
     assert executor._effective_input_cap(profile) == 32_000
 
 
+def test_v3_01_candidate_shard_runner_enforces_the_transport_hard_cap(tmp_path, monkeypatch) -> None:
+    executor = _executor(
+        tmp_path,
+        stability_mode="off",
+        max_source_prompt_tokens=48_000,
+    )
+    profile = SimpleNamespace(
+        input_budget=100_000,
+        max_output_tokens=4_096,
+        estimate_request=lambda _request: {"estimated_input_tokens": 40_000},
+    )
+    monkeypatch.setattr(executor, "_node_route", lambda _node_id: SimpleNamespace(profile=profile))
+    monkeypatch.setattr(
+        executor,
+        "_candidate_shard_requests",
+        lambda **_kwargs: [("candidate_1_provider_generation:local:shard_1", {}, [], [], {"fixture": True})],
+    )
+    monkeypatch.setattr(executor, "_attach_prompt_authority", lambda _node_id, request: dict(request))
+    monkeypatch.setattr(
+        executor,
+        "_provider_call",
+        lambda *_args, **_kwargs: pytest.fail("oversized candidate request reached provider transport"),
+    )
+
+    with pytest.raises(OutlineV3ExecutionError, match="estimate 40000 exceeds effective input cap 32000"):
+        executor._run_hierarchical_candidate_generation(
+            candidate_id="candidate_1",
+            generation_node_id="candidate_1_provider_generation",
+            provider_request={"candidate_id": "candidate_1"},
+            evidence_views=[],
+            relation_candidates=[],
+            allowed_paper_keys=[],
+            allowed_relation_ids=[],
+            generation_deps={},
+            alias_map={},
+        )
+
+
+def test_v3_01_relation_adjudicator_enforces_the_transport_hard_cap(tmp_path, monkeypatch) -> None:
+    executor = _executor(
+        tmp_path,
+        stability_mode="off",
+        max_source_prompt_tokens=48_000,
+    )
+    profile = SimpleNamespace(
+        input_budget=100_000,
+        estimate_request=lambda _request: {"estimated_input_tokens": 40_000},
+    )
+    monkeypatch.setattr(executor, "_role_route", lambda _role: SimpleNamespace(profile=profile))
+    monkeypatch.setattr(
+        executor,
+        "_relation_compact_batch_requests",
+        lambda **_kwargs: [("relation_adjudication:batch_1", {"fixture": True}, {"R1"})],
+    )
+    monkeypatch.setattr(executor, "_attach_prompt_authority", lambda _node_id, request: dict(request))
+    monkeypatch.setattr(
+        executor,
+        "_provider_call",
+        lambda *_args, **_kwargs: pytest.fail("oversized relation request reached provider transport"),
+    )
+
+    with pytest.raises(OutlineV3ExecutionError, match="estimate 40000 exceeds effective input cap 32000"):
+        executor._run_hierarchical_relation_adjudication(
+            evidence_views=[],
+            relation_candidates=[{"relation_id": "R1", "paper_keys": ["A", "B"]}],
+            shard_plan={},
+            relation_contract={},
+            relation_dependencies={},
+            compact_request={"relation_candidates": []},
+        )
+
+
 def test_v3_01_cross_relation_packing_uses_the_effective_cap_not_the_larger_target(
     tmp_path,
 ) -> None:
@@ -2098,6 +2170,49 @@ def test_sharded_arbitration_requires_and_applies_coordination_without_extra_cal
     ]
 
 
+def test_arbitration_can_select_candidate_two_and_preserves_its_revision_hash(tmp_path) -> None:
+    arbitration_hashes: dict[str, str] = {}
+
+    def provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        response = dict(_configured_test_provider(node_id, request))
+        if node_id == "arbitration":
+            arbitration_hashes.update(
+                {str(key): str(value) for key, value in (request.get("candidate_hashes") or {}).items()}
+            )
+            content = dict(response.get("content") or {})
+            assert "candidate_2" in request.get("candidate_ids", ())
+            content["selected_candidate_id"] = "candidate_2"
+            response["content"] = content
+        return response
+
+    result = _executor(
+        tmp_path,
+        provider=provider,
+        stability_mode="off",
+        candidate_count=2,
+    ).run()
+
+    assert result.ok is True, result.diagnostics
+    assert result.status == "ready_for_adoption"
+    assert result.adopted is False
+    assert arbitration_hashes["candidate_2"]
+
+    selected = json.loads(
+        Path(result.artifacts["selected_candidate"]).read_text(encoding="utf-8")
+    )["payload"]
+    revision = json.loads(
+        Path(result.artifacts["selected_candidate_revision"]).read_text(encoding="utf-8")
+    )["payload"]
+    assert selected["candidate_id"] == "candidate_2"
+    assert selected["candidate_hash"] == arbitration_hashes["candidate_2"]
+    assert revision["candidate_id"] == "candidate_2"
+    assert revision["parent_candidate_hash"] == arbitration_hashes["candidate_2"]
+    assert revision["status"] == "completed"
+    assert revision["revised_content_hash"] == executor_module._hash_payload(
+        {"sections": revision["sections"]}
+    )
+
+
 _CRITIQUE_ROLES = {"structure_critique", "evidence_critique", "coverage_critique"}
 
 
@@ -2884,3 +2999,28 @@ def test_same_binding_cross_semantic_cache_without_coverage_ledger_is_not_reused
 
     assert executor._load_node(node_id, binding) is None
     assert executor._shared_semantic_cache_valid(node_id, payload) is False
+
+
+
+def test_v3_04_unrelated_paper_absent_remains_positive_control(tmp_path) -> None:
+    executor = _executor(tmp_path, stability_mode="off")
+    claim = "P001 Study 1 reports the conditional effect."
+    field_a, dependency_a, support_a = _study_support_fixture("A", "1", claim)
+    executor._candidate_interpretation_tables = {
+        "source_fields": [field_a],
+        "dependencies": [dependency_a],
+    }
+
+    executor._validate_candidate_payload(
+        "candidate:test",
+        {"sections": [{
+            "section_id": "paper-a-study-1",
+            "paper_keys": ["A"],
+            "relation_ids": [],
+            "claims": [claim],
+            "claim_support": [support_a],
+        }]},
+        allowed_paper_keys=["A"],
+        allowed_relation_ids=[],
+        alias_map={"papers_reverse": {"P001": "A"}},
+    )

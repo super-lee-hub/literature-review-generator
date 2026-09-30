@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, Mapping, MutableMapping
 
-from runtime.provider_runtime import AUTHORIZED_PROVIDER_CALL_LIMIT
+from runtime.provider_runtime import DEFAULT_PROVIDER_CALL_BUDGET
 from services.config_values import normalize_stage1_config_sections
 from services.model_capabilities import resolve_model_capability
 from services.repair_policy import DEFAULT_REPAIR_POLICY, parse_repair_policy
@@ -559,7 +559,7 @@ class OutlineSettings:
 @dataclass(frozen=True)
 class OutlineStabilitySettings:
     mode: str = "smoke"
-    max_provider_calls: int = AUTHORIZED_PROVIDER_CALL_LIMIT
+    max_provider_calls: int = DEFAULT_PROVIDER_CALL_BUDGET
     max_estimated_cost: float | None = None
     max_estimated_total_tokens: int = 5_000_000
     pricing_source: str = ""
@@ -586,7 +586,7 @@ class OutlineStabilitySettings:
             mode=mode,
             max_provider_calls=max(
                 0,
-                _int(section.get("max_provider_calls"), AUTHORIZED_PROVIDER_CALL_LIMIT),
+                _int(section.get("max_provider_calls"), DEFAULT_PROVIDER_CALL_BUDGET),
             ),
             max_estimated_cost=_optional_float(section.get("max_estimated_cost")),
             max_estimated_total_tokens=max(

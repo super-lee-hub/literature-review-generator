@@ -7,9 +7,11 @@ from pathlib import Path
 import re
 import time
 from dataclasses import replace
+from types import SimpleNamespace
 
 from reviewctl import main as reviewctl_main
 from runtime.control_plane import ReviewControlPlane
+import runtime.control_plane as control_plane_module
 from runtime.outline_v3_dag import OutlineNodeStore
 from services.artifact_registry import ArtifactRegistry
 from services.credential_provenance import PREPROCESS_ENV_MAPPING
@@ -57,11 +59,26 @@ def test_reviewctl_plan_projects_all_reachable_provider_work_without_posting(
     tmp_path: Path, capsys,
 ) -> None:
     spec = _spec(tmp_path)
+    spec = replace(
+        spec,
+        action="run_all",
+        metadata={
+            **dict(spec.metadata or {}),
+            "requested_stages": ["analyze", "outline", "review", "validate"],
+        },
+    )
     config = Path(spec.config)
     parser = configparser.ConfigParser()
     parser.read(Path(__file__).resolve().parents[1] / "config.ini.example", encoding="utf-8")
     parser["Paths"]["output_path"] = str(tmp_path / "output")
-    for section in ("Primary_Reader_API", "Backup_Reader_API"):
+    for section in (
+        "Primary_Reader_API",
+        "Backup_Reader_API",
+        "Writer_API",
+        "Outline_API",
+        "Free_Mode_API",
+        "Validator_API",
+    ):
         parser[section]["api_key"] = "local-fixture-only"
         parser[section]["api_base"] = "http://127.0.0.1:1/v1"
     with config.open("w", encoding="utf-8") as handle:
@@ -77,6 +94,68 @@ def test_reviewctl_plan_projects_all_reachable_provider_work_without_posting(
     assert projection["totals"]["unknown_exposure_count"] >= 1
     assert projection["budget_status"]["admission"] == "incomplete_unknown_exposure"
     assert projection["boundary"]["no_provider_posts"] is True
+    expected_builder_roles = {
+        ("analyze", "backup_reader"),
+        ("outline", "relation_adjudication"),
+        ("outline", "structure_critique"),
+        ("outline", "coverage_critique"),
+        ("outline", "evidence_critique"),
+        ("outline", "arbitration"),
+    }
+    registered = {
+        (item["stage_name"], item["semantic_role"]): item
+        for item in projection["unknown_exposures"]
+        if item.get("request_builder_id")
+    }
+    assert expected_builder_roles <= set(registered)
+    assert all(
+        registered[role]["logical_calls_upper_bound"]
+        == (1 if role == ("outline", "arbitration") else None)
+        for role in expected_builder_roles
+    )
+    assert not any(
+        item["reason"] == "reachable_route_has_no_request_builder_inventory"
+        for item in projection["unknown_exposures"]
+    )
+    outline_exposures = [
+        item for item in projection["unknown_exposures"]
+        if item["stage_name"] == "outline"
+    ]
+    assert all(
+        item["input_tokens_per_call_upper_bound"] <= 32_000
+        for item in outline_exposures
+    )
+    assert all(
+        item["output_tokens_per_call_upper_bound"] <= 2_048
+        for item in outline_exposures
+        if item["semantic_role"] in {
+            "structure_critique", "coverage_critique", "evidence_critique",
+        }
+    )
+    semantic_repairs = [
+        item for item in outline_exposures
+        if str(item.get("request_builder_id") or "").endswith("_semantic_repair_candidate")
+    ]
+    assert len(semantic_repairs) == 1
+    assert semantic_repairs[0]["logical_calls_upper_bound"] == 5
+    assert not any("semantic_recheck" in item["reason"] for item in outline_exposures)
+    reducer_exposures = [
+        item
+        for item in outline_exposures
+        if item["reason"].startswith(("cross_group_request_", "global_request_"))
+    ]
+    assert len(reducer_exposures) == 2
+    assert {item["request_builder_id"] for item in reducer_exposures} == {
+        "outline.v3_executor.OutlineV3Executor._run_bounded_semantic_provider_call:cross_group_comparison",
+        "outline.v3_executor.OutlineV3Executor._run_bounded_semantic_provider_call:global_synthesis",
+    }
+    assert all(item["logical_calls_upper_bound"] == 25 for item in reducer_exposures)
+    assert all(item["physical_attempt_upper_bound"] == 75 for item in reducer_exposures)
+    arbitration = registered[("outline", "arbitration")]
+    assert arbitration["physical_attempt_upper_bound"] == 3
+    assert arbitration["conditional_on"] == "eligible_candidate_and_critique_outputs_materialized"
+    assert projection["totals"]["bounded_logical_call_exposure_count"] == 4
+    assert projection["totals"]["unbounded_logical_call_exposure_count"] > 0
     exposure = projection["unknown_exposures"][0]
     assert exposure["logical_calls_upper_bound"] is None
     assert exposure["input_tokens_per_call_upper_bound"] > 0
@@ -84,20 +163,118 @@ def test_reviewctl_plan_projects_all_reachable_provider_work_without_posting(
     assert exposure["reasoning_tokens_per_call_upper_bound"] >= 0
     assert exposure["retry_attempts_per_call_upper_bound"] >= 0
     assert projection["totals"]["estimated_output_tokens_all_attempts"] is None
-    assert all(
-        item["logical_calls_upper_bound"] is None
-        and isinstance(item["input_tokens_per_call_upper_bound"], int)
-        and isinstance(item["output_tokens_per_call_upper_bound"], int)
-        and isinstance(item["reasoning_tokens_per_call_upper_bound"], int)
-        and isinstance(item["retry_attempts_per_call_upper_bound"], int)
+    invalid_bounds = [
+        item
         for item in projection["unknown_exposures"]
-    )
+        if item["reason"] != "reachable_required_route_is_unresolved"
+        and not (
+            item["logical_calls_upper_bound"]
+            == (
+                5
+                if str(item.get("request_builder_id") or "").endswith("_semantic_repair_candidate")
+                else 25
+                if item["reason"].startswith(("cross_group_request_", "global_request_"))
+                else 1
+                if item["semantic_role"] == "arbitration"
+                else None
+            )
+            and isinstance(item["input_tokens_per_call_upper_bound"], int)
+            and isinstance(item["output_tokens_per_call_upper_bound"], int)
+            and isinstance(item["reasoning_tokens_per_call_upper_bound"], int)
+            and isinstance(item["retry_attempts_per_call_upper_bound"], int)
+        )
+    ]
+    assert not invalid_bounds, [
+        (item["stage_name"], item["semantic_role"], item["reason"], item.get("request_builder_id"), item.get("input_tokens_per_call_upper_bound"), item.get("output_tokens_per_call_upper_bound"))
+        for item in invalid_bounds
+    ]
     assert projection["aggregate_budget_source"] == (
         "application_call_cap_projection_without_bound_acceptance_run"
     )
     assert plan["provider_admission_status"] == "incomplete_unknown_exposure"
     assert plan["ready_for_provider_admission"] is False
     assert "local-fixture-only" not in json.dumps(plan)
+
+
+def test_reuse_only_run_plan_removes_reader_calls_after_typed_authority_verification(
+    tmp_path: Path, capsys, monkeypatch,
+) -> None:
+    spec = _spec(tmp_path)
+    for pdf in Path(spec.source.pdf_folder).glob("*.pdf"):
+        pdf.unlink()
+    reuse_manifest = tmp_path / "typed-reuse-manifest.json"
+    reuse_manifest.write_text("{}", encoding="utf-8")
+    spec = replace(
+        spec,
+        action="run_all",
+        reuse_summary_files=(str(reuse_manifest),),
+        metadata={
+            **dict(spec.metadata or {}),
+            "requested_stages": ["analyze", "outline", "review", "validate"],
+        },
+    )
+    config = Path(spec.config)
+    parser = configparser.ConfigParser()
+    parser.read(Path(__file__).resolve().parents[1] / "config.ini.example", encoding="utf-8")
+    parser["Paths"]["output_path"] = str(tmp_path / "output")
+    for section in (
+        "Primary_Reader_API",
+        "Backup_Reader_API",
+        "Writer_API",
+        "Outline_API",
+        "Free_Mode_API",
+        "Validator_API",
+    ):
+        parser[section]["api_key"] = "local-fixture-only"
+        parser[section]["api_base"] = "http://127.0.0.1:1/v1"
+    with config.open("w", encoding="utf-8") as handle:
+        parser.write(handle)
+    row = {
+        "paper_info": {"canonical_paper_key": "paper-a"},
+        "ai_summary": {"summary": "verified fixture summary"},
+        "stage1_reuse": {
+            "authority_kind": "typed_manifest",
+            "binding": {"canonical_paper_key": "paper-a"},
+        },
+    }
+    monkeypatch.setattr(
+        control_plane_module.InternalStageExecutorRegistry,
+        "_summary_payloads_from_file",
+        lambda _path: [row],
+    )
+    monkeypatch.setattr(
+        control_plane_module,
+        "verify_stage1_typed_manifest_authority",
+        lambda _summary, _binding: (
+            SimpleNamespace(
+                manifest_file_hash="a" * 64,
+                manifest=SimpleNamespace(
+                    canonical_paper_key="paper-a",
+                    source_summary_artifact_hash="b" * 64,
+                ),
+            ),
+            "verified",
+        ),
+    )
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(json.dumps(spec.to_dict()), encoding="utf-8")
+
+    assert reviewctl_main(["plan", "--spec", str(spec_path)]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    projection = plan["full_stage_request_plan"]
+
+    assert projection["stage1_reuse_authority_status"] == "verified_typed_manifest_summary_only_input"
+    assert projection["stage1_reuse_authority"]["typed_manifest_authority_count"] == 1
+    assert projection["stage1_reuse_authority"]["paper_work_item_count"] == 0
+    assert projection["stage1_reuse_authority"]["current_binding_comparison"] == (
+        "not_run_no_stage1_paper_work_items"
+    )
+    assert projection["boundary"]["no_provider_posts"] is True
+    assert not any(
+        item["stage_name"] == "analyze"
+        for item in projection["unknown_exposures"]
+    )
+    assert projection["budget_status"]["admission"] == "incomplete_unknown_exposure"
 
 
 def test_chunk_plan_loads_summary_source_manifest_and_marks_navigation_scope(

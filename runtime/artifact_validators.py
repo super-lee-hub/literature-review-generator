@@ -404,6 +404,56 @@ def _validate_review_json(record: Any, _path: str | Path, root: Mapping[str, Any
     _require_fields(root, ("created_at", "draft_identity", "generation_context", "content", "projections"), artifact_type)
     if not isinstance(root.get("content"), Mapping) or not isinstance(root.get("draft_identity"), Mapping):
         raise ArtifactSchemaError(f"{artifact_type} content and draft_identity must be objects")
+    generation_context = root.get("generation_context")
+    if not isinstance(generation_context, Mapping):
+        raise ArtifactSchemaError(f"{artifact_type} generation_context must be an object")
+    if str(generation_context.get("generation_mode") or "") != "outline_v3":
+        return
+
+    for field in (
+        "outline_artifact_id",
+        "outline_source_path",
+        "adoption_artifact_id",
+    ):
+        if not str(generation_context.get(field) or "").strip():
+            raise ArtifactSchemaError(
+                f"{artifact_type} Outline v3 lineage is missing {field}"
+            )
+    for field in ("outline_artifact_hash", "adoption_artifact_hash"):
+        digest = str(generation_context.get(field) or "").strip().lower()
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise ArtifactSchemaError(
+                f"{artifact_type} Outline v3 lineage has an invalid {field}"
+            )
+
+    section_artifacts = generation_context.get("writer_section_artifacts")
+    sections = root["content"].get("sections")
+    if (
+        not isinstance(section_artifacts, list)
+        or not section_artifacts
+        or not isinstance(sections, list)
+        or len(section_artifacts) != len(sections)
+    ):
+        raise ArtifactSchemaError(
+            f"{artifact_type} writer_section_artifacts must contain one reference per section"
+        )
+    artifact_ids: set[str] = set()
+    for index, reference in enumerate(section_artifacts):
+        if not isinstance(reference, Mapping) or set(reference) != {"artifact_id", "content_hash"}:
+            raise ArtifactSchemaError(
+                f"{artifact_type} writer_section_artifacts[{index}] must contain exactly artifact_id and content_hash"
+            )
+        artifact_id = str(reference.get("artifact_id") or "").strip()
+        digest = str(reference.get("content_hash") or "").strip().lower()
+        if not artifact_id or artifact_id in artifact_ids:
+            raise ArtifactSchemaError(
+                f"{artifact_type} writer_section_artifacts[{index}] has a missing or duplicate artifact_id"
+            )
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise ArtifactSchemaError(
+                f"{artifact_type} writer_section_artifacts[{index}] has an invalid content_hash"
+            )
+        artifact_ids.add(artifact_id)
 
 
 def _validate_citation_json(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
