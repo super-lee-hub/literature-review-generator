@@ -247,6 +247,11 @@ def run_adjudication_stage(
         "response_format": "json",
         "logger": getattr(service, "logger", None),
     }
+    attempt_limit = getattr(service, "validator_attempt_limit", None)
+    if callable(attempt_limit):
+        call_kwargs["retry_attempts"] = max(
+            1, int(cast(int, attempt_limit(api_config)))
+        )
     request_payload: Dict[str, Any] = canonical_provider_request_payload(
         prompt=prompt,
         system_prompt=system_prompt,

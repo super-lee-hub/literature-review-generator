@@ -417,6 +417,11 @@ def test_chunk_plan_builds_route_bound_semantic_request_plan_without_posts(
     )
 
     assert result["provider_posts_emitted"] == 0
+    assert result["semantic_preflight_status"] == "rejected"
+    baseline_preflight = result["semantic_route_preflight_summary"]
+    assert baseline_preflight["rejection_reason"] == "max_provider_physical_attempts_exceeded"
+    assert baseline_preflight["max_provider_calls"] == 24
+    assert baseline_preflight["estimated_provider_physical_attempts_upper_bound"] == 51
     assert result["provider_request_plan_status"] == "planned_semantic_request_graph"
     assert result["semantic_request_plan"]
     assert all(
@@ -463,9 +468,28 @@ def test_chunk_plan_builds_route_bound_semantic_request_plan_without_posts(
         "candidate_count = 2", "candidate_count = 2\nsemantic_output_max_tokens = 8192"
     )
     config_path.write_text(updated_config, encoding="utf-8")
-    increased = ReviewControlPlane(repo_root=tmp_path).chunk_plan(
+    input_constrained = ReviewControlPlane(repo_root=tmp_path).chunk_plan(
         [summary_path], config_path=config_path
     )
+    assert input_constrained["semantic_preflight_status"] == "rejected"
+    assert input_constrained["semantic_route_preflight_summary"]["rejection_reason"] == (
+        "complete_evidence_unit_exceeds_effective_input_cap"
+    )
+    assert input_constrained["semantic_request_plan"] == []
+    assert input_constrained["provider_posts_emitted"] == 0
+
+    config_path.write_text(
+        updated_config.replace("max_context_tokens = 32000", "max_context_tokens = 64000").replace(
+            "max_provider_calls = 24", "max_provider_calls = 64"
+        ),
+        encoding="utf-8",
+    )
+    # The provider-free output comparison needs room for its 51 physical
+    # attempts; the 24-call baseline remains a separate rejected control.
+    increased = ReviewControlPlane(repo_root=tmp_path).chunk_plan(
+        [summary_path], config_path=config_path, physical_call_limit=64
+    )
+    assert increased["semantic_preflight_status"] == "accepted"
     increased_topic = next(
         row for row in increased["semantic_request_plan"]
         if row["node_id"] == baseline_topic["node_id"]

@@ -730,8 +730,13 @@ class OutlineV3Executor:
         replay_status: str,
         transport: Any,
         budget: Mapping[str, Any],
+        effective_input_cap: int,
+        requested_output_tokens: int,
     ) -> int:
         serialized = json.dumps(request, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        canonical_serialized = json.dumps(
+            request, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
         members = self._request_members(request)
         hierarchy = request.get("hierarchy")
         hierarchy_map = hierarchy if isinstance(hierarchy, Mapping) else {}
@@ -772,9 +777,16 @@ class OutlineV3Executor:
             "replay_key_hash": replay_key_hash,
             "replay_status": replay_status,
             "serialized_bytes": len(serialized),
+            "canonical_attached_request_bytes": len(canonical_serialized),
             "estimated_input_tokens": int(budget.get("estimated_input_tokens") or profile.estimate_tokens(request)),
+            # Retain the legacy profile caps while recording the limits used
+            # for admission and the physical transport separately.
             "input_cap": int(profile.input_budget),
             "output_cap": int(profile.max_output_tokens),
+            "route_profile_input_budget": int(profile.input_budget),
+            "route_profile_max_output_tokens": int(profile.max_output_tokens),
+            "effective_input_cap": int(effective_input_cap),
+            "requested_output_tokens": int(requested_output_tokens),
             "reasoning_reserve": int(profile.reasoning_reserve),
             "mock_live": (
                 "mock"
@@ -1344,6 +1356,11 @@ class OutlineV3Executor:
                         "future_directions",
                     )
                 )
+        # A finding without its boundary text can change meaning when this
+        # topic is packed separately from another route for the same paper.
+        # The typed source-field ledger uses this canonical field name.
+        if "findings" in fields:
+            fields.add("moderators_boundaries")
         return tuple(sorted(fields))
 
     @classmethod
@@ -2679,6 +2696,7 @@ class OutlineV3Executor:
         evidence_model: Any,
         content_layers_model: Any,
         batch_index: int,
+        content_layers_hash: str | None = None,
     ) -> dict[str, Any]:
         paper_ids = sorted(
             {
@@ -2825,15 +2843,14 @@ class OutlineV3Executor:
             if selects_all_units or not filter_indexes:
                 selected_units = all_units
             else:
-                selected_units = self._complete_topic_evidence_units(
-                    view_by_paper[paper_id],
-                    dossier,
-                    fields=paper_fields,
-                    chunk_indexes=sorted(filter_indexes),
-                    chunk_target_tokens=chunk_target_tokens,
-                    required_evidence_ids=required_evidence_ids,
-                    include_unbound_claims=include_unbound_claims,
-                )
+                selected_units = [
+                    unit for unit in all_units
+                    if int(unit["chunk_index"]) in filter_indexes
+                ]
+                if {int(unit["chunk_index"]) for unit in selected_units} != filter_indexes:
+                    raise OutlineV3ExecutionError(
+                        "semantic evidence-unit selection was not fully materialized"
+                    )
             expected_unit_ids.update(str(unit["evidence_unit_id"]) for unit in selected_units)
             for unit in selected_units:
                 unit_id = str(unit.get("evidence_unit_id") or "")
@@ -2962,19 +2979,24 @@ class OutlineV3Executor:
                     "study identity, disposition, and source_field_id. An unmapped or "
                     "unresolved row is provenance only, not a validated interpretation."
                 ),
-                "content_layers_hash": getattr(content_layers_model, "content_hash", ""),
+                "content_layers_hash": (
+                    content_layers_hash
+                    if content_layers_hash is not None
+                    else getattr(content_layers_model, "content_hash", "")
+                ),
             },
             "output_contract": {
-                "semantic_result_contract_version": "bounded-topic-synthesis/v4",
+                "semantic_result_contract_version": "bounded-topic-synthesis/v5",
                 "max_output_tokens": self._semantic_output_token_limit(
                     self._node_route("candidate_1_provider_generation").profile
                 ),
+                "max_unresolved_reason_utf8_bytes": 128,
                 "response_root_type": "single JSON object, never a top-level array",
                 "required_top_level_keys": [
                     "topics", "processed_fragment_ids", "claims", "unresolved_questions"
                 ],
                 "termination_rule": "Finish the complete JSON object before the output limit. If the supported synthesis will not fit, return a complete unresolved fragment with an explicit reason rather than a partial claim or unclosed JSON.",
-                "topics": "array of topic synthesis objects; return every requested fragment_id exactly once with topic_id, status, concise conclusions, unresolved_questions, and supporting_evidence_ids for any factual conclusion. For a conclusion using a primary claim whose interpretation_dependencies entry has required_for_synthesis_output=true, set source_claim_ids to primary plus all required_source_claim_ids, supporting_evidence_ids to primary plus all required_evidence_ids, and source_field_ids to all required_source_field_ids. Preserve the qualifier in the conclusion text or omit it and mark unresolved. Conclusions summarize claims without repeating their evidence-specific text.",
+                "topics": "array of topic synthesis objects; return every requested fragment_id exactly once with topic_id, status (integrated/completed/processed/unresolved), concise conclusions, unresolved_questions, and supporting_evidence_ids for any factual conclusion. For a conclusion using a primary claim whose interpretation_dependencies entry has required_for_synthesis_output=true, set source_claim_ids to primary plus all required_source_claim_ids, supporting_evidence_ids to primary plus all required_evidence_ids, and source_field_ids to all required_source_field_ids. Preserve the qualifier in the conclusion text or omit it and mark unresolved. Conclusions summarize claims without repeating their evidence-specific text.",
                 "processed_fragment_ids": "array containing every requested fragment_id exactly once",
                 "claims": "array of distinct evidence-bound synthesis claims, not a one-to-one restatement of every source claim or evidence ID. Combine findings only when direction, conditions, population and horizon align; keep conflicts, conditional effects, null/zero results and material exceptions distinct or unresolved. Each claim has claim_id='synthesis:topic_synthesis:<local-id>', fragment_id, claim_type, paper_key or paper_keys, and evidence_ids. For any claim using a primary claim whose interpretation_dependencies entry has required_for_synthesis_output=true, set source_claim_ids to primary plus required_source_claim_ids, evidence_ids to primary plus required_evidence_ids, and source_field_ids to required_source_field_ids. Preserve the condition or boundary in claim text; qualifier_dependency prose alone is not provenance. Otherwise omit the factual claim and mark unresolved.",
                 "source_locator_policy": "Do not echo source_locators in claims. Full exact locators remain bound to evidence IDs in the local Registry and are resolved downstream.",
@@ -2983,9 +3005,50 @@ class OutlineV3Executor:
                 "conciseness_policy": "Return the smallest complete synthesis that preserves distinct supported conclusions, direction, conditions, conflicts, null/zero findings, unresolved items and evidence support. Do not duplicate the same narrative in topics[].conclusions and claims[].text.",
                 "unresolved_questions": "array of questions that remain unresolved",
                 "no_external_evidence": "do not infer a finding, boundary or consensus from a missing field; emit an unresolved or insufficient-evidence record instead",
-                "overflow_policy": "If material conclusions and exceptions cannot fit, mark the affected fragment unresolved with an explicit reason; never truncate a supported claim or silently omit a requested fragment",
+                "overflow_policy": "Overflow: return a complete unresolved fragment with the exact reason 'Output limit.', no claims/conclusions/support IDs. Keep every fragment and complete JSON.",
             },
         }
+
+    @staticmethod
+    def _minimum_complete_topic_response_bytes(request: Mapping[str, Any]) -> int:
+        """Size one complete, claim-free overflow response using actual IDs.
+
+        The provider can always choose the short, explicitly permitted
+        ``Output limit.`` reason. This proves an accepted fallback exists; it
+        does not size substantive synthesis or guarantee a third-party route's
+        tokenizer behavior.
+        """
+
+        contract = request.get("output_contract")
+        if not isinstance(contract, Mapping) or contract.get(
+            "semantic_result_contract_version"
+        ) != "bounded-topic-synthesis/v5":
+            raise OutlineV3ExecutionError("topic fallback needs the v5 output contract")
+        reason_bytes = contract.get("max_unresolved_reason_utf8_bytes")
+        reason = "Output limit."
+        if type(reason_bytes) is not int or reason_bytes < len(reason.encode("utf-8")):
+            raise OutlineV3ExecutionError("topic fallback reason limit is invalid")
+        topics = [item for item in request.get("topics") or () if isinstance(item, Mapping)]
+        if not topics:
+            raise OutlineV3ExecutionError("topic fallback has no requested fragments")
+        response = {
+            "topics": [
+                {
+                    "topic_id": str(item.get("topic_id") or ""),
+                    "fragment_id": str(item.get("fragment_id") or item.get("topic_id") or ""),
+                    "status": "unresolved",
+                    "unresolved_questions": [reason],
+                }
+                for item in topics
+            ],
+            "processed_fragment_ids": [
+                str(item.get("fragment_id") or item.get("topic_id") or "")
+                for item in topics
+            ],
+            "claims": [],
+            "unresolved_questions": [],
+        }
+        return len(json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
     def _plan_topic_provider_batches(
         self,
@@ -3006,6 +3069,7 @@ class OutlineV3Executor:
                 int(profile.input_budget or 32_000),
             ),
         )
+        content_layers_hash = str(getattr(content_layers_model, "content_hash", ""))
         expanded = self._split_topic_plan_for_budget(
             topic_plan,
             topic_routes=topic_routes,
@@ -3013,6 +3077,7 @@ class OutlineV3Executor:
             content_layers_model=content_layers_model,
             profile=profile,
             input_limit=input_limit,
+            content_layers_hash=content_layers_hash,
         )
         # Keep tasks with the same paper ownership together so the wire
         # serializer can union overlapping complete dossier units inside one
@@ -3026,7 +3091,9 @@ class OutlineV3Executor:
             )
         )
         batches: list[list[TopicSynthesis]] = []
+        batch_measurements: list[tuple[dict[str, Any], dict[str, Any]]] = []
         current: list[TopicSynthesis] = []
+        current_measurement: tuple[dict[str, Any], dict[str, Any]] | None = None
 
         def measure(items: Sequence[TopicSynthesis], batch_index: int) -> tuple[dict[str, Any], dict[str, Any]]:
             request = self._build_topic_provider_request(
@@ -3035,6 +3102,7 @@ class OutlineV3Executor:
                 evidence_model=evidence_model,
                 content_layers_model=content_layers_model,
                 batch_index=batch_index,
+                content_layers_hash=content_layers_hash,
             )
             node_id = f"topic_synthesis_provider:batch:{batch_index}"
             budget = profile.estimate_request(self._attach_prompt_authority(node_id, request))
@@ -3043,23 +3111,35 @@ class OutlineV3Executor:
                 raise OutlineV3ExecutionError(
                     f"BLOCKED_BUDGET: complete topic request {node_id} uses {tokens} input tokens over the effective cap {input_limit}"
                 )
+            fallback_bytes = self._minimum_complete_topic_response_bytes(request)
+            output_limit = self._semantic_output_token_limit(profile)
+            if fallback_bytes + 1 > output_limit:
+                raise OutlineV3ExecutionError(
+                    "BLOCKED_BUDGET: minimum_complete_response_exceeds_output_cap: "
+                    f"{node_id} needs {fallback_bytes + 1} output-token proxy units over cap {output_limit}"
+                )
             return request, budget
 
         for topic in expanded:
             batch_index = len(batches) + 1
             trial = [*current, topic]
             try:
-                measure(trial, batch_index)
+                trial_measurement = measure(trial, batch_index)
             except OutlineV3ExecutionError:
                 if not current:
                     raise
                 batches.append(current)
+                assert current_measurement is not None
+                batch_measurements.append(current_measurement)
                 current = [topic]
-                measure(current, len(batches) + 1)
+                current_measurement = measure(current, len(batches) + 1)
             else:
                 current = trial
+                current_measurement = trial_measurement
         if current:
             batches.append(current)
+            assert current_measurement is not None
+            batch_measurements.append(current_measurement)
 
         bridge_paper_ids_by_topic: dict[str, set[str]] = {}
         for topic in expanded:
@@ -3069,8 +3149,10 @@ class OutlineV3Executor:
 
         plans: list[dict[str, Any]] = []
         semantic_retries = self._semantic_transport_retry_count()
-        for batch_index, batch in enumerate(batches, start=1):
-            request, budget = measure(batch, batch_index)
+        for batch_index, (batch, measurement) in enumerate(
+            zip(batches, batch_measurements, strict=True), start=1
+        ):
+            request, budget = measurement
             evidence_units = [
                 item for item in request.get("evidence_units") or () if isinstance(item, Mapping)
             ]
@@ -3318,6 +3400,7 @@ class OutlineV3Executor:
                         budget.get("estimated_cache_write_tokens") or 0
                     ),
                     "estimated_output_tokens": self._semantic_output_token_limit(profile),
+                    "minimum_complete_unresolved_response_utf8_bytes": self._minimum_complete_topic_response_bytes(request),
                     "estimated_reasoning_tokens": int(profile.reasoning_reserve or 0),
                     "configured_transport_retry_reserve": semantic_retries,
                     "physical_attempt_upper_bound": (
@@ -3423,6 +3506,7 @@ class OutlineV3Executor:
         content_layers_model: Any,
         profile: ProviderContextProfile,
         input_limit: int,
+        content_layers_hash: str,
     ) -> list[TopicSynthesis]:
         """Split oversized topic routes only at paper/evidence-unit boundaries."""
 
@@ -3507,6 +3591,7 @@ class OutlineV3Executor:
                 evidence_model=evidence_model,
                 content_layers_model=content_layers_model,
                 batch_index=len(expanded) + 1,
+                content_layers_hash=content_layers_hash,
             )
             full_budget = profile.estimate_request(
                 self._attach_prompt_authority(
@@ -3565,6 +3650,7 @@ class OutlineV3Executor:
                     evidence_model=evidence_model,
                     content_layers_model=content_layers_model,
                     batch_index=len(expanded) + 1,
+                    content_layers_hash=content_layers_hash,
                 )
                 trial_budget = profile.estimate_request(
                     self._attach_prompt_authority(
@@ -3588,6 +3674,7 @@ class OutlineV3Executor:
                         evidence_model=evidence_model,
                         content_layers_model=content_layers_model,
                         batch_index=len(expanded) + 1,
+                        content_layers_hash=content_layers_hash,
                     )
                     one_budget = profile.estimate_request(
                         self._attach_prompt_authority(
@@ -5480,6 +5567,7 @@ class OutlineV3Executor:
         route = self._role_route("candidate_1_provider_generation")
         input_cap = self._effective_input_cap(profile)
         output_limit = self._semantic_output_token_limit(profile)
+        content_layers_hash = str(getattr(content_layers_model, "content_hash", ""))
         for batch_index, batch in enumerate(topic_batches, start=1):
             node_id = f"topic_synthesis_provider:batch:{batch_index}"
             if node_id not in selected_ids:
@@ -5490,6 +5578,7 @@ class OutlineV3Executor:
                 evidence_model=evidence_model,
                 content_layers_model=content_layers_model,
                 batch_index=batch_index,
+                content_layers_hash=content_layers_hash,
             )
             attached = self._attach_prompt_authority(node_id, request)
             estimate = profile.estimate_request(attached)
@@ -10406,6 +10495,71 @@ class OutlineV3Executor:
             ]
             if sorted(returned_fragments) != sorted(requested_fragments) or len(returned_fragments) != len(set(returned_fragments)):
                 raise OutlineV3ExecutionError(f"{node_id} topic output fragment coverage is invalid")
+            requested_pairs = {
+                str(item.get("fragment_id") or item.get("topic_id") or ""): str(item.get("topic_id") or "")
+                for item in request.get("topics") or ()
+                if isinstance(item, Mapping)
+            }
+            if any(
+                requested_pairs.get(str(topic.get("fragment_id") or ""))
+                != str(topic.get("topic_id") or "")
+                for topic in result.get("topics") or ()
+                if isinstance(topic, Mapping)
+            ):
+                raise OutlineV3ExecutionError(f"{node_id} topic output fragment/topic pairing is invalid")
+            output_contract = request.get("output_contract")
+            if isinstance(output_contract, Mapping) and output_contract.get(
+                "semantic_result_contract_version"
+            ) == "bounded-topic-synthesis/v5":
+                reason_limit = output_contract.get("max_unresolved_reason_utf8_bytes")
+                if type(reason_limit) is not int or reason_limit < 1:
+                    raise OutlineV3ExecutionError(f"{node_id} has an invalid topic fallback reason limit")
+                for topic in result.get("topics") or ():
+                    if not isinstance(topic, Mapping):
+                        continue
+                    status = str(topic.get("status") or "").strip()
+                    if status not in {"integrated", "completed", "processed", "unresolved"}:
+                        raise OutlineV3ExecutionError(
+                            f"{node_id} topic output has an unsupported status"
+                        )
+                    reasons = topic.get("unresolved_questions")
+                    if reasons is None:
+                        reasons = []
+                    if not isinstance(reasons, list):
+                        raise OutlineV3ExecutionError(
+                            f"{node_id} topic unresolved_questions must be an array"
+                        )
+                    if status == "unresolved":
+                        if not reasons:
+                            raise OutlineV3ExecutionError(
+                                f"{node_id} unresolved topic has no explicit reason"
+                            )
+                        fallback_fields = {
+                            "topic_id", "fragment_id", "status", "conclusions",
+                            "unresolved_questions", "supporting_evidence_ids",
+                        }
+                        if (
+                            set(topic) - fallback_fields
+                            or topic.get("conclusions")
+                            or topic.get("supporting_evidence_ids")
+                            or any(
+                                isinstance(claim, Mapping)
+                                and str(claim.get("fragment_id") or "")
+                                == str(topic.get("fragment_id") or "")
+                                for claim in result.get("claims") or ()
+                            )
+                        ):
+                            raise OutlineV3ExecutionError(
+                                f"{node_id} unresolved topic cannot carry partial factual claims"
+                            )
+                    if any(
+                        not isinstance(reason, str)
+                        or len(reason.encode("utf-8")) > reason_limit
+                        for reason in reasons
+                    ):
+                        raise OutlineV3ExecutionError(
+                            f"{node_id} topic reason exceeds max_unresolved_reason_utf8_bytes"
+                        )
         elif prefix.startswith("cross_group_comparison_provider"):
             shared_contract = request.get("shared_synthesis_contract_version") == SHARED_SYNTHESIS_CONTRACT_VERSION
             required_arrays = (
@@ -11309,6 +11463,8 @@ class OutlineV3Executor:
             replay_status="pending",
             transport=transport_for_audit,
             budget=budget,
+            effective_input_cap=effective_cap,
+            requested_output_tokens=int(output_tokens or profile.max_output_tokens),
         )
         replay_lookup = self._replay_store.lookup(replay_key)
         self._finish_request_payload_audit(
@@ -13396,6 +13552,7 @@ class OutlineV3Executor:
                 pilot_request_by_index = {
                     index: request for index, _batch, request in pilot_requests or ()
                 }
+                topic_content_layers_hash = str(getattr(content_layers_model, "content_hash", ""))
                 for batch_index, batch in enumerate(topic_batches, start=1):
                     if pilot_requests is not None and batch_index not in pilot_request_by_index:
                         continue
@@ -13409,6 +13566,7 @@ class OutlineV3Executor:
                             evidence_model=evidence_model,
                             content_layers_model=content_layers_model,
                             batch_index=batch_index,
+                            content_layers_hash=topic_content_layers_hash,
                         )
                     )
                     raw = self._run_semantic_provider_call(

@@ -694,9 +694,19 @@ class ArtifactRegistry:
         owner_record: ArtifactRecord | None = None,
         _dependency_stack: set[tuple[str, str]] | None = None,
         external_snapshots: dict[str, tuple["ArtifactRegistry", int, Dict[str, ArtifactRecord]]] | None = None,
+        _verified_nodes: dict[tuple[str, str, int], ArtifactRecord] | None = None,
+        _historical_targets: dict[str, str] | None = None,
     ) -> List[ArtifactDependencyRefV2]:
         if external_snapshots is None:
             external_snapshots = {}
+        owns_lease_context = bool(
+            owner_record is not None
+            and owner_record.artifact_type == "lease_publication_manifest"
+            and _verified_nodes is None
+        )
+        if owns_lease_context:
+            _verified_nodes = {}
+            _historical_targets = {}
         normalized: List[ArtifactDependencyRefV2] = []
         for dependency in dependencies:
             if isinstance(dependency, ArtifactDependencyRefV2):
@@ -780,6 +790,13 @@ class ArtifactRegistry:
                     raise UnverifiedDependency(
                         f"lease publication target content hash changed: {ref.artifact_id}"
                     )
+                if _historical_targets is not None:
+                    prior_hash = _historical_targets.get(historical_path)
+                    if prior_hash is not None and prior_hash != historical_hash:
+                        raise UnverifiedDependency(
+                            f"lease publication historical target identity conflicts: {ref.artifact_id}"
+                        )
+                    _historical_targets[historical_path] = historical_hash
                 dependency_stack = set(_dependency_stack or ())
                 owner_key = (owner_record.job_id, owner_record.artifact_id)
                 dependency_stack.add(owner_key)
@@ -789,6 +806,8 @@ class ArtifactRegistry:
                     external_registry_resolver=external_registry_resolver,
                     dependency_stack=dependency_stack,
                     external_snapshots=external_snapshots,
+                    verified_nodes=_verified_nodes,
+                    historical_targets=_historical_targets,
                 )
                 normalized.append(
                     ArtifactDependencyRefV2(
@@ -837,7 +856,23 @@ class ArtifactRegistry:
                     external_snapshots=external_snapshots,
                 )
             normalized.append(normalized_ref)
+        if owns_lease_context:
+            assert _verified_nodes is not None and _historical_targets is not None
+            for verified_record in _verified_nodes.values():
+                self._verify_ready_artifact(verified_record)
+            assert owner_record is not None
+            self._verify_ready_artifact(owner_record)
+            self._recheck_historical_targets(_historical_targets)
+            self._assert_external_snapshots_unchanged(external_snapshots)
         return normalized
+
+    @staticmethod
+    def _recheck_historical_targets(targets: Mapping[str, str]) -> None:
+        for path, expected_hash in targets.items():
+            if not os.path.isfile(path) or file_sha256(path) != expected_hash:
+                raise UnverifiedDependency(
+                    f"lease publication historical target content hash changed: {path}"
+                )
 
     def _verify_ready_dependency_closure(
         self,
@@ -847,14 +882,23 @@ class ArtifactRegistry:
         external_registry_resolver: Callable[[str], Optional["ArtifactRegistry"]] | None,
         dependency_stack: set[tuple[str, str]],
         external_snapshots: dict[str, tuple["ArtifactRegistry", int, Dict[str, ArtifactRecord]]] | None = None,
+        verified_nodes: dict[tuple[str, str, int], ArtifactRecord] | None = None,
+        historical_targets: dict[str, str] | None = None,
     ) -> None:
         if external_snapshots is None:
             external_snapshots = {}
+        if verified_nodes is None:
+            verified_nodes = {}
+        if historical_targets is None:
+            historical_targets = {}
         key = (record.job_id, record.artifact_id)
         if key in dependency_stack:
             raise UnverifiedDependency(
                 f"artifact dependency cycle detected at {record.artifact_id}"
             )
+        memo_key = (*key, id(artifacts))
+        if memo_key in verified_nodes:
+            return
         dependency_stack.add(key)
         try:
             self._verify_ready_artifact(record)
@@ -867,6 +911,8 @@ class ArtifactRegistry:
                 owner_record=record,
                 _dependency_stack=dependency_stack,
                 external_snapshots=external_snapshots,
+                _verified_nodes=verified_nodes,
+                _historical_targets=historical_targets,
             )
             for dependency in normalized:
                 if dependency.dependency_kind == "local_job":
@@ -902,7 +948,10 @@ class ArtifactRegistry:
                     external_registry_resolver=external_registry_resolver,
                     dependency_stack=dependency_stack,
                     external_snapshots=external_snapshots,
+                    verified_nodes=verified_nodes,
+                    historical_targets=historical_targets,
                 )
+            verified_nodes[memo_key] = record
         finally:
             dependency_stack.remove(key)
 
@@ -1228,13 +1277,23 @@ class ArtifactRegistry:
                         raise UnverifiedDependency(
                             f"dependency is not registered: {self.job_id}/{normalized_root.artifact_id}"
                         )
+                    verified_nodes: dict[tuple[str, str, int], ArtifactRecord] = {}
+                    historical_targets: dict[str, str] = {}
                     self._verify_ready_dependency_closure(
                         target,
                         artifacts=artifacts,
                         external_registry_resolver=external_registry_resolver,
                         dependency_stack=set(),
                         external_snapshots=external_snapshots,
+                        verified_nodes=verified_nodes,
+                        historical_targets=historical_targets,
                     )
+                    # Recheck every distinct file after traversing the DAG.
+                    # This keeps late byte changes fail-closed without walking
+                    # shared ancestors exponentially many times.
+                    for verified_record in verified_nodes.values():
+                        self._verify_ready_artifact(verified_record)
+                    self._recheck_historical_targets(historical_targets)
                     self._assert_external_snapshots_unchanged(external_snapshots)
                     return self._copy_record(target)
             except RegistrySnapshotChanged as exc:

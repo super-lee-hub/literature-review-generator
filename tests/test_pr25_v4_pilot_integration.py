@@ -69,15 +69,13 @@ class _LocalTopicRouter:
                 if not isinstance(topic, dict):
                     continue
                 if self.emit_content:
-                    # Keep the local pilot fixture substantive without making
-                    # a factual claim that would need the source claim's full
-                    # qualifier set (claim, evidence, and source fields).
+                    # The V5 overflow fallback is a complete unresolved row,
+                    # never a partial factual claim with support IDs.
                     topic["status"] = "unresolved"
-                    topic["reason"] = "The local fixture cannot resolve this fragment without adjudication."
-                    topic["unresolved_questions"] = [{
-                        "fragment_id": str(topic.get("fragment_id") or ""),
-                        "question": "Does the selected evidence support this topic under its stated conditions?",
-                    }]
+                    topic.pop("reason", None)
+                    topic["conclusions"] = []
+                    topic["supporting_evidence_ids"] = []
+                    topic["unresolved_questions"] = ["The local fixture cannot resolve this fragment."]
                 else:
                     topic["conclusions"] = []
                     topic["unresolved_questions"] = []

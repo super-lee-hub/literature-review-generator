@@ -269,6 +269,7 @@ def build_review_draft(
     job_id: str,
     project_name: str,
     draft_id: str,
+    title: str = "",
     outline_artifact_id: str,
     outline_source_path: str,
     summary_file: str,
@@ -370,16 +371,21 @@ def build_review_draft(
             ],
         })
 
+    draft_identity = {
+        "draft_id": draft_id,
+        "project_name": project_name,
+        "scope": "full_review",
+    }
+    normalized_title = str(title or "").strip()
+    if normalized_title:
+        draft_identity["title"] = normalized_title
+
     return ReviewDraft(
         artifact_type="review_draft",
         artifact_version="v3",
         created_from_job_id=job_id,
         created_at=utc_now_iso(),
-        draft_identity={
-            "draft_id": draft_id,
-            "project_name": project_name,
-            "scope": "full_review",
-        },
+        draft_identity=draft_identity,
         generation_context=generation_context,
         content={
             "sections": normalized_sections,

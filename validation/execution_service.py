@@ -340,6 +340,7 @@ class ValidationExecutionService:
             retry_limit = max(0, int(getattr(runtime_settings, "validation_retry_limit", 1)))
         except (TypeError, ValueError):
             retry_limit = 1
+        expected_attempt_limit = self.validator_attempt_limit(config)
         resolved_schema_hash = schema_hash or hashlib.sha256(
             json.dumps(
                 {
@@ -404,11 +405,38 @@ class ValidationExecutionService:
             prompt_id=self._validation_user_prompt_identity.prompt_id,
             prompt_version=self._validation_user_prompt_identity.version,
             prompt_sha256=self._validation_user_prompt_identity.sha256,
-            max_attempts=max(1, retry_limit + 1),
+            max_attempts=expected_attempt_limit,
             usage_required=endpoint_type not in {"internal", "fixture"},
         )
         self._provider_runtimes[resolved_call] = runtime
         return runtime
+
+    def validator_attempt_limit(self, api_config: Mapping[str, Any]) -> int:
+        """Return the total HTTP attempts permitted for one Validator call.
+
+        Validation's ``validation_retry_limit`` is a stage contract. A zero
+        value means exactly the initial attempt, even though a generic
+        ProviderRuntime with a zero retry budget leaves its caller's requested
+        attempt count untouched. Keep this rule local to Stage 4 so generic V1
+        ProviderRuntime zero semantics remain unchanged.
+        """
+
+        from ai_interface import _load_api_runtime_settings
+
+        _timeout_seconds, configured_attempts = _load_api_runtime_settings(
+            api_config
+        )
+        requested_total_attempts = max(1, int(configured_attempts))
+        runtime_settings = getattr(self.settings, "runtime", None)
+        try:
+            validation_retry_limit = max(
+                0, int(getattr(runtime_settings, "validation_retry_limit", 1))
+            )
+        except (TypeError, ValueError):
+            validation_retry_limit = 1
+        if validation_retry_limit == 0:
+            return 1
+        return min(requested_total_attempts, validation_retry_limit + 1)
 
     def bind_provider_call(
         self,
@@ -946,6 +974,7 @@ class ValidationExecutionService:
                 review_draft_record_override=review_draft_record,
                 citation_manifest_record_override=citation_manifest_record,
                 output_dir=output_dir,
+                validation_scope="repair_revalidation",
                 result_artifact_id=result_artifact_id,
                 result_artifact_type="validation_run_result_repaired",
                 result_artifact_role="validation_run_result_repaired",

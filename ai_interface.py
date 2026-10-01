@@ -973,6 +973,8 @@ def build_chat_completions_payload(
         payload["response_format"] = {"type": "json_object"}
     if _config_bool(api_config.get("provider_stream")):
         payload["stream"] = True
+        if _config_bool(api_config.get("provider_stream_include_usage")):
+            payload["stream_options"] = {"include_usage": True}
     apply_reasoning_policy(payload, api_config, capability, logger=logger)
     return payload
 
@@ -1433,19 +1435,36 @@ def _decode_sse_response(
     ):
         raise ValueError("SSE response ended without a terminal completion event")
 
+    # A final usage-only chunk may follow a complete message event. Preserve
+    # it even when the complete event takes the fast path below.
+    final_usage = next(
+        (
+            event["usage"]
+            for event in reversed(events)
+            if isinstance(event.get("usage"), Mapping) and event["usage"]
+        ),
+        None,
+    )
+
+    def with_final_usage(payload: Mapping[str, Any]) -> Dict[str, Any]:
+        completed = dict(payload)
+        if final_usage is not None:
+            completed["usage"] = dict(final_usage)
+        return completed
+
     # Prefer a complete provider event when available; otherwise synthesize a
     # normal response from deltas so the existing schema/finish validation is
     # shared by streamed and non-streamed calls.
     for event in reversed(events):
         if isinstance(event.get("response"), Mapping):
-            return dict(event["response"]), True
+            return with_final_usage(event["response"]), True
         if "choices" in event and any(
             isinstance(choice, Mapping) and isinstance(choice.get("message"), Mapping)
             for choice in (event.get("choices") or [])
         ):
-            return event, True
+            return with_final_usage(event), True
         if "output" in event:
-            return event, True
+            return with_final_usage(event), True
 
     text_parts: List[str] = []
     finish_reason = ""

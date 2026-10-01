@@ -218,6 +218,7 @@ API_KEYS = frozenset(
         "total_timeout_seconds",
         "first_token_timeout_seconds",
         "provider_stream",
+        "provider_stream_include_usage",
         "transport_retries",
         "reasoning_reserve_tokens",
         "safety_margin_tokens",

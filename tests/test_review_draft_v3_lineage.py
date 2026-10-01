@@ -84,7 +84,10 @@ def _lineage_fixture(
     job_id = "review-lineage-job"
     outline_path = _write_json(
         root / "outline.json",
-        {"payload": {"sections": [{"section_id": "section-1"}]}},
+        {"payload": {
+            "title": "中文综述题目",
+            "sections": [{"section_id": "section-1"}],
+        }},
     )
     outline = _record(
         artifact_id="outline-v3:final_outline",
@@ -211,6 +214,7 @@ def test_outline_v3_draft_publishes_adoption_and_immutable_writer_lineage(
     assert len(publications) == 1
     published = publications[0]
     context = published["payload"]["generation_context"]
+    assert published["payload"]["draft_identity"]["title"] == "中文综述题目"
     assert context["outline_artifact_id"] == records["outline"].artifact_id
     assert context["outline_artifact_hash"] == records["outline"].content_hash
     assert context["adoption_artifact_id"] == adoption.artifact_id
@@ -293,9 +297,11 @@ def test_review_draft_v3_validator_requires_lineage_only_for_outline_mode() -> N
     )
     outline_draft = build_review_draft(
         **common,
+        title="中文综述题目",
         generation_mode="outline_v3",
         **lineage,
     ).to_dict()
+    assert outline_draft["draft_identity"]["title"] == "中文综述题目"
     _validate_review_json(record, "review_draft.json", outline_draft)
     outline_draft["generation_context"].pop("writer_section_artifacts")
     with pytest.raises(ArtifactSchemaError, match="writer_section_artifacts"):
@@ -305,6 +311,7 @@ def test_review_draft_v3_validator_requires_lineage_only_for_outline_mode() -> N
         **common,
         generation_mode="full_review",
     ).to_dict()
+    assert "title" not in legacy_draft["draft_identity"]
     _validate_review_json(record, "review_draft.json", legacy_draft)
 
 

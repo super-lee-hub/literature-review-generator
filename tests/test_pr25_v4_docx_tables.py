@@ -103,6 +103,7 @@ def test_review_service_pipe_table_renders_as_cjk_multipage_native_docx_table(
         project_name=workspace.project_name,
         draft_id="docx-table-draft",
         outline_artifact_id="outline-v3:final_outline",
+        title="本地排版验证",
         outline_source_path="local:docx-table-outline",
         summary_file="local:docx-table-summary",
         review_word_path=str(output_path),
@@ -140,6 +141,8 @@ def test_review_service_pipe_table_renders_as_cjk_multipage_native_docx_table(
     )
 
     document = Document(str(output_path))
+    assert document.sections[0].header.paragraphs[0].text == "本地排版验证"
+    assert document.sections[0].footer._element.xml.count("PAGE") == 1
     assert len(document.tables) == 1
     table = document.tables[0]
     assert len(table.rows) == 3
@@ -159,6 +162,34 @@ def test_review_service_pipe_table_renders_as_cjk_multipage_native_docx_table(
         citation_manifest.to_dict(),
     )
     assert scan["passed"] is True, scan
+
+
+def test_legacy_review_draft_uses_default_docx_header_without_duplicate_footer(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "legacy-review.docx"
+    review_draft = {
+        "draft_identity": {"draft_id": "legacy-draft"},
+        "content": {
+            "sections": [{
+                "section_number": 1,
+                "section_title": "Results",
+                "blocks": [{"block_kind": "paragraph", "text": "A local result."}],
+            }],
+            "references": [],
+        },
+    }
+
+    rebuild_review_docx_from_structured_artifacts(
+        SimpleNamespace(logger=None),
+        review_draft,
+        {"bibliography": []},
+        str(output_path),
+    )
+
+    document = Document(str(output_path))
+    assert document.sections[0].header.paragraphs[0].text == "Literature Review"
+    assert document.sections[0].footer._element.xml.count("PAGE") == 1
 
 
 def test_explicit_table_block_is_native_and_malformed_table_fails_closed(

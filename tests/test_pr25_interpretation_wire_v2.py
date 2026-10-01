@@ -234,7 +234,7 @@ def test_method_wire_has_required_interpretation_context_and_rejects_claim_only_
         request["output_contract"]["claims"]
     )
     assert request["output_contract"]["semantic_result_contract_version"] == (
-        "bounded-topic-synthesis/v4"
+        "bounded-topic-synthesis/v5"
     )
     assert error is not None and "interpretation" in str(error).lower()
 

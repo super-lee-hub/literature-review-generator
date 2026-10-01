@@ -823,6 +823,15 @@ def rebuild_review_docx_from_structured_artifacts(
             if reference and reference not in seen_references:
                 _append_reference_paragraph(doc, (ReferenceSegment(reference),))
                 seen_references.add(reference)
+    draft_identity = review_draft.get("draft_identity")
+    draft_title = (
+        str(draft_identity.get("title") or "").strip()
+        if isinstance(draft_identity, Mapping)
+        else ""
+    )
+    header = doc.sections[0].header.paragraphs[0]
+    header.text = draft_title or "Literature Review"
+    header.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
     doc.save(str(output))
     report = scan_docx_for_unresolved_citation_tokens(str(output), citation_manifest)
     if not report["passed"]:

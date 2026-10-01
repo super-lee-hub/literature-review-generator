@@ -100,6 +100,7 @@ _ROUTE_CONFIG_KEYS = frozenset(
         "force_highest_reasoning",
         "omit_temperature_when_reasoning",
         "provider_stream",
+        "provider_stream_include_usage",
         "transport_retries",
     }
 )

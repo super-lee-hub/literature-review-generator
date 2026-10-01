@@ -396,6 +396,9 @@ def test_outline_v3_fixture_executes_evidence_bound_adoption(tmp_path: Path) -> 
     assert audit_rows
     assert all(row["schema_version"] == "outline_request_payload_audit/v1" for row in audit_rows)
     assert all(row["serialized_bytes"] > 0 for row in audit_rows)
+    assert all(row["canonical_attached_request_bytes"] > 0 for row in audit_rows)
+    assert all(0 < row["effective_input_cap"] <= row["input_cap"] for row in audit_rows)
+    assert all(0 < row["requested_output_tokens"] <= row["output_cap"] for row in audit_rows)
     assert all(row["mock_live"] == "mock" for row in audit_rows)
     assert {"paper-a", "paper-b"}.issubset({key for row in audit_rows for key in row["paper_keys"]})
 
@@ -794,7 +797,7 @@ def test_topic_provider_request_materializes_complete_dossier_unit(
         content_layers_model=content_layers,
         batch_index=1,
     )
-    assert request["output_contract"]["semantic_result_contract_version"] == "bounded-topic-synthesis/v4"
+    assert request["output_contract"]["semantic_result_contract_version"] == "bounded-topic-synthesis/v5"
     assert request["output_contract"]["response_root_type"].startswith("single JSON object")
     assert "Do not echo source_locators" in request["output_contract"]["source_locator_policy"]
     assert "null/zero findings" in request["output_contract"]["conciseness_policy"]
@@ -1183,6 +1186,7 @@ def test_topic_request_keeps_multi_study_claims_and_paper_gap_in_their_scopes(
 
 def test_topic_builder_unions_same_paper_fragment_filters_and_checks_wire_ids(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     executor = _executor(tmp_path, stability_mode="off")
     evidence = build_outline_evidence_views(executor.summaries, executor.job_id)
@@ -1227,6 +1231,15 @@ def test_topic_builder_unions_same_paper_fragment_filters_and_checks_wire_ids(
     assert restored.evidence_unit_indexes == first.evidence_unit_indexes
     assert restored.fragment_id == first.fragment_id
 
+    original_complete = executor._complete_topic_evidence_units
+    materializations = 0
+
+    def counted_complete(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        nonlocal materializations
+        materializations += 1
+        return original_complete(*args, **kwargs)
+
+    monkeypatch.setattr(executor, "_complete_topic_evidence_units", counted_complete)
     request = executor._build_topic_provider_request(
         [first, second],
         topic_routes={route.topic_id: route},
@@ -1234,6 +1247,7 @@ def test_topic_builder_unions_same_paper_fragment_filters_and_checks_wire_ids(
         content_layers_model=layers,
         batch_index=1,
     )
+    assert materializations == 1
     actual_claim_ids = {
         str(claim.get("claim_id") or "")
         for unit in request["evidence_units"]
@@ -1301,6 +1315,7 @@ def test_topic_builder_rejects_each_invalid_fragment_before_union(
 
 def test_topic_batch_planning_groups_same_paper_tasks_before_other_papers(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     executor = _executor(
         tmp_path,
@@ -1340,6 +1355,16 @@ def test_topic_batch_planning_groups_same_paper_tasks_before_other_papers(
         )
         for item in topic_plan
     }
+    content_hash_getter = type(layers).content_hash.fget
+    assert content_hash_getter is not None
+    content_hash_reads = 0
+
+    def counted_content_hash(model: Any) -> str:
+        nonlocal content_hash_reads
+        content_hash_reads += 1
+        return content_hash_getter(model)
+
+    monkeypatch.setattr(type(layers), "content_hash", property(counted_content_hash))
     expanded, batches, request_plan = executor._plan_topic_provider_batches(
         topic_plan,
         topic_routes=topic_routes,
@@ -1347,6 +1372,7 @@ def test_topic_batch_planning_groups_same_paper_tasks_before_other_papers(
         content_layers_model=layers,
         profile=executor.profile,
     )
+    assert content_hash_reads == 1
 
     assert [tuple(item.paper_ids) for item in expanded] == [
         ("paper-a",),
@@ -1373,6 +1399,53 @@ def test_topic_batch_planning_groups_same_paper_tasks_before_other_papers(
         batch_index=1,
     )
     assert len(combined_a_request["evidence_units"]) < individual_a_units
+
+
+def test_topic_batch_plan_reuses_its_final_measured_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor = _executor(tmp_path, stability_mode="off")
+    evidence = build_outline_evidence_views(executor.summaries, executor.job_id)
+    layers = build_paper_content_layers(executor.summaries, evidence, job_id=executor.job_id)
+    topic = TopicSynthesis(
+        topic_id="topic:one",
+        fragment_id="fragment:one",
+        paper_ids=["paper-a"],
+        supporting_evidence_ids=list(layers.dossier_by_paper["paper-a"].evidence_ids),
+    )
+    route = TopicRoute(
+        topic_id=topic.topic_id,
+        question="Assess the finding",
+        paper_ids=["paper-a"],
+        dimensions=["finding"],
+    )
+    monkeypatch.setattr(
+        executor,
+        "_split_topic_plan_for_budget",
+        lambda items, **_kwargs: list(items),
+    )
+    original_build = executor._build_topic_provider_request
+    builds = 0
+
+    def counted_build(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        nonlocal builds
+        builds += 1
+        return original_build(*args, **kwargs)
+
+    monkeypatch.setattr(executor, "_build_topic_provider_request", counted_build)
+    expanded, batches, plans = executor._plan_topic_provider_batches(
+        [topic],
+        topic_routes={topic.topic_id: route},
+        evidence_model=evidence,
+        content_layers_model=layers,
+        profile=executor.profile,
+    )
+
+    assert len(expanded) == len(batches) == len(plans) == 1
+    assert builds == 1
+    assert plans[0]["request_hash"]
+    assert plans[0]["planned_wire_ids_equal_materialized_ids"] is True
 
 
 def test_topic_builder_materializes_only_the_required_evidence_for_a_dimension(

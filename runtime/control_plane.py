@@ -4231,6 +4231,7 @@ class ReviewControlPlane:
             output_dir=workspace_obj.artifact_path(
                 f"acceptance/H/{challenge_id}/revalidation"
             ),
+            validation_scope="repair_revalidation",
             result_artifact_id=f"acceptance-H-validation-revalidation:{challenge_id}",
         )
         revalidation_payload = revalidation.get("validation_run_result_payload")

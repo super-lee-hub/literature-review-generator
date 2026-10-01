@@ -1,0 +1,413 @@
+from __future__ import annotations
+
+import json
+from collections.abc import Mapping
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+import requests
+
+import ai_interface
+from runtime.provider_runtime import hash_json
+from services.artifact_registry import ArtifactRegistry
+from services.job_workspace import JobWorkspace
+from services.settings import ApplicationSettings
+from validation import current_validation
+from validation.adjudication_reuse import _request_payload
+from validation.execution_service import ValidationExecutionService
+
+
+def _service(
+    tmp_path: Path, *, validation_retry_limit: int = 1
+) -> ValidationExecutionService:
+    workspace = JobWorkspace.create(
+        str(tmp_path / "output"), "validation", job_id="validator-preflight"
+    )
+    registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+    api_config = {
+        "api_key": "local-fixture-only",
+        "provider_family": "generic",
+        "model": "validator-fixture-model",
+        "api_base": "http://127.0.0.1:1/v1",
+        "endpoint_type": "chat_completions",
+        "max_context_tokens": "32768",
+        "max_output_tokens": "1024",
+        "reasoning_reserve_tokens": "128",
+        "safety_margin_tokens": "256",
+        "transport_retries": "3",
+        "connect_timeout_seconds": "2",
+        "read_timeout_seconds": "7",
+        "total_timeout_seconds": "9",
+        "first_token_timeout_seconds": "1",
+        "proxy_mode": "environment",
+    }
+    settings = ApplicationSettings.from_config(
+        {
+            "Validator_API": api_config,
+            "Runtime": {
+                "max_workers": "1",
+                "validation_retry_limit": str(validation_retry_limit),
+            },
+        }
+    )
+    return ValidationExecutionService(
+        job_id=workspace.job_id,
+        attempt_id="attempt-1",
+        workspace=workspace,
+        artifact_registry=registry,
+        settings=settings,
+        summaries=[],
+        review_draft_record=None,
+        citation_manifest_record=None,
+        paper_artifact_records=[],
+        visual_artifact_records=[],
+        provider_factory=None,
+        cancellation_checker=None,
+        logger=None,
+        runtime_config={"Validator_API": api_config},
+    )
+
+
+def _citation_result(citation_set_key: str, paper_id: str, claim_text: str) -> Any:
+    claim_unit_id = f"{citation_set_key}:unit-1"
+    claim_unit = {
+        "claim_unit_id": claim_unit_id,
+        "claim_text": claim_text,
+        "paper_ids": [paper_id],
+    }
+    return SimpleNamespace(
+        citation_id=citation_set_key,
+        citation_set_key=citation_set_key,
+        paper_id=paper_id,
+        paper_ids=[paper_id],
+        claim_text=claim_text,
+        claim_context=f"Context for {citation_set_key}.",
+        block_context=f"Block for {citation_set_key}.",
+        claim_type="result",
+        claim_type_confidence=0.9,
+        claim_type_rationale="fixture result claim",
+        claim_units=[claim_unit],
+        target_claim_unit=claim_unit,
+        details={
+            "claim_type": "result",
+            "claim_type_confidence": 0.9,
+            "claim_type_rationale": "fixture result claim",
+            "checked_paper_ids": [paper_id],
+            "claim_unit_results": [dict(claim_unit)],
+            "paper_identity_hints": {paper_id: {"title": f"Title {paper_id}"}},
+            "per_paper_evidence_packets": {
+                paper_id: {
+                    claim_unit_id: [
+                        {
+                            "resolver_tier": "normalized_text",
+                            "text_excerpt": f"Evidence for {citation_set_key}.",
+                        }
+                    ]
+                }
+            },
+            "evidence_status": "evidence_gap",
+            "disposition": "manual_review",
+        },
+        evidence_excerpt_list=[f"Evidence for {citation_set_key}."],
+        evidence_status="evidence_gap",
+        disposition="manual_review",
+        low_confidence=True,
+    )
+
+
+def _bind_fixture_reuse_miss(service: ValidationExecutionService, monkeypatch) -> None:
+    monkeypatch.setattr(
+        service,
+        "find_verified_adjudication_reuse",
+        lambda **_kwargs: (None, None, ""),
+    )
+    monkeypatch.setattr(current_validation, "_apply_adjudication", lambda item, _report: item)
+
+
+def test_validator_pretransport_inventory_binds_only_eligible_requests_before_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = _service(tmp_path)
+    _bind_fixture_reuse_miss(service, monkeypatch)
+    eligible = [
+        _citation_result("set-a", "paper-a", "Sensitive claim A."),
+        _citation_result("set-b", "paper-b", "Sensitive claim B."),
+    ]
+    skipped_empty_claim = _citation_result("set-empty", "paper-c", "")
+    skipped_no_papers = _citation_result("set-no-paper", "paper-d", "Claim without a paper.")
+    skipped_no_papers.paper_ids = []
+    seen_packets: list[Any] = []
+
+    def fake_run_adjudication_stage(
+        observed_service: Any, api_config: Mapping[str, Any], packet: Any
+    ) -> Mapping[str, Any]:
+        inventory = observed_service._validator_stage_pretransport_inventory
+        assert inventory["provider_posts_emitted_at_plan"] == 0
+        assert inventory["status"] == "materialized_upper_bound"
+        row = next(
+            item for item in inventory["requests"]
+            if item["call_id"] == current_validation.adjudication_call_id(packet)
+        )
+        assert row["request_hash"] == hash_json(_request_payload(packet, api_config))
+        seen_packets.append(packet)
+        return {"status": "supported", "confidence": 0.99}
+
+    monkeypatch.setattr(
+        current_validation,
+        "run_adjudication_stage",
+        fake_run_adjudication_stage,
+    )
+
+    output = current_validation._adjudicate(
+        service,
+        [*eligible, skipped_empty_claim, skipped_no_papers],
+        scope="repair_revalidation",
+    )
+
+    inventory = service._validator_stage_pretransport_inventory
+    assert output == [*eligible, skipped_empty_claim, skipped_no_papers]
+    assert len(seen_packets) == 2
+    assert inventory["scope"] == "repair_revalidation"
+    assert inventory["request_count"] == 2
+    assert inventory["logical_call_upper_bound"] == 2
+    assert inventory["physical_attempts_upper_bound"] == 4
+    assert inventory["attempt_contract_mismatch_count"] == 0
+    assert inventory["profile_error_count"] == 0
+    assert inventory["estimated_output_tokens_all_attempts_upper_bound"] == 4_096
+    assert inventory["request_timeout_seconds"] == 7
+    assert inventory["requests"][0]["connect_timeout_seconds"] == 2
+    assert inventory["requests"][0]["read_timeout_seconds"] == 7
+    assert inventory["requests"][0]["total_timeout_seconds"] == 9
+    assert inventory["first_token_timeout_enforced"] is False
+    assert inventory["verified_reuse_count"] == 0
+    assert inventory["transport_call_candidate_count"] == 2
+    assert [item["citation_set_key"] for item in inventory["requests"]] == [
+        "set-a",
+        "set-b",
+    ]
+    assert [item["paper_ids"] for item in inventory["requests"]] == [
+        ["paper-a"],
+        ["paper-b"],
+    ]
+    encoded = json.dumps(inventory, ensure_ascii=False)
+    assert "Sensitive claim A." not in encoded
+    assert "Sensitive claim B." not in encoded
+    assert "local-fixture-only" not in encoded
+
+
+def test_verified_adjudication_reuse_stays_transport_free_in_inventory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = _service(tmp_path)
+    result = _citation_result("set-reused", "paper-reused", "Reused claim.")
+    reuse_path = tmp_path / "reuse.json"
+    reuse_path.write_text(
+        json.dumps({"provider_output_artifact_id": "provider-output-fixture"}),
+        encoding="utf-8",
+    )
+    reuse_record = SimpleNamespace(path=str(reuse_path), artifact_id="reuse-fixture")
+    output_record = SimpleNamespace(
+        status="ready", artifact_id="provider-output-fixture"
+    )
+    monkeypatch.setattr(
+        service,
+        "find_verified_adjudication_reuse",
+        lambda **_kwargs: ({"status": "supported", "confidence": 0.99}, reuse_record, ""),
+    )
+    monkeypatch.setattr(
+        service.artifact_registry,
+        "get",
+        lambda _artifact_id: output_record,
+    )
+    registrations: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        service,
+        "register_verified_reuse_call",
+        lambda **kwargs: registrations.append(kwargs),
+    )
+    monkeypatch.setattr(current_validation, "_apply_adjudication", lambda item, _report: item)
+    monkeypatch.setattr(
+        current_validation,
+        "run_adjudication_stage",
+        lambda *_args, **_kwargs: pytest.fail("verified reuse must not call the provider"),
+    )
+
+    output = current_validation._adjudicate(
+        service, [result], scope="repair_revalidation"
+    )
+
+    inventory = service._validator_stage_pretransport_inventory
+    assert output == [result]
+    assert len(registrations) == 1
+    assert inventory["scope"] == "repair_revalidation"
+    assert inventory["logical_call_upper_bound"] == 1
+    assert inventory["physical_attempts_upper_bound"] == 2
+    assert inventory["verified_reuse_count"] == 1
+    assert inventory["transport_call_candidate_count"] == 0
+    assert inventory["outcomes"] == [
+        {"call_id": inventory["requests"][0]["call_id"], "status": "verified_reuse"}
+    ]
+
+
+def test_zero_validator_retry_limit_emits_one_post_and_one_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = _service(tmp_path, validation_retry_limit=0)
+    result = _citation_result("set-zero-retry", "paper-zero-retry", "Retry bounded claim.")
+    monkeypatch.setattr(
+        service,
+        "find_verified_adjudication_reuse",
+        lambda **_kwargs: (None, None, ""),
+    )
+    posts: list[dict[str, Any]] = []
+
+    class RetryableResponse:
+        status_code = 503
+        text = '{"error":{"message":"synthetic retryable response"}}'
+        content = text.encode("utf-8")
+
+        def __init__(self) -> None:
+            self.headers = {
+                "content-type": "application/json",
+                "x-request-id": "local-503",
+            }
+
+        def raise_for_status(self) -> None:
+            raise requests.HTTPError("synthetic local 503", response=self)
+
+        def iter_content(self, chunk_size: int):
+            assert chunk_size > 0
+            yield self.content
+
+        def json(self) -> dict[str, Any]:
+            return {"error": {"message": "synthetic retryable response"}}
+
+        def close(self) -> None:
+            return None
+
+    def fake_post(url: str, **kwargs: Any) -> RetryableResponse:
+        posts.append({"url": url, **kwargs})
+        return RetryableResponse()
+
+    # Intercept the transport boundary; no socket or provider is reached.
+    monkeypatch.setattr(ai_interface.requests, "post", fake_post)
+    monkeypatch.setattr(ai_interface.time, "sleep", lambda *_args, **_kwargs: None)
+
+    current_validation._adjudicate(service, [result])
+
+    inventory = service._validator_stage_pretransport_inventory
+    call_id = inventory["requests"][0]["call_id"]
+    runtime = service._provider_runtimes[call_id]
+    expected_call = service._expected_provider_calls[call_id]
+    assert len(posts) == 1
+    assert posts[0]["url"] == "http://127.0.0.1:1/v1/chat/completions"
+    assert inventory["requests"][0]["attempts_upper_bound"] == 1
+    assert inventory["physical_attempts_upper_bound"] == 1
+    assert inventory["requests"][0]["expected_call_max_attempts"] == 1
+    assert expected_call.max_attempts == 1
+    assert len(runtime.receipts) == 1
+    assert runtime.receipts[0].attempts == 1
+
+
+def test_output_dir_does_not_infer_repair_revalidation_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = _service(tmp_path)
+    observed_scopes: list[str] = []
+    monkeypatch.setattr(
+        current_validation,
+        "_load_inputs",
+        lambda *_args, **_kwargs: ({}, {}, [], None, None),
+    )
+    monkeypatch.setattr(
+        current_validation,
+        "_input_contract",
+        lambda *_args, **_kwargs: (
+            current_validation.ValidationInputArtifactsV1(),
+            0,
+            False,
+            False,
+            (),
+        ),
+    )
+    monkeypatch.setattr(
+        current_validation,
+        "_adjudicate",
+        lambda _service, results, *, scope: observed_scopes.append(scope) or list(results),
+    )
+
+    class EmptyValidator:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def validate(self, **_kwargs: Any) -> Any:
+            return SimpleNamespace(citation_results=[])
+
+    monkeypatch.setattr(current_validation, "ReviewValidator", EmptyValidator)
+    monkeypatch.setattr(current_validation, "_write_reports", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(service, "bind_validation_source_authority", lambda *_args: None)
+    monkeypatch.setattr(
+        "validation.source_binding.build_validation_source_authority_fingerprint",
+        lambda **_kwargs: ({}, "", ()),
+    )
+
+    outcome = current_validation.run_current_validation(
+        service,
+        output_dir=tmp_path / "gate-h-pre-repair-detection",
+    )
+
+    assert outcome["revalidation"] is True
+    assert observed_scopes == ["current_validation"]
+
+
+def test_repair_revalidation_passes_explicit_inventory_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = _service(tmp_path)
+    draft_path = tmp_path / "repaired_draft.json"
+    manifest_path = tmp_path / "repaired_manifest.json"
+    draft_path.write_text("{}", encoding="utf-8")
+    manifest_path.write_text("{}", encoding="utf-8")
+    draft_record = SimpleNamespace(
+        artifact_id="repaired-draft",
+        path=str(draft_path),
+        status="ready",
+    )
+    manifest_record = SimpleNamespace(
+        artifact_id="repaired-manifest",
+        path=str(manifest_path),
+        status="ready",
+    )
+    observed_kwargs: dict[str, Any] = {}
+
+    def fake_run_current_validation(_service: Any, **kwargs: Any) -> dict[str, Any]:
+        observed_kwargs.update(kwargs)
+        return {}
+
+    monkeypatch.setattr(
+        current_validation,
+        "run_current_validation",
+        fake_run_current_validation,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        service,
+        "finalize_provider_receipts",
+        lambda **_kwargs: {
+            "closure": SimpleNamespace(to_dict=dict),
+            "closure_record": SimpleNamespace(artifact_id="closure-record"),
+        },
+    )
+
+    outcome = service.revalidate_review_artifacts(
+        review_draft_record=draft_record,
+        citation_manifest_record=manifest_record,
+        output_dir=str(tmp_path / "repair-revalidation"),
+        result_artifact_id="validation-result-repaired",
+        paper_artifact_records=[],
+    )
+
+    assert observed_kwargs["validation_scope"] == "repair_revalidation"
+    assert outcome["provider_receipt_closure_record_id"] == "closure-record"

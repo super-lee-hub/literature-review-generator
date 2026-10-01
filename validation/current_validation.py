@@ -10,15 +10,21 @@ of this execution path.
 
 from __future__ import annotations
 
-from datetime import datetime
-from dataclasses import asdict, replace
 import json
 import os
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict, replace
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, cast
 
+from ai_interface import _load_api_runtime_settings
+from models import APIConfig
+from runtime.provider_context import ProviderContextProfile
+from runtime.provider_runtime import hash_json
 from services.artifact_registry import ArtifactDependencyRefV2, file_sha256
 from services.job_workspace import publish_bytes_artifact, publish_json_artifact
+from services.model_capabilities import resolve_model_capability
 from services.model_selection import get_validator_api_config
 from services.repair_policy import (
     ValidationRepairPolicy,
@@ -26,12 +32,19 @@ from services.repair_policy import (
     requires_manual_confirmation,
     unsafe_auto_rewrite_enabled,
 )
-from validation.edge_checkpoint import ValidationEdgeCheckpointStore
-from validation.evidence_loader import ValidationSourceAuthorityError
-from validation.adjudication_checkpoint import AdjudicationCheckpointStore, sanitized_route_hash
+from validation.adjudication_checkpoint import (
+    AdjudicationCheckpointStore,
+    sanitized_route_hash,
+)
+from validation.adjudication_reuse import (
+    _request_payload as build_adjudication_request_payload,
+)
 from validation.adjudication_reuse import (
     adjudication_call_id,
+    adjudication_schema_hash,
 )
+from validation.edge_checkpoint import ValidationEdgeCheckpointStore
+from validation.evidence_loader import ValidationSourceAuthorityError
 from validation.llm_adjudicator import build_adjudication_packet, run_adjudication_stage
 from validation.review_validator import (
     CitationValidationResult,
@@ -193,9 +206,11 @@ def _load_inputs(
     if paper_artifacts_override is None and all_binding_records:
         # Lane B is resolved per cited canonical paper key.  A local artifact
         # for one paper must not suppress an external authority for another.
-        from validation.source_binding import resolve_bound_paper_artifacts
-        from validation.source_binding import validation_source_binding_payload_hash
-        from validation.source_binding import validation_source_binding_semantic_hash
+        from validation.source_binding import (
+            resolve_bound_paper_artifacts,
+            validation_source_binding_payload_hash,
+            validation_source_binding_semantic_hash,
+        )
 
         current_binding_id = str(
             getattr(service, "current_validation_source_binding_id", "") or ""
@@ -874,21 +889,258 @@ def _apply_adjudication(result: CitationValidationResult, report: Mapping[str, A
     )
 
 
-def _adjudicate(service: Any, results: Sequence[CitationValidationResult]) -> list[CitationValidationResult]:
+def _positive_setting(value: Any, default: int) -> int:
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _nonnegative_setting(value: Any, default: int) -> int:
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return max(0, parsed)
+
+
+def _validator_stage_pretransport_inventory(
+    service: Any,
+    planned_requests: Sequence[tuple[Any, Any, Mapping[str, Any]]],
+    api_config: APIConfig,
+    *,
+    scope: str,
+) -> dict[str, Any]:
+    """Measure exact eligible adjudication requests before the first call.
+
+    The inventory stores only hashes, citation/paper/claim-unit bindings, and
+    token/attempt bounds. It deliberately omits the prompt and evidence text.
+    It is an upper bound because each planned row can still be satisfied by
+    verified adjudication reuse under the existing single-flight boundary.
+    This does not reserve the batch: ``run_adjudication_stage`` retains its
+    existing per-call ProviderRuntime admission.
+    """
+
+    request_timeout_seconds, requested_attempts = _load_api_runtime_settings(
+        api_config
+    )
+    requested_attempts = max(1, int(requested_attempts))
+    attempt_limit = getattr(service, "validator_attempt_limit", None)
+    if callable(attempt_limit):
+        effective_attempts = max(1, int(cast(int, attempt_limit(api_config))))
+        expected_call_attempt_cap = effective_attempts
+    else:
+        runtime_settings = getattr(service.settings, "runtime", None)
+        try:
+            validation_retry_limit = max(
+                0, int(getattr(runtime_settings, "validation_retry_limit", 1))
+            )
+        except (TypeError, ValueError):
+            validation_retry_limit = 1
+        expected_call_attempt_cap = max(1, validation_retry_limit + 1)
+        effective_attempts = (
+            1
+            if validation_retry_limit == 0
+            else min(requested_attempts, expected_call_attempt_cap)
+        )
+
+    capability = resolve_model_capability(api_config)
+    model = str(api_config.get("model") or "")
+    output_fallback = 4_096
+    reasoning_reserve = _nonnegative_setting(
+        api_config.get("reasoning_reserve_tokens"), 0
+    )
+    safety_margin = _positive_setting(
+        api_config.get("safety_margin_tokens"), 256
+    )
+    model_context_limit = _positive_setting(
+        api_config.get("max_context_tokens"), 128_000
+    )
+    provider = str(api_config.get("provider_family") or capability.provider_family)
+    endpoint_type = str(api_config.get("endpoint_type") or capability.endpoint_type)
+
+    rows: list[dict[str, Any]] = []
+    input_tokens_all_attempts = 0
+    output_tokens_all_attempts = 0
+    reasoning_tokens_all_attempts = 0
+    profile_errors = 0
+    for _result, packet, payload in planned_requests:
+        output_tokens = max(1, int(payload.get("max_output_tokens") or output_fallback))
+        # The transport profile reserves the per-request output allowance.
+        # Use the actual packet limit rather than the config's higher ceiling.
+        try:
+            packet_profile = ProviderContextProfile.conservative(
+                provider=provider,
+                model=model,
+                endpoint_type=endpoint_type,
+                model_context_limit=model_context_limit,
+                max_output_tokens=output_tokens,
+                reasoning_reserve=reasoning_reserve,
+                safety_margin=safety_margin,
+            )
+            estimate = packet_profile.estimate_request(payload)
+            input_tokens: int | None = int(estimate["estimated_input_tokens"])
+            within_input_budget: bool | None = bool(estimate["within_budget"])
+            input_budget: int | None = int(packet_profile.input_budget)
+        except (TypeError, ValueError):
+            packet_profile = None
+            estimate = {}
+            input_tokens = None
+            within_input_budget = None
+            input_budget = None
+            profile_errors += 1
+        claim_unit_ids = sorted(
+            {
+                str(item.get("claim_unit_id") or "").strip()
+                for item in packet.claim_units
+                if isinstance(item, Mapping) and str(item.get("claim_unit_id") or "").strip()
+            }
+        )
+        target_claim_unit_id = str(
+            (packet.target_claim_unit or {}).get("claim_unit_id") or ""
+        ).strip()
+        if target_claim_unit_id and target_claim_unit_id not in claim_unit_ids:
+            claim_unit_ids.append(target_claim_unit_id)
+            claim_unit_ids.sort()
+        paper_ids = sorted({str(value).strip() for value in packet.paper_ids if str(value).strip()})
+        rows.append(
+            {
+                "call_id": adjudication_call_id(packet),
+                "node_id": f"{packet.stage}:{packet.citation_set_key or 'validation'}",
+                "adjudication_stage": packet.stage,
+                "citation_set_key": str(packet.citation_set_key or ""),
+                "paper_ids": paper_ids,
+                "claim_unit_ids": claim_unit_ids,
+                "target_claim_unit_id": target_claim_unit_id,
+                "paper_evidence_packet_hashes": {
+                    paper_id: hash_json(packet.per_paper_evidence_packets.get(paper_id) or {})
+                    for paper_id in paper_ids
+                },
+                "request_hash": hash_json(payload),
+                "schema_hash": adjudication_schema_hash(packet),
+                "estimated_input_tokens": input_tokens,
+                "input_budget": input_budget,
+                "within_input_budget": within_input_budget,
+                "estimate_status": (
+                    "complete" if packet_profile is not None else "provider_profile_invalid"
+                ),
+                "requested_output_tokens": output_tokens,
+                "reasoning_reserve_tokens": reasoning_reserve,
+                "attempts_upper_bound": effective_attempts,
+                "expected_call_max_attempts": expected_call_attempt_cap,
+                "attempt_contract_matches_transport": (
+                    effective_attempts <= expected_call_attempt_cap
+                ),
+                "request_timeout_seconds": int(request_timeout_seconds),
+                "connect_timeout_seconds": _positive_setting(
+                    api_config.get("connect_timeout_seconds"),
+                    min(10, int(request_timeout_seconds)),
+                ),
+                "read_timeout_seconds": _positive_setting(
+                    api_config.get("read_timeout_seconds"),
+                    int(request_timeout_seconds),
+                ),
+                "total_timeout_seconds": _positive_setting(
+                    api_config.get("total_timeout_seconds"),
+                    int(request_timeout_seconds),
+                ),
+                "first_token_timeout_enforced": False,
+                "conditional_on": "verified_adjudication_reuse_not_found",
+            }
+        )
+        input_tokens_all_attempts += (input_tokens or 0) * effective_attempts
+        output_tokens_all_attempts += output_tokens * effective_attempts
+        reasoning_tokens_all_attempts += reasoning_reserve * effective_attempts
+
+    request_plan_hash = hash_json(rows)
+    attempt_contract_mismatch_count = sum(
+        not bool(item["attempt_contract_matches_transport"]) for item in rows
+    )
+    plan: dict[str, Any] = {
+        "schema_version": "validator-pretransport-inventory/v1",
+        "stage_name": "stage4_validate",
+        "scope": str(scope or "primary_validation"),
+        "status": "materialized_upper_bound" if not profile_errors else "incomplete_profile",
+        "request_builder": (
+            "validation.llm_adjudicator.build_adjudication_packet -> "
+            "validation.adjudication_reuse._request_payload -> "
+            "ai_interface.canonical_provider_request_payload"
+        ),
+        "route_fingerprint": sanitized_route_hash(api_config),
+        "provider_posts_emitted_at_plan": 0,
+        "per_call_atomic_admission": True,
+        "request_timeout_seconds": int(request_timeout_seconds),
+        "request_count": len(rows),
+        "logical_call_upper_bound": len(rows),
+        "physical_attempts_upper_bound": sum(
+            int(item["attempts_upper_bound"]) for item in rows
+        ),
+        "attempt_contract_mismatch_count": attempt_contract_mismatch_count,
+        "estimated_input_tokens_all_attempts_upper_bound": input_tokens_all_attempts,
+        "estimated_output_tokens_all_attempts_upper_bound": output_tokens_all_attempts,
+        "estimated_reasoning_tokens_all_attempts_upper_bound": reasoning_tokens_all_attempts,
+        "profile_error_count": profile_errors,
+        "provider_transport_wall_seconds_upper_bound": sum(
+            int(item["total_timeout_seconds"]) for item in rows
+        ),
+        "timeout_semantics": (
+            "connect/read timeouts are clamped by total_timeout_seconds; "
+            "first_token_timeout_seconds is not enforced by this transport"
+        ),
+        "first_token_timeout_enforced": False,
+        "request_plan_hash": request_plan_hash,
+        "requests": rows,
+        "outcomes": [],
+    }
+    plan["inventory_hash"] = hash_json(plan)
+    return plan
+
+
+def _adjudicate(
+    service: Any,
+    results: Sequence[CitationValidationResult],
+    *,
+    scope: str = "primary_validation",
+) -> list[CitationValidationResult]:
     config = get_validator_api_config(
         {"Validator_API": dict(service.settings.section("Validator_API"))}
     )
     if not str(config.get("api_key") or "").strip() or not str(config.get("model") or "").strip():
+        service._validator_stage_pretransport_inventory = {
+            "schema_version": "validator-pretransport-inventory/v1",
+            "stage_name": "stage4_validate",
+            "scope": scope,
+            "status": "route_unconfigured",
+            "request_builder": (
+                "validation.llm_adjudicator.build_adjudication_packet -> "
+                "validation.adjudication_reuse._request_payload -> "
+                "ai_interface.canonical_provider_request_payload"
+            ),
+            "route_fingerprint": sanitized_route_hash(config),
+            "provider_posts_emitted_at_plan": 0,
+            "per_call_atomic_admission": True,
+            "request_count": 0,
+            "logical_call_upper_bound": 0,
+            "physical_attempts_upper_bound": 0,
+            "request_plan_hash": hash_json([]),
+            "requests": [],
+            "outcomes": [],
+        }
+        service._validator_stage_pretransport_inventory["inventory_hash"] = hash_json(
+            service._validator_stage_pretransport_inventory
+        )
         return list(results)
     checkpoint_root = getattr(service.workspace.paths, "checkpoints_dir", "")
     checkpoint_store = AdjudicationCheckpointStore(
         Path(checkpoint_root) / "validation_adjudication"
     )
     route_hash = sanitized_route_hash(config)
-    output: list[CitationValidationResult] = []
+    planned: list[dict[str, Any]] = []
+    planned_requests: list[tuple[Any, Any, Mapping[str, Any]]] = []
     for result in results:
         if not result.claim_text.strip() or not result.paper_ids:
-            output.append(result)
+            planned.append({"result": result, "packet": None, "checkpoint_key": None})
             continue
         packet = build_adjudication_packet(result, stage="primary")
         key = checkpoint_store.key_for(
@@ -896,6 +1148,29 @@ def _adjudicate(service: Any, results: Sequence[CitationValidationResult]) -> li
             stage=packet.stage,
             route_hash=route_hash,
         )
+        request_payload = build_adjudication_request_payload(packet, config)
+        planned.append(
+            {"result": result, "packet": packet, "checkpoint_key": key}
+        )
+        planned_requests.append((result, packet, request_payload))
+    inventory = _validator_stage_pretransport_inventory(
+        service,
+        planned_requests,
+        config,
+        scope=scope,
+    )
+    service._validator_stage_pretransport_inventory = inventory
+    output: list[CitationValidationResult] = []
+    outcomes: list[dict[str, str]] = []
+    for item in planned:
+        result = item["result"]
+        packet = item.get("packet")
+        key = item.get("checkpoint_key")
+        if packet is None or key is None:
+            output.append(result)
+            continue
+        call_id = adjudication_call_id(packet)
+        outcome_status = "provider_call_not_started"
         with checkpoint_store.single_flight(key):
             report, reuse_record, reuse_error = service.find_verified_adjudication_reuse(
                 packet=packet,
@@ -916,6 +1191,7 @@ def _adjudicate(service: Any, results: Sequence[CitationValidationResult]) -> li
                         output_record=output_record,
                         output_payload=report,
                     )
+                    outcome_status = "verified_reuse"
             if report is None:
                 if reuse_record is not None and reuse_error:
                     _log(
@@ -923,9 +1199,13 @@ def _adjudicate(service: Any, results: Sequence[CitationValidationResult]) -> li
                         "warning",
                         f"adjudication reuse rejected: {reuse_error}",
                     )
+                outcome_status = "transport_call_dispatched"
                 report = run_adjudication_stage(service, config, packet)
                 if isinstance(report, Mapping):
-                    call_id = adjudication_call_id(packet)
+                    outcome_status = "transport_call_returned_result"
+                else:
+                    outcome_status = "transport_call_returned_no_result"
+                if isinstance(report, Mapping):
                     expected = getattr(service, "_expected_provider_calls", {}).get(call_id)
                     if expected is not None and expected.artifact_path:
                         output_record = next(
@@ -953,10 +1233,24 @@ def _adjudicate(service: Any, results: Sequence[CitationValidationResult]) -> li
                                 output_record=output_record,
                                 receipt=receipt,
                             )
+            if report is not None and not isinstance(reuse_record, Mapping) and outcome_status == "provider_call_not_started":
+                outcome_status = "reuse_report_without_record"
+        outcomes.append({"call_id": call_id, "status": outcome_status})
         if isinstance(report, Mapping):
             output.append(_apply_adjudication(result, report))
         else:
             output.append(result)
+    inventory["outcomes"] = outcomes
+    inventory["verified_reuse_count"] = sum(
+        item["status"] == "verified_reuse" for item in outcomes
+    )
+    inventory["transport_call_candidate_count"] = sum(
+        item["status"] not in {"verified_reuse", "reuse_report_without_record"}
+        for item in outcomes
+    )
+    inventory["inventory_hash"] = hash_json(
+        {key: value for key, value in inventory.items() if key != "inventory_hash"}
+    )
     return output
 
 
@@ -1247,6 +1541,7 @@ def run_current_validation(
     review_draft_record_override: Any | None = None,
     citation_manifest_record_override: Any | None = None,
     output_dir: str | os.PathLike[str] | None = None,
+    validation_scope: str = "current_validation",
     result_artifact_id: str = "",
     result_artifact_type: str = "validation_run_result",
     result_artifact_role: str = "validation",
@@ -1432,7 +1727,11 @@ def run_current_validation(
             if output_dir
             else None,
         )
-    results = _adjudicate(service, base_report.citation_results)
+    results = _adjudicate(
+        service,
+        base_report.citation_results,
+        scope=validation_scope,
+    )
     report = _build_report(results)
     result = ValidationRunResultV1.from_report(
         report,
@@ -1447,6 +1746,20 @@ def run_current_validation(
         recheck_status="not_required",
         degradation_reasons=degradation_reasons,
     )
+    validator_inventory = getattr(
+        service, "_validator_stage_pretransport_inventory", None
+    )
+    if isinstance(validator_inventory, Mapping):
+        inventory_diagnostic = "validator_pretransport_inventory_v1:" + json.dumps(
+            dict(validator_inventory),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        result = replace(
+            result,
+            diagnostics=(*result.diagnostics, inventory_diagnostic),
+        )
     paths = _write_reports(
         service,
         result,
@@ -1478,6 +1791,11 @@ def run_current_validation(
         "unsafe_auto_rewrite_enabled": unsafe_auto_rewrite_enabled(policy),
         "validation_run_result": result,
         "validation_run_result_payload": result.to_dict(),
+        "validator_pretransport_inventory": (
+            dict(validator_inventory)
+            if isinstance(validator_inventory, Mapping)
+            else None
+        ),
         "execution_status": result.execution_status.value,
         "validation_disposition": result.validation_disposition.value,
         "revalidation": bool(output_dir),

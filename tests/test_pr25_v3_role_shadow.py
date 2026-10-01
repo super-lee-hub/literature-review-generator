@@ -230,10 +230,22 @@ def test_chunk_plan_uses_distinct_outline_role_routes_without_transport(tmp_path
     ]
     runtime_fragment_count = sum(len(row.get("topic_fragments") or ()) for row in topic_rows)
     planner_item_count = sum(len(row.get("cross_group_fragment_plans") or ()) for row in topic_rows)
-    assert runtime_fragment_count == 5
+    # Two shared-construct fragments, an outlier, and each paper's context
+    # and method fragments remain distinct after the current semantic plan.
+    # Keeping each finding's typed boundary text can require one more
+    # physical batch without changing the seven logical fragments.
+    assert len(topic_rows) == 5
+    assert runtime_fragment_count == 7
     assert result["semantic_cross_group_runtime_fragment_count"] == runtime_fragment_count
     assert result["semantic_cross_group_planner_item_count"] == planner_item_count
     assert planner_item_count == runtime_fragment_count
+    coverage = result["r1_request_workload_audit"]["topic_wire_coverage"]
+    assert coverage["status"] == "complete"
+    assert coverage["all_planned_unit_sets_equal_materialized_unit_sets"] is True
+    assert coverage["missing_source_claim_identity_count"] == 0
+    assert coverage["missing_source_evidence_identity_count"] == 0
+    assert coverage["extra_topic_wire_claim_identity_count"] == 0
+    assert coverage["extra_topic_wire_evidence_identity_count"] == 0
     assert result["semantic_cross_group_fragment_bounds_status"] == "materialized_upper_bound"
     assert result["semantic_request_upper_bound_status"] == "materialized_upper_bound"
     assert result["semantic_request_input_tokens_all_attempts_upper_bound"] == (
@@ -286,15 +298,37 @@ def test_three_paper_plan_does_not_reserve_unused_reducer_stage_capacity(
 
     assert result["provider_posts_emitted"] == 0
     assert result["semantic_physical_call_limit"] == 24
-    assert result["semantic_preflight_status"] == "accepted"
+    assert result["semantic_preflight_status"] == "rejected"
     preflight = result["semantic_route_preflight_summary"]
+    assert preflight["rejection_reason"] == "max_provider_calls_exceeded"
+    assert preflight["estimated_provider_calls"] == 30
+    assert preflight["estimated_provider_physical_attempts_upper_bound"] == 30
     assert preflight["semantic_conditional_reducer_call_reserve"] == 0
     assert preflight["semantic_synthesis_calls_reserved"] == (
         result["semantic_topic_batch_count"]
         + result["semantic_cross_materialized_request_count"]
         + result["semantic_global_request_count_upper_bound"]
     )
-    assert result["semantic_request_calls_reserved_upper_bound"] <= 24
+    assert result["semantic_request_calls_reserved_upper_bound"] == 23
+
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            "max_provider_calls = 24", "max_provider_calls = 30"
+        ),
+        encoding="utf-8",
+    )
+    admitted = ReviewControlPlane(repo_root=tmp_path).chunk_plan(
+        [summary_path],
+        job_id="three-paper-reducer-budget",
+        candidate_count=2,
+        physical_call_limit=30,
+        config_path=config_path,
+    )
+    assert admitted["semantic_preflight_status"] == "accepted"
+    assert admitted["semantic_route_preflight_summary"]["estimated_provider_calls"] == 30
+    assert admitted["semantic_route_preflight_summary"]["semantic_conditional_reducer_call_reserve"] == 0
+    assert admitted["r1_request_workload_audit"]["topic_wire_coverage"]["status"] == "complete"
+    assert admitted["provider_posts_emitted"] == 0
 
 
 def test_chunk_plan_uses_runtime_smoke_default_when_mode_is_omitted(tmp_path: Path) -> None:

@@ -2,19 +2,26 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 import logging
-from pathlib import Path
 import re
-from typing import Any, Callable, Mapping, Sequence, cast
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path
+from typing import Any, cast
 
 from models import APIConfig
 from runtime.provider_completion import ProviderCompletionEvaluator
+from runtime.provider_receipt_closure import (
+    ExpectedProviderCall,
+    ProviderReceiptClosure,
+)
+from runtime.provider_routes import build_reachable_provider_route_plan
 from runtime.provider_runtime import (
-    ProviderBudgetV1,
+    ProviderAggregateBudgetV2,
     ProviderBudgetExceeded,
+    ProviderBudgetV1,
     ProviderRuntime,
     ProviderRuntimeLedger,
     _redact_mapping,
@@ -22,9 +29,20 @@ from runtime.provider_runtime import (
     compute_closure_epoch_id,
     hash_json,
     hash_text,
+    provider_budget_controller_from_environment,
 )
-from runtime.provider_receipt_closure import ExpectedProviderCall, ProviderReceiptClosure
-from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry, file_sha256
+from runtime.stage_planning import (
+    ProviderRequestPlanRowV1,
+    ProviderStageRequestInventoryV1,
+    VerifiedProviderReuseAuthorityV1,
+    build_full_stage_request_plan_v1,
+    build_provider_request_plan_row_v1,
+)
+from services.artifact_registry import (
+    ArtifactDependencyRefV2,
+    ArtifactRegistry,
+    file_sha256,
+)
 from services.citation_ref_catalog import (
     build_document_ref_catalog,
     extract_ref_ids_from_token,
@@ -36,10 +54,9 @@ from services.job_workspace import (
     publish_bytes_artifact,
     publish_json_artifact,
 )
-from services.settings import ApplicationSettings
-from services.queue_service import LocalPublicationContext
 from services.prompt_registry import PromptRegistry, PromptRegistryError
-
+from services.queue_service import LocalPublicationContext
+from services.settings import ApplicationSettings
 
 WriterCallable = Callable[..., Mapping[str, Any]]
 
@@ -51,6 +68,20 @@ class ReviewGenerationResult:
     citation_ref_catalog_path: str
     receipt_ids: tuple[str, ...]
     receipt_ledger_path: str
+
+
+@dataclass(frozen=True)
+class _PreparedWriterSection:
+    section_number: int
+    section_id: str
+    section: Mapping[str, Any]
+    packet: Mapping[str, Any]
+    allowed_ref_ids: tuple[str, ...]
+    runtime: ProviderRuntime
+    prompt: str
+    request_payload: dict[str, Any]
+    binding: dict[str, Any]
+    persisted: dict[str, Any] | None
 
 
 class ReviewGenerationService:
@@ -96,8 +127,10 @@ class ReviewGenerationService:
         )
         self.receipt_ledger_path = ""
         self._expected_provider_calls: dict[str, ExpectedProviderCall] = {}
+        self._verified_reuse_proofs: dict[str, dict[str, str]] = {}
         self.expected_call_graph_hash = ""
         self.closure_epoch_id = ""
+        self.provider_request_inventory: ProviderStageRequestInventoryV1 | None = None
 
     def run(
         self,
@@ -107,6 +140,9 @@ class ReviewGenerationService:
         free_mode_context: Mapping[str, Any] | None = None,
     ) -> ReviewGenerationResult:
         self.free_mode_context = dict(free_mode_context or {})
+        self._expected_provider_calls = {}
+        self._verified_reuse_proofs = {}
+        self.provider_request_inventory = None
         catalog, catalog_path = self._build_and_persist_catalog()
         packet_by_section = {
             str(packet.get("section_id") or "").strip(): dict(packet)
@@ -126,6 +162,9 @@ class ReviewGenerationService:
         if not section_ids:
             raise RuntimeError("Review v3 outline contains no executable sections")
         writer_config_for_epoch = dict(self.settings.section("Writer_API"))
+        writer_system_prompt = self._system_prompt()
+        writer_max_output_tokens = self._max_output_tokens(writer_config_for_epoch)
+        writer_transport_attempt_limit = int(self.settings.runtime.transport_retries)
         self.expected_call_graph_hash = hash_json(
             {
                 "stage_name": "stage3_review",
@@ -149,9 +188,9 @@ class ReviewGenerationService:
             schema_version="review-v3",
         )
 
-        # Predeclare the complete section graph before the first Writer
-        # transport.  Resume may later fill output hashes from an existing
-        # section replay, but it cannot change the expected call set.
+        # Prepare the complete section graph, request bodies, and verified
+        # resume state before the first Writer transport.
+        prepared_sections: list[_PreparedWriterSection] = []
         for number, raw_section in enumerate(raw_sections, start=1):
             if not isinstance(raw_section, Mapping):
                 continue
@@ -161,9 +200,16 @@ class ReviewGenerationService:
                 raise RuntimeError(f"Review v3 has no evidence packet for section {section_id}")
             self._require_nonempty_packet(packet, section_id)
             allowed_ref_ids = self._allowed_ref_ids(packet, catalog)
-            runtime = self._new_runtime(section_id)
+            runtime = self._new_runtime(
+                section_id,
+                writer_config=writer_config_for_epoch,
+            )
             prompt = self._prompt(raw_section, packet, catalog, allowed_ref_ids)
-            request_payload = self._writer_request_payload(prompt)
+            request_payload = self._writer_request_payload(
+                prompt,
+                system_prompt=writer_system_prompt,
+                max_output_tokens=writer_max_output_tokens,
+            )
             binding = self._section_binding(
                 section_id=section_id,
                 raw_section=raw_section,
@@ -193,51 +239,6 @@ class ReviewGenerationService:
                 usage_required=str(writer_config_for_epoch.get("endpoint_type") or "responses")
                 not in {"internal", "fixture"},
             )
-
-        for number, raw_section in enumerate(raw_sections, start=1):
-            self._check_cancelled()
-            if not isinstance(raw_section, Mapping):
-                continue
-            section_id = str(raw_section.get("section_id") or f"section_{number}").strip()
-            packet = packet_by_section.get(section_id)
-            if packet is None:
-                raise RuntimeError(f"Review v3 has no evidence packet for section {section_id}")
-            self._require_nonempty_packet(packet, section_id)
-            allowed_ref_ids = self._allowed_ref_ids(packet, catalog)
-            runtime = self._new_runtime(section_id)
-            call_id = f"review:{section_id}"
-            writer_config = dict(self.settings.section("Writer_API"))
-            prompt = self._prompt(raw_section, packet, catalog, allowed_ref_ids)
-            request_payload = self._writer_request_payload(prompt)
-            binding = self._section_binding(
-                section_id=section_id,
-                raw_section=raw_section,
-                packet=packet,
-                catalog=catalog,
-                request_payload=request_payload,
-                runtime=runtime,
-                writer_config=writer_config,
-            )
-            self._expected_provider_calls[call_id] = ExpectedProviderCall(
-                call_id=call_id,
-                job_id=self.job_id,
-                attempt_id=runtime.attempt_id,
-                stage_name=runtime.stage_name,
-                node_id=section_id,
-                closure_epoch_id=self.closure_epoch_id,
-                logical_attempt_identity=self.attempt_id,
-                expected_call_graph_hash=self.expected_call_graph_hash,
-                prompt_id=self._review_prompt_identity.prompt_id,
-                prompt_version=self._review_prompt_identity.version,
-                prompt_sha256=self._review_prompt_identity.sha256,
-                prompt_hash=str(binding["prompt_hash"]),
-                input_hash=str(binding["prompt_payload_hash"]),
-                config_hash=str(binding["writer_config_hash"]),
-                schema_hash=runtime.schema_hash,
-                max_attempts=max(1, self.settings.runtime.node_retry_limit + 1),
-                usage_required=str(writer_config.get("endpoint_type") or "responses")
-                not in {"internal", "fixture"},
-            )
             persisted = self._load_section(
                 section_id,
                 raw_section=raw_section,
@@ -245,8 +246,48 @@ class ReviewGenerationService:
                 catalog=catalog,
                 binding=binding,
             )
-            if persisted is not None:
-                sections.append(persisted)
+            prepared_sections.append(
+                _PreparedWriterSection(
+                    section_number=number,
+                    section_id=section_id,
+                    section=dict(raw_section),
+                    packet=dict(packet),
+                    allowed_ref_ids=allowed_ref_ids,
+                    runtime=runtime,
+                    prompt=prompt,
+                    request_payload=request_payload,
+                    binding=binding,
+                    persisted=persisted,
+                )
+            )
+
+        (
+            self.provider_request_inventory,
+            writer_route_plan,
+        ) = self._build_provider_request_inventory(
+            prepared_sections,
+            writer_config=writer_config_for_epoch,
+            max_output_tokens=writer_max_output_tokens,
+            transport_attempt_limit=writer_transport_attempt_limit,
+        )
+        self._preflight_provider_request_inventory(
+            self.provider_request_inventory,
+            writer_route_plan,
+        )
+
+        for prepared in prepared_sections:
+            self._check_cancelled()
+            number = prepared.section_number
+            section_id = prepared.section_id
+            raw_section = prepared.section
+            packet = prepared.packet
+            allowed_ref_ids = prepared.allowed_ref_ids
+            runtime = prepared.runtime
+            prompt = prepared.prompt
+            request_payload = prepared.request_payload
+            binding = prepared.binding
+            if prepared.persisted is not None:
+                sections.append(prepared.persisted)
                 continue
             provider_result = self._call_writer(
                 section_number=number,
@@ -255,12 +296,19 @@ class ReviewGenerationService:
                 catalog=catalog,
                 allowed_ref_ids=allowed_ref_ids,
                 runtime=runtime,
+                prompt=prompt,
+                system_prompt=writer_system_prompt,
+                writer_config=writer_config_for_epoch,
+                max_output_tokens=writer_max_output_tokens,
+                transport_attempt_limit=writer_transport_attempt_limit,
+                expected_input_hash=str(binding["prompt_payload_hash"]),
             )
             self._ensure_receipt(
                 runtime,
                 prompt=prompt,
                 input_payload=request_payload,
                 result=provider_result,
+                api_config=writer_config_for_epoch,
             )
             blocks = self._normalize_blocks(
                 provider_result,
@@ -401,7 +449,7 @@ class ReviewGenerationService:
         runtime: ProviderRuntime,
         writer_config: Mapping[str, Any],
     ) -> dict[str, Any]:
-        profile = self._provider_context_profile()
+        profile = self._provider_context_profile(writer_config)
         adoption = self._current_adoption_binding()
         free_mode = self.free_mode_context
         return {
@@ -426,7 +474,7 @@ class ReviewGenerationService:
             "writer_model": str(writer_config.get("model") or ""),
             "writer_endpoint": str(writer_config.get("endpoint_type") or "responses"),
             "writer_config_hash": hash_json(_redact_mapping(dict(writer_config))),
-            "system_prompt_hash": hash_text(self._system_prompt()),
+            "system_prompt_hash": hash_text(str(request_payload.get("system") or "")),
             "prompt_id": self._review_prompt_identity.prompt_id,
             "prompt_version": self._review_prompt_identity.version,
             "prompt_sha256": self._review_prompt_identity.sha256,
@@ -578,6 +626,16 @@ class ReviewGenerationService:
         replay = self._load_review_replay(section_id=section_id, binding=binding)
         if replay is None:
             return None
+        replay_epoch_id = str(replay.get("closure_epoch_id") or "")
+        if (
+            str(replay.get("job_id") or "") != self.job_id
+            or str(replay.get("stage_name") or "") != "stage3_review"
+            or not replay_epoch_id
+        ):
+            return None
+        reuse_record = self.registry.get("review_replay")
+        if reuse_record is None or reuse_record.status != "ready":
+            return None
         receipt_id = str(replay.get("receipt_id") or "")
         receipt = next(
             (item for item in self.receipt_ledger.list_receipts() if item.receipt_id == receipt_id),
@@ -592,6 +650,7 @@ class ReviewGenerationService:
             or receipt.stage_name != expected.stage_name
             or receipt.node_id != expected.node_id
             or receipt.call_id != expected.call_id
+            or receipt.closure_epoch_id != replay_epoch_id
             or receipt.prompt_hash != expected.prompt_hash
             or receipt.input_hash != expected.input_hash
             or receipt.config_hash != expected.config_hash
@@ -616,7 +675,34 @@ class ReviewGenerationService:
             registered_artifact_hash=section_hash,
             replay_output_hash=receipt.response_hash or "",
             node_output_hash=section_hash,
+            verified_reuse=True,
+            reuse_evidence_artifact_id=reuse_record.artifact_id,
+            reuse_evidence_artifact_hash=reuse_record.content_hash,
+            reuse_evidence_record_hash=hash_json(replay),
         )
+        receipt_hash = hash_json(receipt.to_dict())
+        self._verified_reuse_proofs[expected.call_id] = {
+            "receipt_hash": receipt_hash,
+            "output_hash": receipt.response_hash or "",
+            "reuse_evidence_artifact_id": reuse_record.artifact_id,
+            "reuse_evidence_artifact_hash": reuse_record.content_hash,
+            "reuse_evidence_record_hash": hash_json(replay),
+            "authority_hash": hash_json(
+                {
+                    "authority_version": "review-section-replay-authority-v1",
+                    "call_id": expected.call_id,
+                    "binding_hash": expected_binding_hash,
+                    "receipt_id": receipt.receipt_id,
+                    "receipt_hash": receipt_hash,
+                    "reuse_evidence_artifact_id": reuse_record.artifact_id,
+                    "reuse_evidence_artifact_hash": reuse_record.content_hash,
+                    "reuse_evidence_record_hash": hash_json(replay),
+                    "artifact_id": record.artifact_id,
+                    "artifact_content_hash": section_hash,
+                    "registry_file_hash": record.content_hash,
+                }
+            ),
+        }
         return dict(payload)
 
     @staticmethod
@@ -700,6 +786,17 @@ class ReviewGenerationService:
         return immutable_record
 
     def _persist_receipt_closure(self) -> None:
+        reuse_record = self.registry.get("review_replay")
+        if reuse_record is not None and reuse_record.status == "ready":
+            for call_id, proof in self._verified_reuse_proofs.items():
+                expected = self._expected_provider_calls.get(call_id)
+                if expected is not None and expected.verified_reuse:
+                    self._expected_provider_calls[call_id] = replace(
+                        expected,
+                        reuse_evidence_artifact_id=reuse_record.artifact_id,
+                        reuse_evidence_artifact_hash=reuse_record.content_hash,
+                        reuse_evidence_record_hash=proof["reuse_evidence_record_hash"],
+                    )
         all_receipts = list(self.receipt_ledger.list_receipts())
         scoped_receipts = [
             receipt
@@ -802,13 +899,25 @@ class ReviewGenerationService:
         catalog: Mapping[str, Any],
         allowed_ref_ids: Sequence[str],
         runtime: ProviderRuntime,
+        prompt: str,
+        system_prompt: str,
+        writer_config: Mapping[str, Any],
+        max_output_tokens: int,
+        transport_attempt_limit: int,
+        expected_input_hash: str,
     ) -> Mapping[str, Any]:
-        prompt = self._prompt(section, packet, catalog, allowed_ref_ids)
-        writer_config = dict(self.settings.section("Writer_API"))
+        frozen_config = dict(writer_config)
+        request_payload = self._writer_request_payload(
+            prompt,
+            system_prompt=system_prompt,
+            max_output_tokens=max_output_tokens,
+        )
+        if hash_json(request_payload) != expected_input_hash:
+            raise RuntimeError("Review v3 Writer request changed after preflight")
         if self.writer is not None:
             value = self.writer(
                 prompt_text=prompt,
-                writer_api_config=writer_config,
+                writer_api_config=frozen_config,
                 provider_runtime=runtime,
                 section_number=section_number,
                 section=dict(section),
@@ -821,17 +930,17 @@ class ReviewGenerationService:
 
         from ai_interface import _call_ai_api_detailed
 
-        if not str(writer_config.get("api_key") or "").strip() or not str(writer_config.get("model") or "").strip():
+        if not str(frozen_config.get("api_key") or "").strip() or not str(frozen_config.get("model") or "").strip():
             raise RuntimeError("Writer_API is not configured for Review v3")
         result = _call_ai_api_detailed(
             prompt,
-            cast(APIConfig, writer_config),
-            self._system_prompt(),
-            max_tokens=self._max_output_tokens(),
+            cast(APIConfig, frozen_config),
+            system_prompt,
+            max_tokens=max_output_tokens,
             temperature=0.2,
             response_format="json",
             logger=self.logger,
-            retry_attempts=self.settings.runtime.transport_retries,
+            retry_attempts=transport_attempt_limit,
             provider_runtime=runtime,
         )
         completion = ProviderCompletionEvaluator.evaluate(
@@ -1052,8 +1161,17 @@ class ReviewGenerationService:
             raise RuntimeError(f"section evidence packet {packet.get('section_id')} has no source summaries")
         return selected
 
-    def _new_runtime(self, section_id: str) -> ProviderRuntime:
-        config = dict(self.settings.section("Writer_API"))
+    def _new_runtime(
+        self,
+        section_id: str,
+        *,
+        writer_config: Mapping[str, Any] | None = None,
+    ) -> ProviderRuntime:
+        config = dict(
+            writer_config
+            if writer_config is not None
+            else self.settings.section("Writer_API")
+        )
         return ProviderRuntime(
             budget=ProviderBudgetV1(
                 max_calls=max(1, self.settings.runtime.node_retry_limit + 1),
@@ -1077,6 +1195,166 @@ class ReviewGenerationService:
             prompt_sha256=self._review_prompt_identity.sha256,
         )
 
+    def _build_provider_request_inventory(
+        self,
+        prepared_sections: Sequence[_PreparedWriterSection],
+        *,
+        writer_config: Mapping[str, Any],
+        max_output_tokens: int,
+        transport_attempt_limit: int,
+    ) -> tuple[ProviderStageRequestInventoryV1, Any]:
+        from runtime.provider_context import ProviderContextProfile
+
+        route_config = dict(self.settings.sections)
+        route_config["Writer_API"] = dict(writer_config)
+        route_plan = build_reachable_provider_route_plan(
+            route_config,
+            action="generate_review",
+            requested_stages=("review",),
+            free_mode_enabled=bool(self.free_mode_context),
+        )
+        route = route_plan.route_for_role("writer")
+        if not route.resolved:
+            raise RuntimeError("Review v3 Writer route is unresolved before request inventory")
+
+        bound_profile = self._provider_context_profile(writer_config)
+        profile = ProviderContextProfile.conservative(
+            provider=route.provider_family,
+            model=route.model,
+            endpoint_type=route.endpoint_type,
+            model_context_limit=bound_profile.model_context_limit,
+            max_output_tokens=max_output_tokens,
+            reasoning_reserve=bound_profile.reasoning_reserve,
+            safety_margin=bound_profile.safety_margin,
+            tokenizer_strategy=bound_profile.tokenizer_strategy,
+        )
+        wall_seconds = self._writer_total_timeout_seconds(writer_config)
+        rows: list[ProviderRequestPlanRowV1] = []
+        for prepared in prepared_sections:
+            call_id = f"review:{prepared.section_id}"
+            request_hash = hash_json(prepared.request_payload)
+            if request_hash != str(prepared.binding.get("prompt_payload_hash") or ""):
+                raise RuntimeError(
+                    f"Review v3 Writer request identity changed before inventory for {call_id}"
+                )
+            verified_reuse: VerifiedProviderReuseAuthorityV1 | None = None
+            reuse_proof = self._verified_reuse_proofs.get(call_id)
+            if prepared.persisted is not None:
+                if reuse_proof is None:
+                    raise RuntimeError(
+                        f"Review v3 Writer replay lacks verified receipt authority for {call_id}"
+                    )
+                verified_reuse = VerifiedProviderReuseAuthorityV1(
+                    request_hash=request_hash,
+                    route_identity=route.identity,
+                    receipt_hash=reuse_proof["receipt_hash"],
+                    output_hash=reuse_proof["output_hash"],
+                    authority_hash=reuse_proof["authority_hash"],
+                )
+            requested_attempts = prepared.runtime.max_attempts_for_call(
+                transport_attempt_limit
+            )
+            rows.append(
+                build_provider_request_plan_row_v1(
+                    stage_name="review",
+                    request_id=call_id,
+                    source_builder=(
+                        "services.review_generation_service.ReviewGenerationService._writer_request_payload"
+                    ),
+                    route=route,
+                    request_payload=prepared.request_payload,
+                    profile=profile,
+                    retry_attempts=max(0, requested_attempts - 1),
+                    requested_output_tokens=max_output_tokens,
+                    reasoning_reserve_tokens=profile.reasoning_reserve,
+                    verified_reuse=verified_reuse,
+                    wall_seconds_upper_bound=wall_seconds,
+                )
+            )
+
+        return (
+            ProviderStageRequestInventoryV1(
+                stage_name="review",
+                source_builder="services.review_generation_service writer request builder",
+                requests=tuple(rows),
+            ),
+            route_plan,
+        )
+
+    @staticmethod
+    def _writer_total_timeout_seconds(writer_config: Mapping[str, Any]) -> float:
+        # This is the same request-level configuration path used by
+        # _call_ai_api_detailed; its transport loop shares one total deadline
+        # across all retries and bounds response reads by that deadline.
+        from ai_interface import _load_api_runtime_settings
+
+        request_timeout, _ = _load_api_runtime_settings(cast(APIConfig, writer_config))
+        try:
+            configured_total = int(
+                str(writer_config.get("total_timeout_seconds") or "").strip()
+            )
+        except (TypeError, ValueError):
+            configured_total = 0
+        return float(configured_total if configured_total > 0 else max(1, int(request_timeout)))
+
+    def _preflight_provider_request_inventory(
+        self,
+        inventory: ProviderStageRequestInventoryV1,
+        route_plan: Any,
+    ) -> None:
+        fresh_rows = [row for row in inventory.requests if not row.verified_reuse]
+        over_context = [
+            row
+            for row in fresh_rows
+            if not row.request_estimate.within_input_budget
+            or not row.request_estimate.within_context_budget
+        ]
+        if over_context:
+            call_id_hashes = ", ".join(row.request_key_hash for row in over_context)
+            raise ProviderBudgetExceeded(
+                "Writer stage preflight exceeds the provider request context budget: "
+                + call_id_hashes
+            )
+
+        controller = provider_budget_controller_from_environment()
+        if controller is None or not isinstance(controller.budget, ProviderAggregateBudgetV2):
+            return
+
+        snapshot = controller.snapshot()
+        budget = controller.budget
+        def remaining(field: str, limit: int) -> int:
+            return max(
+                0,
+                limit - int(snapshot[f"{field}_used"]) - int(snapshot[f"{field}_reserved"]),
+            )
+
+        remaining_budget = ProviderAggregateBudgetV2(
+            max_provider_calls_total=remaining("calls", budget.max_provider_calls_total),
+            max_output_tokens_total=remaining("output_tokens", budget.max_output_tokens_total),
+            max_retry_attempts_total=remaining("retry_attempts", budget.max_retry_attempts_total),
+            max_wall_seconds=max(
+                0.0,
+                budget.max_wall_seconds - float(snapshot["elapsed_seconds"]),
+            ),
+        )
+        projection = build_full_stage_request_plan_v1(
+            stage_plan=route_plan.stage_plan,
+            reachable_route_plan=route_plan,
+            stage_inventories=(inventory,),
+            aggregate_budget=remaining_budget,
+        )
+        budget_status = projection["budget_status"]
+        for key, label in (
+            ("provider_calls", "provider call"),
+            ("requested_output_tokens", "output token"),
+            ("provider_retries", "retry"),
+            ("wall_time", "wall-time"),
+        ):
+            if budget_status.get(key) == "exceeded":
+                raise ProviderBudgetExceeded(
+                    f"Writer stage preflight exceeds remaining aggregate {label} budget"
+                )
+
     def _ensure_receipt(
         self,
         runtime: ProviderRuntime,
@@ -1084,12 +1362,13 @@ class ReviewGenerationService:
         prompt: str,
         input_payload: Mapping[str, Any],
         result: Mapping[str, Any],
+        api_config: Mapping[str, Any],
     ) -> None:
         if runtime.receipts:
             return
         try:
             request = dict(input_payload)
-            profile = self._provider_context_profile()
+            profile = self._provider_context_profile(api_config)
             estimate = profile.estimate_request(request)
             admission = runtime.admit(
                 estimated_tokens=max(1, int(estimate["estimated_input_tokens"])),
@@ -1100,7 +1379,7 @@ class ReviewGenerationService:
                 admission=admission,
                 prompt=prompt,
                 input_payload=input_payload,
-                api_config=dict(self.settings.section("Writer_API")),
+                api_config=dict(api_config),
                 result=result,
                 metadata={"execution_mode": "injected_writer"},
             )
@@ -1108,22 +1387,32 @@ class ReviewGenerationService:
             runtime.blocked_receipt(
                 prompt=prompt,
                 input_payload=input_payload,
-                api_config=dict(self.settings.section("Writer_API")),
+                api_config=dict(api_config),
                 message="Writer did not produce a provider receipt before its budget closed",
             )
 
-    def _provider_context_profile(self) -> Any:
+    def _provider_context_profile(
+        self,
+        writer_config: Mapping[str, Any] | None = None,
+    ) -> Any:
         from runtime.provider_context import ProviderContextProfile
 
-        config = dict(self.settings.section("Writer_API"))
+        config = dict(
+            writer_config
+            if writer_config is not None
+            else self.settings.section("Writer_API")
+        )
         try:
             context_limit = max(1, int(config.get("max_context_tokens") or 128_000))
         except (TypeError, ValueError):
             context_limit = 128_000
         try:
-            output_tokens = max(1, int(config.get("max_output_tokens") or self._max_output_tokens()))
+            output_tokens = max(
+                1,
+                int(config.get("max_output_tokens") or self._max_output_tokens(config)),
+            )
         except (TypeError, ValueError):
-            output_tokens = self._max_output_tokens()
+            output_tokens = self._max_output_tokens(config)
         return ProviderContextProfile.conservative(
             provider=str(config.get("provider_family") or "configured"),
             model=str(config.get("model") or "writer"),
@@ -1157,22 +1446,40 @@ class ReviewGenerationService:
         if self.cancellation_checker is not None:
             self.cancellation_checker()
 
-    def _max_output_tokens(self) -> int:
-        raw = self.settings.section("Writer_API").get("max_output_tokens") or 32000
+    def _max_output_tokens(
+        self,
+        writer_config: Mapping[str, Any] | None = None,
+    ) -> int:
+        config = (
+            writer_config
+            if writer_config is not None
+            else self.settings.section("Writer_API")
+        )
+        raw = config.get("max_output_tokens") or 32000
         try:
             return max(256, int(raw))
         except (TypeError, ValueError):
             return 32000
 
-    def _writer_request_payload(self, prompt: str) -> dict[str, Any]:
+    def _writer_request_payload(
+        self,
+        prompt: str,
+        *,
+        system_prompt: str | None = None,
+        max_output_tokens: int | None = None,
+    ) -> dict[str, Any]:
         """Build the same canonical request identity used by provider transport."""
 
         return canonical_provider_request_payload(
             prompt=prompt,
-            system_prompt=self._system_prompt(),
+            system_prompt=system_prompt if system_prompt is not None else self._system_prompt(),
             user_content=None,
             response_format="json",
-            max_output_tokens=self._max_output_tokens(),
+            max_output_tokens=(
+                self._max_output_tokens()
+                if max_output_tokens is None
+                else int(max_output_tokens)
+            ),
             temperature=0.2,
         )
 

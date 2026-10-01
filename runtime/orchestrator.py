@@ -575,7 +575,7 @@ class _RuntimeStageHost:
         *,
         outline_file: str,
         review_sections: Sequence[Mapping[str, Any]],
-    ) -> tuple[Any, Any, Any, Any, list[Any], list[dict[str, str]]]:
+    ) -> tuple[Any, Any, Any, Any, list[Any], list[dict[str, str]], str]:
         _workspace, registry = self._require_workspace()
         outline_record = registry.get("outline-v3:final_outline")
         if outline_record is None or outline_record.status != "ready":
@@ -708,6 +708,7 @@ class _RuntimeStageHost:
             catalog_record,
             immutable_records,
             section_artifact_refs,
+            str(outline_payload.get("title") or "").strip(),
         )
 
     def _persist_review_draft(
@@ -729,6 +730,7 @@ class _RuntimeStageHost:
         catalog_record = registry.get("citation_ref_catalog")
         immutable_section_records: list[Any] = []
         writer_section_artifacts: list[dict[str, str]] = []
+        outline_title = ""
         if generation_mode == "outline_v3":
             (
                 outline_record,
@@ -737,6 +739,7 @@ class _RuntimeStageHost:
                 catalog_record,
                 immutable_section_records,
                 writer_section_artifacts,
+                outline_title,
             ) = self._outline_v3_review_lineage(
                 outline_file=outline_file,
                 review_sections=review_sections,
@@ -745,6 +748,7 @@ class _RuntimeStageHost:
             job_id=registry.job_id,
             project_name=self.project_name,
             draft_id="review_draft",
+            title=outline_title,
             outline_artifact_id="outline-v3:final_outline",
             outline_source_path=outline_file,
             summary_file=self.summary_file,
