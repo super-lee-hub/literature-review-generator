@@ -3003,7 +3003,7 @@ class OutlineV3Executor:
                 "source_claim_ids": "must exactly reference supplied source claim IDs; do not relabel source IDs as generated synthesis claims",
                 "source_field_policy": "When a factual synthesis uses a supplied source_field_ledger row, cite its exact source_field_id. Preserve the raw field path and study scope; an unmapped or unresolved row alone does not validate a statistical interpretation.",
                 "conciseness_policy": "Return the smallest complete synthesis that preserves distinct supported conclusions, direction, conditions, conflicts, null/zero findings, unresolved items and evidence support. Do not duplicate the same narrative in topics[].conclusions and claims[].text.",
-                "unresolved_questions": "array of questions that remain unresolved",
+                "unresolved_questions": "array of nonempty strings for unresolved questions across this entire request batch; put fragment-specific questions in topics[].unresolved_questions",
                 "no_external_evidence": "do not infer a finding, boundary or consensus from a missing field; emit an unresolved or insufficient-evidence record instead",
                 "overflow_policy": "Overflow: return a complete unresolved fragment with the exact reason 'Output limit.', no claims/conclusions/support IDs. Keep every fragment and complete JSON.",
             },
@@ -9281,7 +9281,22 @@ class OutlineV3Executor:
                 )
             ),
         )
-        self._validate_semantic_provider_output(node_id, request, result)
+        audit_index = next((
+            index for index in range(len(self._request_payload_audit) - 1, -1, -1)
+            if self._request_payload_audit[index].get("node_id") == node_id
+        ), -1)
+        try:
+            self._validate_semantic_provider_output(node_id, request, result)
+        except OutlineV3ExecutionError as exc:
+            self._finish_request_payload_audit(
+                audit_index,
+                semantic_validation_status="rejected",
+                semantic_validation_error=str(exc),
+            )
+            raise
+        self._finish_request_payload_audit(
+            audit_index, semantic_validation_status="accepted"
+        )
         return result
 
     def _run_bounded_semantic_provider_call(
@@ -10514,6 +10529,14 @@ class OutlineV3Executor:
                 reason_limit = output_contract.get("max_unresolved_reason_utf8_bytes")
                 if type(reason_limit) is not int or reason_limit < 1:
                     raise OutlineV3ExecutionError(f"{node_id} has an invalid topic fallback reason limit")
+                questions = result.get("unresolved_questions")
+                if isinstance(questions, list) and any(
+                    not isinstance(question, str) or not question.strip()
+                    for question in questions
+                ):
+                    raise OutlineV3ExecutionError(
+                        f"{node_id} unresolved_questions entries must be non-empty strings"
+                    )
                 for topic in result.get("topics") or ():
                     if not isinstance(topic, Mapping):
                         continue
@@ -10552,9 +10575,18 @@ class OutlineV3Executor:
                             raise OutlineV3ExecutionError(
                                 f"{node_id} unresolved topic cannot carry partial factual claims"
                             )
-                    if any(
-                        not isinstance(reason, str)
-                        or len(reason.encode("utf-8")) > reason_limit
+                    if any(not isinstance(reason, str) for reason in reasons):
+                        raise OutlineV3ExecutionError(
+                            f"{node_id} topic unresolved_questions entries must be strings"
+                        )
+                    if any(not reason.strip() for reason in reasons):
+                        raise OutlineV3ExecutionError(
+                            f"{node_id} topic unresolved_questions entries must be non-empty"
+                        )
+                    # This cap sizes the explicit fallback reason, not scientific
+                    # questions that accompany an integrated/completed topic.
+                    if status == "unresolved" and any(
+                        len(reason.encode("utf-8")) > reason_limit
                         for reason in reasons
                     ):
                         raise OutlineV3ExecutionError(
@@ -11116,6 +11148,11 @@ class OutlineV3Executor:
                 for item in provider_output.get("unresolved_questions") or ()
                 if isinstance(item, Mapping)
                 and str(item.get("fragment_id") or "") == fragment_id
+            ],
+            "batch_unresolved_questions": [
+                item
+                for item in provider_output.get("unresolved_questions") or ()
+                if isinstance(item, str)
             ],
         }
 
@@ -11743,14 +11780,30 @@ class OutlineV3Executor:
             },
         )
         self.receipts.append(receipt.receipt_id)
+        normalized_hash = hash_json(completion.content) if completion.status == "complete" else ""
+        raw_response_refs = []
+        raw_path = response.get("raw_response_path")
+        raw_hash = response.get("raw_response_sha256")
+        raw_bytes = response.get("response_bytes")
+        if (
+            isinstance(raw_path, str) and raw_path.strip()
+            and isinstance(raw_hash, str) and re.fullmatch(r"[0-9a-f]{64}", raw_hash)
+            and type(raw_bytes) is int and raw_bytes > 0
+        ):
+            raw_response_refs.append({
+                "path": raw_path,
+                "sha256": raw_hash,
+                "bytes": raw_bytes,
+                "normalized_response_hash": normalized_hash,
+            })
         self._finish_request_payload_audit(
             audit_index,
             physical_attempt_id=receipt.receipt_id,
             provider_invoked=transport is not None,
             status=str(receipt.status),
             receipt_ids=[receipt.receipt_id],
+            raw_response_refs=raw_response_refs,
         )
-        normalized_hash = hash_json(completion.content) if completion.status == "complete" else ""
         self._expected_provider_calls[call_id] = replace(
             self._expected_provider_calls[call_id],
             provider_response_hash=normalized_hash,

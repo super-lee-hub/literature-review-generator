@@ -85,6 +85,70 @@ def _unresolved_response(
     }
 
 
+def test_rejected_topic_keeps_raw_response_reference_in_persisted_audit(
+    tmp_path: Path,
+) -> None:
+    import hashlib
+    from dataclasses import replace
+
+    from runtime.outline_v3_dag import OutlineNodeRecord
+    from runtime.provider_runtime import hash_json
+
+    raw_path = tmp_path / "response.bin"
+    raw_bytes = b'data: {"choices":[]}\n\ndata: [DONE]\n\n'
+    raw_path.write_bytes(raw_bytes)
+    raw_hash = hashlib.sha256(raw_bytes).hexdigest()
+    rejected_content: dict[str, Any] = {}
+
+    def provider(_node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        rejected_content.update(_unresolved_response(request))
+        rejected_content["claims"] = [{
+            "claim_id": "synthesis:topic_synthesis:unsupported",
+            "fragment_id": request["topics"][0]["fragment_id"],
+            "text": "An unsupported factual conclusion.",
+            "claim_type": "finding",
+            "paper_key": "paper-a",
+            "evidence_ids": [],
+        }]
+        return {
+            "status": "success",
+            "finish_reason": "stop",
+            "content": rejected_content,
+            "raw_response_path": str(raw_path),
+            "raw_response_sha256": raw_hash,
+            "response_bytes": len(raw_bytes),
+        }
+
+    executor = _executor(tmp_path / "job", provider=provider, stability_mode="off")
+    executor._dag = replace(
+        executor._dag,
+        nodes=[
+            *executor._dag.nodes,
+            OutlineNodeRecord(node_id="topic_synthesis_provider:batch:1"),
+        ],
+    )
+    request = _topic_request(executor)
+    with pytest.raises(OutlineV3ExecutionError, match="partial factual claims"):
+        executor._run_semantic_provider_call(
+            "topic_synthesis_provider:batch:1", request, {}
+        )
+
+    executor._persist_audit_evidence()
+    audit_path = Path(executor.artifact_paths["request_payload_audit"])
+    audit_rows = [json.loads(row) for row in audit_path.read_text(encoding="utf-8").splitlines()]
+    assert len(audit_rows) == 1
+    assert audit_rows[0]["status"] == "success"
+    assert audit_rows[0]["semantic_validation_status"] == "rejected"
+    assert "partial factual claims" in audit_rows[0]["semantic_validation_error"]
+    assert audit_rows[0]["raw_response_refs"] == [{
+        "path": str(raw_path),
+        "sha256": raw_hash,
+        "bytes": len(raw_bytes),
+        "normalized_response_hash": hash_json(rejected_content),
+    }]
+    assert raw_path.read_bytes() == raw_bytes
+
+
 def test_v4_unresolved_fallback_covers_fragments_and_rejects_unsupported_facts(
     tmp_path: Path,
 ) -> None:
@@ -160,12 +224,10 @@ def test_v5_fallback_reason_has_a_declared_and_enforced_utf8_byte_limit(
         "bounded-topic-synthesis/v5"
     )
 
-    # v4 requires an explicit fallback reason but currently specifies no finite
-    # bound. The numeric limit remains a product-contract choice; this test
-    # accepts any positive limit that permits the minimal reason used above.
+    # The v5 limit bounds the explicit unresolved fallback reason.
     reason_limit = output_contract.get("max_unresolved_reason_utf8_bytes")
     assert type(reason_limit) is int
-    assert reason_limit >= len("Output limit.".encode("utf-8"))
+    assert reason_limit == 128
 
     response = _unresolved_response(request)
     swapped_topics = deepcopy(response)
@@ -206,14 +268,156 @@ def test_v5_fallback_reason_has_a_declared_and_enforced_utf8_byte_limit(
             "topic_synthesis_provider:batch:1", request, partial_claim
         )
 
+    at_limit = _unresolved_response(request, reason="x" * 128)
+    executor._validate_semantic_provider_output(
+        "topic_synthesis_provider:batch:1", request, at_limit
+    )
+
     too_long = _unresolved_response(
         request,
-        reason="x" * (reason_limit + 1),
+        reason="x" * 129,
     )
     with pytest.raises(OutlineV3ExecutionError, match="max_unresolved_reason_utf8_bytes"):
         executor._validate_semantic_provider_output(
             "topic_synthesis_provider:batch:1", request, too_long
         )
+
+    multibyte_at_limit = _unresolved_response(
+        request,
+        reason="汉" * 42 + "ab",
+    )
+    assert len(
+        multibyte_at_limit["topics"][0]["unresolved_questions"][0].encode("utf-8")
+    ) == 128
+    executor._validate_semantic_provider_output(
+        "topic_synthesis_provider:batch:1", request, multibyte_at_limit
+    )
+
+    multibyte_over_limit = _unresolved_response(
+        request,
+        reason="汉" * 43,
+    )
+    assert len(
+        multibyte_over_limit["topics"][0]["unresolved_questions"][0].encode("utf-8")
+    ) == 129
+    with pytest.raises(OutlineV3ExecutionError, match="max_unresolved_reason_utf8_bytes"):
+        executor._validate_semantic_provider_output(
+            "topic_synthesis_provider:batch:1", request, multibyte_over_limit
+        )
+
+
+@pytest.mark.parametrize("status", ["integrated", "completed", "processed"])
+def test_v5_non_fallback_topics_preserve_long_unresolved_questions(
+    tmp_path: Path,
+    status: str,
+) -> None:
+    executor = _executor(tmp_path, stability_mode="off")
+    request = _topic_request(executor)
+    questions = ["a" * 142, "b" * 119, "c" * 183]
+    response = _unresolved_response(request)
+    response["topics"][0]["status"] = status
+    response["topics"][0]["unresolved_questions"] = questions
+    response["unresolved_questions"] = questions
+
+    executor._validate_semantic_provider_output(
+        "topic_synthesis_provider:batch:1", request, response
+    )
+
+    assert [len(value.encode("utf-8")) for value in response["topics"][0]["unresolved_questions"]] == [
+        142, 119, 183
+    ]
+    assert response["topics"][0]["unresolved_questions"] == questions
+    assert response["unresolved_questions"] == questions
+
+
+@pytest.mark.parametrize(
+    "status", ["integrated", "completed", "processed", "unresolved"]
+)
+def test_v5_topic_unresolved_questions_keep_array_string_and_nonempty_validation(
+    tmp_path: Path,
+    status: str,
+) -> None:
+    executor = _executor(tmp_path, stability_mode="off")
+    request = _topic_request(executor)
+
+    invalid_type = _unresolved_response(request)
+    invalid_type["topics"][0]["status"] = status
+    invalid_type["topics"][0]["unresolved_questions"] = ["open item", 7]
+    with pytest.raises(OutlineV3ExecutionError, match="entries must be strings"):
+        executor._validate_semantic_provider_output(
+            "topic_synthesis_provider:batch:1", request, invalid_type
+        )
+
+    invalid_array = _unresolved_response(request)
+    invalid_array["topics"][0]["status"] = status
+    invalid_array["topics"][0]["unresolved_questions"] = "open item"
+    with pytest.raises(OutlineV3ExecutionError, match="must be an array"):
+        executor._validate_semantic_provider_output(
+            "topic_synthesis_provider:batch:1", request, invalid_array
+        )
+
+    blank_item = _unresolved_response(request)
+    blank_item["topics"][0]["status"] = status
+    blank_item["topics"][0]["unresolved_questions"] = [""]
+    with pytest.raises(OutlineV3ExecutionError, match="entries must be non-empty"):
+        executor._validate_semantic_provider_output(
+            "topic_synthesis_provider:batch:1", request, blank_item
+        )
+
+    if status == "unresolved":
+        empty_array = _unresolved_response(request)
+        empty_array["topics"][0]["unresolved_questions"] = []
+        with pytest.raises(OutlineV3ExecutionError, match="no explicit reason"):
+            executor._validate_semantic_provider_output(
+                "topic_synthesis_provider:batch:1", request, empty_array
+            )
+
+
+@pytest.mark.parametrize("questions", [[" "], [7], [{"question": "Open item"}]])
+def test_v5_root_unresolved_questions_require_nonempty_strings(
+    tmp_path: Path,
+    questions: list[Any],
+) -> None:
+    executor = _executor(tmp_path, stability_mode="off")
+    request = _topic_request(executor)
+    response = _unresolved_response(request)
+    response["unresolved_questions"] = questions
+    with pytest.raises(OutlineV3ExecutionError, match="non-empty strings"):
+        executor._validate_semantic_provider_output(
+            "topic_synthesis_provider:batch:1", request, response
+        )
+
+
+def test_topic_fragment_projection_preserves_batch_questions_without_reassigning_scope(
+    tmp_path: Path,
+) -> None:
+    executor = _executor(tmp_path, stability_mode="off")
+    request = _topic_request(executor)
+    response = _unresolved_response(request)
+    questions = ["a" * 142, "An unresolved question shared by the request batch."]
+    response["unresolved_questions"] = questions
+    executor._validate_semantic_provider_output(
+        "topic_synthesis_provider:batch:1", request, response
+    )
+    fragments = [topic["fragment_id"] for topic in request["topics"]]
+    for fragment_id in fragments:
+        projected = executor._topic_output_for_fragment(response, fragment_id)
+        assert projected["batch_unresolved_questions"] == questions
+        assert projected["unresolved_questions"] == []
+        assert projected["topic"]["unresolved_questions"] == ["Output limit."]
+
+    legacy = deepcopy(response)
+    legacy["unresolved_questions"] = [
+        {"fragment_id": fragment_id, "question": "A fragment-specific legacy question."}
+        for fragment_id in fragments
+    ]
+    for fragment_id in fragments:
+        projected = executor._topic_output_for_fragment(legacy, fragment_id)
+        assert projected["batch_unresolved_questions"] == []
+        assert projected["unresolved_questions"] == [
+            item for item in legacy["unresolved_questions"]
+            if item["fragment_id"] == fragment_id
+        ]
 
 
 def test_topic_packer_rejects_unfit_mandatory_unresolved_envelope(
