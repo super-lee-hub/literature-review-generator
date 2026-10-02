@@ -307,6 +307,12 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--spec", required=True)
         subparser.add_argument("--job-id", default="")
 
+    source_correction = subparsers.add_parser("source-correction-plan")
+    source_correction.add_argument("--workspace", required=True)
+    source_correction.add_argument("--proposal", required=True)
+    source_correction.add_argument("--output-root", required=True)
+    source_correction.add_argument("--json", action="store_true")
+
     for command in ("status", "inspect", "next-action", "resume", "retry-node", "reconcile", "repair-plan", "repair-apply", "repair-promote", "validate", "validation-status", "cancel", "pause", "adopt"):
         subparser = subparsers.add_parser(command)
         subparser.add_argument("--job", default="")
@@ -387,6 +393,8 @@ def _exit_code(command: str, payload: dict[str, Any]) -> int:
         return 0 if bool(payload.get("ok")) else 1
     if command == "acceptance-run":
         return 0 if bool(payload.get("ok")) else 1
+    if command == "source-correction-plan":
+        return 0 if payload.get("status") == "ready_for_owner_review" else 1
     if command == "validate":
         return 1 if payload.get("status") == "blocked" else 0
     if command in {"status", "inspect", "next-action", "reconcile", "repair-plan", "validation-status", "attest", "export", "queue-list"}:
@@ -484,6 +492,12 @@ def main(argv: list[str] | None = None) -> int:
                 job_id=args.job or None,
                 workspace=args.workspace or None,
                 dry_run=args.dry_run,
+            )
+        elif args.command == "source-correction-plan":
+            payload = control.source_correction_plan(
+                workspace=args.workspace,
+                proposal_path=args.proposal,
+                output_root=args.output_root,
             )
         elif args.command == "repair-plan":
             payload = control.repair_plan(job_id=args.job or None, workspace=args.workspace or None)

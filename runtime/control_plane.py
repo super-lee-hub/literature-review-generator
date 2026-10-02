@@ -6130,6 +6130,68 @@ class ReviewControlPlane:
         )
         return payload
 
+    def source_correction_plan(
+        self,
+        *,
+        workspace: str | Path,
+        proposal_path: str | Path,
+        output_root: str | Path,
+    ) -> dict[str, Any]:
+        """Prepare an immutable source correction for review in a separate job."""
+        from services.queue_service import LocalPublicationContext
+        from services.summary_correction import (
+            SourceSummaryCorrectionError,
+            prepare_source_summary_correction_candidate,
+        )
+
+        source_workspace, source_registry = AgentRuntimeRunner._open_workspace(workspace)
+        proposal_file = Path(proposal_path).expanduser().resolve()
+        if not proposal_file.is_file() or proposal_file.stat().st_size > 2 * 1024 * 1024:
+            raise ControlPlaneError("source correction proposal is missing or exceeds 2 MiB")
+        try:
+            proposal = json.loads(proposal_file.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ControlPlaneError("source correction proposal is unreadable or invalid JSON") from exc
+        if not isinstance(proposal, Mapping):
+            raise ControlPlaneError("source correction proposal must be a JSON object")
+        authority = proposal.get("source_authority")
+        if not isinstance(authority, Mapping) or not str(authority.get("artifact_id") or ""):
+            raise ControlPlaneError("source correction proposal lacks a source artifact binding")
+        destination_root = Path(output_root).expanduser().resolve()
+        original_root = Path(source_workspace.root_dir).resolve()
+        if destination_root == original_root or original_root in destination_root.parents:
+            raise ControlPlaneError("source correction output must be outside the original workspace")
+        destination = JobWorkspace.create(
+            str(destination_root), "source_correction", job_id="correction_" + uuid.uuid4().hex
+        )
+        publication = LocalPublicationContext()
+        destination_registry = publication.registry(destination.paths.registry_path, destination.job_id)
+        try:
+            result = prepare_source_summary_correction_candidate(
+                proposal_payload=proposal,
+                source_registry=source_registry,
+                source_artifact_id=str(authority["artifact_id"]),
+                destination_workspace=destination,
+                destination_registry=destination_registry,
+                publication_context=publication,
+            )
+        except (SourceSummaryCorrectionError, RegistryError, OSError, ValueError, TypeError) as exc:
+            return {
+                "status": "blocked",
+                "source_workspace": str(original_root),
+                "destination_workspace": destination.root_dir,
+                "reason": str(exc),
+                "provider_posts": 0,
+                "canonical_pointer_advanced": False,
+                "usable_as_stage1_reuse": False,
+            }
+        return {
+            **result.to_dict(),
+            "source_workspace": str(original_root),
+            "destination_workspace": destination.root_dir,
+            "provider_posts": 0,
+        }
+
     def repair_plan(self, *, job_id: str | None = None, workspace: str | Path | None = None) -> dict[str, Any]:
         inspection = self.inspect(job_id=job_id, workspace=workspace)
         plans = [
