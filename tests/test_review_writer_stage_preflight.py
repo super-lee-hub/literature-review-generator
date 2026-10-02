@@ -158,7 +158,6 @@ def test_writer_inventory_precedes_first_writer_call_and_matches_bound_request_h
     [
         ("calls", 4, 0, 0),
         ("output", 1_024, 513, 0),
-        ("retries", 2, 0, 1),
     ],
 )
 def test_strict_v2_preflight_blocks_insufficient_remaining_budget_before_writer_call(
@@ -208,6 +207,109 @@ def test_strict_v2_preflight_blocks_insufficient_remaining_budget_before_writer_
         "retry_attempts_reserved",
     ):
         assert after[field] == before[field]
+
+
+@pytest.mark.parametrize("remaining_retries", [0, 1, 6])
+def test_writer_optional_retries_share_remaining_run_allowance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    remaining_retries: int,
+) -> None:
+    writer_calls: list[str] = []
+    projections: list[dict[str, Any]] = []
+
+    def writer(**kwargs: Any) -> Mapping[str, Any]:
+        writer_calls.append(str(kwargs["section"]["section_id"]))
+        return {**_successful_writer_result(**kwargs), "attempts": 1}
+
+    service, outline, packets = _writer_fixture(tmp_path, writer=writer)
+    controller = ProviderBudgetController(ProviderAggregateBudgetV2(
+        max_provider_calls_total=100,
+        max_output_tokens_total=100_000,
+        max_retry_attempts_total=remaining_retries + 1,
+        max_wall_seconds=600.0,
+    ))
+    controller.admit(requested_output_tokens=0, requested_retry_attempts=1)
+    monkeypatch.setattr(
+        review_generation_service, "provider_budget_controller_from_environment",
+        lambda: controller,
+    )
+    original_projection = review_generation_service.build_full_stage_request_plan_v1
+
+    def capture_projection(**kwargs: Any) -> dict[str, Any]:
+        projection = original_projection(**kwargs)
+        projections.append(projection)
+        return projection
+
+    monkeypatch.setattr(
+        review_generation_service, "build_full_stage_request_plan_v1", capture_projection
+    )
+    _run(service, outline, packets)
+
+    assert writer_calls == ["section_1", "section_2"]
+    assert service.provider_request_inventory is not None
+    rows = service.provider_request_inventory.requests
+    assert all(row.retry_policy == "shared_optional" for row in rows)
+    assert len(projections) == 1
+    totals = projections[0]["totals"]
+    assert totals["retry_attempts_required_reserve"] == 0
+    assert totals["retry_attempts_possible_upper_bound"] == min(
+        remaining_retries, sum(int(row.retry_attempts or 0) for row in rows)
+    )
+    assert projections[0]["budget_status"]["provider_retries"] == "within_limit"
+
+
+@pytest.mark.parametrize("shared_retries", [0, 1])
+def test_formal_writer_adapter_clamps_transport_to_shared_retry_allowance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    shared_retries: int,
+) -> None:
+    import ai_interface
+    import runtime.provider_runtime as runtime_module
+
+    service, outline, packets = _writer_fixture(tmp_path, writer=None)
+    controller = ProviderBudgetController(ProviderAggregateBudgetV2(
+        max_provider_calls_total=10,
+        max_output_tokens_total=100_000,
+        max_retry_attempts_total=shared_retries,
+        max_wall_seconds=600.0,
+    ))
+    monkeypatch.setattr(
+        runtime_module, "provider_budget_controller_from_environment", lambda: controller
+    )
+    monkeypatch.setattr(
+        review_generation_service, "provider_budget_controller_from_environment",
+        lambda: controller,
+    )
+    calls: list[dict[str, int]] = []
+
+    def local_transport(*_args: Any, **kwargs: Any) -> Mapping[str, Any]:
+        calls.append({
+            key: int(kwargs[key])
+            for key in ("retry_attempts", "max_retries_per_call", "attempt_limit")
+        })
+        return {
+            **_successful_writer_result(),
+            "attempts": 1,
+            "usage_status": "reported",
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+            "finish_reason": "stop",
+        }
+
+    monkeypatch.setattr(ai_interface, "_call_ai_api_detailed_uninstrumented", local_transport)
+    _run(service, outline, packets)
+
+    assert len(calls) == 2
+    assert all(call["retry_attempts"] == min(2, shared_retries + 1) for call in calls)
+    assert all(call["attempt_limit"] == call["retry_attempts"] for call in calls)
+    assert all(call["max_retries_per_call"] == call["retry_attempts"] - 1 for call in calls)
+    snapshot = controller.snapshot()
+    assert snapshot["calls_used"] == 2
+    assert snapshot["retry_attempts_used"] == 0
+    assert snapshot["calls_reserved"] == snapshot["retry_attempts_reserved"] == 0
 
 
 def test_writer_transport_uses_prepared_prompt_config_and_output_after_preflight(

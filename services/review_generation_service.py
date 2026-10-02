@@ -1265,6 +1265,7 @@ class ReviewGenerationService:
                     request_payload=prepared.request_payload,
                     profile=profile,
                     retry_attempts=max(0, requested_attempts - 1),
+                    retry_policy="shared_optional",
                     requested_output_tokens=max_output_tokens,
                     reasoning_reserve_tokens=profile.reasoning_reserve,
                     verified_reuse=verified_reuse,

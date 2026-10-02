@@ -3126,18 +3126,45 @@ class ProviderRuntime:
         return tuple(self._receipts)
 
     def max_attempts_for_call(self, requested_attempts: int) -> int:
-        """Return the transport loop limit imposed by this runtime.
+        """Return a transport-loop limit under local and shared remaining budgets.
 
-        The caller-facing limit is a total-attempt limit.  The formal runtime
-        budget is expressed as retries, so one initial attempt is added when
-        the retry dimension is bounded.  A zero budget means the caller's
-        requested limit remains in force.
+        The initial attempt is retained even when no shared call slot remains;
+        the aggregate controller's atomic admission then rejects that attempt.
+        Snapshot-derived shared limits only reduce optional retries. The
+        controller rechecks all reservations atomically in admit().
         """
 
         requested = max(1, int(requested_attempts))
-        if not self.budget.max_retries_per_call:
+        if self.budget.max_retries_per_call:
+            requested = min(requested, self.budget.max_retries_per_call + 1)
+
+        controller = self.aggregate_budget
+        if controller is None:
             return requested
-        return min(requested, self.budget.max_retries_per_call + 1)
+
+        snapshot = controller.snapshot()
+        aggregate = controller.budget
+        strict_budget = isinstance(aggregate, ProviderAggregateBudgetV2)
+
+        if strict_budget or aggregate.max_retry_attempts_total:
+            remaining_retries = max(
+                0,
+                int(aggregate.max_retry_attempts_total)
+                - int(snapshot["retry_attempts_used"])
+                - int(snapshot["retry_attempts_reserved"]),
+            )
+            requested = min(requested, 1 + remaining_retries)
+
+        if strict_budget or aggregate.max_provider_calls_total:
+            remaining_calls = max(
+                0,
+                int(aggregate.max_provider_calls_total)
+                - int(snapshot["calls_used"])
+                - int(snapshot["calls_reserved"]),
+            )
+            requested = min(requested, max(1, remaining_calls))
+
+        return max(1, requested)
 
     def admit(
         self,

@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import Any, Literal
 
 from runtime.provider_context import ProviderContextProfile, ProviderRequestEstimateV1
 
@@ -196,6 +196,7 @@ class ProviderRequestPlanRowV1:
     price_status: str = "unknown"
     pricing_source: str = ""
     wall_seconds_upper_bound: float | None = None
+    retry_policy: Literal["configured_reserve", "shared_optional"] = "configured_reserve"
 
     def __post_init__(self) -> None:
         if not str(self.stage_name).strip() or not str(self.semantic_role).strip():
@@ -210,6 +211,8 @@ class ProviderRequestPlanRowV1:
             or self.retry_attempts < 0
         ):
             raise StagePlanError("provider request retry reserve must be non-negative or unknown")
+        if self.retry_policy not in ("configured_reserve", "shared_optional"):
+            raise StagePlanError("provider request retry policy is unsupported")
         if self.estimated_cost is not None and (
             not math.isfinite(float(self.estimated_cost)) or float(self.estimated_cost) < 0
         ):
@@ -230,12 +233,25 @@ class ProviderRequestPlanRowV1:
         return bool(self.verified_reuse_authority_hash)
 
     @property
+    def required_retry_attempts(self) -> int | None:
+        if self.verified_reuse or self.retry_policy == "shared_optional":
+            return 0
+        return self.retry_attempts
+
+    @property
+    def possible_retry_attempts_upper_bound(self) -> int | None:
+        if self.verified_reuse:
+            return 0
+        return self.retry_attempts
+
+    @property
     def physical_attempt_upper_bound(self) -> int | None:
         if self.verified_reuse:
             return 0
-        if self.retry_attempts is None:
+        retry_upper = self.possible_retry_attempts_upper_bound
+        if retry_upper is None:
             return None
-        return 1 + int(self.retry_attempts)
+        return 1 + int(retry_upper)
 
     def to_dict(self) -> dict[str, Any]:
         estimate = self.request_estimate.to_dict()
@@ -256,6 +272,9 @@ class ProviderRequestPlanRowV1:
             "within_context_budget": estimate["within_context_budget"],
             "tokenizer_strategy": estimate["tokenizer_strategy"],
             "retry_attempts": self.retry_attempts,
+            "retry_policy": self.retry_policy,
+            "retry_attempts_required_reserve": self.required_retry_attempts,
+            "retry_attempts_possible_upper_bound": self.possible_retry_attempts_upper_bound,
             "physical_attempt_upper_bound": self.physical_attempt_upper_bound,
             "conditional_on": self.conditional_on or None,
             "verified_reuse": self.verified_reuse,
@@ -392,6 +411,7 @@ def build_provider_request_plan_row_v1(
     pricing_per_1k_tokens: Mapping[str, float] | None = None,
     pricing_source: str = "",
     wall_seconds_upper_bound: float | None = None,
+    retry_policy: Literal["configured_reserve", "shared_optional"] = "configured_reserve",
 ) -> ProviderRequestPlanRowV1:
     """Measure a stage builder's actual provider-visible request body.
 
@@ -427,6 +447,8 @@ def build_provider_request_plan_row_v1(
         or retry_attempts < 0
     ):
         raise StagePlanError("provider retry reserve must be non-negative or unknown")
+    if retry_policy not in ("configured_reserve", "shared_optional"):
+        raise StagePlanError("provider retry policy is unsupported")
 
     reuse_hash = ""
     if verified_reuse is not None:
@@ -475,6 +497,7 @@ def build_provider_request_plan_row_v1(
         route_identity=identity,
         request_estimate=estimate,
         retry_attempts=retry_attempts,
+        retry_policy=retry_policy,
         conditional_on=str(conditional_on or "").strip(),
         verified_reuse_authority_hash=reuse_hash,
         estimated_cost=estimated_cost,
@@ -521,6 +544,11 @@ def build_full_stage_request_plan_v1(
     if not isinstance(aggregate_budget, (ProviderAggregateBudgetV1, ProviderAggregateBudgetV2)):
         raise StagePlanError("full-stage projection requires a typed provider aggregate budget")
     strict_budget = isinstance(aggregate_budget, ProviderAggregateBudgetV2)
+    shared_retry_limit = (
+        None
+        if not strict_budget and not aggregate_budget.max_retry_attempts_total
+        else int(aggregate_budget.max_retry_attempts_total)
+    )
     stage_payload = _plan_payload(stage_plan)
     route_payload = _plan_payload(reachable_route_plan)
     requested = tuple(str(item) for item in stage_payload.get("requested_stages") or ())
@@ -618,37 +646,110 @@ def build_full_stage_request_plan_v1(
         item.logical_calls_upper_bound is None for item in active_exposures
     )
 
-    row_attempts = [item.physical_attempt_upper_bound for item in fresh_rows]
-    exposure_attempts = [item.physical_attempt_upper_bound for item in active_exposures]
-    physical_unknown = any(item is None for item in (*row_attempts, *exposure_attempts))
-    physical_upper = (
+    def retry_slot_upper_bound(
+        logical_calls: int | None,
+        retries_per_call: int | None,
+    ) -> int | None:
+        if logical_calls == 0 or retries_per_call == 0:
+            return 0
+        if logical_calls is None or retries_per_call is None:
+            return shared_retry_limit
+        return int(logical_calls) * int(retries_per_call)
+
+    row_retry_slots = [
+        retry_slot_upper_bound(1, item.retry_attempts)
+        for item in fresh_rows
+    ]
+    exposure_retry_slots = [
+        retry_slot_upper_bound(
+            item.logical_calls_upper_bound,
+            item.retry_attempts_per_call_upper_bound,
+        )
+        for item in active_exposures
+    ]
+    configured_exposure_retry_slots = [
         None
-        if physical_unknown
-        else sum(int(item or 0) for item in row_attempts)
-        + sum(int(item or 0) for item in exposure_attempts)
+        if item.logical_calls_upper_bound is None
+        or item.retry_attempts_per_call_upper_bound is None
+        else int(item.logical_calls_upper_bound)
+        * int(item.retry_attempts_per_call_upper_bound)
+        for item in active_exposures
+    ]
+    configured_retry_slots = [
+        item.retry_attempts for item in fresh_rows
+    ] + configured_exposure_retry_slots
+    configured_retry_upper = (
+        None
+        if any(item is None for item in configured_retry_slots)
+        else sum(int(item or 0) for item in configured_retry_slots)
     )
+    retry_upper = (
+        configured_retry_upper
+        if shared_retry_limit is None
+        else shared_retry_limit
+        if configured_retry_upper is None
+        else min(configured_retry_upper, shared_retry_limit)
+    )
+    required_rows = [
+        item for item in definite_rows
+        if item.retry_policy == "configured_reserve"
+    ]
+    required_retry_reserve = (
+        None
+        if any(item.retry_attempts is None for item in required_rows)
+        else sum(int(item.retry_attempts or 0) for item in required_rows)
+    )
+
+    def retry_resource_upper_bound(
+        row_demands: Sequence[tuple[int | float | None, int | None]],
+        exposure_demands: Sequence[tuple[int | float | None, int | None]],
+    ) -> int | float | None:
+        # Spend shared retry slots on the largest eligible per-attempt demands.
+        demands = (*row_demands, *exposure_demands)
+        if shared_retry_limit is None:
+            if any(count is None for _, count in demands):
+                return None
+            if any(cost is None and int(count or 0) > 0 for cost, count in demands):
+                return None
+            return sum(
+                cost * int(count or 0)
+                for cost, count in demands
+                if cost is not None
+            )
+
+        remaining = shared_retry_limit
+        if remaining == 0:
+            return 0
+        bounded_demands: list[tuple[int | float, int]] = []
+        for cost, count in demands:
+            eligible = shared_retry_limit if count is None else int(count)
+            if eligible <= 0:
+                continue
+            if cost is None:
+                return None
+            bounded_demands.append((cost, eligible))
+
+        total: int | float = 0
+        for cost, eligible in sorted(
+            bounded_demands,
+            key=lambda item: float(item[0]),
+            reverse=True,
+        ):
+            used = min(eligible, remaining)
+            total += cost * used
+            remaining -= used
+            if remaining == 0:
+                break
+        return total
+
     physical_lower = len(definite_rows)
     output_reserved_lower = sum(
         int(item.request_estimate.requested_output_tokens) for item in definite_rows
     )
-    retries_unknown = any(item.retry_attempts is None for item in fresh_rows) or any(
-        item.logical_calls_upper_bound is None or item.retry_attempts_per_call_upper_bound is None
-        for item in active_exposures
-    )
-    retry_upper = (
+    physical_upper = (
         None
-        if retries_unknown
-        else sum(int(item.retry_attempts or 0) for item in fresh_rows)
-        + sum(
-            int(item.logical_calls_upper_bound or 0)
-            * int(item.retry_attempts_per_call_upper_bound or 0)
-            for item in active_exposures
-        )
-    )
-    retry_lower = sum(
-        int(item.retry_attempts or 0)
-        for item in definite_rows
-        if item.retry_attempts is not None
+        if logical_upper is None or retry_upper is None
+        else logical_upper + retry_upper
     )
 
     def total_or_unknown(values: Sequence[int | None], exposure_values: Sequence[int | None]) -> int | None:
@@ -669,20 +770,20 @@ def build_full_stage_request_plan_v1(
             for item in active_exposures
         ],
     )
+    input_retry_extra = retry_resource_upper_bound(
+        [
+            (item.request_estimate.estimated_input_tokens, retry_slots)
+            for item, retry_slots in zip(fresh_rows, row_retry_slots)
+        ],
+        [
+            (item.input_tokens_per_call_upper_bound, retry_slots)
+            for item, retry_slots in zip(active_exposures, exposure_retry_slots)
+        ],
+    )
     input_all_attempts = (
         None
-        if physical_upper is None
-        or any(item.input_tokens_per_call_upper_bound is None for item in active_exposures)
-        else sum(
-            int(item.request_estimate.estimated_input_tokens) * int(item.physical_attempt_upper_bound or 0)
-            for item in fresh_rows
-        )
-        + sum(
-            int(item.logical_calls_upper_bound or 0)
-            * int(item.input_tokens_per_call_upper_bound or 0)
-            * (1 + int(item.retry_attempts_per_call_upper_bound or 0))
-            for item in active_exposures
-        )
+        if input_once is None or input_retry_extra is None
+        else input_once + input_retry_extra
     )
     output_reserved = total_or_unknown(
         [item.request_estimate.requested_output_tokens for item in fresh_rows],
@@ -695,36 +796,50 @@ def build_full_stage_request_plan_v1(
             for item in active_exposures
         ],
     )
+    output_retry_extra = retry_resource_upper_bound(
+        [
+            (item.request_estimate.requested_output_tokens, retry_slots)
+            for item, retry_slots in zip(fresh_rows, row_retry_slots)
+        ],
+        [
+            (item.output_tokens_per_call_upper_bound, retry_slots)
+            for item, retry_slots in zip(active_exposures, exposure_retry_slots)
+        ],
+    )
     output_all_attempts = (
         None
-        if physical_upper is None
-        or any(item.output_tokens_per_call_upper_bound is None for item in active_exposures)
-        else sum(
-            int(item.request_estimate.requested_output_tokens) * int(item.physical_attempt_upper_bound or 0)
-            for item in fresh_rows
-        )
-        + sum(
-            int(item.logical_calls_upper_bound or 0)
-            * int(item.output_tokens_per_call_upper_bound or 0)
-            * (1 + int(item.retry_attempts_per_call_upper_bound or 0))
+        if output_reserved is None or output_retry_extra is None
+        else output_reserved + output_retry_extra
+    )
+    reasoning_once = total_or_unknown(
+        [item.request_estimate.reasoning_reserve_tokens for item in fresh_rows],
+        [
+            0
+            if item.logical_calls_upper_bound == 0
+            else None
+            if item.logical_calls_upper_bound is None
+            or item.reasoning_tokens_per_call_upper_bound is None
+            else int(item.logical_calls_upper_bound)
+            * int(item.reasoning_tokens_per_call_upper_bound)
             for item in active_exposures
-        )
+        ],
+    )
+    reasoning_retry_extra = retry_resource_upper_bound(
+        [
+            (item.request_estimate.reasoning_reserve_tokens, retry_slots)
+            for item, retry_slots in zip(fresh_rows, row_retry_slots)
+        ],
+        [
+            (item.reasoning_tokens_per_call_upper_bound, retry_slots)
+            for item, retry_slots in zip(active_exposures, exposure_retry_slots)
+        ],
     )
     reasoning_all_attempts = (
         None
-        if physical_upper is None
-        or any(item.reasoning_tokens_per_call_upper_bound is None for item in active_exposures)
-        else sum(
-            int(item.request_estimate.reasoning_reserve_tokens) * int(item.physical_attempt_upper_bound or 0)
-            for item in fresh_rows
-        )
-        + sum(
-            int(item.logical_calls_upper_bound or 0)
-            * int(item.reasoning_tokens_per_call_upper_bound or 0)
-            * (1 + int(item.retry_attempts_per_call_upper_bound or 0))
-            for item in active_exposures
-        )
+        if reasoning_once is None or reasoning_retry_extra is None
+        else reasoning_once + reasoning_retry_extra
     )
+    # Each row carries one total logical-call deadline shared across its retries.
     wall_unknown = any(item.wall_seconds_upper_bound is None for item in fresh_rows) or any(
         item.wall_seconds_per_call_upper_bound is None
         for item in active_exposures
@@ -763,9 +878,10 @@ def build_full_stage_request_plan_v1(
         "unbounded"
         if not strict_budget and not aggregate_budget.max_retry_attempts_total
         else "exceeded"
-        if retry_lower > aggregate_budget.max_retry_attempts_total
+        if required_retry_reserve is not None
+        and required_retry_reserve > aggregate_budget.max_retry_attempts_total
         else "unknown"
-        if retry_upper is None
+        if required_retry_reserve is None or retry_upper is None
         else "exceeded"
         if retry_upper > aggregate_budget.max_retry_attempts_total
         else "within_limit"
@@ -822,18 +938,24 @@ def build_full_stage_request_plan_v1(
         admission_status = "within_budget"
 
     priced_rows = [item for item in fresh_rows if item.estimated_cost is not None]
+    retry_cost_extra = retry_resource_upper_bound(
+        [
+            (item.estimated_cost, retry_slots)
+            for item, retry_slots in zip(fresh_rows, row_retry_slots)
+        ],
+        [(None, retry_slots) for retry_slots in exposure_retry_slots],
+    )
     cost_unknown = (
         len(priced_rows) != len(fresh_rows)
         or bool(active_exposures)
-        or any(item.physical_attempt_upper_bound is None for item in priced_rows)
+        or retry_cost_extra is None
     )
     if cost_unknown:
         total_cost = None
         cost_status = "unknown_no_complete_route_pricing"
     else:
-        total_cost = sum(
-            float(item.estimated_cost or 0.0) * int(item.physical_attempt_upper_bound or 0)
-            for item in priced_rows
+        total_cost = sum(float(item.estimated_cost or 0.0) for item in priced_rows) + float(
+            retry_cost_extra or 0.0
         )
         cost_status = "estimate" if priced_rows else "zero_provider_posts"
 
@@ -861,6 +983,9 @@ def build_full_stage_request_plan_v1(
             "logical_calls_upper_bound": logical_upper,
             "physical_attempts_known_lower_bound": physical_lower,
             "physical_attempts_upper_bound": physical_upper,
+            "retry_attempts_configured_upper_bound": configured_retry_upper,
+            "retry_attempts_required_reserve": required_retry_reserve,
+            "retry_attempts_possible_upper_bound": retry_upper,
             "retry_attempts_upper_bound": retry_upper,
             "estimated_input_tokens_one_attempt": input_once,
             "estimated_input_tokens_all_attempts": input_all_attempts,
@@ -902,6 +1027,16 @@ def build_full_stage_request_plan_v1(
             "aggregate_output_reserve_is_once_per_logical_call": True,
             "output_admission_uses_all_attempts_upper_bound": True,
             "all_attempt_token_exposure_multiplies_retries": True,
+            "shared_retry_cap_applies_to_attempt_upper_bounds": shared_retry_limit is not None,
+            "retry_totals_distinguish_configured_required_and_possible": True,
+            "shared_optional_retry_policy_has_zero_required_reserve_floor": True,
+            "retry_resource_upper_bounds_use_largest_eligible_per_attempt_demands": (
+                shared_retry_limit is not None
+            ),
+            "per_request_retry_ceilings_are_marginal_when_shared_cap_is_finite": (
+                shared_retry_limit is not None
+            ),
+            "wall_seconds_upper_bound_is_total_per_logical_call_across_retries": True,
             "unknown_or_conditional_stage_work_is_not_inferred_from_other_stage_counts": True,
         },
     }
