@@ -287,6 +287,72 @@ class ProviderRequestPlanRowV1:
 
 
 @dataclass(frozen=True)
+class ProviderExposureCardinalityBasisV1:
+    """Versioned provenance for a finite conditional-call cardinality bound."""
+
+    basis_artifact: str
+    basis_artifact_sha256: str
+    maximum_count: int
+    derivation_rule: str
+    output_schema: str
+    schema_version: str = "provider-exposure-cardinality-basis-v1"
+
+    def __post_init__(self) -> None:
+        if self.schema_version != "provider-exposure-cardinality-basis-v1":
+            raise StagePlanError("provider exposure cardinality basis schema is unsupported")
+        for name in ("basis_artifact", "derivation_rule", "output_schema"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise StagePlanError(f"provider exposure cardinality basis {name} is required")
+        if (
+            isinstance(self.maximum_count, bool)
+            or not isinstance(self.maximum_count, int)
+            or self.maximum_count < 0
+        ):
+            raise StagePlanError("provider exposure maximum count must be a non-negative integer")
+        digest = self.basis_artifact_sha256
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdefABCDEF" for character in digest)
+        ):
+            raise StagePlanError("provider exposure cardinality basis needs a SHA-256 artifact hash")
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "ProviderExposureCardinalityBasisV1":
+        if not isinstance(value, Mapping):
+            raise StagePlanError("provider exposure cardinality basis must be a mapping")
+        required = {
+            "schema_version",
+            "basis_artifact",
+            "basis_artifact_sha256",
+            "maximum_count",
+            "derivation_rule",
+            "output_schema",
+        }
+        if set(value) != required:
+            raise StagePlanError("provider exposure cardinality basis fields are incomplete or unsupported")
+        return cls(
+            schema_version=value["schema_version"],
+            basis_artifact=value["basis_artifact"],
+            basis_artifact_sha256=value["basis_artifact_sha256"],
+            maximum_count=value["maximum_count"],
+            derivation_rule=value["derivation_rule"],
+            output_schema=value["output_schema"],
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "basis_artifact": self.basis_artifact,
+            "basis_artifact_sha256": self.basis_artifact_sha256,
+            "maximum_count": self.maximum_count,
+            "derivation_rule": self.derivation_rule,
+            "output_schema": self.output_schema,
+        }
+
+
+@dataclass(frozen=True)
 class UnplannedProviderExposureV1:
     """A reachable provider branch with no complete serialized request yet."""
 
@@ -302,6 +368,10 @@ class UnplannedProviderExposureV1:
     retry_attempts_per_call_upper_bound: int | None = None
     wall_seconds_per_call_upper_bound: float | None = None
     request_builder_id: str = ""
+    exposure_status: Literal["bounded_conditional", "unbounded"] = "unbounded"
+    cardinality_basis: ProviderExposureCardinalityBasisV1 | Mapping[str, Any] | None = None
+    context_tokens_per_call_upper_bound: int | None = None
+    context_limit_tokens_per_call: int | None = None
 
     def __post_init__(self) -> None:
         if not str(self.stage_name).strip() or not str(self.semantic_role).strip():
@@ -310,21 +380,74 @@ class UnplannedProviderExposureV1:
             raise StagePlanError("unplanned provider exposure requires a reason")
         if self.request_builder_id and not str(self.request_builder_id).strip():
             raise StagePlanError("request builder id must be non-empty when provided")
+        if self.exposure_status not in ("bounded_conditional", "unbounded"):
+            raise StagePlanError("provider exposure status is unsupported")
+        basis = self.cardinality_basis
+        if isinstance(basis, Mapping):
+            basis = ProviderExposureCardinalityBasisV1.from_mapping(basis)
+            object.__setattr__(self, "cardinality_basis", basis)
+        elif basis is not None and not isinstance(basis, ProviderExposureCardinalityBasisV1):
+            raise StagePlanError("provider exposure cardinality basis has an unsupported type")
         for name in (
             "logical_calls_upper_bound",
             "input_tokens_per_call_upper_bound",
             "output_tokens_per_call_upper_bound",
             "reasoning_tokens_per_call_upper_bound",
             "retry_attempts_per_call_upper_bound",
+            "context_tokens_per_call_upper_bound",
+            "context_limit_tokens_per_call",
         ):
             value = getattr(self, name)
             if value is not None and (isinstance(value, bool) or int(value) < 0):
                 raise StagePlanError(f"{name} must be non-negative or unknown")
         if self.wall_seconds_per_call_upper_bound is not None and (
-            not math.isfinite(float(self.wall_seconds_per_call_upper_bound))
+            isinstance(self.wall_seconds_per_call_upper_bound, bool)
+            or not isinstance(self.wall_seconds_per_call_upper_bound, (int, float))
+            or not math.isfinite(float(self.wall_seconds_per_call_upper_bound))
             or float(self.wall_seconds_per_call_upper_bound) < 0
         ):
             raise StagePlanError("unplanned provider exposure wall-time bound must be finite and non-negative")
+        if self.exposure_status == "bounded_conditional":
+            if not self.conditional_on.strip():
+                raise StagePlanError("bounded provider exposure must be conditional")
+            if not str(self.request_builder_id).strip():
+                raise StagePlanError("bounded provider exposure requires a request builder id")
+            if not isinstance(basis, ProviderExposureCardinalityBasisV1):
+                raise StagePlanError("bounded provider exposure requires a versioned cardinality basis")
+            if basis.maximum_count != self.logical_calls_upper_bound:
+                raise StagePlanError("provider exposure count does not match its cardinality basis")
+            for name in (
+                "logical_calls_upper_bound",
+                "input_tokens_per_call_upper_bound",
+                "output_tokens_per_call_upper_bound",
+                "reasoning_tokens_per_call_upper_bound",
+                "context_tokens_per_call_upper_bound",
+                "context_limit_tokens_per_call",
+                "retry_attempts_per_call_upper_bound",
+            ):
+                value = getattr(self, name)
+                if value is None:
+                    raise StagePlanError(f"bounded provider exposure requires finite {name}")
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise StagePlanError(f"bounded provider exposure {name} must be a non-negative integer")
+            if self.wall_seconds_per_call_upper_bound is None:
+                raise StagePlanError("bounded provider exposure requires finite wall_seconds_per_call_upper_bound")
+            if (
+                len(self.route_identity) < 3
+                or any(not str(item).strip() for item in self.route_identity[:3])
+            ):
+                raise StagePlanError("bounded provider exposure requires a complete route identity")
+            minimum_context = (
+                int(self.input_tokens_per_call_upper_bound or 0)
+                + int(self.output_tokens_per_call_upper_bound or 0)
+                + int(self.reasoning_tokens_per_call_upper_bound or 0)
+            )
+            if int(self.context_tokens_per_call_upper_bound or 0) < minimum_context:
+                raise StagePlanError("provider exposure context bound is below its input/output/reasoning total")
+            if int(self.context_tokens_per_call_upper_bound or 0) > int(
+                self.context_limit_tokens_per_call or 0
+            ):
+                raise StagePlanError("provider exposure context bound exceeds its route context limit")
 
     @property
     def physical_attempt_upper_bound(self) -> int | None:
@@ -347,6 +470,14 @@ class UnplannedProviderExposureV1:
             "retry_attempts_per_call_upper_bound": self.retry_attempts_per_call_upper_bound,
             "physical_attempt_upper_bound": self.physical_attempt_upper_bound,
             "wall_seconds_per_call_upper_bound": self.wall_seconds_per_call_upper_bound,
+            "exposure_status": self.exposure_status,
+            "cardinality_basis": (
+                self.cardinality_basis.to_dict()
+                if isinstance(self.cardinality_basis, ProviderExposureCardinalityBasisV1)
+                else None
+            ),
+            "context_tokens_per_call_upper_bound": self.context_tokens_per_call_upper_bound,
+            "context_limit_tokens_per_call": self.context_limit_tokens_per_call,
         }
 
 
@@ -534,7 +665,6 @@ def build_full_stage_request_plan_v1(
     """
 
     from runtime.provider_runtime import (
-        DEFAULT_PROVIDER_CALL_BUDGET,
         ProviderAggregateBudgetV1,
         ProviderAggregateBudgetV2,
         authorized_provider_call_limit,
@@ -590,6 +720,18 @@ def build_full_stage_request_plan_v1(
             raise StagePlanError("provider request row route identity differs from the route plan")
         represented_roles.add((item.stage_name, item.semantic_role))
 
+    for item in exposures:
+        if item.exposure_status != "bounded_conditional":
+            continue
+        route = route_by_role.get((item.stage_name, item.semantic_role))
+        if route is None or not bool(route.get("enabled", True)) or not bool(
+            route.get("resolved", False)
+        ):
+            raise StagePlanError("bounded provider exposure uses a disabled or unresolved route")
+        route_identity = tuple(str(value) for value in route.get("physical_identity") or ())
+        if route_identity != item.route_identity:
+            raise StagePlanError("bounded provider exposure route identity differs from the route plan")
+
     # Every enabled required route in a requested stage must have either an
     # exact request inventory or an explicit unknown-exposure record.
     represented_roles.update((item.stage_name, item.semantic_role) for item in exposures)
@@ -631,7 +773,69 @@ def build_full_stage_request_plan_v1(
     conditional_rows = [item for item in fresh_rows if item.conditional_on]
     definite_rows = [item for item in fresh_rows if not item.conditional_on]
     known_logical = len(fresh_rows)
-    active_exposures = [item for item in exposures if item.logical_calls_upper_bound != 0]
+    active_exposures = [
+        item
+        for item in exposures
+        if item.exposure_status != "bounded_conditional" or item.logical_calls_upper_bound != 0
+    ]
+    bounded_exposures = [
+        item for item in active_exposures if item.exposure_status == "bounded_conditional"
+    ]
+    unbounded_exposures = [
+        item for item in active_exposures if item.exposure_status != "bounded_conditional"
+    ]
+
+    def nonnegative_int(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+    def nonnegative_finite_number(value: Any) -> bool:
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+            and float(value) >= 0
+        )
+
+    def exact_row_dimensions_complete(item: ProviderRequestPlanRowV1) -> bool:
+        estimate = item.request_estimate
+        route = route_by_role.get((item.stage_name, item.semantic_role))
+        route_identity = (
+            tuple(str(value) for value in route.get("physical_identity") or ())
+            if route is not None
+            else ()
+        )
+        return bool(
+            route_identity
+            and route_identity == item.route_identity
+            and all(
+                nonnegative_int(getattr(estimate, name))
+                for name in (
+                    "estimated_input_tokens",
+                    "requested_output_tokens",
+                    "reasoning_reserve_tokens",
+                    "safety_margin_tokens",
+                    "estimated_total_tokens",
+                    "input_budget",
+                    "verified_context_limit",
+                )
+            )
+            and isinstance(estimate.request_hash, str)
+            and len(estimate.request_hash) == 64
+            and all(
+                character in "0123456789abcdefABCDEF"
+                for character in estimate.request_hash
+            )
+            and isinstance(estimate.within_input_budget, bool)
+            and isinstance(estimate.within_context_budget, bool)
+            and nonnegative_int(item.retry_attempts)
+            and nonnegative_finite_number(item.wall_seconds_upper_bound)
+        )
+
+    exact_rows_envelope_complete = all(
+        exact_row_dimensions_complete(item) for item in fresh_rows
+    )
+    envelope_complete = not unbounded_exposures and exact_rows_envelope_complete
+    exact_requests_materialized = not active_exposures
     unknown_count = any(item.logical_calls_upper_bound is None for item in active_exposures)
     exposure_logical_upper = sum(
         int(item.logical_calls_upper_bound or 0)
@@ -639,11 +843,17 @@ def build_full_stage_request_plan_v1(
         if item.logical_calls_upper_bound is not None
     )
     logical_upper = None if unknown_count else known_logical + exposure_logical_upper
-    bounded_logical_call_exposure_count = sum(
-        item.logical_calls_upper_bound is not None for item in active_exposures
+    bounded_logical_call_exposure_count = len(bounded_exposures)
+    unbounded_logical_call_exposure_count = len(unbounded_exposures)
+    conditional_exposure_upper = sum(
+        int(item.logical_calls_upper_bound or 0)
+        for item in bounded_exposures
+        if item.conditional_on
     )
-    unbounded_logical_call_exposure_count = sum(
-        item.logical_calls_upper_bound is None for item in active_exposures
+    conditional_calls_upper = (
+        None
+        if any(item.conditional_on for item in unbounded_exposures)
+        else len(conditional_rows) + conditional_exposure_upper
     )
 
     def retry_slot_upper_bound(
@@ -839,6 +1049,34 @@ def build_full_stage_request_plan_v1(
         if reasoning_once is None or reasoning_retry_extra is None
         else reasoning_once + reasoning_retry_extra
     )
+    context_once = total_or_unknown(
+        [item.request_estimate.estimated_total_tokens for item in fresh_rows],
+        [
+            0
+            if item.logical_calls_upper_bound == 0
+            else None
+            if item.logical_calls_upper_bound is None
+            or item.context_tokens_per_call_upper_bound is None
+            else int(item.logical_calls_upper_bound)
+            * int(item.context_tokens_per_call_upper_bound)
+            for item in active_exposures
+        ],
+    )
+    context_retry_extra = retry_resource_upper_bound(
+        [
+            (item.request_estimate.estimated_total_tokens, retry_slots)
+            for item, retry_slots in zip(fresh_rows, row_retry_slots)
+        ],
+        [
+            (item.context_tokens_per_call_upper_bound, retry_slots)
+            for item, retry_slots in zip(active_exposures, exposure_retry_slots)
+        ],
+    )
+    context_all_attempts = (
+        None
+        if context_once is None or context_retry_extra is None
+        else context_once + context_retry_extra
+    )
     # Each row carries one total logical-call deadline shared across its retries.
     wall_unknown = any(item.wall_seconds_upper_bound is None for item in fresh_rows) or any(
         item.wall_seconds_per_call_upper_bound is None
@@ -914,17 +1152,17 @@ def build_full_stage_request_plan_v1(
         else "within_limit"
     )
     request_context_status = (
-        "exceeded"
+        "unknown"
+        if unbounded_exposures
+        else "exceeded"
         if any(not item.request_estimate.within_context_budget for item in fresh_rows)
-        else "unknown"
-        if active_exposures
         else "within_limit"
     )
     budget_exceeded = any(
         status == "exceeded"
         for status in (call_status, retry_status, output_status, wall_status, request_context_status)
     )
-    unknown_exposure = bool(active_exposures) or any(
+    unknown_exposure = not envelope_complete or any(
         status == "unknown"
         for status in (call_status, retry_status, output_status, wall_status, request_context_status)
     )
@@ -932,10 +1170,14 @@ def build_full_stage_request_plan_v1(
         admission_status = "blocked_budget"
     elif unknown_exposure:
         admission_status = "incomplete_unknown_exposure"
-    elif any(item.conditional_on for item in fresh_rows):
+    elif bounded_exposures or any(item.conditional_on for item in fresh_rows):
         admission_status = "conditional_within_budget"
     else:
         admission_status = "within_budget"
+    ready_for_transport = envelope_complete and exact_requests_materialized and admission_status in (
+        "within_budget",
+        "conditional_within_budget",
+    )
 
     priced_rows = [item for item in fresh_rows if item.estimated_cost is not None]
     retry_cost_extra = retry_resource_upper_bound(
@@ -969,6 +1211,9 @@ def build_full_stage_request_plan_v1(
         "stage_inventories": [item.to_dict() for item in inventories],
         "provider_requests": [item.to_dict() for item in rows],
         "unknown_exposures": [item.to_dict() for item in exposures],
+        "envelope_complete": envelope_complete,
+        "exact_requests_materialized": exact_requests_materialized,
+        "ready_for_transport": ready_for_transport,
         "local_steps": list(dict.fromkeys(str(item) for item in local_steps if str(item).strip())),
         "local_steps_provider_calls": 0,
         "aggregate_budget": aggregate_budget.to_dict(),
@@ -980,6 +1225,7 @@ def build_full_stage_request_plan_v1(
             "logical_calls_known": known_logical,
             "logical_calls_unconditional": len(definite_rows),
             "logical_calls_conditional": len(conditional_rows),
+            "logical_calls_conditional_upper_bound": conditional_calls_upper,
             "logical_calls_upper_bound": logical_upper,
             "physical_attempts_known_lower_bound": physical_lower,
             "physical_attempts_upper_bound": physical_upper,
@@ -993,6 +1239,8 @@ def build_full_stage_request_plan_v1(
             "aggregate_output_tokens_known_lower_bound": output_reserved_lower,
             "estimated_output_tokens_all_attempts": output_all_attempts,
             "estimated_reasoning_tokens_all_attempts": reasoning_all_attempts,
+            "estimated_context_tokens_one_attempt": context_once,
+            "estimated_context_tokens_all_attempts": context_all_attempts,
             "verified_reuse_calls": sum(item.verified_reuse for item in rows),
             "unknown_exposure_count": len(exposures),
             "bounded_logical_call_exposure_count": bounded_logical_call_exposure_count,
@@ -1044,6 +1292,7 @@ def build_full_stage_request_plan_v1(
 
 
 __all__ = [
+    "ProviderExposureCardinalityBasisV1",
     "ProviderRequestPlanRowV1",
     "ProviderStageRequestInventoryV1",
     "StagePlan",

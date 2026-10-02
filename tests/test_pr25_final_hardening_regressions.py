@@ -500,17 +500,21 @@ def test_strict_zero_retry_budget_context_environment_round_trip_keeps_v2_schema
     assert restored.provider_budget.max_retry_attempts_total == 0
 
 
-def test_strict_aggregate_zero_retry_blocks_transport_before_post(monkeypatch) -> None:
+@pytest.mark.parametrize("call_limit", [0, 3])
+def test_strict_zero_retry_allows_only_the_initial_authorized_attempt(monkeypatch, call_limit: int) -> None:
     calls = 0
 
     def post(*_args, **_kwargs):
         nonlocal calls
         calls += 1
-        raise AssertionError("strict retry budget must reject before transport")
+        response = ai_interface.requests.Response()
+        response.status_code = 429
+        response._content = b'{"error":{"message":"synthetic rate limit"}}'
+        return response
 
     monkeypatch.setattr(ai_interface, "_post_with_proxy_mode", post)
     budget = ProviderAggregateBudgetV2(
-        max_provider_calls_total=3,
+        max_provider_calls_total=call_limit,
         max_output_tokens_total=4_096,
         max_retry_attempts_total=0,
         max_wall_seconds=60,
@@ -533,10 +537,15 @@ def test_strict_aggregate_zero_retry_blocks_transport_before_post(monkeypatch) -
         provider_runtime=runtime,
     )
 
-    assert calls == 0
+    assert calls == (1 if call_limit else 0)
     assert result["status"] == "failed"
-    assert result["error_kind"] == "budget_exhausted"
-    assert "retry budget" in result["message"]
+    if not call_limit:
+        assert result["error_kind"] == "budget_exhausted"
+    else:
+        assert result["attempts"] == 1
+    snapshot = runtime.aggregate_budget.snapshot()
+    assert snapshot["retry_attempts_used"] == 0
+    assert snapshot["retry_attempts_reserved"] == 0
 
 
 def test_strict_budget_state_uses_v5_and_rejects_legacy_rebinding(tmp_path) -> None:

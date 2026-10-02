@@ -43,7 +43,13 @@ def _route_and_stage_plan() -> tuple[Any, ReachableProviderRoutePlan]:
     )
 
 
-def _request_row(route: ReachableProviderRoute, *, retries: int | None, output: int = 1_200):
+def _request_row(
+    route: ReachableProviderRoute,
+    *,
+    retries: int | None,
+    output: int = 1_200,
+    wall_seconds: float | None = None,
+):
     profile = ProviderContextProfile.conservative(
         provider=route.provider_family,
         model=route.model,
@@ -62,6 +68,7 @@ def _request_row(route: ReachableProviderRoute, *, retries: int | None, output: 
         profile=profile,
         retry_attempts=retries,
         requested_output_tokens=output,
+        wall_seconds_upper_bound=wall_seconds,
     )
 
 
@@ -97,7 +104,7 @@ def test_output_cap_admission_includes_each_reserved_retry_attempt() -> None:
 
 def test_zero_retry_output_cap_uses_one_attempt_and_stays_within_limit() -> None:
     route, route_plan = _route_and_stage_plan()
-    row = _request_row(route, retries=0)
+    row = _request_row(route, retries=0, wall_seconds=10.0)
     inventory = ProviderStageRequestInventoryV1(
         stage_name="outline",
         source_builder="test request plan",
