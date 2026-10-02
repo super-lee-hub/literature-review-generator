@@ -42,9 +42,24 @@ class ReviewBlock:
     citations: List[Dict[str, Any]] = field(default_factory=list)
     block_source: str = "model_generated"
     span_map: Dict[str, Any] = field(default_factory=dict)
+    writer_task_id: str = ""
+    writer_output_unit_id: str = ""
+    writer_task_basis_hash: str = ""
+
+    def __post_init__(self) -> None:
+        binding = (self.writer_task_id, self.writer_output_unit_id, self.writer_task_basis_hash)
+        if any(binding) and (
+            not all(isinstance(value, str) and value.strip() for value in binding)
+            or re.fullmatch(r"[0-9a-f]{64}", self.writer_task_basis_hash) is None
+        ):
+            raise ValueError("Writer block requires a complete task/unit/basis binding")
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        if not self.writer_task_id:
+            for name in ("writer_task_id", "writer_output_unit_id", "writer_task_basis_hash"):
+                payload.pop(name)
+        return payload
 
 
 @dataclass(frozen=True)
@@ -328,6 +343,9 @@ def build_review_draft(
                         citations=normalized_citations,
                         block_source=block_data.get("block_source", "model_generated"),
                         span_map=block_data.get("span_map") or _build_block_span_map(text),
+                        writer_task_id=block_data.get("writer_task_id", ""),
+                        writer_output_unit_id=block_data.get("writer_output_unit_id", ""),
+                        writer_task_basis_hash=block_data.get("writer_task_basis_hash", ""),
                     )
                 )
         else:
