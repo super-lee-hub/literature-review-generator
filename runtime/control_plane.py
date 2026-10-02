@@ -6192,6 +6192,110 @@ class ReviewControlPlane:
             "provider_posts": 0,
         }
 
+    def source_correction_inspect(
+        self,
+        *,
+        source_workspace: str | Path,
+        workspace: str | Path,
+        candidate_artifact_id: str,
+    ) -> dict[str, Any]:
+        """Recheck the proposed bytes and expose their exact review identity."""
+        from services.summary_correction import (
+            SourceSummaryCorrectionError,
+            verify_source_summary_correction_candidate,
+        )
+
+        original, source_registry = AgentRuntimeRunner._open_workspace(source_workspace)
+        destination, destination_registry = AgentRuntimeRunner._open_workspace(workspace)
+        registry_hashes_before = (
+            file_sha256(source_registry.registry_path),
+            file_sha256(destination_registry.registry_path),
+        )
+        try:
+            verification = verify_source_summary_correction_candidate(
+                source_registry=source_registry,
+                destination_registry=destination_registry,
+                candidate_artifact_id=candidate_artifact_id,
+            )
+            candidate = destination_registry.get(candidate_artifact_id)
+            if candidate is None:
+                raise SourceSummaryCorrectionError("verified candidate disappeared")
+            candidate_bytes = Path(candidate.path).read_bytes()
+            if hashlib.sha256(candidate_bytes).hexdigest() != candidate.content_hash:
+                raise SourceSummaryCorrectionError("candidate changed after verification")
+            payload = json.loads(candidate_bytes)
+            registry_hashes_after = (
+                file_sha256(source_registry.registry_path),
+                file_sha256(destination_registry.registry_path),
+            )
+            if registry_hashes_after != registry_hashes_before:
+                raise SourceSummaryCorrectionError("Registry changed during candidate inspection")
+        except (SourceSummaryCorrectionError, RegistryError, OSError, ValueError, TypeError) as exc:
+            return {
+                "status": "blocked", "reason": str(exc),
+                "provider_posts": 0, "read_only": True,
+                "usable_as_stage1_reuse": False,
+                "canonical_pointer_advanced": False,
+            }
+        return {
+            **verification.to_dict(),
+            "status": "ready_for_owner_review",
+            "source_workspace": original.root_dir,
+            "destination_workspace": destination.root_dir,
+            "candidate_artifact_hash": candidate.content_hash,
+            "normalized_proposal_hash": payload["normalized_proposal_hash"],
+            "source_authority": payload["source_authority"],
+            "field_changes": payload["field_changes"],
+            "source_conflicts_preserved": payload["source_conflicts_preserved"],
+            "summary_count": payload["summary_count_after"],
+            "registries_unchanged": True,
+            "provider_posts": 0,
+            "read_only": True,
+        }
+
+    def source_correction_adopt(
+        self,
+        *,
+        source_workspace: str | Path,
+        workspace: str | Path,
+        candidate_artifact_id: str,
+        expected_candidate_hash: str,
+        actor: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Record an explicit operator adoption of the exact reviewed bytes."""
+        from services.queue_service import LocalPublicationContext
+        from services.summary_correction_adoption import adopt_source_summary_correction_candidate
+
+        original, source_registry = AgentRuntimeRunner._open_workspace(source_workspace)
+        destination, destination_registry = AgentRuntimeRunner._open_workspace(workspace)
+        try:
+            result = adopt_source_summary_correction_candidate(
+                source_registry=source_registry,
+                destination_registry=destination_registry,
+                workspace=destination,
+                publication_context=LocalPublicationContext(),
+                candidate_artifact_id=candidate_artifact_id,
+                expected_candidate_hash=expected_candidate_hash,
+                actor=actor,
+                reason=reason,
+            )
+        except (RegistryError, OSError, ValueError, TypeError) as exc:
+            return {
+                "status": "blocked", "reason": str(exc),
+                "source_workspace": original.root_dir,
+                "destination_workspace": destination.root_dir,
+                "provider_posts": 0,
+                "usable_as_stage1_reuse": False,
+                "canonical_pointer_advanced": False,
+            }
+        return {
+            **result.to_dict(),
+            "source_workspace": original.root_dir,
+            "destination_workspace": destination.root_dir,
+            "provider_posts": 0,
+        }
+
     def repair_plan(self, *, job_id: str | None = None, workspace: str | Path | None = None) -> dict[str, Any]:
         inspection = self.inspect(job_id=job_id, workspace=workspace)
         plans = [
