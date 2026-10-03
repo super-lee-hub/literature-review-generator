@@ -9,6 +9,8 @@ import time
 from dataclasses import replace
 from types import SimpleNamespace
 
+import pytest
+
 from reviewctl import main as reviewctl_main
 from runtime.control_plane import ReviewControlPlane
 import runtime.control_plane as control_plane_module
@@ -53,6 +55,50 @@ def test_reviewctl_plan_and_doctor_emit_machine_json(tmp_path: Path, capsys) -> 
     doctor = json.loads(capsys.readouterr().out)
     assert doctor["status"] == "fail"
     assert "dummy" not in json.dumps(doctor)
+
+
+@pytest.mark.parametrize("explicit_zero", [False, True])
+def test_public_plan_writer_reserves_match_the_writer_runtime(tmp_path: Path, explicit_zero: bool) -> None:
+    from config_loader import load_config
+    from runtime.provider_context import ProviderContextProfile
+    from services.model_selection import get_api_config_for_section
+
+    spec = replace(_spec(tmp_path), action="run_all",
+                   metadata={"requested_stages": ["analyze", "outline", "review", "validate"]})
+    parser = configparser.ConfigParser()
+    parser.read(Path(__file__).resolve().parents[1] / "config.ini.example", encoding="utf-8")
+    parser["Paths"]["output_path"] = str(tmp_path / "output")
+    for section in ("Primary_Reader_API", "Backup_Reader_API", "Writer_API", "Outline_API",
+                    "Free_Mode_API", "Validator_API"):
+        parser[section]["api_key"] = "local-fixture-only"
+        parser[section]["api_base"] = "http://127.0.0.1:1/v1"
+    writer = parser["Writer_API"]
+    writer["max_output_tokens"] = "4096"
+    writer["max_context_tokens"] = "128000"
+    writer["transport_retries"] = "0"
+    for key in ("reasoning_reserve_tokens", "safety_margin_tokens"):
+        if explicit_zero:
+            writer[key] = "0"
+        else:
+            writer.pop(key, None)
+    with Path(spec.config).open("w", encoding="utf-8") as handle:
+        parser.write(handle)
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(json.dumps(spec.to_dict()), encoding="utf-8")
+    plan = ReviewControlPlane().plan(str(spec_path))
+    exposures = [item for item in plan["full_stage_request_plan"]["unknown_exposures"]
+                 if item["stage_name"] == "review" and item["semantic_role"] == "writer"]
+    assert exposures
+    config = load_config(spec.config, action=spec.action,
+                         requested_stages=spec.metadata["requested_stages"], allow_template_credentials=False)
+    api_config = get_api_config_for_section(config, "Writer_API")
+    profile = ProviderContextProfile.from_api_config(api_config, max_output_tokens=4096, default_model="writer")
+    for exposure in exposures:
+        assert exposure["input_tokens_per_call_upper_bound"] == profile.input_budget
+        assert exposure["output_tokens_per_call_upper_bound"] == profile.max_output_tokens
+        assert exposure["reasoning_tokens_per_call_upper_bound"] == profile.reasoning_reserve
+        assert exposure["retry_attempts_per_call_upper_bound"] == 0
+    assert plan["full_stage_request_plan"]["boundary"]["no_provider_posts"] is True
 
 
 def test_reviewctl_plan_projects_all_reachable_provider_work_without_posting(

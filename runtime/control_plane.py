@@ -759,6 +759,10 @@ class ReviewControlPlane:
                         0, int(api_config.get("safety_margin_tokens") or 1_024),
                     ),
                 )
+                if stage_name == "review" and semantic_role == "writer":
+                    profile = ProviderContextProfile.from_api_config(
+                        api_config, max_output_tokens=output_tokens, default_model="writer",
+                    )
             input_tokens_upper_bound = (
                 int(profile.input_budget) if profile is not None else None
             )
