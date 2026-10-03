@@ -404,8 +404,13 @@ def _preferred_axis_order(intent: Optional[ReviewIntent]) -> List[str]:
     return [preferred, *[axis_id for axis_id in axis_ids if axis_id != preferred]]
 
 
-def build_organizing_axes(intent: Optional[ReviewIntent] = None) -> List[OrganizingAxis]:
-    """Return all fixed organizing axes; intent changes preference, not scope."""
+def build_organizing_axes(
+    intent: Optional[ReviewIntent] = None, *, candidate_count: int = 5,
+) -> List[OrganizingAxis]:
+    """Keep the fixed axes first, then compose distinct hierarchical axes."""
+
+    if not 1 <= candidate_count <= 12:
+        raise ValueError("candidate_count must be between 1 and 12")
 
     specs_by_id = {spec[0]: spec for spec in _AXIS_SPECS}
     axes: List[OrganizingAxis] = []
@@ -419,6 +424,31 @@ def build_organizing_axes(intent: Optional[ReviewIntent] = None) -> List[Organiz
             preferred_dimensions=list(dimensions),
             preferred_relation_types=list(relation_types),
         ))
+    base_axes = list(axes)
+    for primary in base_axes:
+        for secondary in base_axes:
+            if len(axes) >= candidate_count:
+                return axes
+            if primary.axis_id == secondary.axis_id:
+                continue
+            axis_id = f"{primary.axis_id}_then_{secondary.axis_id}"
+            axes.append(OrganizingAxis(
+                axis_id=axis_id,
+                organizing_logic=axis_id,
+                label=f"{primary.label} / {secondary.label}",
+                rationale=(
+                    f"Use {primary.axis_id} as the primary organization of sections; "
+                    f"use {secondary.axis_id} to organize comparisons within those sections. "
+                    f"Primary rationale: {primary.rationale} "
+                    f"Secondary rationale: {secondary.rationale}"
+                ),
+                preferred_dimensions=list(dict.fromkeys([
+                    *primary.preferred_dimensions, *secondary.preferred_dimensions,
+                ])),
+                preferred_relation_types=list(dict.fromkeys([
+                    *primary.preferred_relation_types, *secondary.preferred_relation_types,
+                ])),
+            ))
     return axes
 
 
@@ -434,10 +464,8 @@ def build_outline_candidate_plans(
 ) -> OutlineCandidatePlans:
     """Create deterministic candidate plans with provider generation isolated."""
 
-    if candidate_count <= 0:
-        raise ValueError("candidate_count must be positive")
-    axes = build_organizing_axes(intent)
-    selected_axes = axes[:min(candidate_count, len(axes))]
+    axes = build_organizing_axes(intent, candidate_count=candidate_count)
+    selected_axes = axes[:candidate_count]
     shared = {
         "global_corpus_ledger": ledger.content_hash,
         "multi_view_matrix": matrix.content_hash,

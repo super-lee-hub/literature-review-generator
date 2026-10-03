@@ -2826,6 +2826,7 @@ def test_hierarchical_relation_adjudication_emits_local_and_cross_shard_calls(
         (1, "off", 6),
         (2, "off", 7),
         (5, "off", 10),
+        (6, "off", 11),
         (1, "smoke", 12),
         (2, "smoke", 14),
         (5, "smoke", 20),
@@ -2854,6 +2855,24 @@ def test_outline_v3_call_plan_has_exact_transport_count(
     assert len(replay_plans) == (0 if stability_mode == "off" else candidate_count + 5)
     assert executor.stability_preflight["estimated_provider_calls"] == expected_transport_calls
     assert all(item.cost_status == "estimate" for item in transport_plans)
+
+
+def test_twelve_candidate_graph_keeps_all_nodes_when_request_capacity_blocks(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    def provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        calls.append(node_id)
+        return _configured_test_provider(node_id, request)
+
+    executor = _executor(tmp_path, provider=provider, candidate_count=12, stability_mode="off")
+    with pytest.raises(OutlineV3ExecutionError, match="source_prompt_exceeds_effective_input_cap"):
+        executor._preflight_stability_budget()
+    plans = [item for item in executor.provider_call_plans if item.transport_expected]
+    assert len(plans) == 17
+    assert {item.node_id for item in plans if item.node_id.endswith("_provider_generation")} == {
+        f"candidate_{index}_provider_generation" for index in range(1, 13)
+    }
+    assert calls == []
 
 
 @pytest.mark.parametrize(
@@ -2886,6 +2905,53 @@ def test_outline_v3_transport_trace_matches_call_plan(
     assert stability["preflight"]["estimated_provider_calls"] == expected_transport_calls
     assert stability["provider_call_count_total"] == expected_transport_calls
     assert stability["transport_call_count_after_stability"] == expected_transport_calls
+
+
+def test_six_candidates_publish_and_send_the_registered_composed_axis(tmp_path: Path) -> None:
+    candidate_requests: dict[str, Mapping[str, Any]] = {}
+
+    def provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        if node_id.startswith("candidate_") and node_id.endswith("_provider_generation"):
+            candidate_requests[node_id] = request
+        return _configured_test_provider(node_id, request)
+
+    executor = _executor(tmp_path, provider=provider, candidate_count=6, stability_mode="off")
+    result = executor.run()
+    assert result.ok is True
+    assert len(candidate_requests) == 6
+    published = json.loads(Path(result.artifacts["organizing_axes"]).read_text(encoding="utf-8"))["payload"]
+    assert len(published["axes"]) == len(published["candidates"]) == 6
+    request = candidate_requests["candidate_6_provider_generation"]
+    axis = published["axes"][5]
+    assert request["organizing_axis"] == axis
+    assert request["organizing_logic"] == axis["axis_id"]
+    assert "primary organization" in axis["rationale"]
+    assert all("organizing_axis" not in request for key, request in candidate_requests.items()
+               if key != "candidate_6_provider_generation")
+
+
+def test_composed_axis_is_included_in_preflight_before_threshold_packing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor = _executor(tmp_path, candidate_count=6, stability_mode="off")
+    observed: list[Mapping[str, Any]] = []
+    attach = executor._attach_prompt_authority
+
+    def capture(node_id: str, request: Mapping[str, Any]) -> dict[str, Any]:
+        observed.append(request)
+        return attach(node_id, request)
+
+    monkeypatch.setattr(executor, "_attach_prompt_authority", capture)
+    monkeypatch.setattr(executor, "_relation_packing_target", lambda profile: 1)
+    input_upper, shard_count = executor._candidate_hierarchical_preflight(
+        executor.summaries, executor.profile, variant_name="canonical", candidate_id="candidate_6",
+    )
+    assert input_upper == executor._effective_input_cap(executor.profile)
+    assert shard_count >= 1
+    assert observed
+    assert all(item["candidate_id"] == "candidate_6" for item in observed)
+    assert all("primary organization" in item["organizing_axis"]["rationale"] for item in observed)
+    assert all(item["organizing_logic"] == item["organizing_axis"]["axis_id"] for item in observed)
 
 
 def test_stability_dynamic_candidate_and_critique_shards_are_registry_bound(

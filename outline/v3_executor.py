@@ -5010,8 +5010,25 @@ class OutlineV3Executor:
         profile: ProviderContextProfile,
         *,
         variant_name: str,
+        candidate_id: str | None = None,
     ) -> tuple[int, int]:
         """Reserve every possible evidence shard before candidate transport."""
+
+        axes = build_organizing_axes(
+            build_review_intent(self.review_intent_input), candidate_count=self.candidate_count,
+        )
+        if candidate_id is None and self.candidate_count > 5:
+            projections = [
+                self._candidate_hierarchical_preflight(
+                    summaries, profile, variant_name=variant_name,
+                    candidate_id=f"candidate_{index}",
+                )
+                for index in range(1, self.candidate_count + 1)
+            ]
+            return max(item[0] for item in projections), max(item[1] for item in projections)
+        candidate_id = candidate_id or "candidate_1"
+        axis = axes[int(candidate_id.removeprefix("candidate_")) - 1]
+        generation_node_id = f"{candidate_id}_provider_generation"
 
         evidence = build_outline_evidence_views(summaries, self.job_id)
         ledger = build_global_corpus_ledger(evidence)
@@ -5036,7 +5053,9 @@ class OutlineV3Executor:
             if str(item.relation_id) in selected_relation_ids
         ]
         request = {
-            "candidate_id": "candidate_1",
+            "candidate_id": candidate_id,
+            **({"organizing_logic": axis.organizing_logic, "organizing_axis": axis.to_dict()}
+               if "_then_" in axis.axis_id else {}),
             "variant_name": variant_name,
             "paper_keys": paper_keys,
             "relation_ids": relation_ids,
@@ -5056,11 +5075,11 @@ class OutlineV3Executor:
             "evidence_projection": "registry_complete_evidence_ref_v1",
         }
         node_prefix = (
-            "stability:" + hash_json({"variant": variant_name, "candidate": "candidate_1"})[:16]
+            "stability:" + hash_json({"variant": variant_name, "candidate": candidate_id})[:16]
             if variant_name not in {"canonical", "baseline"} else ""
         )
         enriched = self._attach_prompt_authority(
-            f"candidate_1_provider_generation:preflight:{variant_name}:1",
+            f"{generation_node_id}:preflight:{variant_name}:1",
             request,
         )
         budget = profile.estimate_request(enriched)
@@ -5071,7 +5090,7 @@ class OutlineV3Executor:
         effective_cap = self._effective_input_cap(profile)
         if estimate > self._relation_packing_target(profile) or not bool(budget.get("within_budget")):
             shard_requests = self._candidate_shard_requests(
-                generation_node_id="candidate_1_provider_generation",
+                generation_node_id=generation_node_id,
                 provider_request=request,
                 evidence_views=evidence.views,
                 relation_candidates=request["relations"],
@@ -5082,12 +5101,12 @@ class OutlineV3Executor:
                 lower_estimate = int(profile.estimate_request(enriched_shard).get("estimated_input_tokens") or 0)
                 if lower_estimate > effective_cap:
                     raise OutlineV3ExecutionError(
-                        f"BLOCKED_BUDGET: candidate_1_provider_generation shard {node_id} "
+                        f"BLOCKED_BUDGET: {generation_node_id} shard {node_id} "
                         f"complete request estimate {lower_estimate} exceeds effective input cap {effective_cap}"
                     )
             if not shard_requests:
                 raise OutlineV3ExecutionError(
-                    "BLOCKED_BUDGET: candidate_1_provider_generation has no bounded evidence shards"
+                    f"BLOCKED_BUDGET: {generation_node_id} has no bounded evidence shards"
                 )
             return effective_cap, len(shard_requests)
         return estimate, 1
@@ -5120,6 +5139,7 @@ class OutlineV3Executor:
                         variant_summaries,
                         profile,
                         variant_name=variant_name,
+                        candidate_id=node_id.removesuffix("_provider_generation"),
                     )
                 elif (
                     node_id in {"structure_critique", "coverage_critique", "evidence_critique", "arbitration"}
@@ -14516,7 +14536,6 @@ class OutlineV3Executor:
                 self._artifact(OutlineArtifact, contract_model.to_dict(), {"global_corpus_ledger": _hash_payload(ledger), "review_intent": _hash_payload(intent)}),
                 ("global_corpus_ledger", "review_intent"), "deterministic", "local",
             ))
-            axes = build_organizing_axes(intent_model)
             confirmed_map_model = GlobalRelationMap(
                 artifact_type="confirmed_global_relation_map",
                 relations=[candidate_map_model.relations[index] for index, item in enumerate(relation_candidates) if item["relation_id"] in set(confirmed_ids)],
@@ -14532,6 +14551,8 @@ class OutlineV3Executor:
                 candidate_count=self.candidate_count,
                 semantic_chunk_plan_hash=semantic_chunk_plan_model.content_hash,
             )
+            axes = plans_model.axes
+            axes_by_id = {axis.axis_id: axis for axis in axes}
             axes_payload = {"axes": [item.to_dict() for item in axes], "candidates": [item.to_dict() for item in plans_model.candidates], "semantic_chunk_plan_hash": semantic_chunk_plan_model.content_hash, "global_synthesis_hash": _hash_payload(global_synthesis), "topic_routes": [item.to_dict() for item in semantic_chunk_plan_model.topics], "bridge_pass": [{"type": "cross_stream_bridge", "paper_keys": sorted(item.paper_keys)} for item in confirmed_map_model.relations if item.relation_type == "bridge_between_topics"]}
             axes_out = self._run_node("organizing_axes", lambda: (
                 self._artifact(OutlineArtifact, axes_payload, {"global_corpus_ledger": _hash_payload(ledger), "multi_view_matrix": _hash_payload(matrix), "global_relation_map": _hash_payload(confirmed_map), "semantic_chunk_plan": _hash_payload(semantic_chunk_plan), "global_synthesis": _hash_payload(global_synthesis), "review_intent": _hash_payload(intent), "coverage_contract": _hash_payload(contract)}),
@@ -14574,6 +14595,8 @@ class OutlineV3Executor:
                 request = {
                     "candidate_id": candidate_id,
                     "organizing_logic": plan.organizing_logic,
+                    **({"organizing_axis": axes_by_id[plan.axis_id].to_dict()}
+                       if "_then_" in plan.axis_id else {}),
                     "paper_keys": paper_keys,
                     "relation_ids": allowed_relation_ids,
                     "relations": candidate_relations,
