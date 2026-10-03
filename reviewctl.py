@@ -325,6 +325,11 @@ def build_parser() -> argparse.ArgumentParser:
     source_correction_adopt.add_argument("--actor", required=True)
     source_correction_adopt.add_argument("--reason", required=True)
     source_correction_adopt.add_argument("--json", action="store_true")
+    source_correction_reuse = subparsers.add_parser("source-correction-reuse")
+    source_correction_reuse.add_argument("--source-workspace", required=True)
+    source_correction_reuse.add_argument("--workspace", required=True)
+    source_correction_reuse.add_argument("--receipt", required=True)
+    source_correction_reuse.add_argument("--json", action="store_true")
 
     for command in ("status", "inspect", "next-action", "resume", "retry-node", "reconcile", "repair-plan", "repair-apply", "repair-promote", "validate", "validation-status", "cancel", "pause", "adopt"):
         subparser = subparsers.add_parser(command)
@@ -410,6 +415,8 @@ def _exit_code(command: str, payload: dict[str, Any]) -> int:
         return 0 if payload.get("status") == "ready_for_owner_review" else 1
     if command == "source-correction-adopt":
         return 0 if payload.get("status") in {"owner_approved_derived_summary_ready", "already_adopted"} else 1
+    if command == "source-correction-reuse":
+        return 0 if payload.get("usable_as_stage1_reuse") is True else 1
     if command == "validate":
         return 1 if payload.get("status") == "blocked" else 0
     if command in {"status", "inspect", "next-action", "reconcile", "repair-plan", "validation-status", "attest", "export", "queue-list"}:
@@ -528,6 +535,12 @@ def main(argv: list[str] | None = None) -> int:
                 expected_candidate_hash=args.expected_hash,
                 actor=args.actor,
                 reason=args.reason,
+            )
+        elif args.command == "source-correction-reuse":
+            payload = control.source_correction_reuse(
+                source_workspace=args.source_workspace,
+                workspace=args.workspace,
+                adoption_receipt_artifact_id=args.receipt,
             )
         elif args.command == "repair-plan":
             payload = control.repair_plan(job_id=args.job or None, workspace=args.workspace or None)

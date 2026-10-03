@@ -12,14 +12,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
+from collections import Counter
+from copy import deepcopy
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from validation.repair_models import (
     AppliedPatchRecord,
     ApplyGuardResult,
-    DependencyHashBundle,
     PatchGranularity,
     PatchProposal,
     RepairApplyResult,
@@ -28,6 +30,16 @@ from validation.repair_models import (
     NOT_APPLICABLE,
 )
 from services.repair_policy import is_auto_safe_proposal
+from services.citation_ref_catalog import extract_ref_ids_from_token
+from services.review_draft import (
+    find_review_text_block,
+    iter_review_text_blocks,
+    validate_review_section_writer_scope,
+)
+from services.sentence_segmenter import build_sentence_span_map
+
+
+_CITATION_TOKEN = re.compile(r"\[\[cite_ref:[^\]]+\]\]")
 
 
 def _compute_hash(data: Any) -> str:
@@ -36,14 +48,145 @@ def _compute_hash(data: Any) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
 
 
-def _get_block_text(review_draft: Dict[str, Any], block_id: str) -> Optional[str]:
-    """Get current text of a block from review_draft."""
-    sections = review_draft.get("content", {}).get("sections", [])
+def _resolve_review_text_unit(
+    review_draft: Mapping[str, Any], block_id: str,
+) -> tuple[Dict[str, Any] | None, Mapping[str, Any] | None]:
+    """Resolve one mutable paragraph/factual cell and its owning section."""
+    try:
+        target = find_review_text_block(review_draft, block_id)
+    except (KeyError, TypeError, ValueError):
+        return None, None
+    if target is None:
+        return None, None
+    content = review_draft.get("content")
+    sections = content.get("sections") if isinstance(content, Mapping) else None
+    if not isinstance(sections, list):
+        return None, None
     for section in sections:
-        for block in section.get("blocks", []):
-            if block.get("block_id") == block_id:
-                return block.get("text", "")
-    return None
+        if not isinstance(section, Mapping):
+            continue
+        try:
+            units = iter_review_text_blocks(section)
+            if any(str(unit.get("block_id") or "") == block_id for unit in units):
+                return target, section
+        except (KeyError, TypeError, ValueError):
+            return None, None
+    return None, None
+
+
+def _get_block_text(review_draft: Dict[str, Any], block_id: str) -> Optional[str]:
+    """Get current text from a repairable paragraph or factual table cell."""
+    block, _section = _resolve_review_text_unit(review_draft, block_id)
+    return str(block.get("text") or "") if block is not None else None
+
+
+def _refresh_factual_cell_offsets(cell: Dict[str, Any], text: str) -> bool:
+    """Keep cell-local citation spans and sentence spans bound to new text."""
+    citations = cell.get("citations")
+    if not isinstance(citations, list):
+        return False
+    token_matches = list(_CITATION_TOKEN.finditer(text))
+    text_pairs: Counter[tuple[str, str]] = Counter()
+    for match in token_matches:
+        refs = tuple(extract_ref_ids_from_token(match.group(0)))
+        if not refs:
+            return False
+        text_pairs.update((match.group(0), ref_id) for ref_id in refs)
+
+    citation_pairs: Counter[tuple[str, str]] = Counter()
+    normalized: list[tuple[Dict[str, Any], str, str]] = []
+    for citation in citations:
+        if not isinstance(citation, dict):
+            return False
+        token = str(citation.get("citation_token") or citation.get("raw_text") or "")
+        ref_id = str(citation.get("ref_id") or "")
+        if not token or not ref_id or not extract_ref_ids_from_token(token):
+            return False
+        citation_pairs[(token, ref_id)] += 1
+        normalized.append((citation, token, ref_id))
+    if citation_pairs != text_pairs:
+        return False
+
+    allowed_ref_ids = cell.get("allowed_ref_ids")
+    if not isinstance(allowed_ref_ids, list) or not set(
+        ref_id for _token, ref_id in text_pairs
+    ).issubset({str(item) for item in allowed_ref_ids}):
+        return False
+
+    for citation, token, _ref_id in normalized:
+        candidates = [match for match in token_matches if match.group(0) == token]
+        cluster_index = citation.get("cluster_index")
+        try:
+            candidate_index = int(cluster_index) - 1 if cluster_index is not None else -1
+        except (TypeError, ValueError):
+            candidate_index = -1
+        if candidate_index >= 0 and candidate_index < len(token_matches):
+            match = token_matches[candidate_index]
+            if match.group(0) != token:
+                return False
+        elif len(candidates) == 1:
+            match = candidates[0]
+        else:
+            # Repeated identical tokens require an explicit cell-local cluster ID.
+            return False
+        citation["span_start"], citation["span_end"] = match.span()
+        citation["raw_text"] = token
+
+    cell["span_map"] = build_sentence_span_map(text)
+    return True
+
+
+def _apply_explicit_cell_citation_mapping(
+    cell: Dict[str, Any], mapping: Mapping[str, Any],
+) -> bool:
+    """Apply one occurrence-bound ref correction before validating the cell."""
+    citations = cell.get("citations")
+    expected_ref_id = str(mapping.get("expected_ref_id") or "")
+    replacement_ref_id = str(mapping.get("replacement_ref_id") or "")
+    replacement_paper_id = str(mapping.get("replacement_paper_id") or "")
+    local_ref_id = str(mapping.get("local_ref_id") or "")
+    start_offset, end_offset = mapping.get("start_offset"), mapping.get("end_offset")
+    if start_offset is None or end_offset is None:
+        return False
+    try:
+        old_start = int(start_offset)
+        old_end = int(end_offset)
+    except (TypeError, ValueError):
+        return False
+    old_token = f"[[cite_ref:{expected_ref_id}]]"
+    new_token = f"[[cite_ref:{replacement_ref_id}]]"
+    allowed_ref_ids = cell.get("allowed_ref_ids")
+    if (
+        not isinstance(citations, list)
+        or not expected_ref_id
+        or not replacement_ref_id
+        or not replacement_paper_id
+        or not local_ref_id
+        or expected_ref_id == replacement_ref_id
+        or not isinstance(allowed_ref_ids, list)
+        or replacement_ref_id not in {str(item) for item in allowed_ref_ids}
+    ):
+        return False
+    matches = [
+        item
+        for item in citations
+        if isinstance(item, dict)
+        and str(item.get("local_ref_id") or "") == local_ref_id
+        and str(item.get("ref_id") or "") == expected_ref_id
+        and str(item.get("citation_token") or "") == old_token
+        and item.get("span_start") == old_start
+        and item.get("span_end") == old_end
+    ]
+    if len(matches) != 1:
+        return False
+    citation = matches[0]
+    citation["ref_id"] = replacement_ref_id
+    citation["citation_token"] = new_token
+    citation["raw_text"] = new_token
+    citation["paper_id"] = replacement_paper_id
+    citation["paper_key"] = replacement_paper_id
+    citation["canonical_paper_key"] = replacement_paper_id
+    return True
 
 
 def _compute_anchor_hash(text: str) -> str:
@@ -174,8 +317,13 @@ def check_apply_guards(
     
     # Anchor/hash guard
     anchor_hash_guard_passed = True
-    current_block_text = _get_block_text(review_draft, proposal.target.block_id)
-    if current_block_text is None:
+    current_block, _current_section = _resolve_review_text_unit(
+        review_draft, proposal.target.block_id,
+    )
+    current_block_text = (
+        str(current_block.get("text") or "") if current_block is not None else None
+    )
+    if current_block is None or current_block_text is None:
         anchor_hash_guard_passed = False
         block_reasons.append(f"Block {proposal.target.block_id} not found")
     else:
@@ -186,6 +334,25 @@ def check_apply_guards(
                 f"Anchor hash mismatch for block {proposal.target.block_id}: "
                 f"expected {proposal.target.anchor_hash}, got {current_anchor_hash}"
             )
+        if current_block.get("cell_kind") == "factual_output_unit":
+            span_start = proposal.target.span_start
+            span_end = proposal.target.span_end
+            if span_start is not None or span_end is not None:
+                if (
+                    not isinstance(span_start, int)
+                    or not isinstance(span_end, int)
+                    or span_start < 0
+                    or span_end <= span_start
+                    or span_end > len(current_block_text)
+                    or (
+                        proposal.original_text
+                        and current_block_text[span_start:span_end] != proposal.original_text
+                    )
+                ):
+                    anchor_hash_guard_passed = False
+                    block_reasons.append(
+                        f"Cell span is not bound to current cell text for block {proposal.target.block_id}"
+                    )
     
     # Dependency guard
     dependency_guard_passed = _check_dependency_bundle(
@@ -376,42 +543,74 @@ def apply_patch(
     if not guard_result.can_apply:
         return None
     
-    # Find the block
-    sections = review_draft.get("content", {}).get("sections", [])
-    for section in sections:
-        for block in section.get("blocks", []):
-            if block.get("block_id") == proposal.target.block_id:
-                # Get current state
-                original_text = block.get("text", "")
-                anchor_hash_before = _compute_anchor_hash(original_text)
-                
-                # Apply patch based on granularity
-                if proposal.granularity == PatchGranularity.SPAN:
-                    new_text = _apply_span_patch(original_text, proposal)
-                else:  # BLOCK
-                    new_text = _apply_block_patch(original_text, proposal)
-                
-                # Update block
-                block["text"] = new_text
-                
-                # Compute new anchor hash
-                anchor_hash_after = _compute_anchor_hash(new_text)
-                
-                # Return record
-                return AppliedPatchRecord(
-                    record_id=str(uuid.uuid4()),
-                    proposal_id=proposal.proposal_id,
-                    plan_id=proposal.metadata.get("plan_id", ""),
-                    applied_at=datetime.now().isoformat(),
-                    applied_in_job_id=job_id,
-                    original_text=original_text,
-                    applied_text=new_text,
-                    target_block_id=proposal.target.block_id,
-                    anchor_hash_before=anchor_hash_before,
-                    anchor_hash_after=anchor_hash_after,
-                )
-    
-    return None
+    block, section = _resolve_review_text_unit(review_draft, proposal.target.block_id)
+    if block is None or section is None:
+        return None
+    original_text = str(block.get("text") or "")
+    anchor_hash_before = _compute_anchor_hash(original_text)
+
+    if proposal.granularity == PatchGranularity.SPAN:
+        new_text = _apply_span_patch(original_text, proposal)
+    else:
+        new_text = _apply_block_patch(original_text, proposal)
+
+    is_factual_cell = block.get("cell_kind") == "factual_output_unit"
+    section_has_native_table = any(
+        isinstance(candidate, Mapping) and candidate.get("table_layout_schema_version")
+        for candidate in section.get("blocks", []) or ()
+    )
+    preserved_fields = {
+        name: (name in block, deepcopy(block.get(name)))
+        for name in ("citations", "span_map", "anchor_text", "anchor_hash")
+    }
+    block["text"] = new_text
+
+    if is_factual_cell:
+        raw_mapping = proposal.metadata.get("citation_mapping")
+        if isinstance(raw_mapping, Mapping) and not _apply_explicit_cell_citation_mapping(
+            block, raw_mapping,
+        ):
+            _restore_text_unit(block, original_text, preserved_fields)
+            return None
+        if not _refresh_factual_cell_offsets(block, new_text):
+            _restore_text_unit(block, original_text, preserved_fields)
+            return None
+    if is_factual_cell:
+        block["anchor_text"] = new_text[:80] + ("..." if len(new_text) > 80 else "")
+        block["anchor_hash"] = _compute_anchor_hash(new_text)
+    if section_has_native_table:
+        try:
+            validate_review_section_writer_scope(section)
+        except (KeyError, TypeError, ValueError):
+            _restore_text_unit(block, original_text, preserved_fields)
+            return None
+
+    anchor_hash_after = _compute_anchor_hash(new_text)
+    return AppliedPatchRecord(
+        record_id=str(uuid.uuid4()),
+        proposal_id=proposal.proposal_id,
+        plan_id=proposal.metadata.get("plan_id", ""),
+        applied_at=datetime.now().isoformat(),
+        applied_in_job_id=job_id,
+        original_text=original_text,
+        applied_text=new_text,
+        target_block_id=proposal.target.block_id,
+        anchor_hash_before=anchor_hash_before,
+        anchor_hash_after=anchor_hash_after,
+    )
+
+
+def _restore_text_unit(
+    block: Dict[str, Any],
+    original_text: str,
+    preserved_fields: Mapping[str, tuple[bool, Any]],
+) -> None:
+    block["text"] = original_text
+    for name, (was_present, value) in preserved_fields.items():
+        if was_present:
+            block[name] = value
+        else:
+            block.pop(name, None)
 
 
 class RepairApplier:

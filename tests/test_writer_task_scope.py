@@ -260,3 +260,12 @@ def test_source_ref_mismatch_and_multiple_sentences_are_rejected() -> None:
     with pytest.raises(WriterTaskScopeError, match="malformed citation token"):
         validate_writer_task_output_v1(scope, malformed_citation)
 
+
+def test_paragraph_unit_cannot_bypass_bound_layout_with_a_markdown_table() -> None:
+    scope = build_writer_task_scope_v1(_packet(), _catalog())
+    payload = _minimal_payload(scope, text=(
+        "| Finding | Context |\n| --- | --- |\n| Bounded effect [[cite_ref:R001]] | Tested context |"
+    ))
+    with pytest.raises(WriterTaskScopeError, match="bound table layout"):
+        validate_writer_task_output_v1(scope, payload)
+

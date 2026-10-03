@@ -20,6 +20,7 @@ from services.artifact_registry import ArtifactRegistry
 from services.job_workspace import JobWorkspace
 from services.review_generation_service import ReviewGenerationService
 from services.settings import ApplicationSettings
+from tests.writer_source_fixture import bind_production_writer_sources, scoped_writer_content
 
 
 def _writer_fixture(
@@ -69,17 +70,17 @@ def _writer_fixture(
         }
         for number, section in enumerate(sections, start=1)
     ]
+    bind_production_writer_sources(service, packets)
     return service, {"title": "Evidence-led review", "sections": sections}, packets
 
 
-def _successful_writer_result(**_kwargs: Any) -> Mapping[str, Any]:
+def _successful_writer_result(**kwargs: Any) -> Mapping[str, Any]:
     return {
         "status": "success",
-        "content": {
-            "blocks": [
-                {"text": "The controlled result supports the mechanism [[cite_ref:R001]]."}
-            ]
-        },
+        "content": scoped_writer_content(
+            str(kwargs.get("prompt_text") or ""),
+            "The controlled result supports the mechanism [[cite_ref:R001]].",
+        ),
         "usage_status": "provider_not_supported",
     }
 
@@ -290,7 +291,7 @@ def test_formal_writer_adapter_clamps_transport_to_shared_retry_allowance(
             for key in ("retry_attempts", "max_retries_per_call", "attempt_limit")
         })
         return {
-            **_successful_writer_result(),
+            **_successful_writer_result(prompt_text=_args[0]),
             "attempts": 1,
             "usage_status": "reported",
             "input_tokens": 1,
@@ -312,9 +313,18 @@ def test_formal_writer_adapter_clamps_transport_to_shared_retry_allowance(
     assert snapshot["calls_reserved"] == snapshot["retry_attempts_reserved"] == 0
 
 
+@pytest.mark.parametrize("route_retries", [None, 0, "0"])
+@pytest.mark.parametrize(
+    "reserve_config,expected_reserves",
+    [({}, (0, 256)), ({"reasoning_reserve_tokens": "4096", "safety_margin_tokens": "2048"}, (4096, 2048))],
+    ids=["omitted-reserves", "configured-reserves"],
+)
 def test_writer_transport_uses_prepared_prompt_config_and_output_after_preflight(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    route_retries: int | str | None,
+    reserve_config: Mapping[str, Any],
+    expected_reserves: tuple[int, int],
 ) -> None:
     system_prompt = {"value": "prepared Writer system prompt"}
     holder: dict[str, ReviewGenerationService] = {}
@@ -346,7 +356,11 @@ def test_writer_transport_uses_prepared_prompt_config_and_output_after_preflight
         assert prepared_system_prompt == "prepared Writer system prompt"
         assert api_config["model"] == "writer"
         assert kwargs["max_tokens"] == 256
-        assert kwargs["retry_attempts"] == 2
+        expected_limit = 2 if route_retries is None else 0
+        assert kwargs["retry_attempts"] == expected_limit
+        assert row.retry_attempts == max(0, expected_limit - 1)
+        assert row.request_estimate.reasoning_reserve_tokens == expected_reserves[0]
+        assert row.request_estimate.safety_margin_tokens == expected_reserves[1]
         observed_calls.append(
             {
                 "prompt": prompt,
@@ -358,11 +372,7 @@ def test_writer_transport_uses_prepared_prompt_config_and_output_after_preflight
         )
         return {
             "status": "success",
-            "content": {
-                "blocks": [
-                    {"text": "The controlled result supports the mechanism [[cite_ref:R001]]."}
-                ]
-            },
+            "content": scoped_writer_content(prompt, "The controlled result supports the mechanism [[cite_ref:R001]]."),
             "usage_status": "provider_not_supported",
             "attempts": 1,
         }
@@ -371,6 +381,11 @@ def test_writer_transport_uses_prepared_prompt_config_and_output_after_preflight
 
     monkeypatch.setattr(ai_interface, "_call_ai_api_detailed", fake_call)
     service, outline, packets = _writer_fixture(tmp_path, writer=None)
+    sections = {name: dict(values) for name, values in service.settings.sections.items()}
+    sections["Writer_API"].update(reserve_config)
+    if route_retries is not None:
+        sections["Writer_API"]["transport_retries"] = route_retries
+    service.settings = replace(service.settings, sections=sections)
     holder["service"] = service
     monkeypatch.setattr(service, "_system_prompt", lambda: system_prompt["value"])
     original_preflight = service._preflight_provider_request_inventory
@@ -421,9 +436,12 @@ def test_verified_replay_is_inventory_zero_call_and_writer_only_runs_for_missing
 
     service.writer = resume_writer
     resumed_packets = [dict(packet) for packet in packets]
-    resumed_packets[1]["planned_claims"] = [
-        "The revised second-section claim changes only its request."
-    ]
+    revised_claim = "The revised second-section claim changes only its request."
+    resumed_packets[1]["planned_claims"] = [revised_claim]
+    claim_support = resumed_packets[1].get("claim_support")
+    assert isinstance(claim_support, list) and len(claim_support) == 1
+    assert isinstance(claim_support[0], dict)
+    claim_support[0]["claim"] = revised_claim
     _run(service, outline, resumed_packets)
     assert service.closure_epoch_id != first_epoch
 

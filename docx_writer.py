@@ -20,6 +20,21 @@ from services.citation_ref_catalog import LEGAL_CITE_REF_TOKEN_PATTERN, extract_
 from services.citation_style import CitationStyleEngine, ReferenceSegment, normalize_creators
 
 
+_WRITER_TABLE_SCHEMA_VERSION = "writer_table_layout/v1"
+_WRITER_TABLE_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}\Z")
+_WRITER_TABLE_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_WRITER_TABLE_STATIC_LABEL_FORBIDDEN = re.compile(r"[0-9０-９.!?。！？\r\n]")
+_WRITER_TABLE_CITATION_TOKEN = re.compile(r"\[\[cite_ref:[^\]]+\]\]")
+_WRITER_TABLE_SOURCE_CONTEXT_FIELDS = (
+    "source_claim_ids",
+    "evidence_ids",
+    "source_field_ids",
+    "qualifier_source_claim_ids",
+    "qualifier_evidence_ids",
+    "qualifier_source_field_ids",
+)
+
+
 def _log(logger: Any, level: str, message: str) -> None:
     method = getattr(logger, level, None) or getattr(logger, "info", None)
     if callable(method):
@@ -279,6 +294,227 @@ def _parse_pipe_table(text: str) -> tuple[list[str], list[str], list[list[str]]]
     return (header, alignments, body) if body else None
 
 
+def _has_native_writer_table_fields(block: Mapping[str, Any]) -> bool:
+    return "table_layout_schema_version" in block or any(
+        field in block
+        for field in ("table_id", "headers", "rows")
+    )
+
+
+def _validate_native_writer_table_block(
+    block: Mapping[str, Any],
+) -> tuple[list[str], list[list[Mapping[str, Any]]]]:
+    """Validate the projected Writer table contract before creating DOCX XML."""
+
+    if str(block.get("block_kind") or "").casefold() != "table":
+        raise ValueError("native Writer table must have block_kind='table'")
+    if block.get("table_layout_schema_version") != _WRITER_TABLE_SCHEMA_VERSION:
+        raise ValueError("native Writer table has an unsupported layout schema version")
+    if "text" in block and block["text"] != "":
+        raise ValueError("native Writer table must not carry parent text")
+
+    for field in ("block_id", "table_id"):
+        value = block.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"native Writer table is missing {field}")
+    table_block_id = str(block["block_id"])
+    table_id = str(block["table_id"])
+    if not _WRITER_TABLE_IDENTIFIER.fullmatch(table_id):
+        raise ValueError("native Writer table has an invalid table_id")
+    basis_hash = block.get("writer_task_basis_hash")
+    if not isinstance(basis_hash, str) or not _WRITER_TABLE_SHA256.fullmatch(basis_hash):
+        raise ValueError("native Writer table has an invalid writer_task_basis_hash")
+
+    headers = block.get("headers")
+    if (
+        not isinstance(headers, list)
+        or not headers
+        or len(headers) > 16
+        or any(
+            not isinstance(header, str)
+            or not header.strip()
+            or header != header.strip()
+            or len(header) > 80
+            or _WRITER_TABLE_STATIC_LABEL_FORBIDDEN.search(header)
+            or _WRITER_TABLE_CITATION_TOKEN.search(header)
+            for header in headers
+        )
+        or len(headers) != len(set(headers))
+    ):
+        raise ValueError("native Writer table has malformed or duplicate headers")
+
+    rows = block.get("rows")
+    if not isinstance(rows, list) or not rows or len(rows) > 512:
+        raise ValueError("native Writer table has malformed or unbounded rows")
+
+    row_ids: set[str] = set()
+    cell_ids: set[str] = set()
+    cell_block_ids: set[str] = set()
+    factual_unit_ids: set[tuple[str, str]] = set()
+    validated_rows: list[list[Mapping[str, Any]]] = []
+    total_cells = len(headers)
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise ValueError("native Writer table contains a malformed row")
+        row_id = row.get("row_id")
+        cells = row.get("cells")
+        if (
+            not isinstance(row_id, str)
+            or not _WRITER_TABLE_IDENTIFIER.fullmatch(row_id)
+            or row_id in row_ids
+            or not isinstance(cells, list)
+            or len(cells) != len(headers)
+        ):
+            raise ValueError("native Writer table row has an invalid identity or dimensions")
+        row_ids.add(row_id)
+        total_cells += len(cells)
+        if total_cells > 4096:
+            raise ValueError("native Writer table exceeds the fixed cell limit")
+
+        validated_cells: list[Mapping[str, Any]] = []
+        for cell in cells:
+            if not isinstance(cell, Mapping):
+                raise ValueError("native Writer table contains a malformed cell")
+            cell_id = cell.get("cell_id")
+            cell_block_id = cell.get("block_id")
+            text = cell.get("text")
+            cell_kind = cell.get("cell_kind")
+            if (
+                not isinstance(cell_id, str)
+                or not cell_id.strip()
+                or cell_id in cell_ids
+                or not isinstance(cell_block_id, str)
+                or not cell_block_id.strip()
+                or cell_block_id == table_block_id
+                or cell_block_id in cell_block_ids
+                or not isinstance(text, str)
+                or not text.strip()
+            ):
+                raise ValueError("native Writer table cell is missing a unique identity or text")
+            cell_ids.add(cell_id)
+            cell_block_ids.add(cell_block_id)
+
+            if cell_kind == "static_label":
+                if (
+                    cell.get("source_validation_status")
+                    != "caller_allowlisted_nonfactual_label"
+                    or len(text) > 80
+                    or text != text.strip()
+                    or _WRITER_TABLE_STATIC_LABEL_FORBIDDEN.search(text)
+                    or _WRITER_TABLE_CITATION_TOKEN.search(text)
+                    or any(
+                        field in cell
+                        for field in (
+                            "writer_task_id",
+                            "writer_output_unit_id",
+                            "writer_task_basis_hash",
+                            "allowed_ref_ids",
+                            "required_source_context",
+                        )
+                    )
+                ):
+                    raise ValueError("native Writer table static label is not a valid nonfactual label")
+            elif cell_kind == "factual_output_unit":
+                task_id = cell.get("writer_task_id")
+                unit_id = cell.get("writer_output_unit_id")
+                cell_basis_hash = cell.get("writer_task_basis_hash")
+                allowed_ref_ids = cell.get("allowed_ref_ids")
+                source_context = cell.get("required_source_context")
+                if (
+                    not isinstance(task_id, str)
+                    or not _WRITER_TABLE_IDENTIFIER.fullmatch(task_id)
+                    or not isinstance(unit_id, str)
+                    or not _WRITER_TABLE_IDENTIFIER.fullmatch(unit_id)
+                    or cell_basis_hash != basis_hash
+                    or cell.get("source_validation_status")
+                    != "canonical_source_inventory_verified"
+                    or not isinstance(allowed_ref_ids, list)
+                    or not allowed_ref_ids
+                    or any(not isinstance(ref_id, str) or not ref_id.strip() for ref_id in allowed_ref_ids)
+                    or len(allowed_ref_ids) != len(set(allowed_ref_ids))
+                    or not isinstance(source_context, Mapping)
+                    or any(
+                        not isinstance(source_context.get(field), list)
+                        or any(
+                            not isinstance(value, str) or not value.strip()
+                            for value in source_context[field]
+                        )
+                        for field in _WRITER_TABLE_SOURCE_CONTEXT_FIELDS
+                    )
+                ):
+                    raise ValueError("native Writer table factual cell has incomplete source bindings")
+                unit_key = (task_id, unit_id)
+                if unit_key in factual_unit_ids:
+                    raise ValueError("native Writer table repeats a factual output unit")
+                factual_unit_ids.add(unit_key)
+                used_ref_ids: set[str] = set()
+                for token in _WRITER_TABLE_CITATION_TOKEN.findall(text):
+                    ref_ids = extract_ref_ids_from_token(token)
+                    if not ref_ids:
+                        raise ValueError("native Writer table factual cell has a malformed citation")
+                    used_ref_ids.update(ref_ids)
+                if not used_ref_ids or used_ref_ids - set(allowed_ref_ids):
+                    raise ValueError("native Writer table factual cell has missing or foreign citations")
+                if len(text) > 4096 or _parse_pipe_table(text) is not None:
+                    raise ValueError("native Writer table factual cell exceeds its text contract")
+            else:
+                raise ValueError("native Writer table cell has an unsupported cell_kind")
+            validated_cells.append(cell)
+        validated_rows.append(validated_cells)
+
+    return headers, validated_rows
+
+
+def _append_native_writer_table(
+    doc: Any,
+    headers: list[str],
+    rows: list[list[Mapping[str, Any]]],
+    *,
+    generator_instance: Any,
+    citation_manifest: Mapping[str, Any],
+    section_number: int,
+) -> None:
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    table = doc.add_table(rows=1, cols=len(headers))
+    table.style = "Table Grid"
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    table.autofit = True
+    header_row = table.rows[0]
+    header_row_properties = header_row._tr.get_or_add_trPr()
+    repeat_header = OxmlElement("w:tblHeader")
+    repeat_header.set(qn("w:val"), "true")
+    header_row_properties.append(repeat_header)
+
+    for cell, text in zip(header_row.cells, headers, strict=True):
+        paragraph = cell.paragraphs[0]
+        paragraph.paragraph_format.space_after = Pt(0)
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        paragraph.add_run(text).bold = True
+
+    for row in rows:
+        word_cells = table.add_row().cells
+        for word_cell, cell in zip(word_cells, row, strict=True):
+            text = str(cell["text"])
+            if cell["cell_kind"] == "factual_output_unit":
+                text, unresolved = render_structured_citations(
+                    text,
+                    generator_instance,
+                    citation_manifest,
+                    section_number=section_number,
+                    block_id=str(cell["block_id"]),
+                )
+                if unresolved:
+                    raise ValueError(
+                        "unresolved native table citation references: "
+                        + ", ".join(sorted(set(unresolved)))
+                    )
+            paragraph = word_cell.paragraphs[0]
+            paragraph.paragraph_format.space_after = Pt(0)
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            paragraph.add_run(text)
+
+
 def _append_pipe_table(
     doc: Any,
     table_data: tuple[list[str], list[str], list[list[str]]],
@@ -352,9 +588,21 @@ def append_review_section_blocks_to_word_document(
         for block in blocks:
             if not isinstance(block, Mapping):
                 raise ValueError("review block must be an object")
+            native_table_data = None
+            if _has_native_writer_table_fields(block):
+                native_table_data = _validate_native_writer_table_block(block)
             text = str(block.get("text") or "").strip()
             block_id = str(block.get("block_id") or "")
             block_kind = str(block.get("block_kind") or "paragraph").casefold()
+            if native_table_data is not None:
+                _append_native_writer_table(
+                    doc,
+                    *native_table_data,
+                    generator_instance=generator_instance,
+                    citation_manifest=citation_manifest,
+                    section_number=section_number,
+                )
+                continue
             if not text:
                 if block_kind in {"table", "markdown_table"}:
                     raise ValueError(
@@ -758,9 +1006,22 @@ def rebuild_review_docx_from_structured_artifacts(
     output_path: str,
 ) -> None:
     output = Path(output_path)
+    sections = review_draft.get("content", {}).get("sections", [])
+    for section in sections:
+        if not isinstance(section, Mapping):
+            continue
+        for block in section.get("blocks") or []:
+            if not isinstance(block, Mapping):
+                continue
+            block_kind = str(block.get("block_kind") or "paragraph").casefold()
+            if _has_native_writer_table_fields(block) or (
+                block_kind in {"table", "markdown_table"}
+                and not str(block.get("text") or "").strip()
+            ):
+                _validate_native_writer_table_block(block)
     if output.exists():
         output.unlink()
-    for section in review_draft.get("content", {}).get("sections", []):
+    for section in sections:
         blocks = section.get("blocks") or []
         has_table_block = any(
             isinstance(block, Mapping)

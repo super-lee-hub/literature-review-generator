@@ -12,6 +12,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence
 
+from services.review_draft import find_review_text_block
 from validation.repair_models import (
     DependencyHashBundle,
     PatchGranularity,
@@ -147,23 +148,14 @@ def _find_block_for_citation(
     Uses v3 priority: target_claim_unit.block_id → block_ids[0] →
     details.target_claim_unit.block_id → legacy details.block_id → text fallback.
     """
-    sections = review_draft.get("content", {}).get("sections", [])
-
-    # Resolve target block ID via priority order
     target_block_id = _resolve_target_block_id(citation)
-
-    if target_block_id:
-        for section in sections:
-            for block in section.get("blocks", []):
-                if block.get("block_id") == target_block_id:
-                    return block
-
-    for section in sections:
-        for block in section.get("blocks", []):
-            if block.get("block_id") == target_block_id:
-                return block
-
-    return None
+    if not target_block_id:
+        return None
+    try:
+        return find_review_text_block(review_draft, target_block_id)
+    except (KeyError, TypeError, ValueError):
+        # Malformed tables and ambiguous identities are not repair targets.
+        return None
 
 
 def _create_patch_proposal(

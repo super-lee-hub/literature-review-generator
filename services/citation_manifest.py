@@ -15,6 +15,7 @@ from services.citation_style import CitationStyleEngine
 from services.citation_ref_catalog import extract_ref_ids_from_token, resolve_ref_id
 from services.job_workspace import utc_now_iso
 from services.sentence_segmenter import segment_sentences
+from services.review_draft import iter_review_text_blocks, validate_review_section_writer_scope
 
 
 DEFAULT_RENDER_POLICY: Dict[str, str] = {
@@ -608,7 +609,7 @@ def _build_citation_set_bundles(
     for section in sections:
         section_number = int(section.get("section_number") or 0)
         section_title = str(section.get("section_title") or "")
-        for block in section.get("blocks", []):
+        for block in validate_review_section_writer_scope(section):
             block_id = str(block.get("block_id") or "")
             block_text = str(block.get("text") or "")
             block_occurrences = occurrences_by_block.get(block_id, [])
@@ -708,6 +709,11 @@ def _build_citation_set_bundles(
                                 writer_binding=writer_binding,
                             )
                         )
+                        if writer_binding:
+                            unit = aggregate["claim_units"][-1]
+                            for field_name in ("required_source_context", "table_id", "row_id", "cell_id"):
+                                if field_name in block:
+                                    unit[field_name] = block[field_name]
                 for occurrence in sentence_occurrences:
                     if occurrence.citation_token not in aggregate["citation_tokens"]:
                         aggregate["citation_tokens"].append(occurrence.citation_token)
@@ -841,7 +847,7 @@ def build_citation_manifest_from_review_draft(
     for section in sections:
         section_number = int(section.get("section_number") or 0)
         section_title = str(section.get("section_title") or "")
-        for block in section.get("blocks", []):
+        for block in iter_review_text_blocks(section):
             block_id = str(block.get("block_id") or f"s{section_number}_b0")
             block_order = int(block.get("block_order") or 0)
             block_text = str(block.get("text") or "")

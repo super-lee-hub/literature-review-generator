@@ -10,7 +10,13 @@ import pytest
 import requests
 
 import ai_interface
-from runtime.provider_runtime import hash_json
+from runtime import provider_runtime
+from runtime.provider_runtime import (
+    ProviderAggregateBudgetV2,
+    ProviderBudgetController,
+    ProviderBudgetExceeded,
+    hash_json,
+)
 from services.artifact_registry import ArtifactRegistry
 from services.job_workspace import JobWorkspace
 from services.settings import ApplicationSettings
@@ -126,6 +132,30 @@ def _bind_fixture_reuse_miss(service: ValidationExecutionService, monkeypatch) -
     monkeypatch.setattr(current_validation, "_apply_adjudication", lambda item, _report: item)
 
 
+def _bind_aggregate_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    calls: int,
+    output_tokens: int,
+    retries: int,
+    wall_seconds: float = 120.0,
+) -> ProviderBudgetController:
+    controller = ProviderBudgetController(
+        ProviderAggregateBudgetV2(
+            max_provider_calls_total=calls,
+            max_output_tokens_total=output_tokens,
+            max_retry_attempts_total=retries,
+            max_wall_seconds=wall_seconds,
+        )
+    )
+    monkeypatch.setattr(
+        provider_runtime,
+        "provider_budget_controller_from_environment",
+        lambda: controller,
+    )
+    return controller
+
+
 def test_validator_pretransport_inventory_binds_only_eligible_requests_before_call(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -197,19 +227,172 @@ def test_validator_pretransport_inventory_binds_only_eligible_requests_before_ca
     assert "local-fixture-only" not in encoded
 
 
+def test_validator_scope_budget_blocks_before_first_transport_when_one_call_is_short(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = _service(tmp_path, validation_retry_limit=0)
+    _bind_fixture_reuse_miss(service, monkeypatch)
+    controller = _bind_aggregate_budget(
+        monkeypatch, calls=1, output_tokens=2_048, retries=0
+    )
+    eligible = [
+        _citation_result("set-a", "paper-a", "Claim A."),
+        _citation_result("set-b", "paper-b", "Claim B."),
+    ]
+    dispatched: list[str] = []
+
+    def fake_run_adjudication_stage(
+        _service: Any, _api_config: Mapping[str, Any], packet: Any
+    ) -> Mapping[str, Any] | None:
+        try:
+            reservation = controller.admit(
+                requested_output_tokens=1_024,
+                requested_retry_attempts=0,
+                context={"call_id": current_validation.adjudication_call_id(packet)},
+            )
+        except ProviderBudgetExceeded:
+            return None
+        dispatched.append(current_validation.adjudication_call_id(packet))
+        controller.complete(
+            reservation,
+            {"status": "success", "attempts": 1, "output_tokens": 1_024},
+        )
+        return {"status": "supported", "confidence": 0.99}
+
+    monkeypatch.setattr(
+        current_validation,
+        "run_adjudication_stage",
+        fake_run_adjudication_stage,
+    )
+
+    with pytest.raises(ProviderBudgetExceeded, match="Validator stage preflight"):
+        current_validation._adjudicate(service, eligible, scope="primary_validation")
+
+    assert dispatched == []
+    inventory = service._validator_stage_pretransport_inventory
+    assert inventory["request_count"] == 2
+    assert inventory["aggregate_preflight"]["status"] == "blocked_budget"
+    assert inventory["aggregate_preflight"]["budget_status"]["provider_calls"] == "exceeded"
+    snapshot = controller.snapshot()
+    assert snapshot["calls_used"] == 0
+    assert snapshot["calls_reserved"] == 0
+
+
+def test_validator_scope_budget_admits_exact_materialized_call_and_output_bounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = _service(tmp_path, validation_retry_limit=0)
+    _bind_fixture_reuse_miss(service, monkeypatch)
+    controller = _bind_aggregate_budget(
+        monkeypatch, calls=2, output_tokens=2_048, retries=0
+    )
+    eligible = [
+        _citation_result("set-a", "paper-a", "Claim A."),
+        _citation_result("set-b", "paper-b", "Claim B."),
+    ]
+    dispatched: list[str] = []
+
+    def fake_run_adjudication_stage(
+        _service: Any, _api_config: Mapping[str, Any], packet: Any
+    ) -> Mapping[str, Any]:
+        reservation = controller.admit(
+            requested_output_tokens=1_024,
+            requested_retry_attempts=0,
+            context={"call_id": current_validation.adjudication_call_id(packet)},
+        )
+        dispatched.append(current_validation.adjudication_call_id(packet))
+        controller.complete(
+            reservation,
+            {"status": "success", "attempts": 1, "output_tokens": 1_024},
+        )
+        return {"status": "supported", "confidence": 0.99}
+
+    monkeypatch.setattr(
+        current_validation,
+        "run_adjudication_stage",
+        fake_run_adjudication_stage,
+    )
+
+    current_validation._adjudicate(service, eligible, scope="primary_validation")
+
+    inventory = service._validator_stage_pretransport_inventory
+    assert len(dispatched) == 2
+    assert inventory["aggregate_preflight"]["status"] == "within_budget"
+    assert inventory["aggregate_preflight"]["totals"]["logical_calls_upper_bound"] == 2
+    assert inventory["aggregate_preflight"]["totals"]["estimated_output_tokens_all_attempts"] == 2_048
+    snapshot = controller.snapshot()
+    assert snapshot["calls_used"] == 2
+    assert snapshot["output_tokens_used"] == 2_048
+
+
+def test_validator_scope_projection_caps_retries_across_materialized_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = _service(tmp_path, validation_retry_limit=1)
+    _bind_fixture_reuse_miss(service, monkeypatch)
+    controller = _bind_aggregate_budget(
+        monkeypatch, calls=3, output_tokens=3_072, retries=1
+    )
+    eligible = [
+        _citation_result("set-a", "paper-a", "Claim A."),
+        _citation_result("set-b", "paper-b", "Claim B."),
+    ]
+    dispatched: list[str] = []
+
+    def fake_run_adjudication_stage(
+        _service: Any, _api_config: Mapping[str, Any], packet: Any
+    ) -> Mapping[str, Any]:
+        reservation = controller.admit(
+            requested_output_tokens=2_048,
+            requested_retry_attempts=1,
+            context={"call_id": current_validation.adjudication_call_id(packet)},
+        )
+        dispatched.append(current_validation.adjudication_call_id(packet))
+        controller.complete(
+            reservation,
+            {"status": "success", "attempts": 1, "output_tokens": 1_024},
+        )
+        return {"status": "supported", "confidence": 0.99}
+
+    monkeypatch.setattr(
+        current_validation,
+        "run_adjudication_stage",
+        fake_run_adjudication_stage,
+    )
+
+    current_validation._adjudicate(service, eligible, scope="primary_validation")
+
+    totals = service._validator_stage_pretransport_inventory["aggregate_preflight"]["totals"]
+    assert len(dispatched) == 2
+    assert totals["logical_calls_upper_bound"] == 2
+    assert totals["retry_attempts_configured_upper_bound"] == 2
+    assert totals["retry_attempts_possible_upper_bound"] == 1
+    assert totals["physical_attempts_upper_bound"] == 3
+    assert totals["estimated_output_tokens_all_attempts"] == 3_072
+
+
 def test_verified_adjudication_reuse_stays_transport_free_in_inventory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     service = _service(tmp_path)
     result = _citation_result("set-reused", "paper-reused", "Reused claim.")
+    _bind_aggregate_budget(monkeypatch, calls=0, output_tokens=0, retries=0, wall_seconds=0)
     reuse_path = tmp_path / "reuse.json"
     reuse_path.write_text(
-        json.dumps({"provider_output_artifact_id": "provider-output-fixture"}),
+        json.dumps(
+            {
+                "provider_output_artifact_id": "provider-output-fixture",
+                "provider_output_artifact_hash": "o" * 64,
+                "source_receipt_hash": "r" * 64,
+            }
+        ),
         encoding="utf-8",
     )
-    reuse_record = SimpleNamespace(path=str(reuse_path), artifact_id="reuse-fixture")
+    reuse_record = SimpleNamespace(
+        path=str(reuse_path), artifact_id="reuse-fixture", content_hash="a" * 64
+    )
     output_record = SimpleNamespace(
-        status="ready", artifact_id="provider-output-fixture"
+        status="ready", artifact_id="provider-output-fixture", content_hash="o" * 64
     )
     monkeypatch.setattr(
         service,
@@ -246,6 +429,9 @@ def test_verified_adjudication_reuse_stays_transport_free_in_inventory(
     assert inventory["physical_attempts_upper_bound"] == 2
     assert inventory["verified_reuse_count"] == 1
     assert inventory["transport_call_candidate_count"] == 0
+    assert inventory["aggregate_preflight"]["status"] == "within_budget"
+    assert inventory["aggregate_preflight"]["totals"]["logical_calls_upper_bound"] == 0
+    assert inventory["aggregate_preflight"]["totals"]["physical_attempts_upper_bound"] == 0
     assert inventory["outcomes"] == [
         {"call_id": inventory["requests"][0]["call_id"], "status": "verified_reuse"}
     ]

@@ -76,6 +76,7 @@ from services.stage1_output_budget import (
     stage1_semantic_retry_max_attempts,
 )
 from services.stage1_reuse import (
+    Stage1TypedManifestAuthorityV2,
     STAGE1_REUSE_POLICY,
     Stage1ReusableSummaryBindingV1,
     Stage1ReusableSummaryManifestV1,
@@ -4540,6 +4541,7 @@ class Stage1AnalysisService:
         typed_authority, typed_authority_reason = verify_stage1_typed_manifest_authority(
             previous,
             prior_binding,
+            external_registry_resolver=self.external_registry_resolver,
         )
         typed_authority_requested = (
             isinstance(prior_reuse_metadata, Mapping)
@@ -4576,6 +4578,7 @@ class Stage1AnalysisService:
         portable_manifest_record: ArtifactRecord | None = None
         portable_closure_record: ArtifactRecord | None = None
         portable_ledger_record: ArtifactRecord | None = None
+        owner_correction_records: dict[str, ArtifactRecord] = {}
         authority_kind = "parent_registry"
 
         if typed_authority is not None:
@@ -4628,6 +4631,32 @@ class Stage1AnalysisService:
                 runtime_dependency,
                 ArtifactDependencyRefV2.from_record(portable_source_record),
             ]
+            if isinstance(typed_authority, Stage1TypedManifestAuthorityV2):
+                authority_refs = typed_authority.manifest.owner_correction_authority
+                for label, ref_name, source_path in (
+                    ("origin_source", "origin_source", typed_authority.owner_correction_origin_source_path),
+                    ("prior_manifest", "origin_prior_manifest", typed_authority.owner_correction_prior_manifest_path),
+                    ("derived_summary_set", "derived_summary_set", typed_authority.owner_correction_derived_summary_path),
+                    ("adoption_receipt", "adoption_receipt", typed_authority.owner_correction_receipt_path),
+                ):
+                    original_ref = authority_refs[ref_name]
+                    if not isinstance(original_ref, Mapping):
+                        raise RuntimeError("owner correction authority reference is malformed")
+                    proof_record = self._publish_portable_authority_record(
+                        source_path=source_path,
+                        expected_hash=str(original_ref["content_hash"]),
+                        portable_kind=f"owner_correction_{label}",
+                        source_authority_job_id=str(original_ref["job_id"]),
+                        original_artifact_id=str(original_ref["artifact_id"]),
+                        dependencies=(runtime_dependency, *(
+                            ArtifactDependencyRefV2.from_record(item)
+                            for item in owner_correction_records.values()
+                        )),
+                        typed_manifest_artifact_id=typed_authority.manifest_artifact_id,
+                        typed_manifest_artifact_hash=typed_authority.manifest_file_hash,
+                    )
+                    owner_correction_records[label] = proof_record
+                    manifest_dependencies.append(ArtifactDependencyRefV2.from_record(proof_record))
             for portable_record in (
                 portable_closure_record,
                 portable_ledger_record,
@@ -4996,6 +5025,16 @@ class Stage1AnalysisService:
             "created_at": utc_now_iso(),
         }
         evidence["content_hash"] = hash_json(evidence)
+        if owner_correction_records:
+            if not isinstance(typed_authority, Stage1TypedManifestAuthorityV2):
+                raise RuntimeError("owner correction proof records have no verified V2 authority")
+            evidence.pop("content_hash")
+            evidence["owner_correction_authority"] = dict(typed_authority.manifest.owner_correction_authority)
+            evidence["portable_owner_correction_records"] = {
+                label: {"artifact_id": item.artifact_id, "content_hash": item.content_hash}
+                for label, item in owner_correction_records.items()
+            }
+            evidence["content_hash"] = hash_json(evidence)
         digest = str(evidence["content_hash"])[:24]
         path = self.workspace.artifact_path(f"stage1/reuse_records/{digest}.json")
         dependencies: list[ArtifactDependencyRefV2] = []
@@ -5008,6 +5047,7 @@ class Stage1AnalysisService:
             source_ledger,
             source_authority_record,
             source_authority_manifest,
+            *owner_correction_records.values(),
         ):
             if dependency_record is None or dependency_record.status != "ready":
                 continue

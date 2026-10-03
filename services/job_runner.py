@@ -125,7 +125,8 @@ def _typed_reuse_manifest_mode(paths: Sequence[str]) -> bool:
     """Return whether an explicit reuse source starts the typed-manifest path.
 
     Legacy summary files remain supported when PDF-backed reuse is requested;
-    only the portable ``stage1_reusable_summary_manifest/v1`` contract is
+    only the portable ``stage1_reusable_summary_manifest/v1`` and explicit
+    owner-corrected ``v2`` contracts are
     allowed to take the zero-preprocessing fast path.
     """
 
@@ -135,7 +136,7 @@ def _typed_reuse_manifest_mode(paths: Sequence[str]) -> bool:
         payload = json.loads(Path(paths[0]).expanduser().read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
         return False
-    return isinstance(payload, Mapping) and payload.get("artifact_type") == "stage1_reusable_summary_manifest" and payload.get("artifact_version") == "v1"
+    return isinstance(payload, Mapping) and payload.get("artifact_type") == "stage1_reusable_summary_manifest" and payload.get("artifact_version") in {"v1", "v2"}
 
 
 def build_job_request_from_mapping(params: Mapping[str, Any]) -> JobRunRequest:

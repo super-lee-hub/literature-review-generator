@@ -692,12 +692,62 @@ class ReviewValidator:
         return _build_review_validation_report(citation_results)
 
     def _get_block_from_review_draft(self, block_id: str) -> Optional[Dict[str, Any]]:
-        sections = self.review_draft.get("content", {}).get("sections", [])
+        from services.review_draft import find_review_text_block
+
+        return find_review_text_block(self.review_draft, block_id)
+
+    def _get_review_text_block_context(self, block_id: str) -> Optional[Dict[str, Any]]:
+        from services.review_draft import iter_review_text_blocks
+
+        content = self.review_draft.get("content")
+        sections = content.get("sections", []) if isinstance(content, dict) else []
+        if not isinstance(sections, list):
+            return None
+        matches: List[Dict[str, Any]] = []
         for section in sections:
-            for block in section.get("blocks", []):
-                if block.get("block_id") == block_id:
-                    return block
-        return None
+            if not isinstance(section, dict):
+                continue
+            matches.extend(
+                dict(block)
+                for block in iter_review_text_blocks(section)
+                if str(block.get("block_id") or "").strip() == block_id
+            )
+        if len(matches) > 1:
+            raise ValueError(f"Review text block identity is duplicated: {block_id}")
+        return matches[0] if matches else None
+
+    def _attach_review_text_context(self, claim_units: List[Dict[str, Any]]) -> None:
+        for unit in claim_units:
+            block_id = str(unit.get("block_id") or "").strip()
+            if not block_id:
+                continue
+            block = self._get_block_from_review_draft(block_id)
+            context = self._get_review_text_block_context(block_id)
+            if block is None or context is None:
+                continue
+            block_text = str(block.get("text") or "")
+            if context.get("table_id"):
+                start, end = unit.get("span_start"), unit.get("span_end")
+                raw_text = unit.get("raw_text")
+                expected_anchor = hashlib.sha256(block_text.encode("utf-8")).hexdigest()[:8]
+                if (
+                    isinstance(start, bool)
+                    or not isinstance(start, int)
+                    or isinstance(end, bool)
+                    or not isinstance(end, int)
+                    or not 0 <= start < end <= len(block_text)
+                    or raw_text != block_text[start:end]
+                    or unit.get("block_anchor_hash") != expected_anchor
+                    or str(unit.get("claim_text") or "").strip() != _strip_citation_tokens(block_text[start:end])
+                ):
+                    raise ValueError(f"Native table claim unit has a stale cell-local span: {block_id}")
+                for field_name in ("table_id", "row_id", "cell_id"):
+                    expected = context.get(field_name)
+                    if expected and unit.get(field_name) not in (None, expected):
+                        raise ValueError(f"Native table claim unit has stale {field_name}: {block_id}")
+                    if expected:
+                        unit[field_name] = expected
+            unit["block_context"] = block_text
 
     def _get_occurrences_from_manifest(self) -> List[Dict[str, Any]]:
         occurrences = self.citation_manifest.get("occurrences", [])
@@ -753,6 +803,7 @@ class ReviewValidator:
     def _build_claim_units_for_bundle(self, bundle: Dict[str, Any]) -> List[Dict[str, Any]]:
         claim_units = [dict(item) for item in bundle.get("claim_units", []) if isinstance(item, dict)]
         if claim_units:
+            self._attach_review_text_context(claim_units)
             return claim_units
 
         claim_texts = [str(item).strip() for item in bundle.get("claim_texts", []) if str(item).strip()]
@@ -797,6 +848,7 @@ class ReviewValidator:
                 )
 
         if claim_units:
+            self._attach_review_text_context(claim_units)
             return claim_units
 
         for claim_index, claim_text in enumerate(claim_texts, start=1):
@@ -813,6 +865,7 @@ class ReviewValidator:
                     claim_unit_id=f"{bundle.get('citation_set_key', 'unknown')}:{claim_index}",
                 )
             )
+        self._attach_review_text_context(claim_units)
         return claim_units
 
     def _resolver_context_for_paper(self, paper_id: str, paper_artifact: Dict[str, Any]) -> EvidenceResolverContext:
@@ -893,6 +946,13 @@ class ReviewValidator:
         claim_texts = [str(item).strip() for item in bundle.get("claim_texts", []) if str(item).strip()]
         claim_context = "; ".join(str(item).strip() for item in bundle.get("section_titles", []) if str(item).strip())
         claim_units = self._build_claim_units_for_bundle(bundle)
+        table_contexts = list(dict.fromkeys(
+            f"table {unit['table_id']} row {unit['row_id']} cell {unit['cell_id']}"
+            for unit in claim_units
+            if all(str(unit.get(name) or "").strip() for name in ("table_id", "row_id", "cell_id"))
+        ))
+        if table_contexts:
+            claim_context = "; ".join(filter(None, (claim_context, *table_contexts)))
         used_block_text = False
         claim_text = "\n".join(claim_texts or [item.get("claim_text", "") for item in claim_units]).strip()
         claim_type, claim_type_confidence, claim_type_rationale = _classify_claim_type(
@@ -1189,6 +1249,12 @@ class ReviewValidator:
         target_block_id = str(target_claim_unit.get("block_id") or (block_ids[0] if block_ids else "")).strip()
         target_block = self._get_block_from_review_draft(target_block_id) if target_block_id else None
         block_context = str(target_block.get("text") or "").strip() if target_block else ""
+        target_block_projection = self._get_review_text_block_context(target_block_id) if target_block_id else None
+        target_table_context = {
+            name: str(target_block_projection.get(name) or "")
+            for name in ("table_id", "row_id", "cell_id")
+            if target_block_projection is not None and target_block_projection.get(name)
+        }
         details: Dict[str, Any] = {
             "citation_set_key": citation_set_key,
             "paper_ids": paper_ids,
@@ -1208,6 +1274,8 @@ class ReviewValidator:
             "missing_papers": missing_papers,
             "used_block_text": used_block_text,
             "block_context": block_context,
+            "table_contexts": table_contexts,
+            "target_table_context": target_table_context,
             "claim_type": claim_type,
             "claim_type_confidence": claim_type_confidence,
             "claim_type_rationale": claim_type_rationale,

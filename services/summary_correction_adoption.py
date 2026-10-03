@@ -817,11 +817,9 @@ def verify_source_summary_correction_adoption(
         str(source_registry_identity.get("job_id") or "") == source_registry.job_id
         and str(source_registry_identity.get("registry_path") or "")
         == str(Path(source_registry.registry_path).resolve())
-        and str(source_registry_identity.get("registry_file_sha256") or "")
-        == file_sha256(source_registry.registry_path)
-        and str(source_registry_identity.get("registry_revision") or "")
-        == str(source_registry.revision),
-        "adoption receipt source Registry snapshot is stale",
+        and _SHA256_RE.fullmatch(str(source_registry_identity.get("registry_file_sha256") or "")) is not None
+        and bool(str(source_registry_identity.get("registry_revision") or "")),
+        "adoption receipt source Registry identity or original fence is invalid",
     )
 
     normalized_candidate_hash = str(owner_action.get("expected_candidate_sha256") or "")

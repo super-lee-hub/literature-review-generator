@@ -136,15 +136,59 @@ def _iter_blocks(review_draft: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     sections = content.get("sections")
     if not isinstance(sections, list):
         return []
+    from services.review_draft import iter_review_text_blocks
+
     blocks: list[Mapping[str, Any]] = []
     for section in sections:
         if not isinstance(section, Mapping):
             continue
-        raw_blocks = section.get("blocks")
-        if not isinstance(raw_blocks, list):
+        try:
+            blocks.extend(iter_review_text_blocks(section))
+        except (AttributeError, KeyError, TypeError, ValueError):
             continue
-        blocks.extend(item for item in raw_blocks if isinstance(item, Mapping))
     return blocks
+
+
+def _review_section_scope_issues(review_draft: Mapping[str, Any]) -> list[str]:
+    content = review_draft.get("content")
+    sections = content.get("sections") if isinstance(content, Mapping) else None
+    if not isinstance(sections, list):
+        return []
+    from services.review_draft import validate_review_section_writer_scope
+
+    issues: list[str] = []
+    for index, section in enumerate(sections, start=1):
+        if not isinstance(section, Mapping):
+            issues.append(f"review_section_writer_scope_invalid:{index}")
+            continue
+        try:
+            validate_review_section_writer_scope(section)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            issues.append(f"review_section_writer_scope_invalid:{index}")
+    return issues
+
+
+def _native_citation_span_matches(block_text: str, occurrence: Mapping[str, Any]) -> bool:
+    token = occurrence.get("citation_token")
+    spans = occurrence.get("spans")
+    if not isinstance(token, str) or not token or not isinstance(spans, list) or not spans:
+        return False
+    for span in spans:
+        if not isinstance(span, Mapping):
+            return False
+        start, end = span.get("start_offset"), span.get("end_offset")
+        if (
+            isinstance(start, bool)
+            or not isinstance(start, int)
+            or isinstance(end, bool)
+            or not isinstance(end, int)
+            or not 0 <= start < end <= len(block_text)
+        ):
+            return False
+        actual = block_text[start:end]
+        if actual != token or span.get("text") != actual:
+            return False
+    return True
 
 
 def _citation_ref_ids(block: Mapping[str, Any]) -> set[str]:
@@ -567,6 +611,8 @@ def _stage1_typed_manifest_authority_issues(
     manifest_record: ArtifactRecord | None,
     closure_record: ArtifactRecord | None,
     ledger_record: ArtifactRecord | None,
+    registry: ArtifactRegistry | None = None,
+    external_registry_resolver: Callable[[str], ArtifactRegistry | None] | None = None,
 ) -> list[str]:
     """Re-validate portable Stage 1 authority bytes at completion time."""
 
@@ -593,7 +639,7 @@ def _stage1_typed_manifest_authority_issues(
     )
     if (
         manifest_payload.get("artifact_type") != "stage1_reusable_summary_manifest"
-        or manifest_payload.get("artifact_version") != "v1"
+        or manifest_payload.get("artifact_version") not in {"v1", "v2"}
         or str(manifest_payload.get("stage_name") or "") != "stage1_analyze"
         or str(manifest_payload.get("canonical_paper_key") or "") != paper_key
         or not declared_content_hash
@@ -651,6 +697,70 @@ def _stage1_typed_manifest_authority_issues(
         blocking.append(f"provider_closure_reuse_typed_manifest_summary_mismatch:{stage}")
 
     raw_closure = _json_object(closure_record.path) if closure_record is not None else None
+    if manifest_payload.get("artifact_version") == "v2":
+        from services.stage1_reuse import Stage1ReusableSummaryBindingV1, verify_stage1_typed_manifest_authority
+
+        previous_summary = {
+            "paper_info": manifest_payload.get("paper_info"),
+            "ai_summary": manifest_summary,
+            "stage1_reuse": {
+                "authority_kind": "typed_manifest",
+                "typed_manifest_path": manifest_record.path,
+                "typed_manifest_artifact_id": reuse_payload.get("typed_manifest_artifact_id"),
+                "typed_manifest_artifact_hash": manifest_record.content_hash,
+            },
+        }
+        authority, reason = verify_stage1_typed_manifest_authority(
+            previous_summary,
+            Stage1ReusableSummaryBindingV1.from_mapping(manifest_binding),
+            external_registry_resolver=external_registry_resolver,
+        )
+        if authority is None:
+            blocking.append(f"owner_correction_reuse_authority_untrusted:{stage}:{reason}")
+        source_dependency = next((item for item in manifest_record.depends_on if item.artifact_id == source_record.artifact_id), None)
+        if source_dependency is None or not _dependency_ref_matches_record(source_dependency, source_record):
+            blocking.append(f"owner_correction_reuse_source_dependency_invalid:{stage}")
+        owner_refs = manifest_payload.get("owner_correction_authority")
+        portable_refs = reuse_payload.get("portable_owner_correction_records")
+        if (
+            registry is None
+            or not isinstance(owner_refs, Mapping)
+            or not isinstance(portable_refs, Mapping)
+            or reuse_payload.get("owner_correction_authority") != owner_refs
+        ):
+            return [*blocking, f"owner_correction_reuse_dependencies_missing:{stage}"]
+        for label, ref_name in (
+            ("origin_source", "origin_source"), ("prior_manifest", "origin_prior_manifest"),
+            ("derived_summary_set", "derived_summary_set"), ("adoption_receipt", "adoption_receipt"),
+        ):
+            original_ref = owner_refs.get(ref_name)
+            portable_ref = portable_refs.get(label)
+            if not isinstance(original_ref, Mapping) or not isinstance(portable_ref, Mapping):
+                blocking.append(f"owner_correction_reuse_{label}_missing:{stage}")
+                continue
+            identifier = str(portable_ref.get("artifact_id") or "")
+            record = registry.get(identifier)
+            # The manifest itself must retain each local proof dependency.
+            dependency = next((item for item in manifest_record.depends_on if item.artifact_id == identifier), None)
+            metadata = record.metadata if record is not None else {}
+            if (
+                record is None or record.status != "ready" or dependency is None
+                or record.artifact_type != f"stage1_portable_owner_correction_{label}"
+                or record.content_hash != portable_ref.get("content_hash")
+                or record.content_hash != original_ref.get("content_hash")
+                or dependency.content_hash != record.content_hash
+                or metadata.get("original_artifact_id") != original_ref.get("artifact_id")
+                or metadata.get("source_authority_job_id") != original_ref.get("job_id")
+                or metadata.get("typed_manifest_artifact_id") != reuse_payload.get("typed_manifest_artifact_id")
+                or metadata.get("typed_manifest_artifact_hash") != reuse_payload.get("typed_manifest_artifact_hash")
+            ):
+                blocking.append(f"owner_correction_reuse_{label}_binding_invalid:{stage}")
+                continue
+            try:
+                registry.verify_ready_artifact_closure(record, external_registry_resolver=external_registry_resolver)
+            except (RegistryError, OSError, ValueError, TypeError) as exc:
+                blocking.append(f"owner_correction_reuse_{label}_untrusted:{stage}:{exc}")
+        return blocking
     provider_generated = str(manifest_payload.get("source_kind") or "") in {
         "stage1_provider_generated",
         "provider_generated",
@@ -1212,7 +1322,7 @@ def _adjudication_reuse_call_issues(
         issues.append(
             f"provider_closure_adjudication_reuse_authority_invalid:{stage}:{call_id}:{authority_issue}"
         )
-    for field in (
+    for field_name in (
         "call_id",
         "node_id",
         "prompt_hash",
@@ -1220,9 +1330,9 @@ def _adjudication_reuse_call_issues(
         "schema_hash",
         "redacted_provider_config_hash",
     ):
-        if str(expected_call.get(field) or "") != str(payload.get(field) or ""):
+        if str(expected_call.get(field_name) or "") != str(payload.get(field_name) or ""):
             issues.append(
-                f"provider_closure_adjudication_reuse_{field}_mismatch:{stage}:{call_id}"
+                f"provider_closure_adjudication_reuse_{field_name}_mismatch:{stage}:{call_id}"
             )
     output_id = str(payload.get("provider_output_artifact_id") or "")
     output_hash = str(payload.get("provider_output_artifact_hash") or "")
@@ -1321,6 +1431,7 @@ def _provider_closure_entry(
     registry: ArtifactRegistry,
     *,
     current_set: CurrentArtifactSetV1 | None = None,
+    external_registry_resolver: Callable[[str], ArtifactRegistry | None] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Build a stage-indexed, hash-bound closure descriptor."""
 
@@ -1801,10 +1912,7 @@ def _provider_closure_entry(
         reused_papers: list[str] = []
         for reuse_record in reuse_records:
             reuse_payload = _json_object(reuse_record.path) or {}
-            reuse_external_registry_resolver = _external_registry_resolver_from_payloads(
-                registry,
-                [reuse_payload],
-            )
+            reuse_external_registry_resolver = external_registry_resolver
             identity = reuse_payload.get("source_bundle_paper_identity")
             paper_key = str(identity.get("canonical_paper_key") or "") if isinstance(identity, Mapping) else ""
             if not paper_key or paper_key in reused_papers or (expected_papers and paper_key not in expected_papers):
@@ -2014,6 +2122,8 @@ def _provider_closure_entry(
                     manifest_record=manifest_record,
                     closure_record=source_closure_record,
                     ledger_record=source_ledger_record,
+                    registry=registry,
+                    external_registry_resolver=reuse_external_registry_resolver,
                 )
             )
         if expected_reused_papers and set(reused_papers) != expected_reused_papers:
@@ -2111,7 +2221,11 @@ def _provider_closure_entry(
     receipt_row_ids = {str(row.get("call_id") or "") for row in receipt_rows if str(row.get("call_id") or "")}
     if receipt_rows and receipt_row_ids != set(observed_ids):
         blocking.append(f"provider_closure_receipt_set_mismatch:{stage}")
+    test_only_authority = closure.get("test_only") is True
     for row in receipt_rows:
+        if row.get("test_only") is not False:
+            test_only_authority = True
+            blocking.append(f"provider_closure_test_only_receipt:{stage}")
         row_stage = str(row.get("stage_name") or "")
         row_job = str(row.get("job_id") or "")
         row_epoch = str(row.get("closure_epoch_id") or "")
@@ -2137,7 +2251,9 @@ def _provider_closure_entry(
                 blocking.append(f"provider_closure_receipt_binding_mismatch:{stage}:{field_name}")
     if not str(closure.get("closure_hash") or ""):
         blocking.append(f"provider_closure_hash_missing:{stage}")
-    complete = bool(closure.get("complete")) if payload is not None else False
+    if closure.get("test_only") is True:
+        blocking.append(f"provider_closure_test_only_authority:{stage}")
+    complete = bool(closure.get("complete")) if payload is not None and not test_only_authority else False
     entry["complete"] = complete
     entry["status"] = "complete" if complete else "blocked"
     if not complete:
@@ -2158,6 +2274,7 @@ def resolve_current_stage_closure_map(
     registry: ArtifactRegistry,
     *,
     job_id: str | None = None,
+    external_registry_resolver: Callable[[str], ArtifactRegistry | None] | None = None,
 ) -> CurrentStageClosureMapV1:
     """Resolve exact current stage artifacts through the atomic set pointer."""
 
@@ -2212,6 +2329,7 @@ def resolve_current_stage_closure_map(
             terminal_payload,
             registry,
             current_set=current_set,
+            external_registry_resolver=external_registry_resolver,
         )
         provider_closures[logical_stage] = entry
         blocking.extend(entry_blocking)
@@ -2241,9 +2359,13 @@ def resolve_current_stage_closure_map(
 class ValidationClosureService:
     """Read-only canonical draft/manifest/validation closure service."""
 
-    def __init__(self, workspace: JobWorkspace, registry: ArtifactRegistry) -> None:
+    def __init__(
+        self, workspace: JobWorkspace, registry: ArtifactRegistry,
+        *, external_registry_resolver: Callable[[str], ArtifactRegistry | None] | None = None,
+    ) -> None:
         self.workspace = workspace
         self.registry = registry
+        self.external_registry_resolver = external_registry_resolver
 
     def _resolve_inputs(self) -> _InputResolution:
         records = self.registry.list_records()
@@ -2333,6 +2455,9 @@ class ValidationClosureService:
             if manifest.get("artifact_type") != "citation_manifest" or manifest.get("artifact_version") != "v3":
                 blocking.append("citation_manifest_schema_mismatch")
 
+        if draft is not None:
+            blocking.extend(_review_section_scope_issues(draft))
+
         # A citation manifest is a derived view of the canonical draft.  The
         # registry dependency must name that exact draft and hash.
         if resolution.manifest and resolution.draft:
@@ -2350,10 +2475,14 @@ class ValidationClosureService:
                 blocking.append("citation_manifest_draft_dependency_hash_mismatch")
 
         blocks = _iter_blocks(draft or {})
-        block_ids = {
-            str(block.get("block_id") or "").strip()
+        blocks_by_id = {
+            str(block.get("block_id") or "").strip(): block
             for block in blocks
             if str(block.get("block_id") or "").strip()
+        }
+        block_ids = set(blocks_by_id)
+        native_cell_ids = {
+            block_id for block_id, block in blocks_by_id.items() if block.get("table_id")
         }
         occurrences = manifest.get("occurrences") if isinstance(manifest, Mapping) else []
         occurrences = occurrences if isinstance(occurrences, list) else []
@@ -2375,6 +2504,11 @@ class ValidationClosureService:
                 blocking.append(f"citation_mapping_error:{occurrence_id or 'unknown'}")
             else:
                 mapped_occurrences += 1
+                if block_id in native_cell_ids and not _native_citation_span_matches(
+                    str(blocks_by_id[block_id].get("text") or ""),
+                    occurrence,
+                ):
+                    blocking.append(f"native_table_citation_span_stale:{occurrence_id or 'unknown'}")
             if not paper_id:
                 blocking.append(f"citation_source_identity_missing:{occurrence_id or 'unknown'}")
             if not occurrence.get("spans"):
@@ -2537,7 +2671,15 @@ class ValidationClosureService:
         }
         pointer = self.registry.current_artifact_set_pointer()
         try:
-            stage_map = resolve_current_stage_closure_map(self.registry)
+            if self.external_registry_resolver is None:
+                from runtime.runner import AgentRuntimeRunner
+
+                resolver = AgentRuntimeRunner._external_registry_resolver(
+                    self.workspace, registry_paths=AgentRuntimeRunner._review_batch_registry_paths(self.registry),
+                )
+            else:
+                resolver = self.external_registry_resolver
+            stage_map = resolve_current_stage_closure_map(self.registry, external_registry_resolver=resolver)
         except (OSError, RegistryError, ValueError, TypeError) as exc:
             stage_map = CurrentStageClosureMapV1(
                 job_id=self.workspace.job_id,

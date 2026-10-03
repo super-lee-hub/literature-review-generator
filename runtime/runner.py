@@ -85,6 +85,8 @@ class RuntimeExecutionResult:
 def _evaluate_runtime_completion(
     outcome: JobOutcomeV1,
     registry: ArtifactRegistry,
+    *,
+    external_registry_resolver: Callable[[str], ArtifactRegistry | None] | None = None,
 ) -> CompletionEvaluationV1:
     """Read and verify the durable evidence used by status projections."""
 
@@ -113,7 +115,7 @@ def _evaluate_runtime_completion(
             validation_record = validation_record or record.artifact_type == "validation_run_result"
         from validation.closure import resolve_current_stage_closure_map
 
-        current_stage_closure_map = resolve_current_stage_closure_map(registry).to_dict()
+        current_stage_closure_map = resolve_current_stage_closure_map(registry, external_registry_resolver=external_registry_resolver).to_dict()
         provider_entries = current_stage_closure_map.get("provider_closures_by_stage")
         if required_provider_stages:
             if not isinstance(provider_entries, Mapping):
@@ -1801,7 +1803,12 @@ class AgentRuntimeRunner:
             raise RuntimeRunnerError(
                 f"canonical job outcome is invalid after finalization: {exc}"
             ) from exc
-        evaluation = _evaluate_runtime_completion(outcome, session.context.registry)
+        evaluation = _evaluate_runtime_completion(
+            outcome, session.context.registry,
+            external_registry_resolver=self._external_registry_resolver(
+                session.context.workspace, registry_paths=self._review_batch_registry_paths(session.context.registry),
+            ),
+        )
         stage1_projection = _stage1_status_projection(session.context.registry)
         return RuntimeExecutionResult(
             job_id=outcome.job_id,
@@ -1895,7 +1902,10 @@ class AgentRuntimeRunner:
         outcome_path = Path(outcome_record.path)
         if outcome.job_id != workspace.job_id:
             raise RuntimeRunnerError("job outcome belongs to another workspace")
-        evaluation = _evaluate_runtime_completion(outcome, _registry)
+        evaluation = _evaluate_runtime_completion(
+            outcome, _registry,
+            external_registry_resolver=cls._external_registry_resolver(workspace, registry_paths=cls._review_batch_registry_paths(_registry)),
+        )
         stage1_projection = _stage1_status_projection(_registry)
         return RuntimeExecutionResult(
             job_id=outcome.job_id,

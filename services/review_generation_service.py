@@ -82,6 +82,7 @@ class _PreparedWriterSection:
     request_payload: dict[str, Any]
     binding: dict[str, Any]
     persisted: dict[str, Any] | None
+    writer_task_scope: dict[str, Any] | None
 
 
 class ReviewGenerationService:
@@ -143,6 +144,9 @@ class ReviewGenerationService:
         self._expected_provider_calls = {}
         self._verified_reuse_proofs = {}
         self.provider_request_inventory = None
+        from services.writer_source_inventory import load_writer_source_inventory_v1
+
+        source_inventory = load_writer_source_inventory_v1(self.registry)
         catalog, catalog_path = self._build_and_persist_catalog()
         packet_by_section = {
             str(packet.get("section_id") or "").strip(): dict(packet)
@@ -164,7 +168,12 @@ class ReviewGenerationService:
         writer_config_for_epoch = dict(self.settings.section("Writer_API"))
         writer_system_prompt = self._system_prompt()
         writer_max_output_tokens = self._max_output_tokens(writer_config_for_epoch)
-        writer_transport_attempt_limit = int(self.settings.runtime.transport_retries)
+        if "transport_retries" in writer_config_for_epoch:
+            from ai_interface import _load_api_runtime_settings
+
+            writer_transport_attempt_limit = _load_api_runtime_settings(writer_config_for_epoch)[1]
+        else:
+            writer_transport_attempt_limit = int(self.settings.runtime.transport_retries)
         self.expected_call_graph_hash = hash_json(
             {
                 "stage_name": "stage3_review",
@@ -200,11 +209,23 @@ class ReviewGenerationService:
                 raise RuntimeError(f"Review v3 has no evidence packet for section {section_id}")
             self._require_nonempty_packet(packet, section_id)
             allowed_ref_ids = self._allowed_ref_ids(packet, catalog)
+            task_scope = None
+            if source_inventory is not None:
+                from services.writer_task_scope import build_writer_task_scope_v1
+
+                task_scope = build_writer_task_scope_v1(packet, catalog, source_inventory=source_inventory)
+                if task_scope.get("usable_for_provider_admission") is not True:
+                    reasons = sorted({reason for task in task_scope["tasks"] for reason in task["reason_codes"]})
+                    raise RuntimeError(f"Writer source task scope for {section_id} requires review: {', '.join(reasons)}")
+                if "writer_table_plan" in raw_section:
+                    from services.writer_table_plan import bind_writer_table_plan_v1
+
+                    task_scope = bind_writer_table_plan_v1(task_scope, packet, raw_section["writer_table_plan"])
             runtime = self._new_runtime(
                 section_id,
                 writer_config=writer_config_for_epoch,
             )
-            prompt = self._prompt(raw_section, packet, catalog, allowed_ref_ids)
+            prompt = self._prompt(raw_section, packet, catalog, allowed_ref_ids, writer_task_scope=task_scope)
             request_payload = self._writer_request_payload(
                 prompt,
                 system_prompt=writer_system_prompt,
@@ -258,6 +279,7 @@ class ReviewGenerationService:
                     request_payload=request_payload,
                     binding=binding,
                     persisted=persisted,
+                    writer_task_scope=task_scope,
                 )
             )
 
@@ -310,11 +332,24 @@ class ReviewGenerationService:
                 result=provider_result,
                 api_config=writer_config_for_epoch,
             )
+            if prepared.writer_task_scope is not None:
+                from services.writer_task_scope import validate_writer_task_output_v1
+
+                content = provider_result.get("content", provider_result)
+                if isinstance(content, str):
+                    content = json.loads(content)
+                if not isinstance(content, Mapping):
+                    raise RuntimeError("Writer section content must be an object")
+                scoped_output = validate_writer_task_output_v1(prepared.writer_task_scope, content)
+                if scoped_output["scope_status"] != "ready":
+                    self._persist_writer_review_disposition(prepared, scoped_output, provider_result)
+                    raise RuntimeError(f"Writer section {section_id} requires source review; disposition saved")
             blocks = self._normalize_blocks(
                 provider_result,
                 section_number=number,
                 allowed_ref_ids=allowed_ref_ids,
                 catalog=catalog,
+                writer_task_scope=prepared.writer_task_scope,
             )
             section_payload = {
                     "section_number": number,
@@ -325,6 +360,12 @@ class ReviewGenerationService:
                     "evidence_packet_id": section_id,
                     "provider_receipt_ids": [receipt.receipt_id for receipt in runtime.receipts],
                 }
+            if prepared.writer_task_scope is not None:
+                content = provider_result.get("content", provider_result)
+                if isinstance(content, str):
+                    content = json.loads(content)
+                section_payload["writer_task_scope"] = prepared.writer_task_scope
+                section_payload["writer_task_dispositions"] = content["task_dispositions"]
             section_record = self._persist_section(
                 section_id,
                 section_payload,
@@ -368,6 +409,39 @@ class ReviewGenerationService:
             citation_ref_catalog_path=str(catalog_path),
             receipt_ids=tuple(receipt.receipt_id for receipt in self.receipt_ledger.list_receipts()),
             receipt_ledger_path=self.receipt_ledger_path,
+        )
+
+    def _persist_writer_review_disposition(
+        self,
+        prepared: _PreparedWriterSection,
+        scoped_output: Mapping[str, Any],
+        provider_result: Mapping[str, Any],
+    ) -> None:
+        self._register_receipt_ledger()
+        dependencies = []
+        for identifier in ("outline-v3:outline_content_layers", "review_provider_receipts"):
+            record = self.registry.get(identifier)
+            if record is None or record.status != "ready":
+                raise RuntimeError("Writer review disposition lost its source or receipt authority")
+            dependencies.append(ArtifactDependencyRefV2.from_record(record))
+        payload = {
+            "artifact_type": "review_writer_review_disposition", "artifact_version": "v1",
+            "job_id": self.job_id, "section_id": prepared.section_id,
+            "status": "needs_review", "canonical_ready": False,
+            "request_hash": hash_json(prepared.request_payload),
+            "writer_task_scope": prepared.writer_task_scope,
+            "validated_output": dict(scoped_output),
+            "provider_result_hash": hash_json(provider_result),
+            "provider_receipt_ids": [item.receipt_id for item in prepared.runtime.receipts],
+        }
+        digest = hash_json(payload)
+        publish_json_artifact(
+            self.publication_context, self.registry,
+            self.workspace.artifact_path(f"review_source_review/{digest[:24]}.json"), payload,
+            artifact_id=f"review:source_review:{digest[:24]}", artifact_role="review_source_review",
+            artifact_type="review_writer_review_disposition", artifact_version="v1",
+            producer="services.review_generation_service.ReviewGenerationService",
+            status="quarantined", depends_on=dependencies,
         )
 
     def _build_and_persist_catalog(self) -> tuple[dict[str, Any], Path]:
@@ -644,6 +718,8 @@ class ReviewGenerationService:
         expected = self._expected_provider_calls.get(f"review:{section_id}")
         if expected is None or receipt is None or receipt.status != "success":
             return None
+        if receipt.test_only and not self._fixture_context_enabled():
+            return None
         if (
             receipt.job_id != self.job_id
             or receipt.attempt_id != expected.attempt_id
@@ -810,6 +886,7 @@ class ReviewGenerationService:
             out_of_scope=out_of_scope_receipts,
         )
         path = Path(self.workspace.artifact_path("review_provider_receipt_closure.json"))
+        test_only = any(receipt.test_only for receipt in scoped_receipts)
         closure_payload = {
             **closure.to_dict(),
             "job_id": self.job_id,
@@ -818,6 +895,8 @@ class ReviewGenerationService:
             "logical_attempt_identity": self.attempt_id,
             "closure_epoch_id": self.closure_epoch_id,
             "expected_call_graph_hash": self.expected_call_graph_hash,
+            "test_only": test_only,
+            "authority_scope": "offline_fixture" if test_only else "provider_transport",
             "expected_calls": [
                 asdict(expected)
                 for expected in self._expected_provider_calls.values()
@@ -831,6 +910,7 @@ class ReviewGenerationService:
             "attempt_id": self.attempt_id,
             "closure_epoch_id": self.closure_epoch_id,
             "expected_call_graph_hash": self.expected_call_graph_hash,
+            "test_only": test_only,
             "payload": closure_payload,
         }
         dependencies: list[ArtifactDependencyRefV2] = []
@@ -887,6 +967,7 @@ class ReviewGenerationService:
                 "expected_call_graph_hash": self.expected_call_graph_hash,
                 "closure_hash": closure.closure_hash,
                 "complete": closure.complete,
+                "test_only": test_only,
             },
         )
 
@@ -915,17 +996,39 @@ class ReviewGenerationService:
         if hash_json(request_payload) != expected_input_hash:
             raise RuntimeError("Review v3 Writer request changed after preflight")
         if self.writer is not None:
-            value = self.writer(
-                prompt_text=prompt,
-                writer_api_config=frozen_config,
-                provider_runtime=runtime,
-                section_number=section_number,
-                section=dict(section),
-                evidence_packet=dict(packet),
-                citation_ref_catalog=dict(catalog),
+            if not self._fixture_context_enabled():
+                raise RuntimeError("Opaque Writer callbacks require explicit in-process test dependencies; production transport is service-owned")
+            runtime.test_only = True
+            profile = self._provider_context_profile(frozen_config)
+            estimate = profile.estimate_request(request_payload)
+            admission = runtime.admit(
+                estimated_tokens=max(1, int(estimate["estimated_input_tokens"])),
+                requested_output_tokens=max_output_tokens,
+                requested_retry_attempts=0,
             )
-            if not isinstance(value, Mapping):
-                raise RuntimeError("Writer returned a non-object")
+            try:
+                value = self.writer(
+                    prompt_text=prompt,
+                    writer_api_config=frozen_config,
+                    section_number=section_number,
+                    section=dict(section),
+                    evidence_packet=dict(packet),
+                    citation_ref_catalog=dict(catalog),
+                )
+                attempts = value.get("attempts", 1) if isinstance(value, Mapping) else None
+                if not isinstance(value, Mapping) or isinstance(attempts, bool) or not isinstance(attempts, int) or attempts != 1:
+                    raise RuntimeError("Offline Writer callback must return one fixture result without transport retries")
+            except Exception:
+                runtime.complete(
+                    admission=admission, prompt=prompt, input_payload=request_payload, api_config=frozen_config,
+                    result={"status": "failed", "error_kind": "invalid_response", "attempts": 1},
+                    metadata={"execution_mode": "offline_fixture_callback", "transport_started": False},
+                )
+                raise
+            runtime.complete(
+                admission=admission, prompt=prompt, input_payload=request_payload, api_config=frozen_config,
+                result=value, metadata={"execution_mode": "offline_fixture_callback", "transport_started": False},
+            )
             return dict(value)
 
         from ai_interface import _call_ai_api_detailed
@@ -971,6 +1074,7 @@ class ReviewGenerationService:
         section_number: int,
         allowed_ref_ids: Sequence[str],
         catalog: Mapping[str, Any],
+        writer_task_scope: Mapping[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         if str(provider_result.get("status") or "success").strip().lower() != "success":
             raise RuntimeError(
@@ -984,6 +1088,18 @@ class ReviewGenerationService:
                 raise RuntimeError("Writer returned non-JSON section content") from exc
         if not isinstance(content, Mapping):
             raise RuntimeError("Writer section content must be an object")
+        if writer_task_scope is not None:
+            from services.writer_task_scope import validate_writer_task_output_v1
+
+            scoped_output = validate_writer_task_output_v1(writer_task_scope, content)
+            if scoped_output.get("scope_status") != "ready":
+                raise RuntimeError("Writer returned non-adoptable source tasks requiring review")
+            if writer_task_scope.get("schema_version") == "writer_task_scope/v2":
+                return self._normalize_table_projection(
+                    scoped_output, scope=writer_task_scope, section_number=section_number,
+                    allowed_ref_ids=allowed_ref_ids, catalog=catalog,
+                )
+            content = scoped_output
         raw_blocks = content.get("blocks")
         if not isinstance(raw_blocks, list):
             raise RuntimeError("Writer section content must contain a blocks array")
@@ -1058,8 +1174,52 @@ class ReviewGenerationService:
                     "block_source": "writer_v3",
                 }
             )
+            if writer_task_scope is not None:
+                blocks[-1].update({
+                    name: raw_block[name]
+                    for name in ("writer_task_id", "writer_output_unit_id", "writer_task_basis_hash")
+                })
         if not blocks:
             raise RuntimeError(f"Writer produced no blocks for section {section_number}")
+        return blocks
+
+    def _normalize_table_projection(
+        self, validated_output: Mapping[str, Any], *, scope: Mapping[str, Any],
+        section_number: int, allowed_ref_ids: Sequence[str], catalog: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        from services.writer_table_layout import project_writer_table_layouts_v1
+
+        normalized_units = self._normalize_blocks(
+            {"status": "success", "content": {"blocks": validated_output["blocks"]}},
+            section_number=section_number, allowed_ref_ids=allowed_ref_ids, catalog=catalog,
+        )
+        normalized_by_unit = {
+            raw["writer_output_unit_id"]: normalized
+            for raw, normalized in zip(validated_output["blocks"], normalized_units)
+        }
+        projected = project_writer_table_layouts_v1(scope, validated_output)["blocks"]
+
+        def normalize_unit(unit):
+            normalized = dict(normalized_by_unit[unit["writer_output_unit_id"]])
+            normalized.update({key: value for key, value in unit.items() if key != "text"})
+            for index, citation in enumerate(normalized["citations"], start=1):
+                citation["local_ref_id"] = f"{unit['block_id']}_cite_{index}"
+            return normalized
+
+        blocks = []
+        for order, block in enumerate(projected, start=1):
+            if block["block_kind"] == "table":
+                normalized = {**block, "text": "", "citations": [], "block_source": "writer_v3_local_table_projection"}
+                normalized["rows"] = [{
+                    "row_id": row["row_id"], "cells": [
+                        normalize_unit(cell) if cell["cell_kind"] == "factual_output_unit" else dict(cell)
+                        for cell in row["cells"]
+                    ],
+                } for row in block["rows"]]
+            else:
+                normalized = normalize_unit(block)
+            normalized["block_order"] = order
+            blocks.append(normalized)
         return blocks
 
     def _allowed_ref_ids(
@@ -1109,6 +1269,8 @@ class ReviewGenerationService:
         packet: Mapping[str, Any],
         catalog: Mapping[str, Any],
         allowed_ref_ids: Sequence[str],
+        *,
+        writer_task_scope: Mapping[str, Any] | None = None,
     ) -> str:
         evidence = self._summaries_for_packet(packet)
         payload = {
@@ -1128,6 +1290,26 @@ class ReviewGenerationService:
             },
             "free_mode_context": dict(self.free_mode_context) if self.free_mode_context else None,
         }
+        if writer_task_scope is not None:
+            from services.writer_wire_projection import project_writer_scope_for_provider_v1
+
+            payload["writer_task_scope"] = project_writer_scope_for_provider_v1(writer_task_scope)
+            payload.pop("source_evidence")
+            payload["section_context"] = {
+                name: packet[name]
+                for name in (
+                    "section_goal", "research_question_link", "paper_roles", "paper_keys",
+                    "must_use_paper_keys", "relation_ids", "contradictions", "boundary_conditions", "gaps",
+                ) if name in packet
+            }
+            payload.pop("evidence_packet")
+            payload["output_contract"] = {
+                **dict(writer_task_scope["output_contract"]),
+                "schema_version": writer_task_scope["schema_version"],
+                "requires_one_disposition_per_task": True,
+                "requires_primary_unit_for_covered_task": True,
+                "requires_exact_task_unit_and_basis_ids": True,
+            }
         return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
     def _summaries_for_packet(self, packet: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -1189,6 +1371,7 @@ class ReviewGenerationService:
             closure_epoch_id=self.closure_epoch_id,
             logical_attempt_identity=self.attempt_id,
             endpoint_type=str(config.get("endpoint_type") or "responses"),
+            test_only=self.writer is not None,
             schema_hash=hashlib.sha256(b"review_draft_v3_writer_section").hexdigest(),
             prompt_id=self._review_prompt_identity.prompt_id,
             prompt_version=self._review_prompt_identity.version,
@@ -1367,6 +1550,9 @@ class ReviewGenerationService:
     ) -> None:
         if runtime.receipts:
             return
+        if not self._fixture_context_enabled():
+            raise RuntimeError("Writer transport returned no instrumented provider receipt")
+        runtime.test_only = True
         try:
             request = dict(input_payload)
             profile = self._provider_context_profile(api_config)
@@ -1382,7 +1568,7 @@ class ReviewGenerationService:
                 input_payload=input_payload,
                 api_config=dict(api_config),
                 result=result,
-                metadata={"execution_mode": "injected_writer"},
+                metadata={"execution_mode": "offline_mocked_transport", "transport_started": False},
             )
         except ProviderBudgetExceeded:
             runtime.blocked_receipt(
@@ -1391,6 +1577,17 @@ class ReviewGenerationService:
                 api_config=dict(api_config),
                 message="Writer did not produce a provider receipt before its budget closed",
             )
+            raise
+
+    @staticmethod
+    def _fixture_context_enabled() -> bool:
+        from runtime.test_dependencies import current_runtime_test_dependencies
+
+        dependencies = current_runtime_test_dependencies()
+        if dependencies is None:
+            return False
+        dependencies.validate()
+        return True
 
     def _provider_context_profile(
         self,
@@ -1403,23 +1600,10 @@ class ReviewGenerationService:
             if writer_config is not None
             else self.settings.section("Writer_API")
         )
-        try:
-            context_limit = max(1, int(config.get("max_context_tokens") or 128_000))
-        except (TypeError, ValueError):
-            context_limit = 128_000
-        try:
-            output_tokens = max(
-                1,
-                int(config.get("max_output_tokens") or self._max_output_tokens(config)),
-            )
-        except (TypeError, ValueError):
-            output_tokens = self._max_output_tokens(config)
-        return ProviderContextProfile.conservative(
-            provider=str(config.get("provider_family") or "configured"),
-            model=str(config.get("model") or "writer"),
-            endpoint_type=str(config.get("endpoint_type") or "responses"),
-            model_context_limit=context_limit,
-            max_output_tokens=output_tokens,
+        return ProviderContextProfile.from_api_config(
+            config,
+            max_output_tokens=self._max_output_tokens(config),
+            default_model="writer",
         )
 
     def _register_receipt_ledger(self) -> None:

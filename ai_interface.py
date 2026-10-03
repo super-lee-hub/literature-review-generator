@@ -3046,13 +3046,6 @@ def _call_ai_api_detailed(
             message="a bound ProviderRuntime is required for production model calls",
         )
 
-    def _positive_int(value: Any, default: int) -> int:
-        try:
-            parsed = int(str(value).strip())
-        except (TypeError, ValueError):
-            return default
-        return parsed if parsed > 0 else default
-
     admitted_user_content, admission_omissions = _admit_local_images_to_budget(
         user_content,
         max_single_image_bytes=max_single_image_bytes,
@@ -3084,14 +3077,11 @@ def _call_ai_api_detailed(
         blocked["provider_receipt"] = receipt.to_dict()
         return blocked
     capability = resolve_model_capability(api_config)
-    profile = ProviderContextProfile.conservative(
-        provider=str(api_config.get("provider_family") or capability.provider_family),
-        model=str(api_config.get("model") or ""),
-        endpoint_type=str(api_config.get("endpoint_type") or capability.endpoint_type),
-        model_context_limit=_positive_int(api_config.get("max_context_tokens"), 128_000),
+    profile = ProviderContextProfile.from_api_config(
+        api_config,
         max_output_tokens=max(1, int(max_tokens)),
-        reasoning_reserve=max(0, _positive_int(api_config.get("reasoning_reserve_tokens"), 0)),
-        safety_margin=max(0, _positive_int(api_config.get("safety_margin_tokens"), 256)),
+        default_provider=capability.provider_family,
+        default_endpoint_type=capability.endpoint_type,
     )
     budget = profile.estimate_request(request_payload)
     if not budget["within_budget"]:

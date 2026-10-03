@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 import threading
+import traceback
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -46,6 +47,7 @@ def _write_source_pdf(path: Path, *, title: str, finding: str) -> None:
         (72, 72),
         f"Title: {title}\n"
         "Methodology: A controlled study of 24 participants.\n"
+        "Analysis: Descriptive comparison of observed group means.\n"
         f"Results: {finding}\n"
         "Conclusion: Findings apply only to the observed sample.",
     )
@@ -73,8 +75,67 @@ def _fixture_reader_summary(paper_key: str, title: str, finding: str) -> dict[st
                 "future_research_directions": [],
             }
         )
-    summary["specialized_details"] = {"empirical": None, "review": None, "conceptual": None}
+    summary["specialized_details"] = {
+        "empirical": {
+            "research_questions_or_hypotheses": [],
+            "data_source_and_size": "Observed controlled sample of 24 participants.",
+            "analysis_technique": "Descriptive comparison of observed group means.",
+            "core_variables": {"independent": ["treatment"], "dependent": ["measured outcome"]},
+            "sample_characteristics_or_context": "Observed controlled sample.",
+        },
+        "review": None,
+        "conceptual": None,
+    }
     return summary
+
+
+def _grounded_fixture_candidate(node_id: str, request: Mapping[str, Any]) -> dict[str, Any]:
+    content = _outline_provider_response(node_id, dict(request))["content"]
+    if not node_id.endswith("_provider_generation"):
+        return content
+    tables = request["shared_semantic_context"]["interpretation_source_tables"]
+    dependencies = tables["dependencies"]
+    paper_keys = list(request["paper_keys"])
+    evidence = list(request["evidence"])
+    paper_a = next((row["paper_key"] for row in evidence if str(row.get("title") or "").lower().replace(" ", "-") == "study-a"), None)
+    paper_b = next((row["paper_key"] for row in evidence if str(row.get("title") or "").lower().replace(" ", "-") == "study-b"), None)
+    assert paper_a and paper_b, f"fixture candidate lacks A/B comparison: keys={paper_keys}, evidence={[(row.get('title'), row.get('paper_key')) for row in evidence]}"
+
+    def support(paper_key: str, claim: str) -> dict[str, Any]:
+        paper_dependencies = [row for row in dependencies if row["paper_key"] == paper_key]
+        assert paper_dependencies, f"candidate request has no interpretation dependencies for {paper_key}; papers={sorted({row.get('paper_key') for row in dependencies})}; request_keys={list(request)}"
+        dependency = paper_dependencies[0]
+        return {
+            "claim": claim, "paper_key": paper_key, "primary_claim_id": dependency["primary_claim_id"],
+            "source_claim_ids": sorted({value for row in paper_dependencies for value in [row["primary_claim_id"], *row["required_source_claim_ids"]]}),
+            "evidence_ids": sorted({value for row in paper_dependencies for value in [*row["primary_evidence_ids"], *row["required_evidence_ids"]]}),
+            "source_field_ids": sorted({value for row in paper_dependencies for value in row["required_source_field_ids"]}),
+            "qualifier_source_claim_ids": sorted({value for row in paper_dependencies for value in row["required_source_claim_ids"]}),
+            "qualifier_evidence_ids": sorted({value for row in paper_dependencies for value in row["required_evidence_ids"]}),
+            "qualifier_source_field_ids": sorted({value for row in paper_dependencies for value in row["required_source_field_ids"]}),
+            "study_id": dependency["owner_study_id"],
+        }
+
+    sections = []
+    for index, section in enumerate(content["sections"]):
+        paper_key = section["paper_keys"][0]
+        if index > 0 and paper_key == paper_b:
+            continue
+        if index == 0:
+            claim = (
+                "In the observed controlled samples, Study B reported a two-point "
+                "improvement whereas Study A reported a four-point improvement"
+            )
+            section["paper_keys"] = [paper_a, paper_b]
+            section["claims"] = [claim]
+            section["claim_support"] = [support(paper_b, claim), support(paper_a, claim)]
+        else:
+            claim = section["claims"][0]
+            section["claim_support"] = [support(paper_key, claim)]
+        sections.append(section)
+    content["sections"] = sections
+    content["claims"] = [claim for section in content["sections"] for claim in section["claims"]]
+    return content
 
 
 class _LocalModelFixture(BaseHTTPRequestHandler):
@@ -108,6 +169,7 @@ class _LocalModelFixture(BaseHTTPRequestHandler):
                     ("study-a", "Study A", "Treatment improved the measured outcome by four points."),
                     ("study-b", "Study B", "Treatment improved the measured outcome by two points."),
                     ("study-c", "Study C", "Treatment improved the measured outcome by one point."),
+                    ("study-d", "Study D", "Treatment did not change the measured outcome."),
                 )
                 source_key, source_title, source_finding = source_rows[
                     min(self.server.reader_calls, len(source_rows) - 1)  # type: ignore[attr-defined]
@@ -136,29 +198,32 @@ class _LocalModelFixture(BaseHTTPRequestHandler):
                     or node_id in {"arbitration", "structure_critique", "coverage_critique", "evidence_critique"}
                 )
                 if is_outline_request:
-                    content = _outline_provider_response(
+                    content = _grounded_fixture_candidate(
                         node_id,
                         dict(request_payload),
-                    )["content"]
-                elif model == "writer-local":
-                    references = re.findall(r"R\d{3,}", user_text)
-                    reference = references[0] if references else "R001"
-                    self.server.review_writer_calls += 1  # type: ignore[attr-defined]
-                    claim = (
-                        "Study B found that treatment improved the measured outcome by two points"
-                        if self.server.review_writer_calls == 1  # type: ignore[attr-defined]
-                        else (
-                            "In the controlled sample, treatment improved the measured outcome "
-                            "by four points" if self.server.review_writer_calls == 2  # type: ignore[attr-defined]
-                            else "In the controlled sample, treatment improved the measured outcome by one point"
-                        )
                     )
+                elif model == "writer-local":
+                    writer_request = json.loads(user_text)
+                    scope = writer_request["writer_task_scope"]
+                    catalog = writer_request["citation_ref_catalog"]
+                    self.server.review_writer_calls += 1  # type: ignore[attr-defined]
+                    first_comparison = self.server.review_writer_calls == 1  # type: ignore[attr-defined]
+                    reference = next(entry["ref_id"] for entry in catalog if "studya_" in entry["canonical_paper_key"]) if first_comparison else None
                     content = {
-                        "blocks": [
-                            {
-                                "text": f"{claim} [[cite_ref:{reference}]]."
-                            }
-                        ]
+                        "blocks": [{
+                            "writer_task_id": task["writer_task_id"], "writer_output_unit_id": unit["writer_output_unit_id"],
+                            "writer_task_basis_hash": scope["writer_task_basis_hash"],
+                            "text": (
+                                "Study B found that treatment improved the measured outcome "
+                                f"by two points in the observed controlled sample [[cite_ref:{reference}]]."
+                                if first_comparison else
+                                f"{task['planned_claim'].rstrip('.')} in the observed controlled sample [[cite_ref:{unit['allowed_ref_ids'][0]}]]."
+                            ),
+                        } for task in scope["tasks"] for unit in task["output_units"] if unit["required"]],
+                        "task_dispositions": [{
+                            "writer_task_id": task["writer_task_id"], "writer_task_basis_hash": scope["writer_task_basis_hash"],
+                            "disposition": "covered",
+                        } for task in scope["tasks"]],
                     }
                 else:
                     raise ValueError(f"outline fixture request is not a node envelope for {model}")
@@ -228,8 +293,8 @@ class _LocalModelFixture(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        except Exception as exc:  # make fixture faults visible as provider failures
-            body = json.dumps({"error": {"message": str(exc)}}).encode("utf-8")
+        except Exception:  # make fixture faults visible as provider failures
+            body = json.dumps({"error": {"message": traceback.format_exc()}}).encode("utf-8")
             self.send_response(500)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -284,6 +349,7 @@ def _runtime_config(tmp_path: Path, api_base: str) -> Path:
         parser[section]["transport_retries"] = "0"
         parser[section]["max_context_tokens"] = "128000"
     parser["Outline"]["candidate_count"] = "2"
+    parser["Writer_API"]["max_output_tokens"] = "4096"
     parser["Outline"]["require_explicit_adoption"] = "true"
     parser["OutlineStability"]["mode"] = "off"
     parser["Validation"]["review_enabled"] = "true"
@@ -468,6 +534,7 @@ def test_current_text_finding_can_be_explicitly_repaired_and_exported(
             ("study-a", "Study A", "Treatment improved the measured outcome by four points."),
             ("study-b", "Study B", "Treatment improved the measured outcome by two points."),
             ("study-c", "Study C", "Treatment improved the measured outcome by one point."),
+            ("study-d", "Study D", "Treatment did not change the measured outcome."),
         )
         for key, title, finding in source_rows:
             _write_source_pdf(pdf_dir / f"{key}.pdf", title=title, finding=finding)
@@ -531,8 +598,9 @@ def test_current_text_finding_can_be_explicitly_repaired_and_exported(
         block_id = str(block["block_id"])
         expected_anchor_hash = hashlib.sha256(original_text.encode("utf-8")).hexdigest()
         assert "Study B found" in original_text
-        assert server.reader_calls == 3  # type: ignore[attr-defined]
+        assert server.reader_calls == 4  # type: ignore[attr-defined]
         assert server.validator_calls == 3  # type: ignore[attr-defined]
+        initial_validation_calls = server.validator_calls  # type: ignore[attr-defined]
         assert any(
             item["claim_about_study_b"] and item["cites_study_a"]
             for item in server.validator_observations  # type: ignore[attr-defined]
@@ -561,7 +629,7 @@ def test_current_text_finding_can_be_explicitly_repaired_and_exported(
             "block_id": block_id,
             "expected_anchor_hash": expected_anchor_hash,
             "replacement_text": (
-                f"Study B found that treatment improved the measured outcome by two points "
+                f"Study B found that treatment improved the measured outcome by two points in the observed controlled sample "
                 f"[[cite_ref:{target_source['ref_id']}]]."
             ),
             "source_evidence_ids": [str(target_source["canonical_paper_key"])],
@@ -714,7 +782,8 @@ def test_current_text_finding_can_be_explicitly_repaired_and_exported(
         assert promoted["status"] == "promoted", promoted
         assert promoted["revalidation_execution_status"] == "succeeded", promoted
         assert promoted["revalidation_disposition"] == "clean", promoted
-        assert server.validator_calls == 5  # type: ignore[attr-defined]
+        assert server.validator_calls == 2 * initial_validation_calls  # type: ignore[attr-defined]
+        calls_after_promotion = server.validator_calls  # type: ignore[attr-defined]
         assert any(
             item["claim_about_study_b"] and item["cites_study_b"]
             for item in server.validator_observations  # type: ignore[attr-defined]
@@ -749,7 +818,7 @@ def test_current_text_finding_can_be_explicitly_repaired_and_exported(
         assert resumed["job_status"] == "completed", resumed
         assert resumed["completion_status"] == "complete", resumed
         assert resumed["canonical_ready"] is True, resumed
-        assert server.validator_calls == 5  # type: ignore[attr-defined]
+        assert server.validator_calls == calls_after_promotion  # type: ignore[attr-defined]
         _resumed_workspace, current_registry = AgentRuntimeRunner._open_workspace(first.workspace_path)
         current_set = current_registry.resolve_current_artifact_set()
         assert current_set is not None

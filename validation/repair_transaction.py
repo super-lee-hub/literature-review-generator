@@ -39,9 +39,14 @@ from services.audit_record import AuditArtifactRefV1, AuditRecordV1
 from services.queue_service import LocalPublicationContext
 from services.citation_manifest import build_citation_manifest_from_review_draft
 from services.citation_ref_catalog import resolve_ref_id, validate_document_ref_catalog
+from services.review_draft import (
+    find_review_text_block,
+    iter_review_text_blocks,
+    validate_review_section_writer_scope,
+)
 from services.sentence_segmenter import SENTENCE_SEGMENTER_VERSION, segment_sentences
 from validation.closure import ValidationClosureResult, ValidationClosureService
-from validation.repair_apply import run_repair_apply
+from validation.repair_apply import _refresh_factual_cell_offsets, run_repair_apply
 from validation.repair_models import (
     AutoSafePatch,
     DependencyHashBundle,
@@ -268,16 +273,13 @@ def _write_current_artifact_pointer(
 
 
 def _find_block(review_draft: Mapping[str, Any], block_id: str) -> Mapping[str, Any] | None:
-    content = review_draft.get("content")
-    if not isinstance(content, Mapping):
+    if not str(block_id or "").strip():
         return None
-    for section in content.get("sections") or []:
-        if not isinstance(section, Mapping):
-            continue
-        for block in section.get("blocks") or []:
-            if isinstance(block, Mapping) and str(block.get("block_id") or "") == block_id:
-                return block
-    return None
+    try:
+        return find_review_text_block(review_draft, block_id)
+    except (KeyError, TypeError, ValueError):
+        # Malformed native tables and duplicate unit IDs are never repairable.
+        return None
 
 
 def _targeted_revalidate(
@@ -311,10 +313,20 @@ def _targeted_revalidate(
             if not isinstance(blocks, list) or not blocks:
                 diagnostics.append(f"section_blocks_missing:{section_index}")
                 continue
-            for block_index, block in enumerate(blocks, start=1):
-                if not isinstance(block, Mapping):
-                    diagnostics.append(f"block_not_object:{section_index}:{block_index}")
-                    continue
+            try:
+                text_blocks = list(iter_review_text_blocks(section))
+            except (KeyError, TypeError, ValueError):
+                diagnostics.append(f"section_text_units_invalid:{section_index}")
+                continue
+            if any(
+                isinstance(block, Mapping) and block.get("table_layout_schema_version")
+                for block in blocks
+            ):
+                try:
+                    validate_review_section_writer_scope(section)
+                except (KeyError, TypeError, ValueError):
+                    diagnostics.append(f"section_writer_scope_invalid:{section_index}")
+            for block_index, block in enumerate(text_blocks, start=1):
                 block_id = str(block.get("block_id") or "").strip()
                 if not block_id:
                     diagnostics.append(f"block_id_missing:{section_index}:{block_index}")
@@ -1236,21 +1248,15 @@ class RepairTransactionService:
                 "reason": "manual proposal needs a block, full anchor hash, replacement text, and source evidence",
                 "mutation_performed": False,
             }
-        draft_blocks = [
-            block
-            for section in (review_draft.get("content") or {}).get("sections", [])
-            if isinstance(section, Mapping)
-            for block in section.get("blocks", [])
-            if isinstance(block, Mapping) and str(block.get("block_id") or "") == block_id
-        ]
-        if len(draft_blocks) != 1:
+        draft_block = _find_block(review_draft, block_id)
+        if not isinstance(draft_block, Mapping):
             return {
                 "status": "blocked",
                 "plan_id": source_plan_id,
                 "reason": "manual proposal target block is missing or ambiguous",
                 "mutation_performed": False,
             }
-        original_text = str(draft_blocks[0].get("text") or "")
+        original_text = str(draft_block.get("text") or "")
         if (
             not original_text
             or original_text == replacement_text
@@ -1607,6 +1613,55 @@ class RepairTransactionService:
             )
             approval.validate()
 
+        cell_citation_mapping: dict[str, Any] | None = None
+        if (
+            citation_mapping is not None
+            and target_occurrence is not None
+            and draft_block.get("cell_kind") == "factual_output_unit"
+        ):
+            old_spans = target_occurrence.get("spans") or []
+            old_span = old_spans[0] if old_spans and isinstance(old_spans[0], Mapping) else {}
+            start_offset = old_span.get("start_offset")
+            end_offset = old_span.get("end_offset")
+            if not isinstance(start_offset, int) or not isinstance(end_offset, int):
+                return {
+                    "status": "blocked",
+                    "plan_id": source_plan_id,
+                    "reason": "cell citation mapping requires exact cell-local occurrence spans",
+                    "mutation_performed": False,
+                }
+            expected_token = f"[[cite_ref:{citation_mapping.expected_ref_id}]]"
+            cell_citations = draft_block.get("citations")
+            matching_cell_citations = [
+                item
+                for item in cell_citations or ()
+                if isinstance(item, Mapping)
+                and str(item.get("ref_id") or "") == citation_mapping.expected_ref_id
+                and str(item.get("citation_token") or "") == expected_token
+                and item.get("span_start") == start_offset
+                and item.get("span_end") == end_offset
+            ]
+            if len(matching_cell_citations) != 1:
+                return {
+                    "status": "blocked",
+                    "plan_id": source_plan_id,
+                    "reason": "cell citation mapping does not resolve one structured local citation",
+                    "mutation_performed": False,
+                }
+            cell_citation_mapping = {
+                **citation_mapping.to_dict(),
+                "start_offset": start_offset,
+                "end_offset": end_offset,
+                "local_ref_id": str(matching_cell_citations[0].get("local_ref_id") or ""),
+            }
+            if not cell_citation_mapping["local_ref_id"]:
+                return {
+                    "status": "blocked",
+                    "plan_id": source_plan_id,
+                    "reason": "cell citation mapping has no stable local citation identity",
+                    "mutation_performed": False,
+                }
+
         proposal = PatchProposal(
             proposal_id=approval.approval_id,
             citation_id=(
@@ -1635,6 +1690,11 @@ class RepairTransactionService:
                     approval.citation_mapping.occurrence_id
                     if approval.citation_mapping is not None
                     else ""
+                ),
+                **(
+                    {"citation_mapping": cell_citation_mapping}
+                    if cell_citation_mapping is not None
+                    else {}
                 ),
             },
         )
@@ -1746,60 +1806,90 @@ class RepairTransactionService:
                 }
             old_spans = target_occurrence.get("spans") or []
             old_span = old_spans[0] if old_spans and isinstance(old_spans[0], Mapping) else {}
-            matches = [
-                item
-                for item in citations
-                if isinstance(item, dict)
-                and str(item.get("ref_id") or "") == citation_mapping.expected_ref_id
-                and str(item.get("citation_token") or "")
-                == f"[[cite_ref:{citation_mapping.expected_ref_id}]]"
-                and int(item.get("span_start") or -1) == int(old_span.get("start_offset") or -2)
-                and int(item.get("span_end") or -1) == int(old_span.get("end_offset") or -2)
-            ]
-            if len(matches) != 1:
-                return {
-                    "status": "blocked",
-                    "plan_id": source_plan_id,
-                    "reason": "citation block span does not uniquely match the approved occurrence",
-                    "mutation_performed": False,
-                }
-            citation = matches[0]
-            citation["ref_id"] = citation_mapping.replacement_ref_id
-            citation["citation_token"] = f"[[cite_ref:{citation_mapping.replacement_ref_id}]]"
-            citation["raw_text"] = citation["citation_token"]
-            citation["paper_id"] = citation_mapping.replacement_paper_id
-            citation["paper_key"] = citation_mapping.replacement_paper_id
-            citation["canonical_paper_key"] = citation_mapping.replacement_paper_id
-            block_text = str(patched_block.get("text") or "")
-            cursor = 0
-            for item in sorted(
-                (value for value in citations if isinstance(value, dict)),
-                key=lambda value: int(value.get("span_start") or 0),
-            ):
-                token = str(item.get("citation_token") or "")
-                position = block_text.find(token, cursor) if token else -1
-                if position < 0:
+            if cell_citation_mapping is not None:
+                local_ref_id = str(cell_citation_mapping.get("local_ref_id") or "")
+                matches = [
+                    item
+                    for item in citations
+                    if isinstance(item, dict)
+                    and str(item.get("local_ref_id") or "") == local_ref_id
+                    and str(item.get("ref_id") or "") == citation_mapping.replacement_ref_id
+                    and str(item.get("citation_token") or "")
+                    == f"[[cite_ref:{citation_mapping.replacement_ref_id}]]"
+                    and str(item.get("paper_id") or "") == citation_mapping.replacement_paper_id
+                ]
+                if len(matches) != 1:
                     return {
                         "status": "blocked",
                         "plan_id": source_plan_id,
-                        "reason": "citation metadata no longer matches the approved replacement text",
+                        "reason": "mapped factual cell citation no longer matches the approved occurrence",
                         "mutation_performed": False,
                     }
-                item["span_start"] = position
-                item["span_end"] = position + len(token)
-                item["raw_text"] = token
-                cursor = position + len(token)
+            else:
+                matches = [
+                    item
+                    for item in citations
+                    if isinstance(item, dict)
+                    and str(item.get("ref_id") or "") == citation_mapping.expected_ref_id
+                    and str(item.get("citation_token") or "")
+                    == f"[[cite_ref:{citation_mapping.expected_ref_id}]]"
+                    and int(item.get("span_start") or -1) == int(old_span.get("start_offset") or -2)
+                    and int(item.get("span_end") or -1) == int(old_span.get("end_offset") or -2)
+                ]
+                if len(matches) != 1:
+                    return {
+                        "status": "blocked",
+                        "plan_id": source_plan_id,
+                        "reason": "citation block span does not uniquely match the approved occurrence",
+                        "mutation_performed": False,
+                    }
+                citation = matches[0]
+                citation["ref_id"] = citation_mapping.replacement_ref_id
+                citation["citation_token"] = f"[[cite_ref:{citation_mapping.replacement_ref_id}]]"
+                citation["raw_text"] = citation["citation_token"]
+                citation["paper_id"] = citation_mapping.replacement_paper_id
+                citation["paper_key"] = citation_mapping.replacement_paper_id
+                citation["canonical_paper_key"] = citation_mapping.replacement_paper_id
+            block_text = str(patched_block.get("text") or "")
+            if patched_block.get("cell_kind") == "factual_output_unit":
+                if not _refresh_factual_cell_offsets(patched_block, block_text):
+                    return {
+                        "status": "blocked",
+                        "plan_id": source_plan_id,
+                        "reason": "cell citation metadata does not match the approved replacement text",
+                        "mutation_performed": False,
+                    }
+            else:
+                cursor = 0
+                for item in sorted(
+                    (value for value in citations if isinstance(value, dict)),
+                    key=lambda value: int(value.get("span_start") or 0),
+                ):
+                    token = str(item.get("citation_token") or "")
+                    position = block_text.find(token, cursor) if token else -1
+                    if position < 0:
+                        return {
+                            "status": "blocked",
+                            "plan_id": source_plan_id,
+                            "reason": "citation metadata no longer matches the approved replacement text",
+                            "mutation_performed": False,
+                        }
+                    item["span_start"] = position
+                    item["span_end"] = position + len(token)
+                    item["raw_text"] = token
+                    cursor = position + len(token)
             patched_block["anchor_text"] = (
                 block_text[:80] + ("..." if len(block_text) > 80 else "")
             )
             patched_block["anchor_hash"] = hashlib.sha256(block_text.encode("utf-8")).hexdigest()[:8]
-            patched_block["span_map"] = {
-                "segmenter_version": SENTENCE_SEGMENTER_VERSION,
-                "sentences": [
-                    item.to_dict(sentence_index=index)
-                    for index, item in enumerate(segment_sentences(block_text), start=1)
-                ],
-            }
+            if patched_block.get("cell_kind") != "factual_output_unit":
+                patched_block["span_map"] = {
+                    "segmenter_version": SENTENCE_SEGMENTER_VERSION,
+                    "sentences": [
+                        item.to_dict(sentence_index=index)
+                        for index, item in enumerate(segment_sentences(block_text), start=1)
+                    ],
+                }
 
         tx_seed = {
             "manual_plan": manual_plan_id,

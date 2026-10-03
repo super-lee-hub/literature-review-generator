@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import copy
+import json
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, Mapping
 
+import pytest
 from docx import Document
+from docx.oxml.ns import qn
 
 from docx_writer import (
     append_review_section_blocks_to_word_document,
@@ -16,27 +21,98 @@ from services.job_workspace import JobWorkspace
 from services.review_draft import build_review_draft
 from services.review_generation_service import ReviewGenerationService
 from services.settings import ApplicationSettings
-from tests.test_current_review_generation import _stage1_summary
+from tests import test_current_review_generation as review_generation_helpers
+from tests.writer_source_fixture import bind_production_writer_sources
 from tests.test_docx_citation_renderer import _manifest
 
 
-def test_review_service_pipe_table_renders_as_cjk_multipage_native_docx_table(
+def test_review_service_projects_source_bound_cjk_sentence_into_multipage_native_table(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    summary, _source_pdf = _stage1_summary(tmp_path)
-    paper_key = str(summary["paper_info"]["canonical_paper_key"])
-    long_cjk_paragraph = (
-        "中文分页验证文本用于检查真实 Review 服务生成的 Word 连续分页、字体回退和表格布局。"
-        * 360
-    ) + " [[cite_ref:R001]]"
-    markdown_table = "\n".join(
-        (
-            "| 指标 | 结果 |",
-            "| --- | --- |",
-            "| 样本量 | 24 名参与者 [[cite_ref:R001]] |",
-            "| 排版范围 | 本地中文表格验证 |",
-        )
+    long_finding = ("用于分页测试的中文内容，" * 250) + "本句仅用于检验原生表格分页。"
+    qualifier = "本结果仅为合成排版测试文本，不能外推为真实研究结论。"
+    assert 3000 <= len(long_finding) < 4096
+    assert long_finding.count("。") == 1
+
+    canonical_summary = copy.deepcopy(review_generation_helpers._canonical_summary())
+    canonical_summary["core_analysis"]["findings"] = long_finding
+    canonical_summary["core_analysis"]["key_points"] = [long_finding]
+    canonical_summary["core_analysis"]["limitations"] = qualifier
+    monkeypatch.setattr(
+        review_generation_helpers,
+        "_canonical_summary",
+        lambda: copy.deepcopy(canonical_summary),
     )
+
+    summary, _source_pdf = review_generation_helpers._stage1_summary(tmp_path)
+    paper_key = str(summary["paper_info"]["canonical_paper_key"])
+    packet: dict[str, Any] = {
+        "section_id": "section:results",
+        "section_goal": "展示来源约束下的长中文结果",
+        "planned_claims": [long_finding],
+        "paper_keys": [paper_key],
+        "source_summary_hashes": [],
+        "retrieval_provenance": {
+            "source": "stage1_summary",
+            "paper_keys": [paper_key],
+        },
+    }
+
+    seen_writer_scope: list[Mapping[str, Any]] = []
+
+    def writer(**kwargs: Any) -> Mapping[str, Any]:
+        prompt = json.loads(str(kwargs["prompt_text"]))
+        scope = prompt["writer_task_scope"]
+        seen_writer_scope.append(scope)
+        assert scope["schema_version"] == "writer_task_scope_wire/v2"
+        task = scope["tasks"][0]
+        primary_unit = next(
+            unit for unit in task["output_units"]
+            if unit["unit_kind"] == "planned_claim"
+        )
+        qualifier_claim = next(
+            scope["evidence_store"][reference]["value"]
+            for row in task["canonical_source_bundle_refs"]
+            for reference in row["source_claims_refs"]
+            if scope["evidence_store"][reference]["value"].get("text") == qualifier
+        )
+        assert qualifier_claim["claim_id"] in task["qualifier_source_claim_ids"]
+        qualifier_unit = next(
+            unit for unit in task["output_units"]
+            if unit["unit_kind"] == "source_claim_expansion"
+            and unit["source_claim_id"] == qualifier_claim["claim_id"]
+        )
+        assert primary_unit["required"] is True
+        assert qualifier_unit["required"] is False
+        citation = f"[[cite_ref:{task['allowed_ref_ids'][0]}]]"
+        primary_text = f"{long_finding[:-1]} {citation}{long_finding[-1]}"
+        qualifier_text = f"{qualifier[:-1]} {citation}{qualifier[-1]}"
+        basis = str(scope["writer_task_basis_hash"])
+        return {
+            "status": "success",
+            "content": {
+                "blocks": [
+                    {
+                        "writer_task_id": task["writer_task_id"],
+                        "writer_output_unit_id": primary_unit["writer_output_unit_id"],
+                        "writer_task_basis_hash": basis,
+                        "text": primary_text,
+                    },
+                    {
+                        "writer_task_id": task["writer_task_id"],
+                        "writer_output_unit_id": qualifier_unit["writer_output_unit_id"],
+                        "writer_task_basis_hash": basis,
+                        "text": qualifier_text,
+                    },
+                ],
+                "task_dispositions": [{
+                    "writer_task_id": task["writer_task_id"],
+                    "writer_task_basis_hash": basis,
+                    "disposition": "covered",
+                }],
+            },
+        }
 
     workspace = JobWorkspace.create(
         str(tmp_path / "review-output"),
@@ -54,48 +130,74 @@ def test_review_service_pipe_table_renders_as_cjk_multipage_native_docx_table(
                 "api_key": "writer-test",
                 "model": "writer-test",
                 "api_base": "https://writer.test/v1",
+                "max_context_tokens": "128000",
+                "max_output_tokens": "4096",
             },
         }),
         summaries=[summary],
-        writer=lambda **_kwargs: {
-            "status": "success",
-            "content": {
-                "blocks": [
-                    {"text": long_cjk_paragraph},
-                    {"text": markdown_table},
-                ],
-            },
-        },
+        writer=writer,
     )
+    bind_production_writer_sources(service, [packet])
     result = service.run(
         outline_payload={
             "title": "本地排版验证",
             "sections": [{
                 "section_id": "section:results",
                 "title": "中文结果",
-                "goal": "展示长段落与表格",
+                "goal": "展示来源约束下的长中文结果",
+                "writer_table_plan": {
+                    "schema_version": "writer_table_plan/v1",
+                    "tables": [{
+                        "table_id": "results_table",
+                        "headers": ["指标", "结果"],
+                        "rows": [{
+                            "row_id": "primary_finding",
+                            "cells": [
+                                {"static_text": "研究发现"},
+                                {"planned_claim_index": 0, "source_claim_id": None},
+                            ],
+                        }],
+                    }],
+                },
             }],
         },
-        evidence_packets=[{
-            "section_id": "section:results",
-            "section_goal": "展示长段落与表格",
-            "planned_claims": ["The controlled result is included for renderer QA."],
-            "paper_keys": [paper_key],
-            "source_summary_hashes": ["docx-table-summary-hash"],
-            "retrieval_provenance": {
-                "source": "local_docx_table_fixture",
-                "paper_keys": [paper_key],
-            },
-        }],
+        evidence_packets=[packet],
     )
 
-    # The production Writer service preserves the table as a Markdown block
-    # within its current text-only block contract. The DOCX renderer promotes
-    # only a complete, unambiguous pipe table to a native Word table.
+    assert len(seen_writer_scope) == 1
+    assert seen_writer_scope[0]["source_inventory_binding"]["artifact_id"]
+    task_source_hashes = {
+        row["source_summary_hash"]
+        for row in result.sections[0]["writer_task_scope"]["tasks"][0]["source_evidence"]
+    }
+    assert packet["source_summary_hashes"] == sorted(task_source_hashes)
+    assert all(len(value) == 64 for value in packet["source_summary_hashes"])
     assert len(result.sections) == 1
-    assert len(result.sections[0]["blocks"]) == 2
-    assert result.sections[0]["blocks"][1]["block_kind"] == "paragraph"
-    assert result.sections[0]["blocks"][1]["text"] == markdown_table
+    section = result.sections[0]
+    table_block = next(block for block in section["blocks"] if block["block_kind"] == "table")
+    assert table_block.get("text", "") == ""
+    assert table_block["headers"] == ["指标", "结果"]
+    assert len(table_block["rows"]) == 1
+    label_cell, factual_cell = table_block["rows"][0]["cells"]
+    assert label_cell["text"] == "研究发现"
+    assert label_cell["cell_kind"] == "static_label"
+    assert factual_cell["cell_kind"] == "factual_output_unit"
+    assert factual_cell["text"] == f"{long_finding[:-1]} [[cite_ref:R001]]{long_finding[-1]}"
+    assert factual_cell["block_id"]
+    assert factual_cell["writer_task_id"]
+    assert factual_cell["writer_output_unit_id"]
+    assert factual_cell["writer_task_basis_hash"] == table_block["writer_task_basis_hash"]
+    assert factual_cell["required_source_context"]["source_claim_ids"]
+    assert factual_cell["required_source_context"]["qualifier_source_claim_ids"]
+    qualifier_block = next(
+        block for block in section["blocks"]
+        if block["block_kind"] == "paragraph"
+        and block["text"].startswith(qualifier[:-1])
+        and block["text"].endswith(qualifier[-1])
+    )
+    assert qualifier_block["block_id"]
+    assert qualifier_block["writer_output_unit_id"]
+    assert qualifier_block["required_source_context"]["qualifier_source_claim_ids"]
 
     output_path = tmp_path / "review-with-native-table.docx"
     review_draft = build_review_draft(
@@ -118,6 +220,15 @@ def test_review_service_pipe_table_renders_as_cjk_multipage_native_docx_table(
         ),
     )
     review_draft_payload = review_draft.to_dict()
+    draft_section = review_draft_payload["content"]["sections"][0]
+    draft_table = next(
+        block for block in draft_section["blocks"]
+        if block.get("table_layout_schema_version") == "writer_table_layout/v1"
+    )
+    assert draft_table["text"] == ""
+    draft_fact_cell = draft_table["rows"][0]["cells"][1]
+    assert draft_fact_cell["block_id"] == factual_cell["block_id"]
+    assert draft_fact_cell["citations"][0]["ref_id"] == "R001"
     citation_manifest = build_citation_manifest_from_review_draft(
         job_id=workspace.job_id,
         project_name=workspace.project_name,
@@ -132,11 +243,22 @@ def test_review_service_pipe_table_renders_as_cjk_multipage_native_docx_table(
             result.citation_ref_catalog.get("catalog_hash") or ""
         ),
     )
+    manifest_payload = citation_manifest.to_dict()
+    assert any(
+        occurrence["block_id"] == factual_cell["block_id"]
+        and occurrence["ref_id"] == "R001"
+        for occurrence in manifest_payload["occurrences"]
+    )
+    assert any(
+        occurrence["block_id"] == qualifier_block["block_id"]
+        and occurrence["ref_id"] == "R001"
+        for occurrence in manifest_payload["occurrences"]
+    )
 
     rebuild_review_docx_from_structured_artifacts(
         SimpleNamespace(logger=None),
         review_draft_payload,
-        citation_manifest.to_dict(),
+        manifest_payload,
         str(output_path),
     )
 
@@ -145,21 +267,30 @@ def test_review_service_pipe_table_renders_as_cjk_multipage_native_docx_table(
     assert document.sections[0].footer._element.xml.count("PAGE") == 1
     assert len(document.tables) == 1
     table = document.tables[0]
-    assert len(table.rows) == 3
+    assert len(table.rows) == 2
     assert len(table.columns) == 2
+    assert table.rows[0]._tr.trPr is not None
+    assert table.rows[0]._tr.trPr.find(qn("w:tblHeader")) is not None
     table_text = "\n".join(
         cell.text for row in table.rows for cell in row.cells
     )
     assert "指标" in table_text
-    assert "样本量" in table_text
-    assert "本地中文表格验证" in table_text
+    assert "研究发现" in table_text
+    assert len(table.cell(1, 1).text) > 2500
+    assert table.cell(1, 1).text.startswith(long_finding[:200])
+    assert long_finding[1200:1400] in table.cell(1, 1).text
+    assert table.cell(1, 1).text.endswith("。")
     assert "[[cite_ref:" not in table_text
     assert "(" in table_text and ")" in table_text
-    assert any("中文分页验证文本" in paragraph.text for paragraph in document.paragraphs)
+    assert any(
+        paragraph.text.startswith(qualifier[:-1])
+        and paragraph.text.endswith(qualifier[-1])
+        for paragraph in document.paragraphs
+    )
 
     scan = scan_docx_for_unresolved_citation_tokens(
         str(output_path),
-        citation_manifest.to_dict(),
+        manifest_payload,
     )
     assert scan["passed"] is True, scan
 

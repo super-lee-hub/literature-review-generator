@@ -308,7 +308,7 @@ def _validate_stage1_reusable_summary_manifest(record: ArtifactRecord, path: Pat
         record,
         payload,
         artifact_type="stage1_reusable_summary_manifest",
-        versions=("v1",),
+        versions=("v1", "v2"),
     )
     _require_owned_job(record, payload, field="job_id")
     _require_fields(
@@ -369,6 +369,22 @@ def _validate_stage1_reusable_summary_manifest(record: ArtifactRecord, path: Pat
             raise ReconcileValidationError(
                 f"stage1_reusable_summary_manifest.{hash_label} is not a SHA-256 digest"
             )
+    if payload.get("artifact_version") == "v2":
+        from runtime.artifact_validators import ArtifactSchemaError, _validate_owner_corrected_manifest_shape
+
+        try:
+            _validate_owner_corrected_manifest_shape(payload)
+        except ArtifactSchemaError as exc:
+            raise ReconcileValidationError(str(exc)) from exc
+
+
+def _validate_stage1_portable_owner_correction(record: ArtifactRecord, path: Path) -> None:
+    from runtime.artifact_validators import ArtifactSchemaError, _validate_stage1_portable_owner_correction as validate_shape
+
+    try:
+        validate_shape(record, path, _read_json_object(path))
+    except ArtifactSchemaError as exc:
+        raise ReconcileValidationError(str(exc)) from exc
 
 
 def _validate_nonempty_text(_record: ArtifactRecord, path: Path) -> None:
@@ -706,7 +722,7 @@ def _validate_paper_artifact(record: ArtifactRecord, path: Path) -> None:
 
 
 def _validate_review_draft(record: ArtifactRecord, path: Path) -> None:
-    from services.review_draft import ReviewDraft
+    from services.review_draft import ReviewDraft, validate_review_section_writer_scope
 
     payload = _read_json_object(path)
     _require_contract_header(
@@ -761,7 +777,13 @@ def _validate_review_draft(record: ArtifactRecord, path: Path) -> None:
         for block in blocks:
             block_data = _require_mapping(block, label="review block")
             _require_nonempty_string(block_data.get("block_id"), label="review block_id")
-            _require_nonempty_string(block_data.get("text"), label="review block text")
+        try:
+            text_blocks = validate_review_section_writer_scope(section_data)
+        except (TypeError, ValueError, KeyError) as exc:
+            raise ReconcileValidationError(f"review section source/layout contract is invalid: {exc}") from exc
+        for block_data in text_blocks:
+            _require_nonempty_string(block_data.get("block_id"), label="review text block_id")
+            _require_nonempty_string(block_data.get("text"), label="review text block text")
 
     if draft.generation_context.get("generation_mode") == "outline_v3":
         # The focused compatibility checks above predate Outline v3 lineage.
@@ -1672,6 +1694,10 @@ DEFAULT_SCHEMA_VALIDATORS: dict[str, SchemaValidator] = {
     "stage1_progress_snapshot": _validate_json_object,
     "summary_source_manifest": _validate_summary_source_manifest,
     "stage1_reusable_summary_manifest": _validate_stage1_reusable_summary_manifest,
+    "stage1_portable_owner_correction_origin_source": _validate_stage1_portable_owner_correction,
+    "stage1_portable_owner_correction_prior_manifest": _validate_stage1_portable_owner_correction,
+    "stage1_portable_owner_correction_derived_summary_set": _validate_stage1_portable_owner_correction,
+    "stage1_portable_owner_correction_adoption_receipt": _validate_stage1_portable_owner_correction,
     "summary_selection": _validate_summary_selection,
     "review_batch_manifest": _validate_review_batch_manifest,
     "paper_artifact": _validate_paper_artifact,

@@ -404,6 +404,16 @@ def _validate_review_json(record: Any, _path: str | Path, root: Mapping[str, Any
     _require_fields(root, ("created_at", "draft_identity", "generation_context", "content", "projections"), artifact_type)
     if not isinstance(root.get("content"), Mapping) or not isinstance(root.get("draft_identity"), Mapping):
         raise ArtifactSchemaError(f"{artifact_type} content and draft_identity must be objects")
+    from services.review_draft import validate_review_section_writer_scope
+
+    for section in root["content"].get("sections", []):
+        if not isinstance(section, Mapping):
+            raise ArtifactSchemaError(f"{artifact_type} section must be an object")
+        if section.get("writer_task_scope") or any(block.get("table_layout_schema_version") for block in section.get("blocks", [])):
+            try:
+                validate_review_section_writer_scope(section)
+            except (TypeError, ValueError, KeyError) as exc:
+                raise ArtifactSchemaError(f"{artifact_type} source/layout contract is invalid: {exc}") from exc
     generation_context = root.get("generation_context")
     if not isinstance(generation_context, Mapping):
         raise ArtifactSchemaError(f"{artifact_type} generation_context must be an object")
@@ -900,11 +910,14 @@ def _validate_stage1_reusable_summary_manifest(
     _path: str | Path,
     root: Mapping[str, Any],
 ) -> None:
+    version = str(getattr(record, "artifact_version", "") or "")
+    if version not in {"v1", "v2"}:
+        raise ArtifactSchemaError("stage1 reusable manifest version is unsupported")
     _validate_production_identity(
         record,
         root,
         expected_types=("stage1_reusable_summary_manifest",),
-        expected_version="v1",
+        expected_version=version,
     )
     _require_fields(
         root,
@@ -964,6 +977,25 @@ def _validate_stage1_reusable_summary_manifest(
             raise ArtifactSchemaError(
                 f"stage1_reusable_summary_manifest.{hash_label} is not a SHA-256 hex digest"
             )
+    if version == "v2":
+        _validate_owner_corrected_manifest_shape(root)
+
+
+def _validate_owner_corrected_manifest_shape(root: Mapping[str, Any]) -> None:
+    from services.stage1_reuse import Stage1ReusableSummaryBindingV1, _validate_manifest_self_binding
+
+    binding_value = root.get("binding")
+    paper_info = root.get("paper_info")
+    summary_payload = root.get("summary_payload")
+    if not all(isinstance(item, Mapping) for item in (binding_value, paper_info, summary_payload)):
+        raise ArtifactSchemaError("owner corrected manifest requires binding, paper and summary objects")
+    manifest, reason = _validate_manifest_self_binding(
+        root,
+        binding=Stage1ReusableSummaryBindingV1.from_mapping(binding_value),
+        previous_summary={"paper_info": paper_info, "ai_summary": summary_payload},
+    )
+    if manifest is None:
+        raise ArtifactSchemaError(f"owner corrected manifest is invalid: {reason}")
 
 
 def _validate_stage1_portable_metadata(record: Any, *, expected_type: str) -> Mapping[str, Any]:
@@ -1016,6 +1048,28 @@ def _validate_stage1_portable_metadata(record: Any, *, expected_type: str) -> Ma
             "stage1 portable summary manifest metadata is not self-bound"
         )
     return metadata
+
+
+def _validate_stage1_portable_owner_correction(
+    record: Any,
+    _path: str | Path,
+    root: Mapping[str, Any],
+) -> None:
+    expected_type = str(getattr(record, "artifact_type", ""))
+    metadata = _validate_stage1_portable_metadata(record, expected_type=expected_type)
+    headers = {
+        "stage1_portable_owner_correction_origin_source": ("stage1_canonical_summaries", "v1"),
+        "stage1_portable_owner_correction_prior_manifest": ("stage1_reusable_summary_manifest", "v1"),
+        "stage1_portable_owner_correction_derived_summary_set": ("stage1_derived_summary_set", "owner-corrected-v1"),
+        "stage1_portable_owner_correction_adoption_receipt": ("stage1_summary_correction_adoption_receipt", "v1"),
+    }
+    artifact_type, artifact_version = headers[expected_type]
+    if (
+        root.get("artifact_type") != artifact_type
+        or root.get("artifact_version") != artifact_version
+        or root.get("job_id") != metadata.get("source_authority_job_id")
+    ):
+        raise ArtifactSchemaError("portable owner correction source header is invalid")
 
 
 def _validate_stage1_portable_summary_source(
@@ -1080,7 +1134,7 @@ def _validate_stage1_portable_summary_manifest(
     )
     if (
         root.get("artifact_type") != "stage1_reusable_summary_manifest"
-        or root.get("artifact_version") != "v1"
+        or root.get("artifact_version") not in {"v1", "v2"}
         or str(root.get("job_id") or "")
         != str(metadata.get("source_authority_job_id") or "")
         or str(root.get("stage_name") or "") != "stage1_analyze"
@@ -1088,6 +1142,8 @@ def _validate_stage1_portable_summary_manifest(
         or not isinstance(root.get("binding"), Mapping)
     ):
         raise ArtifactSchemaError("stage1 portable summary manifest identity is invalid")
+    if root.get("artifact_version") == "v2":
+        _validate_owner_corrected_manifest_shape(root)
     qualification_issues = validate_current_visual_evidence_qualification_pair(root)
     if qualification_issues:
         raise ArtifactSchemaError(
@@ -2790,10 +2846,15 @@ def _validate_current_production_artifact(record: Any, path: str | Path, root: M
         ("provider_expected_call_graph", "v1"): _validate_provider_expected_call_graph,
         ("stage1_summary_reuse_record", "v1"): _validate_stage1_summary_reuse_record,
         ("stage1_reusable_summary_manifest", "v1"): _validate_stage1_reusable_summary_manifest,
+        ("stage1_reusable_summary_manifest", "v2"): _validate_stage1_reusable_summary_manifest,
         ("stage1_portable_summary_source", "v1"): _validate_stage1_portable_summary_source,
         ("stage1_portable_summary_manifest", "v1"): _validate_stage1_portable_summary_manifest,
         ("stage1_portable_provider_closure", "v1"): _validate_stage1_portable_provider_closure,
         ("stage1_portable_provider_ledger", "v1"): _validate_stage1_portable_provider_ledger,
+        ("stage1_portable_owner_correction_origin_source", "v1"): _validate_stage1_portable_owner_correction,
+        ("stage1_portable_owner_correction_prior_manifest", "v1"): _validate_stage1_portable_owner_correction,
+        ("stage1_portable_owner_correction_derived_summary_set", "v1"): _validate_stage1_portable_owner_correction,
+        ("stage1_portable_owner_correction_adoption_receipt", "v1"): _validate_stage1_portable_owner_correction,
         ("outline_provider_call_plan", "v1"): _validate_outline_provider_call_plan,
         ("outline_request_payload_audit", "v1"): _validate_outline_request_payload_audit,
         ("outline_hierarchical_call_graph", "v1"): _validate_outline_hierarchical_call_graph,

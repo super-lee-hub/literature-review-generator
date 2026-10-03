@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, replace
 from datetime import datetime
@@ -21,7 +22,11 @@ from typing import Any, cast
 from ai_interface import _load_api_runtime_settings
 from models import APIConfig
 from runtime.provider_context import ProviderContextProfile
-from runtime.provider_runtime import hash_json
+from runtime.provider_runtime import (
+    ProviderAggregateBudgetV2,
+    ProviderBudgetExceeded,
+    hash_json,
+)
 from services.artifact_registry import ArtifactDependencyRefV2, file_sha256
 from services.job_workspace import publish_bytes_artifact, publish_json_artifact
 from services.model_capabilities import resolve_model_capability
@@ -61,6 +66,80 @@ from validation.run_result import (
     ValidationInputArtifactsV1,
     ValidationRunResultV1,
 )
+
+
+_CITATION_TOKEN = re.compile(r"\[\[cite(?:_ref)?:[^\]]+\]\]")
+
+
+def _review_text_inventory(
+    review_draft: Mapping[str, Any],
+) -> tuple[int, dict[str, str], tuple[str, ...]]:
+    """Count citations and collect canonical paragraph/cell text bindings."""
+    from services.review_draft import iter_review_text_blocks, validate_review_section_writer_scope
+
+    content = review_draft.get("content")
+    sections = content.get("sections") if isinstance(content, Mapping) else None
+    if not isinstance(sections, list):
+        return 0, {}, ("review_sections_missing",)
+
+    citation_count = 0
+    native_cell_text: dict[str, str] = {}
+    seen_block_ids: set[str] = set()
+    issues: list[str] = []
+    for section_index, section in enumerate(sections, start=1):
+        if not isinstance(section, Mapping):
+            issues.append(f"review_section_writer_scope_invalid:{section_index}")
+            continue
+        try:
+            text_blocks = validate_review_section_writer_scope(section)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            issues.append(f"review_section_writer_scope_invalid:{section_index}")
+            try:
+                text_blocks = list(iter_review_text_blocks(section))
+            except (AttributeError, KeyError, TypeError, ValueError):
+                continue
+        for block in text_blocks:
+            if not isinstance(block, Mapping):
+                continue
+            block_id = str(block.get("block_id") or "").strip()
+            if not block_id or block_id in seen_block_ids:
+                issues.append(f"review_text_block_identity_invalid:{section_index}")
+            else:
+                seen_block_ids.add(block_id)
+            text = str(block.get("text") or "")
+            citations = block.get("citations")
+            structured_count = len(citations) if isinstance(citations, list) else 0
+            token_count = len(_CITATION_TOKEN.findall(text))
+            citation_count += max(structured_count, token_count)
+            if block.get("table_id") and block_id:
+                native_cell_text[block_id] = text
+    return citation_count, native_cell_text, tuple(dict.fromkeys(issues))
+
+
+def _native_citation_span_matches_text(
+    occurrence: Mapping[str, Any],
+    block_text: str,
+) -> bool:
+    token = occurrence.get("citation_token")
+    spans = occurrence.get("spans")
+    if not isinstance(token, str) or not token or not isinstance(spans, list) or not spans:
+        return False
+    for span in spans:
+        if not isinstance(span, Mapping):
+            return False
+        start, end = span.get("start_offset"), span.get("end_offset")
+        if (
+            isinstance(start, bool)
+            or not isinstance(start, int)
+            or isinstance(end, bool)
+            or not isinstance(end, int)
+            or not 0 <= start < end <= len(block_text)
+        ):
+            return False
+        actual = block_text[start:end]
+        if actual != token or span.get("text") != actual:
+            return False
+    return True
 
 
 def _log(service: Any, level: str, message: str) -> None:
@@ -601,13 +680,19 @@ def _input_contract(
     cited_ids = _cited_paper_ids(citation_manifest)
     citation_sets = citation_manifest.get("citation_sets") or ()
     occurrences = citation_manifest.get("occurrences") or ()
-    draft_citation_count = sum(
-        len(block.get("citations") or ())
-        for section in (review_draft.get("content", {}).get("sections") or ())
-        if isinstance(section, Mapping)
-        for block in (section.get("blocks") or ())
-        if isinstance(block, Mapping)
-    )
+    draft_citation_count, native_cell_text, section_issues = _review_text_inventory(review_draft)
+    degradation.extend(section_issues)
+    if isinstance(occurrences, list):
+        for index, occurrence in enumerate(occurrences, start=1):
+            if not isinstance(occurrence, Mapping):
+                continue
+            block_id = str(occurrence.get("block_id") or "").strip()
+            if block_id in native_cell_text and not _native_citation_span_matches_text(
+                occurrence,
+                native_cell_text[block_id],
+            ):
+                occurrence_id = str(occurrence.get("occurrence_id") or index)
+                degradation.append(f"native_table_citation_span_invalid:{occurrence_id}")
     review_has_citations = bool(
         draft_citation_count or citation_sets or occurrences or cited_ids
     )
@@ -1097,6 +1182,197 @@ def _validator_stage_pretransport_inventory(
     return plan
 
 
+def _preflight_validator_aggregate_scope(
+    service: Any,
+    planned_requests: Sequence[tuple[Any, Any, Mapping[str, Any]]],
+    api_config: APIConfig,
+    inventory: dict[str, Any],
+    *,
+    controller: Any | None,
+    verified_reuse: Mapping[str, Mapping[str, Any]],
+) -> None:
+    """Preflight the exact Validator miss set against the remaining run budget."""
+
+    from runtime.provider_context import ProviderContextProfile
+    from runtime.provider_routes import build_reachable_provider_route_plan
+    from runtime.stage_planning import (
+        ProviderStageRequestInventoryV1,
+        VerifiedProviderReuseAuthorityV1,
+        build_full_stage_request_plan_v1,
+        build_provider_request_plan_row_v1,
+        build_stage_plan,
+    )
+
+    if not planned_requests:
+        return
+    if controller is None or not isinstance(controller.budget, ProviderAggregateBudgetV2):
+        return
+
+    route_config = dict(getattr(service.settings, "sections", {}) or {})
+    route_config["Validator_API"] = dict(api_config)
+    stage_plan = build_stage_plan(
+        action="validate_review",
+        requested_stages=("validate",),
+        validation_enabled=True,
+        validation_required=True,
+    )
+    route_plan = build_reachable_provider_route_plan(
+        route_config,
+        action="validate_review",
+        requested_stages=("validate",),
+        stage_plan=stage_plan,
+    )
+    route = route_plan.route_for_role("validator")
+    if not route.resolved:
+        raise ProviderBudgetExceeded(
+            "Validator stage preflight cannot bind its request inventory to the reachable route"
+        )
+
+    capability = resolve_model_capability(api_config)
+    try:
+        model_context_limit = max(1, int(api_config.get("max_context_tokens") or 128_000))
+    except (TypeError, ValueError):
+        model_context_limit = 128_000
+    try:
+        configured_output_tokens = max(1, int(api_config.get("max_output_tokens") or 4_096))
+    except (TypeError, ValueError):
+        configured_output_tokens = 4_096
+    profile = ProviderContextProfile.conservative(
+        provider=str(api_config.get("provider_family") or capability.provider_family),
+        model=str(api_config.get("model") or ""),
+        endpoint_type=str(api_config.get("endpoint_type") or capability.endpoint_type),
+        model_context_limit=model_context_limit,
+        max_output_tokens=configured_output_tokens,
+        reasoning_reserve=_nonnegative_setting(
+            api_config.get("reasoning_reserve_tokens"), 0
+        ),
+        safety_margin=_positive_setting(api_config.get("safety_margin_tokens"), 256),
+    )
+    inventory_rows = {
+        str(item["call_id"]): item for item in inventory.get("requests") or ()
+    }
+    rows = []
+    for _result, packet, payload in planned_requests:
+        call_id = adjudication_call_id(packet)
+        inventory_row = inventory_rows[call_id]
+        cached = verified_reuse.get(call_id)
+        reuse_authority = None
+        retry_attempts = max(0, int(inventory_row["attempts_upper_bound"]) - 1)
+        if cached is not None:
+            raw_reuse = cached["raw_reuse"]
+            reuse_authority = VerifiedProviderReuseAuthorityV1(
+                request_hash=hash_json(payload),
+                route_identity=route.identity,
+                receipt_hash=str(raw_reuse.get("source_receipt_hash") or ""),
+                output_hash=str(raw_reuse.get("provider_output_artifact_hash") or ""),
+                authority_hash=str(cached["reuse_record"].content_hash),
+            )
+            retry_attempts = 0
+        request_output_tokens = max(
+            1, int(payload.get("max_output_tokens") or configured_output_tokens)
+        )
+        total_timeout = max(1, int(inventory_row["total_timeout_seconds"]))
+        rows.append(
+            build_provider_request_plan_row_v1(
+                stage_name="validate",
+                request_id=call_id,
+                source_builder=(
+                    "validation.llm_adjudicator.build_adjudication_packet -> "
+                    "validation.adjudication_reuse._request_payload"
+                ),
+                route=route,
+                request_payload=payload,
+                profile=profile,
+                retry_attempts=retry_attempts,
+                requested_output_tokens=request_output_tokens,
+                reasoning_reserve_tokens=profile.reasoning_reserve,
+                verified_reuse=reuse_authority,
+                retry_policy="shared_optional",
+                wall_seconds_upper_bound=float(total_timeout),
+            )
+        )
+
+    stage_inventory = ProviderStageRequestInventoryV1(
+        stage_name="validate",
+        source_builder=(
+            "validation.llm_adjudicator.build_adjudication_packet -> "
+            "validation.adjudication_reuse._request_payload"
+        ),
+        requests=tuple(rows),
+    )
+    snapshot = controller.snapshot()
+    budget = controller.budget
+
+    def remaining(field: str, limit: int) -> int:
+        return max(
+            0,
+            limit - int(snapshot[f"{field}_used"]) - int(snapshot[f"{field}_reserved"]),
+        )
+
+    remaining_budget = ProviderAggregateBudgetV2(
+        max_provider_calls_total=remaining("calls", budget.max_provider_calls_total),
+        max_output_tokens_total=remaining(
+            "output_tokens", budget.max_output_tokens_total
+        ),
+        max_retry_attempts_total=remaining(
+            "retry_attempts", budget.max_retry_attempts_total
+        ),
+        max_wall_seconds=max(
+            0.0,
+            budget.max_wall_seconds - float(snapshot["elapsed_seconds"]),
+        ),
+    )
+    projection = build_full_stage_request_plan_v1(
+        stage_plan=stage_plan,
+        reachable_route_plan=route_plan,
+        stage_inventories=(stage_inventory,),
+        aggregate_budget=remaining_budget,
+    )
+    budget_status = projection["budget_status"]
+    preflight_status = (
+        "blocked_budget"
+        if any(value == "exceeded" for value in budget_status.values())
+        else "within_budget"
+        if projection["ready_for_transport"]
+        else "incomplete_envelope"
+    )
+    inventory["aggregate_preflight"] = {
+        "schema_version": "validator-aggregate-preflight/v1",
+        "status": preflight_status,
+        "provider_posts_emitted": 0,
+        "remaining_budget": remaining_budget.to_dict(),
+        "budget_status": budget_status,
+        "totals": projection["totals"],
+        "projection_identity_hash": projection["projection_identity_hash"],
+    }
+    inventory.pop("inventory_hash", None)
+    inventory["inventory_hash"] = hash_json(inventory)
+    service._validator_stage_pretransport_inventory = inventory
+
+    if preflight_status == "within_budget":
+        return
+    if preflight_status == "blocked_budget":
+        labels = (
+            ("provider_calls", "provider call"),
+            ("requested_output_tokens", "output token"),
+            ("provider_retries", "retry"),
+            ("per_request_context", "provider request context"),
+            ("wall_time", "wall-time"),
+        )
+        exceeded = next(
+            (label for key, label in labels if budget_status.get(key) == "exceeded"),
+            "aggregate provider resource",
+        )
+        raise ProviderBudgetExceeded(
+            f"Validator stage preflight exceeds remaining aggregate {exceeded} budget "
+            f"(requests={len(rows)}, projection={projection['projection_identity_hash']})"
+        )
+    raise ProviderBudgetExceeded(
+        "Validator stage preflight cannot prove a complete remaining-budget envelope "
+        f"(requests={len(rows)}, projection={projection['projection_identity_hash']})"
+    )
+
+
 def _adjudicate(
     service: Any,
     results: Sequence[CitationValidationResult],
@@ -1160,6 +1436,49 @@ def _adjudicate(
         scope=scope,
     )
     service._validator_stage_pretransport_inventory = inventory
+    from runtime.provider_runtime import provider_budget_controller_from_environment
+
+    aggregate_controller = provider_budget_controller_from_environment()
+    verified_reuse: dict[str, dict[str, Any]] = {}
+    if aggregate_controller is not None and isinstance(
+        aggregate_controller.budget, ProviderAggregateBudgetV2
+    ):
+        for item in planned:
+            packet = item.get("packet")
+            key = item.get("checkpoint_key")
+            if packet is None or key is None:
+                continue
+            with checkpoint_store.single_flight(key):
+                report, reuse_record, reuse_error = service.find_verified_adjudication_reuse(
+                    packet=packet,
+                    api_config=config,
+                )
+                item["preflight_reuse_error"] = reuse_error
+                if report is None or reuse_record is None:
+                    continue
+                raw_reuse = json.loads(Path(reuse_record.path).read_text(encoding="utf-8"))
+                output_record = service.artifact_registry.get(
+                    str(raw_reuse.get("provider_output_artifact_id") or "")
+                )
+                if output_record is None or output_record.status != "ready":
+                    continue
+                call_id = adjudication_call_id(packet)
+                reuse_state = {
+                    "report": report,
+                    "reuse_record": reuse_record,
+                    "output_record": output_record,
+                    "raw_reuse": raw_reuse,
+                }
+                item["preflight_verified_reuse"] = reuse_state
+                verified_reuse[call_id] = reuse_state
+    _preflight_validator_aggregate_scope(
+        service,
+        planned_requests,
+        config,
+        inventory,
+        controller=aggregate_controller,
+        verified_reuse=verified_reuse,
+    )
     output: list[CitationValidationResult] = []
     outcomes: list[dict[str, str]] = []
     for item in planned:
@@ -1170,12 +1489,26 @@ def _adjudicate(
             output.append(result)
             continue
         call_id = adjudication_call_id(packet)
+        cached = item.get("preflight_verified_reuse")
+        if isinstance(cached, Mapping):
+            service.register_verified_reuse_call(
+                packet=packet,
+                api_config=config,
+                reuse_record=cached["reuse_record"],
+                output_record=cached["output_record"],
+                output_payload=cached["report"],
+            )
+            outcomes.append({"call_id": call_id, "status": "verified_reuse"})
+            output.append(_apply_adjudication(result, cached["report"]))
+            continue
         outcome_status = "provider_call_not_started"
         with checkpoint_store.single_flight(key):
             report, reuse_record, reuse_error = service.find_verified_adjudication_reuse(
                 packet=packet,
                 api_config=config,
             )
+            if not reuse_error:
+                reuse_error = str(item.get("preflight_reuse_error") or "")
             if report is not None and reuse_record is not None:
                 raw_reuse = json.loads(Path(reuse_record.path).read_text(encoding="utf-8"))
                 output_record = service.artifact_registry.get(
@@ -1617,6 +1950,33 @@ def run_current_validation(
         review_draft_record_override=review_draft_record_override,
         citation_manifest_record_override=citation_manifest_record_override,
     )
+    invalid_review_structure = tuple(
+        reason
+        for reason in degradation_reasons
+        if reason.startswith((
+            "review_section_writer_scope_invalid:",
+            "review_text_block_identity_invalid:",
+            "native_table_citation_span_invalid:",
+        ))
+    )
+    if invalid_review_structure:
+        return _terminal(
+            service,
+            status=ValidationExecutionStatus.FAILED,
+            policy=policy,
+            diagnostic="validation_review_structure_invalid",
+            failure_reason="; ".join(invalid_review_structure),
+            output_dir=output_dir,
+            result_artifact_id=result_artifact_id,
+            result_artifact_type=result_artifact_type,
+            result_artifact_role=result_artifact_role,
+            dependency_records=(
+                review_draft_record_override,
+                citation_manifest_record_override,
+            )
+            if output_dir
+            else None,
+        )
     from validation.source_binding import (
         BINDING_CONTRACT_VERSION,
         build_validation_source_authority_fingerprint,

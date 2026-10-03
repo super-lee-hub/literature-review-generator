@@ -314,8 +314,14 @@ def _derive_current_evidence(
     }
     try:
         from validation.closure import resolve_current_stage_closure_map
+        from runtime.runner import AgentRuntimeRunner
 
-        stage_map = resolve_current_stage_closure_map(registry)
+        stage_map = resolve_current_stage_closure_map(
+            registry,
+            external_registry_resolver=AgentRuntimeRunner._external_registry_resolver(
+                workspace, registry_paths=AgentRuntimeRunner._review_batch_registry_paths(registry),
+            ),
+        )
         stage_map_payload = stage_map.to_dict()
         current_receipt_id = str(
             (stage_map.stages.get("validation_receipt_closure") or {}).get("artifact_id") or ""

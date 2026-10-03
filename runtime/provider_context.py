@@ -108,6 +108,35 @@ class ProviderContextProfile:
             tokenizer_strategy=tokenizer_strategy,
         )
 
+    @classmethod
+    def from_api_config(
+        cls,
+        api_config: Mapping[str, Any],
+        *,
+        max_output_tokens: int,
+        default_provider: str = "configured",
+        default_model: str = "",
+        default_endpoint_type: str = "responses",
+    ) -> ProviderContextProfile:
+        """Use the same configured reserves for planning and transport."""
+
+        def positive(value: Any, default: int) -> int:
+            try:
+                parsed = int(str(value).strip())
+            except (TypeError, ValueError):
+                return default
+            return parsed if parsed > 0 else default
+
+        return cls.conservative(
+            provider=str(api_config.get("provider_family") or default_provider),
+            model=str(api_config.get("model") or default_model),
+            endpoint_type=str(api_config.get("endpoint_type") or default_endpoint_type),
+            model_context_limit=positive(api_config.get("max_context_tokens"), 128_000),
+            max_output_tokens=max(1, int(max_output_tokens)),
+            reasoning_reserve=positive(api_config.get("reasoning_reserve_tokens"), 0),
+            safety_margin=positive(api_config.get("safety_margin_tokens"), 256),
+        )
+
     def estimate_tokens(self, value: Any) -> int:
         """Estimate a complete request without pretending characters are tokens."""
 

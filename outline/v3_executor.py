@@ -9586,6 +9586,23 @@ class OutlineV3Executor:
 
             # First divide topic units by their complete serialized content and
             # the same route prompt/schema used by the real provider call.
+            packing_items: list[Any] = []
+            for item in current_items:
+                single = reducer_request([item], level=level, index=1)
+                if isinstance(item, Mapping) and estimate(
+                    single, f"{node_id}:reduce:{level}:1"
+                ) > input_limit:
+                    from outline.semantic_reducer_projection import split_nested_topic_for_reduction_v1
+
+                    try:
+                        packing_items.extend(split_nested_topic_for_reduction_v1(item))
+                    except ValueError as exc:
+                        raise OutlineV3ExecutionError(
+                            f"invalid nested topic reduction scope: {exc}"
+                        ) from exc
+                else:
+                    packing_items.append(item)
+            current_items = packing_items
             groups: list[list[Any]] = []
             current_group: list[Any] = []
             for item in current_items:
@@ -13897,7 +13914,7 @@ class OutlineV3Executor:
                         ]
                     semantic_topic_fragment_context.append(row)
             self._candidate_interpretation_tables = self._candidate_semantic_source_tables(
-                semantic_topic_fragment_context
+                semantic_topic_context
             )
             semantic_relation_candidates = [
                 self._compact_relation_candidate(item.to_dict())

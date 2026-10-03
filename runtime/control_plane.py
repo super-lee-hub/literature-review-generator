@@ -3930,26 +3930,16 @@ class ReviewControlPlane:
         )
         if not isinstance(mutated_sections, list):
             raise ControlPlaneError("Gate H baseline review draft sections are invalid")
-        for section_index, section in enumerate(sections):
-            if not isinstance(section, Mapping):
-                continue
-            blocks = section.get("blocks")
-            if not isinstance(blocks, list):
-                continue
-            for block_index, block in enumerate(blocks):
-                if not isinstance(block, Mapping) or str(block.get("block_id") or "") != challenge_input.block_id:
-                    continue
-                original_text = str(block.get("text") or "")
-                mutation_locator = (
-                    f"content.sections[{section_index}].blocks[{block_index}].text"
-                )
-                mutated_block = mutated_sections[section_index]["blocks"][block_index]
-                if not isinstance(mutated_block, dict):
-                    raise ControlPlaneError("Gate H target block is not mutable structured data")
-                mutated_block["text"] = str(challenge_input.mutated_text)
-                break
-            if mutation_locator:
-                break
+        from services.review_draft import find_review_text_block, find_review_text_block_location
+
+        try:
+            target = find_review_text_block_location(mutated_payload, challenge_input.block_id)
+        except (TypeError, ValueError, KeyError) as exc:
+            raise ControlPlaneError(f"Gate H challenge target is invalid: {exc}") from exc
+        if target is not None:
+            mutation_locator, mutated_block = target
+            original_text = str(mutated_block.get("text") or "")
+            mutated_block["text"] = str(challenge_input.mutated_text)
         if not mutation_locator:
             raise ControlPlaneError(
                 f"Gate H challenge block is missing: {challenge_input.block_id}"
@@ -4164,16 +4154,8 @@ class ReviewControlPlane:
         )
         if not isinstance(patched_sections, list) or not patched_sections:
             raise ControlPlaneError("Gate H repair output has no structured sections")
-        repaired_text = ""
-        for section in patched_sections:
-            if not isinstance(section, Mapping):
-                continue
-            for block in section.get("blocks", []) or ():
-                if isinstance(block, Mapping) and str(block.get("block_id") or "") == challenge_input.block_id:
-                    repaired_text = str(block.get("text") or "")
-                    break
-            if repaired_text:
-                break
+        repaired_block = find_review_text_block(patched_payload, challenge_input.block_id)
+        repaired_text = str(repaired_block.get("text") or "") if repaired_block is not None else ""
         if repaired_text != original_text:
             raise ControlPlaneError("Gate H repair output did not restore the challenged value")
         patched_path = Path(
@@ -6293,6 +6275,42 @@ class ReviewControlPlane:
             **result.to_dict(),
             "source_workspace": original.root_dir,
             "destination_workspace": destination.root_dir,
+            "provider_posts": 0,
+        }
+
+    def source_correction_reuse(
+        self,
+        *,
+        source_workspace: str | Path,
+        workspace: str | Path,
+        adoption_receipt_artifact_id: str,
+    ) -> dict[str, Any]:
+        """Export qualified, already-approved correction authority for Stage1."""
+        from services.queue_service import LocalPublicationContext
+        from services.summary_correction_reuse import export_owner_corrected_stage1_reuse_authority
+
+        original, origin_registry = AgentRuntimeRunner._open_workspace(source_workspace)
+        correction, correction_registry = AgentRuntimeRunner._open_workspace(workspace)
+        try:
+            result = export_owner_corrected_stage1_reuse_authority(
+                origin_registry=origin_registry,
+                correction_registry=correction_registry,
+                correction_workspace=correction,
+                adoption_receipt_artifact_id=adoption_receipt_artifact_id,
+                publication_context=LocalPublicationContext(),
+            )
+        except (RegistryError, OSError, ValueError, TypeError) as exc:
+            return {
+                "status": "blocked", "reason": str(exc),
+                "source_workspace": original.root_dir,
+                "destination_workspace": correction.root_dir,
+                "usable_as_stage1_reuse": False,
+                "provider_posts": 0,
+            }
+        return {
+            **result.to_dict(),
+            "source_workspace": original.root_dir,
+            "destination_workspace": correction.root_dir,
             "provider_posts": 0,
         }
 

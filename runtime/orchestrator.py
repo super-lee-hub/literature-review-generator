@@ -919,7 +919,7 @@ class InternalStageExecutorRegistry:
         if (
             isinstance(payload, Mapping)
             and payload.get("artifact_type") == "stage1_reusable_summary_manifest"
-            and payload.get("artifact_version") == "v1"
+            and payload.get("artifact_version") in {"v1", "v2"}
         ):
             summary_payload = payload.get("summary_payload")
             binding = payload.get("binding")
@@ -999,6 +999,7 @@ class InternalStageExecutorRegistry:
         self,
         session: AgentRuntimeSession,
         results: Mapping[str, StageResult],
+        external_registry_resolver: Callable[[str], Any | None] | None = None,
     ) -> list[dict[str, Any]]:
         if session.stage_host.summaries:
             summaries = [dict(item) for item in session.stage_host.summaries]
@@ -1006,7 +1007,7 @@ class InternalStageExecutorRegistry:
                 isinstance(self.bridge.job_spec.metadata.get("outline_pilot"), Mapping)
                 and self.bridge.job_spec.summary_sources
             ):
-                self._verify_typed_reuse_summaries(summaries)
+                self._verify_typed_reuse_summaries(summaries, external_registry_resolver=external_registry_resolver)
             return summaries
 
         paths: list[str] = []
@@ -1034,7 +1035,7 @@ class InternalStageExecutorRegistry:
             # A topic-only downstream run may consume Stage 1 typed manifests
             # as summary_sources because reuse_stage1 is reserved for Stage 1
             # actions. Preserve the typed authority check on that path.
-            self._verify_typed_reuse_summaries(summaries)
+            self._verify_typed_reuse_summaries(summaries, external_registry_resolver=external_registry_resolver)
         return summaries
 
     def _build_outline_evidence_pack(
@@ -1214,7 +1215,7 @@ class InternalStageExecutorRegistry:
         attempt_id: str,
         external_registry_resolver: Callable[[str], Any | None] | None = None,
     ) -> tuple[StageResult, int]:
-        summaries = self._load_summary_payloads(session, results)
+        summaries = self._load_summary_payloads(session, results, external_registry_resolver=external_registry_resolver)
         if bundle.paper_work_items:
             generation_service = Stage1AnalysisService(
                 job_id=session.context.workspace.job_id,
@@ -1261,7 +1262,7 @@ class InternalStageExecutorRegistry:
                     raise RuntimeError(
                         "reuse_summary_files mixed typed and legacy Stage 1 authorities"
                     )
-                self._verify_typed_reuse_summaries(summaries)
+                self._verify_typed_reuse_summaries(summaries, external_registry_resolver=external_registry_resolver)
         normalized = self._validate_summary_identity(summaries, bundle)
         generation_service = Stage1AnalysisService(
             job_id=session.context.workspace.job_id,
@@ -1289,6 +1290,8 @@ class InternalStageExecutorRegistry:
     @staticmethod
     def _verify_typed_reuse_summaries(
         summaries: Sequence[Mapping[str, Any]],
+        *,
+        external_registry_resolver: Callable[[str], Any | None] | None = None,
     ) -> None:
         """Verify reusable Stage 1 authorities before accepting zero transport."""
 
@@ -1307,6 +1310,7 @@ class InternalStageExecutorRegistry:
             authority, reason = verify_stage1_typed_manifest_authority(
                 summary,
                 binding,
+                external_registry_resolver=external_registry_resolver,
             )
             if authority is None:
                 raise RuntimeError(
