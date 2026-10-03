@@ -208,7 +208,10 @@ def test_reviewctl_plan_projects_all_reachable_provider_work_without_posting(
     arbitration = registered[("outline", "arbitration")]
     assert arbitration["physical_attempt_upper_bound"] == 3
     assert arbitration["conditional_on"] == "eligible_candidate_and_critique_outputs_materialized"
-    assert projection["totals"]["bounded_logical_call_exposure_count"] == 4
+    # Numeric call limits alone lack a verified cardinality basis and wall
+    # bound. The public pre-admission plan must keep them unbounded.
+    assert projection["totals"]["bounded_logical_call_exposure_count"] == 0
+    assert all(item["exposure_status"] == "unbounded" for item in projection["unknown_exposures"])
     assert projection["totals"]["unbounded_logical_call_exposure_count"] > 0
     exposure = projection["unknown_exposures"][0]
     assert exposure["logical_calls_upper_bound"] is None

@@ -3,12 +3,12 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
-import re
 import sys
 import types
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.parse import urlparse
 
 import pytest
 
@@ -102,29 +102,62 @@ def _patch_run_all_providers(
     papers: list[tuple[str, str, str]],
     adjudicator: Any,
 ) -> None:
-    from tests.test_current_runtime_full_e2e import (
-        _outline_provider_response,
-        _provider_response,
-    )
+    from tests.test_current_runtime_full_e2e import _outline_provider_response
+    from ai_interface import _call_ai_api_detailed_uninstrumented as original_uninstrumented
 
     _patch_reader(monkeypatch, papers)
 
     def configured_outline(*args: Any, **kwargs: Any) -> Mapping[str, Any]:
         envelope = json.loads(str(args[0] if args else kwargs.get("prompt") or ""))
-        return _outline_provider_response(str(envelope["node_id"]), dict(envelope["request"]))
-
-    def configured_writer(*args: Any, **kwargs: Any) -> Mapping[str, Any]:
-        prompt = str(args[0] if args else kwargs.get("prompt") or "")
-        ref_ids = re.findall(r"R\d{3,}", prompt)
-        ref_id = ref_ids[0] if ref_ids else "R001"
-        return _provider_response(
-            {"blocks": [{"text": f"The evidence supports the synthesis [[cite_ref:{ref_id}]]."}]}
-        )
+        if isinstance(envelope, Mapping) and envelope.get("node_id") and isinstance(envelope.get("request"), Mapping):
+            return _outline_provider_response(str(envelope["node_id"]), dict(envelope["request"]))
+        api_config = args[1] if len(args) > 1 else kwargs.get("api_config")
+        if (isinstance(envelope, Mapping) and isinstance(envelope.get("writer_task_scope"), Mapping)
+                and isinstance(api_config, Mapping)
+                and urlparse(str(api_config.get("api_base") or "")).hostname == "127.0.0.1"):
+            return original_uninstrumented(*args, **kwargs)
+        raise AssertionError("parity fixture rejected an unknown or non-loopback provider request")
 
     monkeypatch.setattr("ai_interface._call_ai_api_detailed_uninstrumented", configured_outline)
-    monkeypatch.setattr("ai_interface._call_ai_api_detailed", configured_writer)
     monkeypatch.setattr("ai_interface._call_ai_api", adjudicator)
     monkeypatch.setattr("validation.llm_adjudicator._call_ai_api", adjudicator)
+
+
+@pytest.fixture
+def parity_writer_server() -> Any:
+    from tests.test_current_runtime_full_e2e import _start_source_bound_writer_server
+
+    server, thread, api_base = _start_source_bound_writer_server([])
+    try:
+        yield server, api_base
+    finally:
+        server.shutdown()
+        thread.join()
+        server.server_close()
+
+
+def test_parity_fixture_rejects_non_loopback_or_unknown_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    import ai_interface
+
+    sends: list[Mapping[str, Any]] = []
+
+    def transport(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        sends.append(args[1] if len(args) > 1 else kwargs["api_config"])
+        return {"status": "success"}
+
+    monkeypatch.setattr(ai_interface, "_call_ai_api_detailed_uninstrumented", transport)
+    _patch_run_all_providers(monkeypatch, [], _adjudicator_response)
+    writer = json.dumps({"writer_task_scope": {"schema_version": "writer_task_scope_wire/v2"}})
+    with pytest.raises(AssertionError, match="non-loopback"):
+        ai_interface._call_ai_api_detailed_uninstrumented(writer, {"api_base": "https://example.test"}, "")
+    with pytest.raises(AssertionError, match="unknown"):
+        ai_interface._call_ai_api_detailed_uninstrumented(json.dumps({"unexpected": True}),
+                                                        {"api_base": "http://127.0.0.1:1/v1"}, "")
+    assert sends == []
+    assert ai_interface._call_ai_api_detailed_uninstrumented(
+        writer, {"api_base": "http://127.0.0.1:1/v1"}, "",
+    )["status"] == "success"
+    assert len(sends) == 1
 
 
 def _complete_adopted_run(workspace_path: str) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -355,11 +388,20 @@ def test_run_all_clean_parity_across_production_entrypoints(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     gui_app_module: Any,
+    parity_writer_server: Any,
 ) -> None:
     """Compare canonical run_all outputs after each real entrypoint path."""
 
     pdf_dir, papers, config = _seed_run_all_fixture(tmp_path)
     _patch_run_all_providers(monkeypatch, papers, _adjudicator_response)
+    from tests.test_current_runtime_full_e2e import (
+        _assert_writer_http_receipts_match, _configure_writer_loopback,
+    )
+
+    writer_server, writer_api_base = parity_writer_server
+    _configure_writer_loopback(config, writer_api_base)
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    control = ReviewControlPlane(repo_root=Path(__file__).resolve().parents[1])
 
     intent = {
         "config": str(config),
@@ -398,6 +440,8 @@ def test_run_all_clean_parity_across_production_entrypoints(
     assert direct_initial.job_disposition == "needs_review"
     direct_completion, direct_export = _complete_adopted_run(direct_initial.workspace_path)
     direct_signature = _run_all_signature(direct_initial.workspace_path, direct_completion, direct_export)
+    _assert_writer_http_receipts_match(writer_server, control.inspect(workspace=direct_initial.workspace_path))
+    writer_server.calls.clear()
 
     job_request = build_job_request_from_mapping({**intent, "job_id": "run-all-job-runner"})
     job_initial = JobRunner().run(job_request)
@@ -405,6 +449,8 @@ def test_run_all_clean_parity_across_production_entrypoints(
     assert job_initial.job_disposition == "needs_review"
     job_completion, job_export = _complete_adopted_run(job_initial.workspace_path)
     job_signature = _run_all_signature(job_initial.workspace_path, job_completion, job_export)
+    _assert_writer_http_receipts_match(writer_server, control.inspect(workspace=job_initial.workspace_path))
+    writer_server.calls.clear()
 
     queue_path = tmp_path / "queue" / "queue.json"
     queue = PersistentQueueService(queue_path)
@@ -427,6 +473,7 @@ def test_run_all_clean_parity_across_production_entrypoints(
     queue_workspace = str(queue_runtime.workspace_path)
     queue_completion, queue_export = _complete_adopted_run(queue_workspace)
     queue_signature = _run_all_signature(queue_workspace, queue_completion, queue_export)
+    _assert_writer_http_receipts_match(writer_server, control.inspect(workspace=queue_workspace))
 
     assert job_signature == direct_signature
     assert queue_signature == direct_signature
