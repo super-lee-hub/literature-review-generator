@@ -4,6 +4,7 @@ import ai_interface
 import json
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.parse import urlparse
 
 from runtime.control_plane import ReviewControlPlane
 from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
@@ -70,7 +71,12 @@ def test_current_production_full_chain_uses_runner_validation_export_and_attesta
                 dict(envelope["request"]),
                 fixture_trace=fixture_trace,
             )
-        return original_uninstrumented(*args, **kwargs)
+        api_config = args[1] if len(args) > 1 else kwargs.get("api_config")
+        if (isinstance(envelope, Mapping) and isinstance(envelope.get("writer_task_scope"), Mapping)
+                and isinstance(api_config, Mapping)
+                and urlparse(str(api_config.get("api_base") or "")).hostname == "127.0.0.1"):
+            return original_uninstrumented(*args, **kwargs)
+        raise AssertionError("production fixture rejected an unknown or non-loopback request")
 
     monkeypatch.setattr("ai_interface.get_summary_from_ai_detailed", configured_reader)
     monkeypatch.setattr("ai_interface._call_ai_api_detailed_uninstrumented", configured_outline)
@@ -98,6 +104,21 @@ def test_current_production_full_chain_uses_runner_validation_export_and_attesta
     assert first.job_disposition == "needs_review", first
     assert first.failed_stage is None, first
     assert first.completed_stages == ("source_intake", "analyze", "outline"), first
+    from services.writer_source_inventory import load_writer_source_inventory_v1
+
+    _workspace, registry = AgentRuntimeRunner._open_workspace(first.workspace_path)
+    scope_record = registry.get("outline-v3:candidate_output_scope")
+    assert scope_record is not None
+    registry.verify_ready_artifact_closure(scope_record)
+    scope_payload = json.loads(Path(scope_record.path).read_text(encoding="utf-8"))
+    assert scope_payload["limits"]["max_claims"] == len(scope_payload["claim_groups"])
+    assert scope_payload["limits"]["max_support_rows"] == len(scope_payload["claim_slots"])
+    assert scope_payload["source_inventory_binding"]["artifact_id"] == load_writer_source_inventory_v1(registry).artifact_id
+    for artifact in registry.list_records():
+        if artifact.artifact_id.startswith("outline-v3:candidate_") and artifact.artifact_id.endswith("_provider_generation"):
+            content = json.loads(Path(artifact.path).read_text(encoding="utf-8"))["payload"]
+            assert all(section.get("task_ids") for section in content["sections"])
+            assert all(row.get("claim_slot_id") for section in content["sections"] for row in section["claim_support"])
     assert "explicit adoption" in first.message, first
 
     control = ReviewControlPlane(repo_root=Path(__file__).resolve().parents[1])

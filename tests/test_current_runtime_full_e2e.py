@@ -629,14 +629,39 @@ def _candidate_source_bound_response(
         study_id = str(chosen.get("study_id") or "")
         if study_id:
             support["study_id"] = study_id
+        output_scope = request.get("candidate_output_scope")
+        if isinstance(output_scope, Mapping):
+            matching_slots = [
+                slot for slot in output_scope.get("claim_slots") or ()
+                if isinstance(slot, Mapping) and slot.get("paper_key") == paper_key
+                and slot.get("primary_claim_id") == primary_id
+                and slot.get("synthesis_claim_id") == chosen.get("claim_id")
+            ]
+            if not matching_slots:
+                raise AssertionError("candidate fixture has no matching finite source claim slot")
+            slot = sorted(matching_slots, key=lambda item: str(item["claim_slot_id"]))[0]
+            support.update({
+                "claim_slot_id": slot["claim_slot_id"], "task_id": slot["task_id"],
+                "source_claim_ids": list(slot["source_claim_ids"]),
+                "evidence_ids": list(slot["evidence_ids"]),
+                "source_field_ids": list(slot["source_field_ids"]),
+            })
+            if slot.get("study_id"):
+                support["study_id"] = slot["study_id"]
+            else:
+                support.pop("study_id", None)
+        section_relations = (
+            list(slot.get("relation_ids") or ()) if isinstance(output_scope, Mapping) else list(relation_ids)
+        )
         sections.append({
             "section_id": f"{candidate_id}_section_{index}",
             "title": f"{str(evidence.get('title') or paper_key)}: {organizing_logic.replace('_', ' ')} synthesis",
             "goal": "Present one evidence-bound finding with its recorded qualification.",
             "paper_keys": [paper_key],
-            "relation_ids": list(relation_ids),
+            "relation_ids": section_relations,
             "claims": [text],
             "claim_support": [support],
+            **({"task_ids": [support["task_id"]]} if "task_id" in support else {}),
             "rationale": "Use the matching included-paper claim and preserve its declared source dependencies.",
         })
         trace_sections.append({
@@ -1187,7 +1212,7 @@ def _outline_provider_response(
             }
         )
 
-    if node_id.endswith("_provider_generation"):
+    if node_id.endswith("_provider_generation") or "_provider_generation:local:" in node_id:
         source_bound = _candidate_source_bound_response(node_id, request, fixture_trace)
         if source_bound is not None:
             return source_bound

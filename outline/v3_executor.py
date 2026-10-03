@@ -370,6 +370,7 @@ class OutlineV3Executor:
             or str(self.profile.endpoint_type or "").casefold() not in {"internal", "fixture"}
         )
         self._candidate_interpretation_tables: dict[str, Any] = {}
+        self._candidate_output_scope: Any | None = None
         # Role-aware routing is opt-in so existing single-provider callers keep
         # working, but when it is supplied every node must resolve through it.
         self.router = provider_router
@@ -8872,6 +8873,13 @@ class OutlineV3Executor:
                 and set(str(value) for value in item.get("paper_keys") or () if str(value)).issubset(shard_key_set)
             ]
             request = dict(provider_request)
+            if self._alias_enabled and self._alias_map is not None:
+                from outline.evidence_alias import canonicalize_structural
+
+                request = canonicalize_structural(request, self._alias_map)
+            if self._candidate_output_scope is not None:
+                shard_scope = self._candidate_output_scope_wire(paper_keys)
+                request["candidate_output_scope"] = shard_scope
             request.update({
                 "hierarchy": {
                     "level": "candidate_local_shard",
@@ -8893,11 +8901,39 @@ class OutlineV3Executor:
                     if isinstance(item, Mapping)
                 ],
             })
+            if self._alias_enabled and self._alias_map is not None:
+                from outline.evidence_alias import alias_structural
+
+                request = alias_structural(request, self._alias_map)
             node_id = f"{generation_node_id}:local:{shard_id}"
             if node_prefix:
                 node_id = f"{node_prefix}:{node_id}"
             requests.append((node_id, shard, paper_keys, shard_relation_ids, request))
         return requests
+
+    def _candidate_output_scope_wire(self, paper_keys: Sequence[str]) -> dict[str, Any]:
+        """Expose the complete slot closure once, leaving audit lineage in Registry."""
+
+        parent_scope = self._candidate_output_scope
+        if parent_scope is None:
+            raise OutlineV3ExecutionError("candidate output scope is missing before wire materialization")
+        scope = parent_scope.for_papers(paper_keys)
+        payload = scope.to_dict()
+        group_indices = {group.claim_group_id: index for index, group in enumerate(scope.claim_groups)}
+        return {
+            "schema_version": "outline-candidate-output-scope-wire/v1",
+            "content_hash": scope.content_hash,
+            "parent_content_hash": parent_scope.content_hash,
+            "task_ids": list(scope.task_ids), "limits": payload["limits"],
+            "claim_slots": [
+                {"claim_group_index": group_indices[slot.claim_group_id], **{
+                    key: value for key, value in slot.to_dict().items() if key in {
+                    "claim_slot_id", "task_id", "synthesis_claim_id",
+                    "paper_key", "primary_claim_id", "study_id", "source_claim_ids",
+                    "evidence_ids", "source_field_ids", "relation_ids",
+                }}} for slot in scope.claim_slots
+            ],
+        }
 
     @staticmethod
     def _apply_section_coordination(
@@ -8956,6 +8992,7 @@ class OutlineV3Executor:
             claims: list[str] = []
             source_rationales: list[dict[str, str]] = []
             claim_support: list[dict[str, Any]] = []
+            task_ids: list[str] = []
             support_by_id: dict[str, dict[str, Any]] = {}
             paper_roles: dict[str, Any] = {}
             for section in source_sections:
@@ -8969,6 +9006,7 @@ class OutlineV3Executor:
                 paper_keys.extend(str(value) for value in section.get("paper_keys") or () if str(value))
                 relation_ids.extend(str(value) for value in section.get("relation_ids") or () if str(value))
                 claims.extend(local_claims)
+                task_ids.extend(str(value) for value in section.get("task_ids") or () if str(value))
                 for raw_support in section.get("claim_support") or ():
                     if not isinstance(raw_support, Mapping):
                         raise OutlineV3ExecutionError("section coordination has malformed claim support")
@@ -8993,6 +9031,7 @@ class OutlineV3Executor:
                 "relation_ids": list(dict.fromkeys(relation_ids)),
                 "claims": list(dict.fromkeys(claims)),
                 "claim_support": claim_support,
+                **({"task_ids": list(dict.fromkeys(task_ids))} if task_ids else {}),
                 "paper_roles": paper_roles,
                 "rationale": " ".join([
                     f"Integration: {str(raw_group['integration_reason']).strip()}",
@@ -9113,6 +9152,8 @@ class OutlineV3Executor:
                 if alias_map is not None
                 else dict(raw)
             )
+            if content.get("candidate_id") != candidate_id:
+                raise OutlineV3ExecutionError("candidate shard output omitted or changed candidate_id")
             self._validate_candidate_payload(
                 candidate_id,
                 content,
@@ -9197,6 +9238,10 @@ class OutlineV3Executor:
                         if row not in existing_support:
                             existing_support.append(row)
                     existing["claim_support"] = existing_support
+                    if section_payload.get("task_ids"):
+                        existing["task_ids"] = list(dict.fromkeys([
+                            *list(existing.get("task_ids") or ()), *list(section_payload["task_ids"]),
+                        ]))
                     if isinstance(section_payload.get("paper_roles"), Mapping):
                         roles = dict(existing.get("paper_roles") or {})
                         for paper_key, role in dict(section_payload.get("paper_roles") or {}).items():
@@ -12547,6 +12592,16 @@ class OutlineV3Executor:
         allowed_relation_ids: Sequence[str],
         alias_map: Mapping[str, Any] | None = None,
     ) -> None:
+        scope = self._candidate_output_scope
+        if scope is not None:
+            from outline.candidate_output_scope import CandidateOutputScopeError
+
+            try:
+                if payload.get("candidate_id") not in (None, candidate_id):
+                    raise CandidateOutputScopeError("candidate identity differs from its request")
+                scope.for_papers(allowed_paper_keys).validate(payload)
+            except CandidateOutputScopeError as exc:
+                raise OutlineV3ExecutionError(f"{candidate_id} finite output contract: {exc}") from exc
         sections = payload.get("sections")
         if not isinstance(sections, list) or not sections:
             raise OutlineV3ExecutionError(f"{candidate_id} provider output has no sections")
@@ -12863,6 +12918,10 @@ class OutlineV3Executor:
             "allowed_relation_ids": allowed_relations_view,
             "repair_rules": list(SEMANTIC_REPAIR_RULES_V1),
             "output_schema": dict(SEMANTIC_REPAIR_OUTPUT_SCHEMA_V1),
+            **({"candidate_output_scope": alias_structural(
+                self._candidate_output_scope_wire(allowed_paper_keys), alias_map,
+            ) if alias_map is not None else self._candidate_output_scope_wire(allowed_paper_keys)}
+               if self._candidate_output_scope is not None else {}),
         }
         repair_deps = {"candidate": _hash_payload(content)}
         try:
@@ -14527,6 +14586,46 @@ class OutlineV3Executor:
                 ("relation_adjudication", "relation_candidates", "semantic_chunk_plan"), self.profile.model, self.profile.provider,
             ))
 
+            if self.semantic_provider_synthesis_enabled:
+                from outline.candidate_output_scope import build_candidate_output_scope_v1
+                from services.writer_source_inventory import load_writer_source_inventory_v1
+
+                source_inventory = load_writer_source_inventory_v1(self.registry)
+                task_ids_by_topic = {
+                    topic.topic_id: topic.logical_node_id for topic in semantic_chunk_plan_model.topics
+                }
+                scoped_routes = [
+                    {**route, "logical_node_id": task_ids_by_topic[str(route.get("topic_id") or "")]}
+                    for route in semantic_topic_context
+                ]
+                self._candidate_output_scope = build_candidate_output_scope_v1(
+                    source_inventory, scoped_routes, selected_relation_ids=confirmed_ids,
+                    bridge_claims=[
+                        {"task_id": node, "result_id": self.artifact_records[node].artifact_id,
+                         "provider_output": output}
+                        for node, output in (
+                            ("cross_group_comparison", loaded_cross_provider_result or cross_provider_result),
+                            ("global_synthesis", loaded_global_provider_result or global_provider_result),
+                        )
+                        if isinstance(output, Mapping)
+                    ],
+                )
+                scope_record = publish_json_artifact(
+                    self.publication_context, self.registry,
+                    self._path(f"outline_v3/candidate_output_scope_{self._candidate_output_scope.content_hash}.json"),
+                    self._candidate_output_scope.to_dict(),
+                    artifact_id="outline-v3:candidate_output_scope",
+                    artifact_role="outline_candidate_output_scope",
+                    artifact_type="outline_candidate_output_scope", artifact_version="v1",
+                    producer="outline.v3_executor.OutlineV3Executor",
+                    depends_on=[ArtifactDependencyRefV2.from_record(self.artifact_records[node]) for node in (
+                        "outline_content_layers", "semantic_chunk_plan", "topic_synthesis",
+                        "cross_group_comparison", "global_synthesis",
+                    )],
+                )
+                self.artifact_records["candidate_output_scope"] = scope_record
+                self.artifact_paths["candidate_output_scope"] = scope_record.path
+
             intent_model = build_review_intent(self.review_intent_input)
             intent = self._run_node("review_intent", lambda: (
                 self._artifact(OutlineArtifact, intent_model.to_dict(), {}), (), "deterministic", "local",
@@ -14562,6 +14661,8 @@ class OutlineV3Executor:
             candidate_ids: list[str] = []
             primary_candidate_requests: dict[str, dict[str, Any]] = {}
             for index, plan in enumerate(plans_model.candidates, start=1):
+                if self.semantic_provider_synthesis_enabled and self._candidate_output_scope is None:
+                    raise OutlineV3ExecutionError("candidate generation lacks its source-bound finite output scope")
                 candidate_id = f"candidate_{index}"
                 candidate_ids.append(candidate_id)
                 plan_payload = plan.to_dict()
@@ -14595,6 +14696,8 @@ class OutlineV3Executor:
                 request = {
                     "candidate_id": candidate_id,
                     "organizing_logic": plan.organizing_logic,
+                    **({"candidate_output_scope": self._candidate_output_scope_wire(paper_keys)}
+                       if self._candidate_output_scope is not None else {}),
                     **({"organizing_axis": axes_by_id[plan.axis_id].to_dict()}
                        if "_then_" in plan.axis_id else {}),
                     "paper_keys": paper_keys,
@@ -14682,6 +14785,16 @@ class OutlineV3Executor:
                         ),
                     },
                     "output_contract": {
+                        **({"finite_scope_rule": (
+                            "Use only the supplied candidate_output_scope claim slots. "
+                            "Every section lists task_ids; every support row echoes its claim_slot_id and task_id "
+                            "with complete source/qualifier IDs. Consume a slot at most once. "
+                            "Choose claims with organizing value; unused slots remain available and need not become prose. "
+                            "A multi-paper claim group must retain all of its support slots in one section. "
+                            "Slots with the same claim_group_index belong to one assertion group. "
+                            "Attach only relations recorded on the consumed groups, and leave unrelated relation judgments in their ledger. "
+                            "Do not exceed max_sections, max_claims or max_support_rows."
+                        )} if self._candidate_output_scope is not None else {}),
                         "output_fields": {
                             "candidate_id": (
                                 "string; echo the candidate_id from this request verbatim"
@@ -14768,6 +14881,8 @@ class OutlineV3Executor:
                 )
                 generation_deps = {
                     "candidate": _hash_payload(provider_request),
+                    **({"candidate_output_scope": self._candidate_output_scope.content_hash}
+                       if self._candidate_output_scope is not None else {}),
                     "global_relation_map": _hash_payload(confirmed_map),
                     "coverage_contract": _hash_payload(contract),
                     "semantic_chunk_plan": _hash_payload(semantic_chunk_plan),
@@ -14783,6 +14898,10 @@ class OutlineV3Executor:
                     generation_binding,
                 )
                 if loaded_generation is not None:
+                    self._validate_candidate_payload(
+                        candidate_id, loaded_generation, allowed_paper_keys=paper_keys,
+                        allowed_relation_ids=allowed_relation_ids, alias_map=alias_map,
+                    )
                     continue
                 generation_route = self._node_route(generation_node_id)
                 generation_budget = generation_route.profile.estimate_request(
