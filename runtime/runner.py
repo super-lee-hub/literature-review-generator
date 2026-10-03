@@ -1253,7 +1253,14 @@ class AgentRuntimeRunner:
             return self._execute(resume=True)
 
     def _execute(self, *, resume: bool) -> RuntimeExecutionResult:
+        config_source_id = str(Path(self.job_spec.config).expanduser().resolve())
+        try:
+            config_source_sha256 = file_sha256(config_source_id)
+        except OSError as exc:
+            raise RuntimeRunnerError("configuration source cannot be read") from exc
         spec = self._normalized_spec(resume=resume)
+        if file_sha256(config_source_id) != config_source_sha256:
+            raise RuntimeRunnerError("configuration source changed during runtime normalization")
         batch_spec = self._review_batch_spec(spec)
         if spec.action == "derive_review_batch" and batch_spec is None:
             raise RuntimeRunnerError("derive_review_batch action requires a review batch spec")
@@ -1324,6 +1331,8 @@ class AgentRuntimeRunner:
                 workspace_preflight=workspace_preflight,
                 publish_running_state=False,
             )
+            if file_sha256(config_source_id) != config_source_sha256:
+                raise RuntimeRunnerError("configuration source changed during runtime bootstrap")
         except BaseException as exc:
             if execution_lease is not None:
                 execution_lease.release()
@@ -1390,6 +1399,8 @@ class AgentRuntimeRunner:
                     validated_batch_parent_registry_path=validated_batch_parent_registry_path,
                     resume=resume,
                     normalized_spec_payload=normalized_spec_payload,
+                    config_source_id=config_source_id,
+                    config_source_sha256=config_source_sha256,
                 )
         finally:
             execution_lease.release()
@@ -1404,7 +1415,11 @@ class AgentRuntimeRunner:
         validated_batch_parent_registry_path: str | None,
         resume: bool,
         normalized_spec_payload: Mapping[str, Any],
+        config_source_id: str,
+        config_source_sha256: str,
     ) -> RuntimeExecutionResult:
+        if file_sha256(config_source_id) != config_source_sha256:
+            raise RuntimeRunnerError("configuration source changed before runtime publication")
         normalized_spec_path = session.context.workspace.artifact_path("runtime_job_spec_v1.json")
         attempt_store = AttemptStore(session.context.workspace, session.context.registry)
         started = attempt_store.start(
@@ -1454,6 +1469,13 @@ class AgentRuntimeRunner:
                     "stage_plan_hash": str(
                         (normalized_spec_payload.get("metadata") or {}).get("stage_plan_hash") or ""
                     ),
+                    "config_snapshot_binding": {
+                        "schema_version": "runtime-config-source/v1",
+                        "config_source_id": config_source_id,
+                        "config_source_sha256": config_source_sha256,
+                        "effective_config_sha256": str(session.context.fingerprint_bundle["config_hash"]),
+                        "normalized_spec_payload_sha256": hash_json(normalized_spec_payload),
+                    },
                 },
             )
         self._fault("after_artifact_write_before_registry", artifact_type="runtime_job_spec")

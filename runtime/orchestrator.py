@@ -1507,6 +1507,15 @@ class InternalStageExecutorRegistry:
         if self.bridge.free_mode_envelope is not None:
             self.bridge.persist_free_mode_review_intent_projection(session)
             free_mode_review_intent = dict(self.bridge.free_mode_envelope["review_intent"])
+        runtime_spec_binding = None
+        spec_record = session.context.registry.get("runtime_job_spec")
+        if spec_record is not None and "config_snapshot_binding" in spec_record.metadata:
+            from runtime.runtime_spec_binding import read_runtime_spec_binding_v1
+
+            runtime_spec_binding = read_runtime_spec_binding_v1(
+                session.context.registry,
+                expected_effective_config_sha256=str(session.context.fingerprint_bundle["config_hash"]),
+            )
         executor = OutlineV3Executor(
             job_id=session.context.workspace.job_id,
             summaries=summaries,
@@ -1522,6 +1531,7 @@ class InternalStageExecutorRegistry:
             review_intent=free_mode_review_intent,
             cancellation_checker=session.stage_host.check_cancelled,
             publication_context=self.bridge.publication_context,
+            runtime_spec_binding=runtime_spec_binding,
             stability_mode=stability.mode,
             semantic_repair_enabled=semantic_repair_enabled,
             opaque_alias_enabled=opaque_alias_enabled,

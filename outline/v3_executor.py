@@ -61,6 +61,7 @@ from outline.v3_models import (
     compute_v3_hash,
 )
 from outline.v3_relations import build_global_relation_map, build_organizing_axes, build_outline_candidate_plans
+from outline.candidate_repair_plan import OutlineCandidateRepairPlanV1
 from outline.semantic_chunking import (
     build_paper_content_layers,
     build_semantic_chunk_plan,
@@ -74,10 +75,12 @@ from runtime.checkout_identity import CheckoutIdentityError, read_checkout_sha
 from runtime.pause_state import PauseRequestedError, PauseStateStore
 from runtime.provider_completion import ProviderCompletionEvaluator
 from runtime.provider_context import ProviderContextProfile
+from runtime.runtime_spec_binding import RuntimeSpecBindingV1, read_runtime_spec_binding_v1
 from runtime.provider_receipt_closure import ExpectedProviderCall, ProviderReceiptClosure
 from outline.provider_router import (
     OutlineProviderRouter,
     OutlineRoleRoute,
+    safe_config_identity,
     semantic_role,
 )
 from runtime.provider_runtime import (
@@ -284,6 +287,7 @@ class OutlineV3Executor:
         pricing_effective_date: str | None = None,
         pricing_policy: str = "estimate_only_not_billing_v1",
         publication_context: Any | None = None,
+        runtime_spec_binding: RuntimeSpecBindingV1 | None = None,
         _skip_exact_replay_verification: bool = False,
     ) -> None:
         if not str(job_id).strip():
@@ -294,6 +298,9 @@ class OutlineV3Executor:
         if normalized_stability_mode not in {"off", "smoke", "full"}:
             raise ValueError("stability_mode must be one of: off, smoke, full")
         self.semantic_repair_enabled = bool(semantic_repair_enabled)
+        self.runtime_spec_binding = runtime_spec_binding
+        self._primary_candidate_repair_plan: OutlineCandidateRepairPlanV1 | None = None
+        self._primary_candidate_repair_plan_record: ArtifactRecord | None = None
         self.opaque_alias_enabled = bool(opaque_alias_enabled)
         self.outline_pilot = dict(outline_pilot) if outline_pilot is not None else None
         if self.outline_pilot is not None and self.outline_pilot.get("schema_version") != "outline-topic-pilot/v1":
@@ -11665,6 +11672,7 @@ class OutlineV3Executor:
         # Re-check after replay lookup: replay is local and may be usable while
         # a paused job must still refuse any new provider admission.
         self._pause_state.assert_runnable(node_id=node_id)
+        self._materialize_primary_repair_request(node_id, request, route, binding)
         self._assert_primary_repair_fresh_attempt(node_id)
         runtime = ProviderRuntime(
             budget=ProviderBudgetV1(
@@ -12928,6 +12936,130 @@ class OutlineV3Executor:
         )
         return repaired_content
 
+    def _initialize_primary_candidate_repair_plan(self) -> OutlineCandidateRepairPlanV1:
+        """Bind the primary repair envelope to actual READY runtime sources."""
+        from ai_interface import _coerce_positive_int, _load_api_runtime_settings
+        from outline.candidate_repair_plan import build_primary_candidate_repair_plan_v1
+
+        accepted = self.runtime_spec_binding
+        if accepted is None:
+            raise OutlineV3ExecutionError("primary candidate repair requires a verified runtime spec binding")
+        current = read_runtime_spec_binding_v1(
+            self.registry, expected_effective_config_sha256=accepted.effective_config_sha256,
+        )
+        if current != accepted:
+            raise OutlineV3ExecutionError("primary candidate repair runtime spec binding changed")
+        layers = self.registry.get("outline-v3:outline_content_layers")
+        if layers is None or layers.status != "ready":
+            raise OutlineV3ExecutionError("primary candidate repair source authority is not ready")
+        from services.writer_source_inventory import load_writer_source_inventory_v1
+
+        if load_writer_source_inventory_v1(self.registry) is None:
+            raise OutlineV3ExecutionError("primary candidate repair lacks canonical source inventory authority")
+        layers = self.registry.verify_ready_artifact_closure(layers)
+        route = self._node_route("candidate_1_provider_generation")
+        transport_config = getattr(route.transport, "api_config", None)
+        if not isinstance(transport_config, Mapping):
+            raise OutlineV3ExecutionError("primary repair finite plan requires a runtime-owned transport configuration")
+        if safe_config_identity(transport_config) != dict(route.config_identity):
+            raise OutlineV3ExecutionError("primary repair transport configuration differs from its bound route")
+        request_timeout, _attempts = _load_api_runtime_settings(transport_config)
+        total_timeout = _coerce_positive_int(transport_config.get("total_timeout_seconds"), request_timeout)
+        plan = build_primary_candidate_repair_plan_v1(
+            candidate_count=self.candidate_count, semantic_repair_enabled=self.semantic_repair_enabled,
+            route_identity=route.binding_identity,
+            route_config_fingerprint_sha256=route.safe_config_fingerprint(), profile=route.profile,
+            effective_input_cap=self._effective_input_cap(route.profile),
+            retry_attempts_per_call_upper_bound=max(0, int(route.config_identity.get("transport_retries") or 0)),
+            wall_seconds_per_call_upper_bound=float(total_timeout),
+            config_source_id=current.config_source_id, config_source_sha256=current.config_source_sha256,
+            runtime_spec_sha256=current.normalized_spec_artifact_sha256,
+            canonical_source_authority_id=layers.artifact_id, canonical_source_authority_sha256=layers.content_hash,
+        )
+        if self._primary_candidate_repair_plan is not None:
+            if plan.contract_sha256 != self._primary_candidate_repair_plan.contract_sha256:
+                raise OutlineV3ExecutionError("primary candidate repair envelope changed after materialization")
+            return self._primary_candidate_repair_plan
+        spec_record = self.registry.get(current.normalized_spec_artifact_id)
+        if spec_record is None:
+            raise OutlineV3ExecutionError("primary candidate repair spec authority disappeared")
+        plan_record = publish_json_artifact(
+            self.publication_context, self.registry,
+            self._path(f"outline_v3/primary_repair_plan_{plan.contract_sha256}.json"), plan.to_dict(),
+            artifact_role="outline_repair_plan", artifact_type="outline_candidate_repair_plan",
+            artifact_version="v1", producer="outline.v3_executor.OutlineV3Executor",
+            artifact_id=plan.cardinality_basis().basis_artifact,
+            depends_on=(ArtifactDependencyRefV2.from_record(spec_record), ArtifactDependencyRefV2.from_record(layers)),
+            metadata={"scope": "primary", "normalized_spec_hash_kind": "registered_artifact_bytes_sha256"},
+        )
+        self._primary_candidate_repair_plan_record = plan_record
+        exposure = plan.to_exposure()
+        if exposure is not None and exposure.cardinality_basis is not None:
+            exposure = replace(
+                exposure,
+                cardinality_basis=replace(
+                    plan.cardinality_basis(),
+                    basis_artifact=plan_record.artifact_id,
+                    basis_artifact_sha256=plan_record.content_hash,
+                ),
+            )
+            self.stability_preflight["primary_candidate_repair_exposure"] = exposure.to_dict()
+            initial_record = self.registry.get(f"outline-v3:provider_call_plan:{self.stability_mode}")
+            dependencies = [ArtifactDependencyRefV2.from_record(plan_record)]
+            if initial_record is not None:
+                dependencies.append(ArtifactDependencyRefV2.from_record(initial_record))
+            publish_json_artifact(
+                self.publication_context, self.registry,
+                self._path(f"outline_v3/primary_repair_exposure_{plan.contract_sha256}.json"),
+                {"schema_version": "outline-primary-repair-exposure/v1", "scope": "primary",
+                 "plan_contract_sha256": plan.contract_sha256, "exposure": exposure.to_dict()},
+                artifact_role="outline_repair_exposure", artifact_type="outline_primary_repair_exposure",
+                artifact_version="v1", producer="outline.v3_executor.OutlineV3Executor",
+                artifact_id=f"outline-v3:primary-repair-exposure:{plan.contract_sha256}",
+                depends_on=tuple(dependencies),
+            )
+        self._primary_candidate_repair_plan = plan
+        return plan
+
+    @staticmethod
+    def _unbound_component_repair_transport(route: OutlineRoleRoute) -> bool:
+        from runtime.test_dependencies import current_runtime_test_dependencies
+
+        dependencies = current_runtime_test_dependencies()
+        return bool(
+            dependencies is not None and dependencies.external_transport_disabled
+            and not isinstance(getattr(route.transport, "api_config", None), Mapping)
+        )
+
+    def _materialize_primary_repair_request(
+        self, node_id: str, request: Mapping[str, Any], route: OutlineRoleRoute, binding: Mapping[str, Any],
+    ) -> None:
+        if re.fullmatch(r"candidate_[1-9]\d*_semantic_repair", node_id) is None:
+            return
+        if self._unbound_component_repair_transport(route):
+            return  # This explicit test adapter cannot provide production wall/config authority.
+        if self.runtime_spec_binding is None:
+            from runtime.test_dependencies import current_runtime_test_dependencies
+
+            dependencies = current_runtime_test_dependencies()
+            if dependencies is not None and dependencies.external_transport_disabled:
+                return  # Explicit component-test lane has no production source envelope.
+            raise OutlineV3ExecutionError("primary candidate repair runtime binding is missing before transport")
+        plan = self._initialize_primary_candidate_repair_plan()
+        accepted = self.runtime_spec_binding
+        row = plan.materialize_request_row(
+            node_id.removesuffix("_semantic_repair"), request, route=route,
+            route_config_fingerprint_sha256=route.safe_config_fingerprint(), profile=route.profile,
+            retry_attempts=max(0, int(route.config_identity.get("transport_retries") or 0)),
+            wall_seconds_upper_bound=plan.wall_seconds_per_call_upper_bound,
+            config_source_id=accepted.config_source_id, config_source_sha256=accepted.config_source_sha256,
+            runtime_spec_sha256=accepted.normalized_spec_artifact_sha256,
+            canonical_source_authority_id=plan.canonical_source_authority_id,
+            canonical_source_authority_sha256=plan.canonical_source_authority_sha256,
+        )
+        if row.request_estimate.request_hash != binding.get("prompt_payload_hash"):
+            raise OutlineV3ExecutionError("primary candidate repair materialization differs from its transport binding")
+
     def _assert_primary_repair_fresh_attempt(self, node_id: str) -> None:
         """Refuse a second primary repair after exact replay was considered.
 
@@ -13488,6 +13620,11 @@ class OutlineV3Executor:
                 "deterministic",
                 "local",
             ))
+            if (
+                self.semantic_repair_enabled and self.runtime_spec_binding is not None
+                and not self._unbound_component_repair_transport(self._node_route("candidate_1_provider_generation"))
+            ):
+                self._initialize_primary_candidate_repair_plan()
             candidate_map_model = build_global_relation_map(evidence_model, matrix_model, ledger_model)
             candidate_map = self._run_node("relation_candidates", lambda: (
                 self._artifact(OutlineArtifact, candidate_map_model.to_dict(), {"multi_view_matrix": _hash_payload(matrix)}),
