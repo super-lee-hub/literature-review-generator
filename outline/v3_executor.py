@@ -6862,6 +6862,7 @@ class OutlineV3Executor:
         provider_node = (
             node_id in self._provider_node_ids()
             or node_id.startswith("stability:")
+            or node_id.endswith("_semantic_repair")
             or node_id.startswith("relation_adjudication:")
             or (node_id.startswith("candidate_") and "_provider_generation:" in node_id)
             or node_id.startswith((
@@ -11541,7 +11542,13 @@ class OutlineV3Executor:
                 normalized_hash = replay_lookup.record.normalized_output_hash or replay_lookup.record.output_hash
                 canonical_candidate_replay = bool(
                     isinstance(payload, Mapping)
-                    and node_id.endswith("_provider_generation")
+                    and (
+                        node_id.endswith("_provider_generation")
+                        or (
+                            node_id.endswith("_semantic_repair")
+                            and replay_record.artifact_type == "outline_candidate_repair"
+                        )
+                    )
                     and (self._alias_enabled or self._repair_enabled)
                     and replay_lookup.record.registered_artifact_hash
                     == str(replay_payload.get("content_hash") or "")
@@ -11658,6 +11665,7 @@ class OutlineV3Executor:
         # Re-check after replay lookup: replay is local and may be usable while
         # a paused job must still refuse any new provider admission.
         self._pause_state.assert_runnable(node_id=node_id)
+        self._assert_primary_repair_fresh_attempt(node_id)
         runtime = ProviderRuntime(
             budget=ProviderBudgetV1(
                 max_calls=1,
@@ -12783,6 +12791,10 @@ class OutlineV3Executor:
         failure publishes outline_candidate_repair_failure/v1 and raises
         (fail-closed, no third provider attempt from this call path).
         """
+        from outline.candidate_repair_plan import (
+            SEMANTIC_REPAIR_OUTPUT_SCHEMA_V1, SEMANTIC_REPAIR_RULES_V1,
+        )
+
         from outline.evidence_alias import (
             alias_for_paper,
             alias_for_relation,
@@ -12821,30 +12833,8 @@ class OutlineV3Executor:
             "validation_error": str(error),
             "allowed_paper_ids": allowed_papers_view,
             "allowed_relation_ids": allowed_relations_view,
-            "repair_rules": [
-                "Repair ONLY the structure of the candidate sections.",
-                "Remove or replace every section paper_key that is not in allowed_paper_ids.",
-                "Remove or replace every section relation_id that is not in allowed_relation_ids.",
-                "Do not introduce new papers, new relations, new citations, or new facts.",
-                "Do not invent citation identities; do not attribute evidence to any work outside the provided evidence corpus.",
-                "If a section has no in-corpus evidence left after removal, retain its identity and return needs_manual_review; never invent a replacement fact or silently delete the section.",
-                "Do not add sections beyond those in original_provider_output and do not increase the total number of planned claims.",
-                "Return exactly the same number of sections in exactly the same order as original_provider_output.",
-                "Copy every original section_id verbatim; never create, delete, duplicate, or rename a section_id.",
-                "Every claim that names a paper alias must be supported by a paper_key in that same section; remove the claim if its paper is not assigned there.",
-                "Do not write cross-paper limitation or gap aggregations unless each named paper explicitly supports the same limitation; prefer separate paper-specific claims or remove the aggregation.",
-                "Ensure each section goal accurately covers every remaining claim; rewrite a goal to a neutral evidence-bound purpose when the original goal is narrower than the claims.",
-                "Keep candidate_id unchanged and return the same top-level shape.",
-            ],
-            "output_schema": {
-                "candidate_id": "string; echo the candidate_id verbatim",
-                "sections": (
-                "non-empty array; each section object has section_id, title, "
-                    "paper_keys (subset of allowed_paper_ids), relation_ids (subset "
-                    "of allowed_relation_ids), claims (non-empty) and rationale"
-                ),
-                "needs_manual_review": "array of section_ids that cannot be repaired without a new semantic decision; empty when none",
-            },
+            "repair_rules": list(SEMANTIC_REPAIR_RULES_V1),
+            "output_schema": dict(SEMANTIC_REPAIR_OUTPUT_SCHEMA_V1),
         }
         repair_deps = {"candidate": _hash_payload(content)}
         try:
@@ -12938,6 +12928,44 @@ class OutlineV3Executor:
         )
         return repaired_content
 
+    def _assert_primary_repair_fresh_attempt(self, node_id: str) -> None:
+        """Refuse a second primary repair after exact replay was considered.
+
+        A completed receipt without a verified output and an explicitly failed
+        repair both require recovery, even if their transport outcome is unknown.
+        Stability variants have separate node identities and budgets.
+        """
+        if re.fullmatch(r"candidate_[1-9]\d*_semantic_repair", node_id) is None:
+            return
+        candidate_id = node_id.removesuffix("_semantic_repair")
+        for record in self.registry.list_records():
+            if record.artifact_type != "outline_candidate_repair_failure" or record.status != "ready":
+                continue
+            payload = json.loads(Path(record.path).read_text(encoding="utf-8"))
+            if (
+                isinstance(payload, Mapping)
+                and payload.get("candidate_id") == candidate_id
+                and payload.get("repair_node_id") == node_id
+                and payload.get("attempt_identity") == self.logical_attempt_identity
+            ):
+                self.registry.verify_ready_artifact_closure(record)
+                if payload.get("provider_attempted") is False:
+                    continue
+                raise OutlineV3ExecutionError(
+                    f"{node_id} was already attempted; recover its recorded failure before new transport"
+                )
+        call_id = self._provider_call_id(node_id)
+        for receipt in self._receipt_ledger.list_receipts():
+            if (
+                receipt.job_id == self.job_id
+                and receipt.call_id == call_id
+                and receipt.logical_attempt_identity == self.logical_attempt_identity
+                and receipt.status != "blocked"
+            ):
+                raise OutlineV3ExecutionError(
+                    f"{node_id} was already attempted without reusable output; preserve its receipt for recovery"
+                )
+
     def _persist_repair_output(
         self,
         node_id: str,
@@ -12983,15 +13011,44 @@ class OutlineV3Executor:
                 registered_artifact_hash=artifact.content_hash,
                 node_output_hash=artifact.content_hash,
             )
+            pending = self._pending_replays.pop(node_id, None)
+            if pending is not None and expected.normalized_output_hash:
+                replay_key, normalized_hash, receipt_id = pending
+                self._replay_store.append(
+                    replay_key,
+                    output_hash=normalized_hash,
+                    normalized_output_hash=normalized_hash,
+                    registered_artifact_hash=artifact.content_hash,
+                    node_output_hash=artifact.content_hash,
+                    output_artifact_ids=(artifact_id,),
+                    receipt_ids=(receipt_id,),
+                    audit_node_id=node_id,
+                    closure_epoch_id=self.closure_epoch_id,
+                )
+                self._expected_provider_calls[expected.call_id] = replace(
+                    self._expected_provider_calls[expected.call_id],
+                    replay_output_hash=normalized_hash,
+                )
 
     def _publish_repair_failure(
         self, candidate_id: str, error: Exception, *, node_id: str = ""
     ) -> None:
+        repair_node_id = node_id or f"{candidate_id}_semantic_repair"
+        provider_attempted = any(
+            audit.get("node_id") == repair_node_id and audit.get("provider_invoked") is True
+            for audit in self._request_payload_audit
+        ) or any(
+            receipt.call_id == self._provider_call_id(repair_node_id)
+            and receipt.logical_attempt_identity == self.logical_attempt_identity
+            and receipt.status != "blocked"
+            for receipt in self._receipt_ledger.list_receipts()
+        )
         payload = {
             "artifact_type": "outline_candidate_repair_failure",
             "artifact_version": "v1",
             "candidate_id": candidate_id,
-            "repair_node_id": node_id or f"{candidate_id}_semantic_repair",
+            "repair_node_id": repair_node_id,
+            "provider_attempted": provider_attempted,
             "error": str(error),
             "attempt_identity": str(
                 getattr(self, "logical_attempt_identity", "") or ""
@@ -14475,10 +14532,13 @@ class OutlineV3Executor:
                                 "stating the section's purpose in the review), paper_keys "
                                 "(subset of the provided evidence paper_keys), relation_ids "
                                 "(subset of provided relation_ids), claims (non-empty array "
-                                "of planned claim strings) and rationale; for any claim naming "
-                                "an explicit Study/Experiment/Trial ID, include claim_support "
-                                "with that exact claim, paper_key, study_id, source_claim_ids, "
-                                "evidence_ids, and source_field_ids from interpretation_source_tables"
+                                "of planned claim strings) and rationale. Every planned claim "
+                                "must include claim_support with its exact claim text, paper_key, "
+                                "source_claim_ids, evidence_ids and complete qualifier source_field_ids "
+                                "from the supplied shared semantic context. Include study_id only "
+                                "when the supplied sources verify that study; do not invent a study "
+                                "identity for paper-level fallback. Preserve all primary and required "
+                                "qualifier provenance so the Writer can bind the same assertion."
                             ),
                         },
                         "paper_keys_are_the_only_allowed_keys": (
@@ -14510,6 +14570,7 @@ class OutlineV3Executor:
                         "section_paper_keys_must_be_subset_of_evidence": True,
                         "section_relation_ids_must_be_subset_of_relation_ids": True,
                         "planned_claims_must_be_non_empty": True,
+                        "planned_claims_require_source_support": True,
                         "explicit_study_claims_require_scoped_support": (
                             "A planned claim naming Study/Experiment/Trial S1 or 1 must "
                             "include a claim_support row with the exact claim text and all "

@@ -102,6 +102,10 @@ _ROUTE_CONFIG_KEYS = frozenset(
         "provider_stream",
         "provider_stream_include_usage",
         "transport_retries",
+        "connect_timeout_seconds",
+        "read_timeout_seconds",
+        "total_timeout_seconds",
+        "first_token_timeout_seconds",
     }
 )
 

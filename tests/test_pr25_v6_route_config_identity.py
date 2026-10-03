@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from outline.provider_router import OutlineRoleRoute, safe_config_identity
 from runtime.provider_context import ProviderContextProfile
 from services.model_selection import get_api_config_for_section
@@ -59,3 +61,32 @@ def test_provider_stream_reaches_the_route_from_current_api_config() -> None:
     route_config = get_api_config_for_section(config, "Outline_API")
     assert route_config["provider_stream"] == "true"
     assert safe_config_identity(route_config)["provider_stream"] == "true"
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "connect_timeout_seconds",
+        "read_timeout_seconds",
+        "total_timeout_seconds",
+        "first_token_timeout_seconds",
+    ),
+)
+def test_transport_deadline_changes_invalidate_the_route_binding(field: str) -> None:
+    config = {
+        "Outline_API": {
+            "api_key": "local-fixture-only",
+            "model": "claude-opus-5-5",
+            "api_base": "http://127.0.0.1:1/v1",
+            field: "60",
+        }
+    }
+    current = get_api_config_for_section(config, "Outline_API")
+    first = _route(current)
+    changed = _route({**current, field: "120"})
+    integer = _route({**current, field: 60})
+
+    assert first.config_identity.get(field) == "60"
+    assert first.safe_config_fingerprint() != changed.safe_config_fingerprint()
+    assert first.safe_config_fingerprint() == integer.safe_config_fingerprint()
+    assert "api_key" not in first.config_identity
