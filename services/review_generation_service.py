@@ -1640,11 +1640,9 @@ class ReviewGenerationService:
             if writer_config is not None
             else self.settings.section("Writer_API")
         )
-        raw = config.get("max_output_tokens") or 32000
-        try:
-            return max(256, int(raw))
-        except (TypeError, ValueError):
-            return 32000
+        from runtime.provider_context import writer_output_token_limit
+
+        return writer_output_token_limit(config)
 
     def _writer_request_payload(
         self,

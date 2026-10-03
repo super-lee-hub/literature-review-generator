@@ -760,6 +760,9 @@ class ReviewControlPlane:
                     ),
                 )
                 if stage_name == "review" and semantic_role == "writer":
+                    from runtime.provider_context import writer_output_token_limit
+
+                    output_tokens = writer_output_token_limit(api_config)
                     profile = ProviderContextProfile.from_api_config(
                         api_config, max_output_tokens=output_tokens, default_model="writer",
                     )

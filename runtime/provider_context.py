@@ -7,6 +7,16 @@ from dataclasses import dataclass
 from typing import Any
 
 
+def writer_output_token_limit(api_config: Mapping[str, Any]) -> int:
+    """Apply the production Writer's output default and minimum consistently."""
+
+    raw = api_config.get("max_output_tokens") or 32000
+    try:
+        return max(256, int(raw))
+    except (TypeError, ValueError):
+        return 32000
+
+
 @dataclass(frozen=True)
 class ProviderRequestEstimateV1:
     """A secret-free estimate bound to one serialized provider request."""
@@ -228,4 +238,4 @@ class ProviderContextProfile:
         )
 
 
-__all__ = ["ProviderContextProfile", "ProviderRequestEstimateV1"]
+__all__ = ["ProviderContextProfile", "ProviderRequestEstimateV1", "writer_output_token_limit"]

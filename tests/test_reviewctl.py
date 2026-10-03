@@ -58,7 +58,10 @@ def test_reviewctl_plan_and_doctor_emit_machine_json(tmp_path: Path, capsys) -> 
 
 
 @pytest.mark.parametrize("explicit_zero", [False, True])
-def test_public_plan_writer_reserves_match_the_writer_runtime(tmp_path: Path, explicit_zero: bool) -> None:
+@pytest.mark.parametrize("output_tokens", [None, 4096])
+def test_public_plan_writer_reserves_match_the_writer_runtime(
+    tmp_path: Path, explicit_zero: bool, output_tokens: int | None,
+) -> None:
     from config_loader import load_config
     from runtime.provider_context import ProviderContextProfile
     from services.model_selection import get_api_config_for_section
@@ -73,7 +76,10 @@ def test_public_plan_writer_reserves_match_the_writer_runtime(tmp_path: Path, ex
         parser[section]["api_key"] = "local-fixture-only"
         parser[section]["api_base"] = "http://127.0.0.1:1/v1"
     writer = parser["Writer_API"]
-    writer["max_output_tokens"] = "4096"
+    if output_tokens is None:
+        writer.pop("max_output_tokens", None)
+    else:
+        writer["max_output_tokens"] = str(output_tokens)
     writer["max_context_tokens"] = "128000"
     writer["transport_retries"] = "0"
     for key in ("reasoning_reserve_tokens", "safety_margin_tokens"):
@@ -92,7 +98,9 @@ def test_public_plan_writer_reserves_match_the_writer_runtime(tmp_path: Path, ex
     config = load_config(spec.config, action=spec.action,
                          requested_stages=spec.metadata["requested_stages"], allow_template_credentials=False)
     api_config = get_api_config_for_section(config, "Writer_API")
-    profile = ProviderContextProfile.from_api_config(api_config, max_output_tokens=4096, default_model="writer")
+    profile = ProviderContextProfile.from_api_config(
+        api_config, max_output_tokens=output_tokens or 32000, default_model="writer",
+    )
     for exposure in exposures:
         assert exposure["input_tokens_per_call_upper_bound"] == profile.input_budget
         assert exposure["output_tokens_per_call_upper_bound"] == profile.max_output_tokens
