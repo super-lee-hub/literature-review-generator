@@ -1257,7 +1257,9 @@ def _outline_provider_response(
             }
         )
 
-    if node_id.endswith("_critique") or node_id in {
+    if node_id.endswith("_critique") or any(role in node_id for role in (
+        "structure_critique", "coverage_critique", "evidence_critique",
+    )) or node_id in {
         "structure_critique",
         "coverage_critique",
         "evidence_critique",

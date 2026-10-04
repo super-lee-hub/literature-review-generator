@@ -195,6 +195,8 @@ class _LocalModelFixture(BaseHTTPRequestHandler):
                     ))
                     or node_id == "relation_adjudication"
                     or node_id.endswith(("_provider_generation", "_critique"))
+                    or "_provider_generation:local:" in node_id
+                    or any(role in node_id for role in ("structure_critique", "coverage_critique", "evidence_critique"))
                     or node_id in {"arbitration", "structure_critique", "coverage_critique", "evidence_critique"}
                 )
                 if is_outline_request:
