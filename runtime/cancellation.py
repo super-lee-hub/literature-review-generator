@@ -13,12 +13,16 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
-from services.artifact_registry import ArtifactRecord, ArtifactRegistry
+from services.artifact_registry import ArtifactRecord, ArtifactRegistry, file_sha256
 from services.job_workspace import JobWorkspace, atomic_write_json, utc_now_iso
 
 
 CANCEL_REQUEST_ARTIFACT_TYPE = "cancel_request"
 CANCEL_REQUEST_ARTIFACT_VERSION = "v1"
+
+
+class CancellationRequestError(ValueError):
+    """Raised when a durable cancellation marker is missing or invalid."""
 
 
 @dataclass(frozen=True)
@@ -57,13 +61,41 @@ class CancellationRequestStore:
     def read(self) -> CancellationRequestV1 | None:
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
+        except FileNotFoundError:
+            if self.registry is not None:
+                self.registry.reload()
+                if self.registry.get(self.artifact_id) is not None:
+                    raise CancellationRequestError(
+                        "CONTROL_STATE_INVALID: registered cancellation marker is missing"
+                    )
             return None
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise CancellationRequestError(
+                f"CONTROL_STATE_INVALID: cancellation marker cannot be read: {type(exc).__name__}"
+            ) from exc
         if not isinstance(payload, Mapping):
-            return None
+            raise CancellationRequestError("CONTROL_STATE_INVALID: cancellation marker must be an object")
+        if type(payload.get("active")) is not bool:
+            raise CancellationRequestError("CONTROL_STATE_INVALID: cancellation active flag must be boolean")
         request = CancellationRequestV1.from_dict(payload)
-        if request.job_id and request.job_id != self.workspace.job_id:
-            return None
+        if (
+            request.job_id != self.workspace.job_id
+            or request.request_id != f"cancel:{self.workspace.job_id}"
+            or not request.requested_at
+        ):
+            raise CancellationRequestError("CONTROL_STATE_INVALID: cancellation marker identity is invalid")
+        if self.registry is not None:
+            self.registry.reload()
+            record = self.registry.get(self.artifact_id)
+            if (
+                record is None
+                or record.status != "ready"
+                or str(record.path) != str(self.path)
+                or str(record.content_hash or "") != file_sha256(self.path)
+            ):
+                raise CancellationRequestError(
+                    "CONTROL_STATE_INVALID: cancellation marker is not backed by the current Registry record"
+                )
         return request
 
     def _persist(self, request: CancellationRequestV1, *, producer: str) -> ArtifactRecord | None:
@@ -120,6 +152,7 @@ class CancellationRequestStore:
 __all__ = [
     "CANCEL_REQUEST_ARTIFACT_TYPE",
     "CANCEL_REQUEST_ARTIFACT_VERSION",
+    "CancellationRequestError",
     "CancellationRequestV1",
     "CancellationRequestStore",
 ]

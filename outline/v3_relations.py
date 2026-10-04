@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from collections import defaultdict
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
@@ -94,7 +93,7 @@ _AXIS_SPECS = (
 
 
 def _safe_text(value: Any) -> str:
-    return str(value or "").strip()
+    return "" if value is None else str(value).strip()
 
 
 def _stable_unique(values: Iterable[Any]) -> List[str]:
@@ -345,18 +344,25 @@ def build_global_relation_map(
         right_support = _has_signal(right, "support")
         left_contradict = _has_signal(left, "contradict")
         right_contradict = _has_signal(right, "contradict")
-        relation_dimension = next((d for d in shared_dimensions if d in {"theory", "construct", "mechanism", "context"}), shared_dimensions[0])
-        shared_labels = sorted(dimension_map[relation_dimension])
+        # Positive/negative words are only a retrieval signal.  A substantive
+        # relation requires a shared theory, construct, mechanism, or finding
+        # dimension; year, author, template labels, and context alone cannot
+        # establish support or contradiction.
+        relation_dimension = next(
+            (d for d in shared_dimensions if d in {"theory", "construct", "mechanism", "finding"}),
+            "",
+        )
+        shared_labels = sorted(dimension_map[relation_dimension]) if relation_dimension else []
         evidence_fields = {
             left.paper_key: ["findings", "conclusions"],
             right.paper_key: ["findings", "conclusions"],
         }
-        if (left_support and right_support) and not (left_contradict or right_contradict):
+        if relation_dimension and (left_support and right_support) and not (left_contradict or right_contradict):
             _add_relation(relations, _relation(
                 "supports", left, right, dimension=relation_dimension,
                 labels=shared_labels, confidence="low", evidence_fields=evidence_fields,
             ))
-        if left_contradict or right_contradict:
+        if relation_dimension and (left_contradict or right_contradict):
             _add_relation(relations, _relation(
                 "contradicts", left, right, dimension=relation_dimension,
                 labels=shared_labels, confidence="low", evidence_fields=evidence_fields,
@@ -398,8 +404,13 @@ def _preferred_axis_order(intent: Optional[ReviewIntent]) -> List[str]:
     return [preferred, *[axis_id for axis_id in axis_ids if axis_id != preferred]]
 
 
-def build_organizing_axes(intent: Optional[ReviewIntent] = None) -> List[OrganizingAxis]:
-    """Return all fixed organizing axes; intent changes preference, not scope."""
+def build_organizing_axes(
+    intent: Optional[ReviewIntent] = None, *, candidate_count: int = 5,
+) -> List[OrganizingAxis]:
+    """Keep the fixed axes first, then compose distinct hierarchical axes."""
+
+    if not 1 <= candidate_count <= 12:
+        raise ValueError("candidate_count must be between 1 and 12")
 
     specs_by_id = {spec[0]: spec for spec in _AXIS_SPECS}
     axes: List[OrganizingAxis] = []
@@ -413,6 +424,31 @@ def build_organizing_axes(intent: Optional[ReviewIntent] = None) -> List[Organiz
             preferred_dimensions=list(dimensions),
             preferred_relation_types=list(relation_types),
         ))
+    base_axes = list(axes)
+    for primary in base_axes:
+        for secondary in base_axes:
+            if len(axes) >= candidate_count:
+                return axes
+            if primary.axis_id == secondary.axis_id:
+                continue
+            axis_id = f"{primary.axis_id}_then_{secondary.axis_id}"
+            axes.append(OrganizingAxis(
+                axis_id=axis_id,
+                organizing_logic=axis_id,
+                label=f"{primary.label} / {secondary.label}",
+                rationale=(
+                    f"Use {primary.axis_id} as the primary organization of sections; "
+                    f"use {secondary.axis_id} to organize comparisons within those sections. "
+                    f"Primary rationale: {primary.rationale} "
+                    f"Secondary rationale: {secondary.rationale}"
+                ),
+                preferred_dimensions=list(dict.fromkeys([
+                    *primary.preferred_dimensions, *secondary.preferred_dimensions,
+                ])),
+                preferred_relation_types=list(dict.fromkeys([
+                    *primary.preferred_relation_types, *secondary.preferred_relation_types,
+                ])),
+            ))
     return axes
 
 
@@ -424,13 +460,12 @@ def build_outline_candidate_plans(
     coverage_contract: CoverageContract,
     *,
     candidate_count: int = 5,
+    semantic_chunk_plan_hash: str = "",
 ) -> OutlineCandidatePlans:
     """Create deterministic candidate plans with provider generation isolated."""
 
-    if candidate_count <= 0:
-        raise ValueError("candidate_count must be positive")
-    axes = build_organizing_axes(intent)
-    selected_axes = axes[:min(candidate_count, len(axes))]
+    axes = build_organizing_axes(intent, candidate_count=candidate_count)
+    selected_axes = axes[:candidate_count]
     shared = {
         "global_corpus_ledger": ledger.content_hash,
         "multi_view_matrix": matrix.content_hash,
@@ -438,6 +473,8 @@ def build_outline_candidate_plans(
         "review_intent": intent.content_hash,
         "coverage_contract": coverage_contract.content_hash,
     }
+    if str(semantic_chunk_plan_hash or "").strip():
+        shared["semantic_chunk_plan"] = str(semantic_chunk_plan_hash).strip()
     inherited_blocking = [
         *ledger.blocking_diagnostics,
         *matrix.blocking_diagnostics,
@@ -457,6 +494,7 @@ def build_outline_candidate_plans(
                 "global_corpus_ledger",
                 "multi_view_matrix",
                 "relation_candidates",
+                *(["semantic_chunk_plan"] if str(semantic_chunk_plan_hash or "").strip() else []),
                 "global_relation_map",
                 "review_intent",
                 "coverage_contract",

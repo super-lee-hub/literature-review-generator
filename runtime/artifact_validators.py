@@ -89,6 +89,9 @@ CURRENT_PRODUCTION_ARTIFACT_TYPES = frozenset(
         "outline_adoption_pointer",
         "outline_request_payload_audit",
         "outline_hierarchical_call_graph",
+        "outline_topic_pilot_plan",
+        "outline_topic_pilot_receipt_closure",
+        "outline_topic_pilot_checkpoint",
         "export_bundle",
         "forensic_attestation",
         "provider_receipt_ledger",
@@ -401,6 +404,66 @@ def _validate_review_json(record: Any, _path: str | Path, root: Mapping[str, Any
     _require_fields(root, ("created_at", "draft_identity", "generation_context", "content", "projections"), artifact_type)
     if not isinstance(root.get("content"), Mapping) or not isinstance(root.get("draft_identity"), Mapping):
         raise ArtifactSchemaError(f"{artifact_type} content and draft_identity must be objects")
+    from services.review_draft import validate_review_section_writer_scope
+
+    for section in root["content"].get("sections", []):
+        if not isinstance(section, Mapping):
+            raise ArtifactSchemaError(f"{artifact_type} section must be an object")
+        if section.get("writer_task_scope") or any(block.get("table_layout_schema_version") for block in section.get("blocks", [])):
+            try:
+                validate_review_section_writer_scope(section)
+            except (TypeError, ValueError, KeyError) as exc:
+                raise ArtifactSchemaError(f"{artifact_type} source/layout contract is invalid: {exc}") from exc
+    generation_context = root.get("generation_context")
+    if not isinstance(generation_context, Mapping):
+        raise ArtifactSchemaError(f"{artifact_type} generation_context must be an object")
+    if str(generation_context.get("generation_mode") or "") != "outline_v3":
+        return
+
+    for field in (
+        "outline_artifact_id",
+        "outline_source_path",
+        "adoption_artifact_id",
+    ):
+        if not str(generation_context.get(field) or "").strip():
+            raise ArtifactSchemaError(
+                f"{artifact_type} Outline v3 lineage is missing {field}"
+            )
+    for field in ("outline_artifact_hash", "adoption_artifact_hash"):
+        digest = str(generation_context.get(field) or "").strip().lower()
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise ArtifactSchemaError(
+                f"{artifact_type} Outline v3 lineage has an invalid {field}"
+            )
+
+    section_artifacts = generation_context.get("writer_section_artifacts")
+    sections = root["content"].get("sections")
+    if (
+        not isinstance(section_artifacts, list)
+        or not section_artifacts
+        or not isinstance(sections, list)
+        or len(section_artifacts) != len(sections)
+    ):
+        raise ArtifactSchemaError(
+            f"{artifact_type} writer_section_artifacts must contain one reference per section"
+        )
+    artifact_ids: set[str] = set()
+    for index, reference in enumerate(section_artifacts):
+        if not isinstance(reference, Mapping) or set(reference) != {"artifact_id", "content_hash"}:
+            raise ArtifactSchemaError(
+                f"{artifact_type} writer_section_artifacts[{index}] must contain exactly artifact_id and content_hash"
+            )
+        artifact_id = str(reference.get("artifact_id") or "").strip()
+        digest = str(reference.get("content_hash") or "").strip().lower()
+        if not artifact_id or artifact_id in artifact_ids:
+            raise ArtifactSchemaError(
+                f"{artifact_type} writer_section_artifacts[{index}] has a missing or duplicate artifact_id"
+            )
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise ArtifactSchemaError(
+                f"{artifact_type} writer_section_artifacts[{index}] has an invalid content_hash"
+            )
+        artifact_ids.add(artifact_id)
 
 
 def _validate_citation_json(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
@@ -847,11 +910,14 @@ def _validate_stage1_reusable_summary_manifest(
     _path: str | Path,
     root: Mapping[str, Any],
 ) -> None:
+    version = str(getattr(record, "artifact_version", "") or "")
+    if version not in {"v1", "v2"}:
+        raise ArtifactSchemaError("stage1 reusable manifest version is unsupported")
     _validate_production_identity(
         record,
         root,
         expected_types=("stage1_reusable_summary_manifest",),
-        expected_version="v1",
+        expected_version=version,
     )
     _require_fields(
         root,
@@ -911,6 +977,25 @@ def _validate_stage1_reusable_summary_manifest(
             raise ArtifactSchemaError(
                 f"stage1_reusable_summary_manifest.{hash_label} is not a SHA-256 hex digest"
             )
+    if version == "v2":
+        _validate_owner_corrected_manifest_shape(root)
+
+
+def _validate_owner_corrected_manifest_shape(root: Mapping[str, Any]) -> None:
+    from services.stage1_reuse import Stage1ReusableSummaryBindingV1, _validate_manifest_self_binding
+
+    binding_value = root.get("binding")
+    paper_info = root.get("paper_info")
+    summary_payload = root.get("summary_payload")
+    if not all(isinstance(item, Mapping) for item in (binding_value, paper_info, summary_payload)):
+        raise ArtifactSchemaError("owner corrected manifest requires binding, paper and summary objects")
+    manifest, reason = _validate_manifest_self_binding(
+        root,
+        binding=Stage1ReusableSummaryBindingV1.from_mapping(binding_value),
+        previous_summary={"paper_info": paper_info, "ai_summary": summary_payload},
+    )
+    if manifest is None:
+        raise ArtifactSchemaError(f"owner corrected manifest is invalid: {reason}")
 
 
 def _validate_stage1_portable_metadata(record: Any, *, expected_type: str) -> Mapping[str, Any]:
@@ -963,6 +1048,28 @@ def _validate_stage1_portable_metadata(record: Any, *, expected_type: str) -> Ma
             "stage1 portable summary manifest metadata is not self-bound"
         )
     return metadata
+
+
+def _validate_stage1_portable_owner_correction(
+    record: Any,
+    _path: str | Path,
+    root: Mapping[str, Any],
+) -> None:
+    expected_type = str(getattr(record, "artifact_type", ""))
+    metadata = _validate_stage1_portable_metadata(record, expected_type=expected_type)
+    headers = {
+        "stage1_portable_owner_correction_origin_source": ("stage1_canonical_summaries", "v1"),
+        "stage1_portable_owner_correction_prior_manifest": ("stage1_reusable_summary_manifest", "v1"),
+        "stage1_portable_owner_correction_derived_summary_set": ("stage1_derived_summary_set", "owner-corrected-v1"),
+        "stage1_portable_owner_correction_adoption_receipt": ("stage1_summary_correction_adoption_receipt", "v1"),
+    }
+    artifact_type, artifact_version = headers[expected_type]
+    if (
+        root.get("artifact_type") != artifact_type
+        or root.get("artifact_version") != artifact_version
+        or root.get("job_id") != metadata.get("source_authority_job_id")
+    ):
+        raise ArtifactSchemaError("portable owner correction source header is invalid")
 
 
 def _validate_stage1_portable_summary_source(
@@ -1027,7 +1134,7 @@ def _validate_stage1_portable_summary_manifest(
     )
     if (
         root.get("artifact_type") != "stage1_reusable_summary_manifest"
-        or root.get("artifact_version") != "v1"
+        or root.get("artifact_version") not in {"v1", "v2"}
         or str(root.get("job_id") or "")
         != str(metadata.get("source_authority_job_id") or "")
         or str(root.get("stage_name") or "") != "stage1_analyze"
@@ -1035,6 +1142,8 @@ def _validate_stage1_portable_summary_manifest(
         or not isinstance(root.get("binding"), Mapping)
     ):
         raise ArtifactSchemaError("stage1 portable summary manifest identity is invalid")
+    if root.get("artifact_version") == "v2":
+        _validate_owner_corrected_manifest_shape(root)
     qualification_issues = validate_current_visual_evidence_qualification_pair(root)
     if qualification_issues:
         raise ArtifactSchemaError(
@@ -2609,6 +2718,115 @@ def _validate_playwright_trace(
         raise ArtifactSchemaError("Playwright trace archive is invalid") from exc
 
 
+def _validate_outline_topic_pilot_artifact(
+    record: Any, _path: str | Path, root: Mapping[str, Any] | None
+) -> None:
+    """Keep a pilot checkpoint distinct from a canonical Outline result."""
+
+    if not isinstance(root, Mapping):
+        raise ArtifactSchemaError("topic pilot artifact must be a JSON object")
+    kind = str(getattr(record, "artifact_type", "") or "")
+    schemas = {
+        "outline_topic_pilot_plan": "outline-topic-pilot-plan/v1",
+        "outline_topic_pilot_receipt_closure": "outline-topic-pilot-receipt-closure/v1",
+        "outline_topic_pilot_checkpoint": "outline-topic-pilot-checkpoint/v1",
+    }
+    if root.get("schema_version") != schemas.get(kind):
+        raise ArtifactSchemaError("topic pilot artifact schema identity is invalid")
+
+    def sha(value: Any) -> bool:
+        return isinstance(value, str) and len(value) == 64 and all(
+            character in "0123456789abcdef" for character in value
+        )
+
+    if not sha(root.get("pilot_scope_hash")) or not str(root.get("acceptance_run_id") or ""):
+        raise ArtifactSchemaError("topic pilot scope or acceptance identity is missing")
+    if kind == "outline_topic_pilot_plan":
+        rows = root.get("selected_requests")
+        if (
+            root.get("status") != "accepted_before_transport"
+            or root.get("provider_posts_emitted") != 0
+            or not sha(root.get("source_summary_set_hash"))
+            or not sha(root.get("route_fingerprint"))
+            or not isinstance(rows, list)
+            or not rows
+        ):
+            raise ArtifactSchemaError("topic pilot plan is incomplete")
+        ids = [str(item.get("node_id") or "") for item in rows if isinstance(item, Mapping)]
+        if (
+            len(ids) != len(rows)
+            or len(set(ids)) != len(ids)
+            or any(not item.startswith("topic_synthesis_provider:batch:") for item in ids)
+            or any(not sha(item.get("request_hash")) for item in rows)
+            or root.get("logical_call_count") != len(rows)
+            or not isinstance(root.get("physical_attempt_upper_bound"), int)
+            or isinstance(root.get("physical_attempt_upper_bound"), bool)
+            or root["physical_attempt_upper_bound"] < len(rows)
+            or not isinstance(root.get("output_token_all_attempts_upper_bound"), int)
+            or isinstance(root.get("output_token_all_attempts_upper_bound"), bool)
+            or root["output_token_all_attempts_upper_bound"] <= 0
+        ):
+            raise ArtifactSchemaError("topic pilot plan request envelope is invalid")
+        return
+    if kind == "outline_topic_pilot_receipt_closure":
+        selected = root.get("selected_call_ids")
+        if (
+            root.get("complete") is not True
+            or root.get("canonical_outline_complete") is not False
+            or not isinstance(selected, list)
+            or not selected
+            or any(not isinstance(item, str) or not item for item in selected)
+            or sorted(selected) != sorted(root.get("expected_call_ids") or ())
+            or len(set(selected)) != len(selected)
+            or not sha(root.get("closure_hash"))
+            or any(
+                root.get(field)
+                for field in (
+                    "missing_call_ids", "stale_call_ids", "failed_call_ids",
+                    "incomplete_call_ids", "hash_mismatches", "unexpected_receipts",
+                    "retry_exceeded_call_ids", "usage_incomplete_call_ids",
+                )
+            )
+        ):
+            raise ArtifactSchemaError("topic pilot receipt closure is incomplete")
+        return
+    selected = root.get("selected_topic_batch_ids")
+    result_hashes = root.get("topic_result_hashes")
+    output_ids = root.get("provider_output_artifact_ids")
+    if (
+        root.get("status") != "TOPIC_PILOT_COMPLETE"
+        or root.get("canonical_ready") is not False
+        or root.get("auto_continue") is not False
+        or root.get("adoption_authorized") is not False
+        or root.get("final_outline_artifact_id") != ""
+        or not sha(root.get("source_summary_set_hash"))
+        or not sha(root.get("receipt_closure_hash"))
+        or not isinstance(selected, list)
+        or not selected
+        or any(not isinstance(item, str) or not item for item in selected)
+        or len(set(selected)) != len(selected)
+        or not isinstance(result_hashes, Mapping)
+        or set(result_hashes) != set(selected)
+        or any(not sha(value) for value in result_hashes.values())
+        or not isinstance(output_ids, list)
+        or len(output_ids) != len(selected)
+        or any(not isinstance(item, str) or not item for item in output_ids)
+        or len(set(output_ids)) != len(output_ids)
+        or not str(root.get("receipt_closure_artifact_id") or "")
+    ):
+        raise ArtifactSchemaError("topic pilot checkpoint is incomplete or canonicalized")
+    dependencies = {
+        str(item.artifact_id): str(item.content_hash)
+        for item in getattr(record, "depends_on", ())
+    }
+    if (
+        dependencies.get(str(root["receipt_closure_artifact_id"]))
+        != root["receipt_closure_hash"]
+        or any(str(item) not in dependencies for item in output_ids)
+    ):
+        raise ArtifactSchemaError("topic pilot checkpoint dependency binding is incomplete")
+
+
 def _validate_current_production_artifact(record: Any, path: str | Path, root: Mapping[str, Any] | None) -> None:
     artifact_type = str(getattr(record, "artifact_type", "") or "")
     version = str(getattr(record, "artifact_version", "") or "")
@@ -2628,13 +2846,21 @@ def _validate_current_production_artifact(record: Any, path: str | Path, root: M
         ("provider_expected_call_graph", "v1"): _validate_provider_expected_call_graph,
         ("stage1_summary_reuse_record", "v1"): _validate_stage1_summary_reuse_record,
         ("stage1_reusable_summary_manifest", "v1"): _validate_stage1_reusable_summary_manifest,
+        ("stage1_reusable_summary_manifest", "v2"): _validate_stage1_reusable_summary_manifest,
         ("stage1_portable_summary_source", "v1"): _validate_stage1_portable_summary_source,
         ("stage1_portable_summary_manifest", "v1"): _validate_stage1_portable_summary_manifest,
         ("stage1_portable_provider_closure", "v1"): _validate_stage1_portable_provider_closure,
         ("stage1_portable_provider_ledger", "v1"): _validate_stage1_portable_provider_ledger,
+        ("stage1_portable_owner_correction_origin_source", "v1"): _validate_stage1_portable_owner_correction,
+        ("stage1_portable_owner_correction_prior_manifest", "v1"): _validate_stage1_portable_owner_correction,
+        ("stage1_portable_owner_correction_derived_summary_set", "v1"): _validate_stage1_portable_owner_correction,
+        ("stage1_portable_owner_correction_adoption_receipt", "v1"): _validate_stage1_portable_owner_correction,
         ("outline_provider_call_plan", "v1"): _validate_outline_provider_call_plan,
         ("outline_request_payload_audit", "v1"): _validate_outline_request_payload_audit,
         ("outline_hierarchical_call_graph", "v1"): _validate_outline_hierarchical_call_graph,
+        ("outline_topic_pilot_plan", "v1"): _validate_outline_topic_pilot_artifact,
+        ("outline_topic_pilot_receipt_closure", "v1"): _validate_outline_topic_pilot_artifact,
+        ("outline_topic_pilot_checkpoint", "v1"): _validate_outline_topic_pilot_artifact,
         ("validation_disposition", "v1"): _validate_validation_disposition,
         ("lease_publication_manifest", "v1"): _validate_lease_publication_manifest,
         ("provider_receipt_ledger", "v1"): _validate_receipt_ledger,

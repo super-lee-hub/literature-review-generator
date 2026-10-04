@@ -13,10 +13,38 @@ import json
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping, Sequence
 
+from services.review_draft import iter_review_text_blocks, validate_review_section_writer_scope
+
 
 def _hash(value: Any) -> str:
     payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _native_occurrence_spans_match_text(
+    occurrence: Mapping[str, Any],
+    block_text: str,
+) -> bool:
+    token = occurrence.get("citation_token")
+    spans = occurrence.get("spans")
+    if not isinstance(token, str) or not token or not isinstance(spans, list) or not spans:
+        return False
+    for span in spans:
+        if not isinstance(span, Mapping):
+            return False
+        start, end = span.get("start_offset"), span.get("end_offset")
+        if (
+            isinstance(start, bool)
+            or not isinstance(start, int)
+            or isinstance(end, bool)
+            or not isinstance(end, int)
+            or not 0 <= start < end <= len(block_text)
+        ):
+            return False
+        actual = block_text[start:end]
+        if actual != token or span.get("text") != actual:
+            return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -47,6 +75,8 @@ def run_semantic_revalidation(
     content = review_draft.get("content")
     sections = content.get("sections") if isinstance(content, Mapping) else None
     block_ids: set[str] = set()
+    native_cell_ids: set[str] = set()
+    block_text_by_id: dict[str, str] = {}
     block_count = 0
     if not isinstance(sections, list) or not sections:
         diagnostics.add("sections_missing")
@@ -55,13 +85,22 @@ def run_semantic_revalidation(
         if not isinstance(section, Mapping):
             diagnostics.add(f"section_not_object:{section_index}")
             continue
-        if not str(section.get("title") or section.get("heading") or "").strip():
+        if not str(section.get("title") or section.get("heading") or section.get("section_title") or "").strip():
             diagnostics.add(f"section_heading_missing:{section_index}")
         blocks = section.get("blocks")
         if not isinstance(blocks, list) or not blocks:
             diagnostics.add(f"section_blocks_missing:{section_index}")
             continue
-        for block_index, block in enumerate(blocks, start=1):
+        try:
+            text_blocks = validate_review_section_writer_scope(section)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            diagnostics.add(f"writer_section_scope_invalid:{section_index}")
+            try:
+                text_blocks = list(iter_review_text_blocks(section))
+            except (AttributeError, KeyError, TypeError, ValueError):
+                diagnostics.add(f"writer_section_structure_invalid:{section_index}")
+                text_blocks = []
+        for block_index, block in enumerate(text_blocks, start=1):
             if not isinstance(block, Mapping):
                 diagnostics.add(f"block_not_object:{section_index}:{block_index}")
                 continue
@@ -73,6 +112,9 @@ def run_semantic_revalidation(
                 diagnostics.add(f"duplicate_block_id:{block_id}")
             else:
                 block_ids.add(block_id)
+                block_text_by_id[block_id] = text
+            if block.get("table_id") and block_id:
+                native_cell_ids.add(block_id)
             if not text.strip():
                 diagnostics.add(f"block_text_empty:{block_id or f'{section_index}:{block_index}'}")
             if "CITATION_MAPPING_ERROR" in text or "needs manual review" in text:
@@ -123,6 +165,11 @@ def run_semantic_revalidation(
         paper_id = str(occurrence.get("paper_id") or occurrence.get("paper_key") or "").strip()
         if not block_id or block_id not in block_ids:
             diagnostics.add(f"citation_block_unresolved:{occurrence_id}")
+        elif block_id in native_cell_ids and not _native_occurrence_spans_match_text(
+            occurrence,
+            block_text_by_id.get(block_id, ""),
+        ):
+            diagnostics.add(f"native_table_citation_span_stale:{occurrence_id}")
         if not ref_id or (active_refs and ref_id not in active_refs):
             diagnostics.add(f"citation_ref_unresolved:{occurrence_id}")
         if not paper_id or paper_id.lower() == "unknown" or (known_papers and paper_id not in known_papers):

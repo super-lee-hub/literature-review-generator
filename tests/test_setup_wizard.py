@@ -57,7 +57,7 @@ def test_run_setup_wizard_covers_extended_config_and_env(monkeypatch, tmp_path) 
 
             # --- Outline_API ---
             "",                                # provider (default: videocaptioner)
-            "claude-opus-5",                   # model (complete route, no Writer fallback)
+                "claude-opus-5-5",                 # model (complete route, no Writer fallback)
             "https://api.anthropic.com/v1",    # api_base (its own address)
             "outline-key",                     # api_key
             "anthropic",                       # endpoint_type
@@ -200,7 +200,7 @@ def test_run_setup_wizard_covers_extended_config_and_env(monkeypatch, tmp_path) 
     assert parser["Primary_Reader_API"]["model"] == "deepseek-r1"
     assert parser["Primary_Reader_API"]["endpoint_type"] == "chat_completions"
 
-    assert parser["Outline_API"]["model"] == "claude-opus-5"
+    assert parser["Outline_API"]["model"] == "claude-opus-5-5"
     # Outline_API is its own route authority: it must not have borrowed Writer's
     # gateway address or protocol. This is the mongrel-route regression guard.
     assert parser["Outline_API"]["api_base"] == "https://api.anthropic.com/v1"

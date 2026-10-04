@@ -1562,7 +1562,7 @@ def test_acceptance_execution_context_is_the_provider_budget_authority(tmp_path:
     )
     state_path = tmp_path / "acceptance" / "run-1" / "provider_budget_state.json"
     controller = ProviderBudgetController(budget)
-    controller.bind_state_path(state_path)
+    controller.bind_state_path(state_path, acceptance_run_id="run-1", state_started=False)
     context = AcceptanceExecutionContextV1(
         acceptance_run_id="run-1",
         final_executable_sha="a" * 40,
@@ -1573,6 +1573,7 @@ def test_acceptance_execution_context_is_the_provider_budget_authority(tmp_path:
         process_event_log=str(state_path.parent / "process_events.jsonl"),
         scenario_state_path=str(state_path.parent / "acceptance_state.json"),
         owner_authorized=True,
+        provider_budget_state_started=True,
     )
     monkeypatch.setenv(
         "AUTO_GENERATE_ACCEPTANCE_BUDGET_JSON",

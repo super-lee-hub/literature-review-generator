@@ -255,21 +255,27 @@ def create_outline_v3_node_dag(job_id: str, *, candidate_count: int = 5) -> Outl
         _node("outline_evidence_views"),
         _node("global_corpus_ledger", ["outline_evidence_views"]),
         _node("multi_view_matrix", ["outline_evidence_views", "global_corpus_ledger"]),
+        _node("outline_content_layers", ["outline_evidence_views"]),
         _node("relation_candidates", ["multi_view_matrix"]),
         _node("relation_shard_plan", ["outline_evidence_views", "relation_candidates"]),
         _node("relation_shard_digests", ["relation_shard_plan"]),
-        _node("relation_adjudication", ["relation_candidates", "relation_shard_plan", "relation_shard_digests"]),
-        _node("global_relation_map", ["relation_adjudication", "relation_candidates", "multi_view_matrix"]),
+        _node("semantic_chunk_plan", ["outline_content_layers", "relation_candidates", "global_corpus_ledger", "multi_view_matrix"]),
+        _node("global_navigation", ["outline_content_layers", "semantic_chunk_plan"]),
+        _node("topic_synthesis", ["global_navigation", "semantic_chunk_plan"]),
+        _node("cross_group_comparison", ["topic_synthesis", "semantic_chunk_plan"]),
+        _node("global_synthesis", ["cross_group_comparison", "relation_candidates", "semantic_chunk_plan"]),
+        _node("relation_adjudication", ["relation_candidates", "relation_shard_plan", "relation_shard_digests", "semantic_chunk_plan"]),
+        _node("global_relation_map", ["relation_adjudication", "relation_candidates", "semantic_chunk_plan", "multi_view_matrix"]),
         _node("review_intent"),
         _node("coverage_contract", ["global_corpus_ledger", "review_intent"]),
         _node(
             "organizing_axes",
-            ["global_corpus_ledger", "multi_view_matrix", "global_relation_map", "review_intent", "coverage_contract"],
+            ["global_corpus_ledger", "multi_view_matrix", "global_relation_map", "semantic_chunk_plan", "global_synthesis", "review_intent", "coverage_contract"],
         ),
     ]
     candidate_ids = [f"candidate_{index}" for index in range(1, candidate_count + 1)]
     for candidate_id in candidate_ids:
-        nodes.append(_node(candidate_id, ["organizing_axes", "global_relation_map", "coverage_contract"]))
+        nodes.append(_node(candidate_id, ["organizing_axes", "global_relation_map", "semantic_chunk_plan", "global_synthesis", "coverage_contract"]))
         nodes.append(_node(f"{candidate_id}_provider_generation", [candidate_id]))
     provider_nodes = [f"{candidate_id}_provider_generation" for candidate_id in candidate_ids]
     nodes.extend([
@@ -278,7 +284,8 @@ def create_outline_v3_node_dag(job_id: str, *, candidate_count: int = 5) -> Outl
         _node("evidence_critique", ["global_relation_map", *provider_nodes]),
         _node("arbitration", ["structure_critique", "coverage_critique", "evidence_critique"]),
         _node("selected_candidate", ["arbitration"]),
-        _node("section_evidence_packets", ["selected_candidate", "global_corpus_ledger", "global_relation_map"]),
+        _node("selected_candidate_revision", ["selected_candidate", *provider_nodes]),
+        _node("section_evidence_packets", ["selected_candidate_revision", "global_corpus_ledger", "global_relation_map", "semantic_chunk_plan"]),
         _node("final_outline", ["section_evidence_packets"]),
         _node("coverage_audit", ["final_outline", "coverage_contract"]),
         _node("stability_audit", ["coverage_audit"]),
@@ -463,9 +470,34 @@ class OutlineNodeStore:
             if current.job_id != job_id:
                 raise ValueError("existing Outline v3 node DAG belongs to another job")
             expected = create_outline_v3_node_dag(job_id, candidate_count=candidate_count)
-            if {node.node_id for node in current.nodes} != {node.node_id for node in expected.nodes}:
-                current_by_id = current.node_map()
-                merged = [current_by_id.get(node.node_id, node) for node in expected.nodes]
+            current_by_id = current.node_map()
+            expected_by_id = expected.node_map()
+            changed_ids = {
+                node_id
+                for node_id, node in expected_by_id.items()
+                if node_id not in current_by_id
+                or set(current_by_id[node_id].depends_on) != set(node.depends_on)
+                or current_by_id[node_id].idempotency_key != node.idempotency_key
+            }
+            if set(current_by_id) != set(expected_by_id) or changed_ids:
+                affected = set(changed_ids)
+                changed = True
+                while changed:
+                    changed = False
+                    for node in expected.nodes:
+                        if node.node_id in affected or not affected.intersection(node.depends_on):
+                            continue
+                        affected.add(node.node_id)
+                        changed = True
+                merged: List[OutlineNodeRecord] = []
+                for node in expected.nodes:
+                    previous = current_by_id.get(node.node_id)
+                    if previous is None or node.node_id in affected:
+                        diagnostics = list(previous.diagnostics) if previous is not None else []
+                        reason = "dag_contract_changed" if node.node_id in changed_ids else "dag_dependency_ancestor_changed"
+                        merged.append(replace(node, status="pending", diagnostics=_stable_unique([*diagnostics, reason])))
+                    else:
+                        merged.append(previous)
                 current, _record = self.save(replace(current, nodes=merged, updated_at=_utc_now_iso()))
             return current
         current, _record = self.save(create_outline_v3_node_dag(job_id, candidate_count=candidate_count))

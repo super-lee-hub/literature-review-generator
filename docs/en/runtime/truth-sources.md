@@ -212,7 +212,7 @@ unaffected upstream nodes. A final outline is adoptable only after the
 coverage, quality, stability, stage-health, identity, and canonical-completion
 gates pass; adoption writes a versioned identity and a current-pointer record.
 
-The shipped route map is deliberately heterogeneous: Claude Opus 5 handles
+The shipped route map is deliberately heterogeneous: Claude Opus 5.5 handles
 candidate generation and arbitration, GPT-5.6-sol handles structure/evidence
 critique, and DeepSeek V4 Pro handles relation/coverage critique. Each node's
 binding and receipt records a secret-free provider/model/endpoint identity; a

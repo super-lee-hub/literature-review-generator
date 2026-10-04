@@ -973,6 +973,8 @@ def build_chat_completions_payload(
         payload["response_format"] = {"type": "json_object"}
     if _config_bool(api_config.get("provider_stream")):
         payload["stream"] = True
+        if _config_bool(api_config.get("provider_stream_include_usage")):
+            payload["stream_options"] = {"include_usage": True}
     apply_reasoning_policy(payload, api_config, capability, logger=logger)
     return payload
 
@@ -1104,6 +1106,9 @@ def _format_success_result(content: Any, response_format: str, response: Any, fi
 
 
 def _post_with_proxy_mode(api_url: str, *, api_config: APIConfig, **kwargs: Any) -> Any:
+    # A 307/308 may replay the request body at another host. Each provider
+    # attempt must correspond to exactly one POST at the admitted endpoint.
+    kwargs["allow_redirects"] = False
     if should_bypass_environment_proxy(api_config):
         session = requests.Session()
         session.trust_env = False
@@ -1430,19 +1435,36 @@ def _decode_sse_response(
     ):
         raise ValueError("SSE response ended without a terminal completion event")
 
+    # A final usage-only chunk may follow a complete message event. Preserve
+    # it even when the complete event takes the fast path below.
+    final_usage = next(
+        (
+            event["usage"]
+            for event in reversed(events)
+            if isinstance(event.get("usage"), Mapping) and event["usage"]
+        ),
+        None,
+    )
+
+    def with_final_usage(payload: Mapping[str, Any]) -> Dict[str, Any]:
+        completed = dict(payload)
+        if final_usage is not None:
+            completed["usage"] = dict(final_usage)
+        return completed
+
     # Prefer a complete provider event when available; otherwise synthesize a
     # normal response from deltas so the existing schema/finish validation is
     # shared by streamed and non-streamed calls.
     for event in reversed(events):
         if isinstance(event.get("response"), Mapping):
-            return dict(event["response"]), True
+            return with_final_usage(event["response"]), True
         if "choices" in event and any(
             isinstance(choice, Mapping) and isinstance(choice.get("message"), Mapping)
             for choice in (event.get("choices") or [])
         ):
-            return event, True
+            return with_final_usage(event), True
         if "output" in event:
-            return event, True
+            return with_final_usage(event), True
 
     text_parts: List[str] = []
     finish_reason = ""
@@ -2581,6 +2603,17 @@ def _call_ai_api_detailed_uninstrumented(
                 # Capture the remote identity before status/body handling can
                 # raise for an HTTP error or a truncated body.
                 provider_request_id = _response_header(response, "x-aihubmix-request-id")
+                response_status = getattr(response, "status_code", None)
+                if isinstance(response_status, int) and 300 <= response_status < 400:
+                    _close_provider_response(response)
+                    blocked = _api_result(
+                        status="failed",
+                        error_kind="outcome_unknown",
+                        http_status=response_status,
+                        message="provider redirect blocked without a follow-up request",
+                    )
+                    blocked["provider_request_id"] = provider_request_id
+                    return finish(blocked)
                 response.raise_for_status()
 
                 raw_root = str(
@@ -3013,13 +3046,6 @@ def _call_ai_api_detailed(
             message="a bound ProviderRuntime is required for production model calls",
         )
 
-    def _positive_int(value: Any, default: int) -> int:
-        try:
-            parsed = int(str(value).strip())
-        except (TypeError, ValueError):
-            return default
-        return parsed if parsed > 0 else default
-
     admitted_user_content, admission_omissions = _admit_local_images_to_budget(
         user_content,
         max_single_image_bytes=max_single_image_bytes,
@@ -3051,14 +3077,11 @@ def _call_ai_api_detailed(
         blocked["provider_receipt"] = receipt.to_dict()
         return blocked
     capability = resolve_model_capability(api_config)
-    profile = ProviderContextProfile.conservative(
-        provider=str(api_config.get("provider_family") or capability.provider_family),
-        model=str(api_config.get("model") or ""),
-        endpoint_type=str(api_config.get("endpoint_type") or capability.endpoint_type),
-        model_context_limit=_positive_int(api_config.get("max_context_tokens"), 128_000),
+    profile = ProviderContextProfile.from_api_config(
+        api_config,
         max_output_tokens=max(1, int(max_tokens)),
-        reasoning_reserve=max(0, _positive_int(api_config.get("reasoning_reserve_tokens"), 0)),
-        safety_margin=max(0, _positive_int(api_config.get("safety_margin_tokens"), 256)),
+        default_provider=capability.provider_family,
+        default_endpoint_type=capability.endpoint_type,
     )
     budget = profile.estimate_request(request_payload)
     if not budget["within_budget"]:

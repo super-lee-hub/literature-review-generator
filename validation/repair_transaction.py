@@ -15,6 +15,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -29,14 +30,23 @@ from services.artifact_registry import (
 )
 from services.job_workspace import (
     JobWorkspace,
+    atomic_write_json,
     publish_bytes_artifact,
     publish_json_artifact,
     utc_now_iso,
 )
 from services.audit_record import AuditArtifactRefV1, AuditRecordV1
 from services.queue_service import LocalPublicationContext
+from services.citation_manifest import build_citation_manifest_from_review_draft
+from services.citation_ref_catalog import resolve_ref_id, validate_document_ref_catalog
+from services.review_draft import (
+    find_review_text_block,
+    iter_review_text_blocks,
+    validate_review_section_writer_scope,
+)
+from services.sentence_segmenter import SENTENCE_SEGMENTER_VERSION, segment_sentences
 from validation.closure import ValidationClosureResult, ValidationClosureService
-from validation.repair_apply import run_repair_apply
+from validation.repair_apply import _refresh_factual_cell_offsets, run_repair_apply
 from validation.repair_models import (
     AutoSafePatch,
     DependencyHashBundle,
@@ -91,6 +101,11 @@ CURRENT_REPAIR_POINTERS = {
 def _hash(value: Any) -> str:
     encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _repair_apply_hash(value: Any) -> str:
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
 
 
 def _load_json(record: ArtifactRecord | None) -> dict[str, Any] | None:
@@ -258,16 +273,13 @@ def _write_current_artifact_pointer(
 
 
 def _find_block(review_draft: Mapping[str, Any], block_id: str) -> Mapping[str, Any] | None:
-    content = review_draft.get("content")
-    if not isinstance(content, Mapping):
+    if not str(block_id or "").strip():
         return None
-    for section in content.get("sections") or []:
-        if not isinstance(section, Mapping):
-            continue
-        for block in section.get("blocks") or []:
-            if isinstance(block, Mapping) and str(block.get("block_id") or "") == block_id:
-                return block
-    return None
+    try:
+        return find_review_text_block(review_draft, block_id)
+    except (KeyError, TypeError, ValueError):
+        # Malformed native tables and duplicate unit IDs are never repairable.
+        return None
 
 
 def _targeted_revalidate(
@@ -301,10 +313,20 @@ def _targeted_revalidate(
             if not isinstance(blocks, list) or not blocks:
                 diagnostics.append(f"section_blocks_missing:{section_index}")
                 continue
-            for block_index, block in enumerate(blocks, start=1):
-                if not isinstance(block, Mapping):
-                    diagnostics.append(f"block_not_object:{section_index}:{block_index}")
-                    continue
+            try:
+                text_blocks = list(iter_review_text_blocks(section))
+            except (KeyError, TypeError, ValueError):
+                diagnostics.append(f"section_text_units_invalid:{section_index}")
+                continue
+            if any(
+                isinstance(block, Mapping) and block.get("table_layout_schema_version")
+                for block in blocks
+            ):
+                try:
+                    validate_review_section_writer_scope(section)
+                except (KeyError, TypeError, ValueError):
+                    diagnostics.append(f"section_writer_scope_invalid:{section_index}")
+            for block_index, block in enumerate(text_blocks, start=1):
                 block_id = str(block.get("block_id") or "").strip()
                 if not block_id:
                     diagnostics.append(f"block_id_missing:{section_index}:{block_index}")
@@ -493,6 +515,115 @@ class RepairTransactionRecord:
         payload["previous_artifact_ids"] = list(self.previous_artifact_ids)
         payload["applied_artifact_ids"] = list(self.applied_artifact_ids)
         payload["applied_patch_ids"] = list(self.applied_patch_ids)
+        return payload
+
+
+@dataclass(frozen=True)
+class CitationMappingCorrectionV1:
+    """Explicit occurrence-level correction from a human reviewer."""
+
+    occurrence_id: str
+    expected_ref_id: str
+    expected_paper_id: str
+    replacement_ref_id: str
+    replacement_paper_id: str
+
+    def validate(self) -> None:
+        if not all(
+            str(value or "").strip()
+            for value in (
+                self.occurrence_id,
+                self.expected_ref_id,
+                self.expected_paper_id,
+                self.replacement_ref_id,
+                self.replacement_paper_id,
+            )
+        ):
+            raise ValueError("citation mapping correction requires a complete occurrence and source mapping")
+        if not re.fullmatch(r"R\d{3,}", self.expected_ref_id):
+            raise ValueError("citation mapping expected_ref_id is invalid")
+        if not re.fullmatch(r"R\d{3,}", self.replacement_ref_id):
+            raise ValueError("citation mapping replacement_ref_id is invalid")
+
+    def to_dict(self) -> dict[str, str]:
+        self.validate()
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ManualRepairApprovalV1:
+    """Typed, reviewer-approved correction bound to exact Registry inputs."""
+
+    approval_id: str
+    job_id: str
+    source_report_plan_id: str
+    source_report_plan_hash: str
+    actor: str
+    reason: str
+    source_claim_id: str
+    block_id: str
+    expected_anchor_hash: str
+    replacement_text: str
+    source_evidence_ids: tuple[str, ...]
+    canonical_input_ids: Mapping[str, str]
+    canonical_input_hashes: Mapping[str, str]
+    citation_mapping: CitationMappingCorrectionV1 | None = None
+    created_at: str = field(default_factory=utc_now_iso)
+    artifact_type: str = "manual_repair_approval"
+    artifact_version: str = "v1"
+    schema_version: str = "manual_repair_approval_v1"
+
+    def validate(self) -> None:
+        required = (
+            self.approval_id,
+            self.job_id,
+            self.source_report_plan_id,
+            self.actor,
+            self.reason,
+            self.source_claim_id,
+            self.block_id,
+            self.replacement_text,
+        )
+        if any(not str(value or "").strip() for value in required):
+            raise ValueError("manual repair approval requires plan, reviewer, target, and replacement text")
+        hashes = {
+            **dict(self.canonical_input_hashes),
+            "source_report_plan": self.source_report_plan_hash,
+        }
+        if set(self.canonical_input_ids) != {"review_draft", "citation_manifest", "validation"}:
+            raise ValueError("manual repair approval must bind current draft, manifest, and validation identities")
+        if set(self.canonical_input_hashes) != {"review_draft", "citation_manifest", "validation"}:
+            raise ValueError("manual repair approval must bind current draft, manifest, and validation hashes")
+        if any(
+            len(str(value)) != 64
+            or any(char not in "0123456789abcdef" for char in str(value).lower())
+            for value in hashes.values()
+        ):
+            raise ValueError("manual repair approval input hashes must be SHA-256 values")
+        if (
+            len(self.expected_anchor_hash) != 64
+            or any(char not in "0123456789abcdef" for char in self.expected_anchor_hash.lower())
+        ):
+            raise ValueError("manual repair approval expected_anchor_hash must be a SHA-256 value")
+        if not self.source_evidence_ids or len(set(self.source_evidence_ids)) != len(self.source_evidence_ids):
+            raise ValueError("manual repair approval requires unique source evidence identities")
+        if self.citation_mapping is not None:
+            self.citation_mapping.validate()
+            if self.citation_mapping.replacement_paper_id not in self.source_evidence_ids:
+                raise ValueError("corrected citation source must be included in source_evidence_ids")
+            tokens = re.findall(r"\[\[cite_ref:(R\d{3,})\]\]", self.replacement_text)
+            if tokens.count(self.citation_mapping.replacement_ref_id) != 1:
+                raise ValueError("replacement text must contain the corrected citation exactly once")
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        payload = asdict(self)
+        payload["source_evidence_ids"] = list(self.source_evidence_ids)
+        payload["canonical_input_ids"] = dict(self.canonical_input_ids)
+        payload["canonical_input_hashes"] = dict(self.canonical_input_hashes)
+        payload["citation_mapping"] = (
+            self.citation_mapping.to_dict() if self.citation_mapping is not None else None
+        )
         return payload
 
 
@@ -887,6 +1018,1207 @@ class RepairTransactionService:
             "closure": current.to_dict(),
             "mutation_performed": True,
             "read_only": False,
+        }
+
+    def apply_manual_proposal(
+        self,
+        plan_id: str,
+        manual_proposal: Mapping[str, Any],
+        *,
+        actor: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Apply one explicit reviewer correction into quarantined derived artifacts.
+
+        The source report-only plan remains unchanged. The new typed approval is
+        bound to the current draft, citation manifest, validation result, target
+        block, source paper identities, and (for mapping repairs) one exact
+        citation occurrence plus its old and replacement catalog mappings.
+        """
+
+        source_plan_id = str(plan_id or "").strip()
+        actor = str(actor or "").strip()
+        reason = str(reason or "").strip()
+        if not source_plan_id or not actor or not reason:
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "reason": "manual repair requires a report plan, reviewer, and reason",
+                "mutation_performed": False,
+            }
+        if not isinstance(manual_proposal, Mapping):
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "reason": "manual repair proposal must be an object",
+                "mutation_performed": False,
+            }
+        allowed_fields = {
+            "block_id",
+            "expected_anchor_hash",
+            "replacement_text",
+            "source_evidence_ids",
+            "citation_mapping",
+        }
+        if set(manual_proposal) - allowed_fields:
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "reason": "manual repair proposal contains unsupported fields",
+                "mutation_performed": False,
+            }
+
+        closure = self.closure_service.inspect()
+        source_plan_record = self.registry.get(source_plan_id) or self.registry.get(
+            f"repair_plan:{source_plan_id}"
+        )
+        if source_plan_record is None or source_plan_record.status != "ready":
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "reason": "source report-only repair plan is not a verified ready artifact",
+                "mutation_performed": False,
+            }
+        source_plan_payload = _load_json(source_plan_record)
+        if (
+            source_plan_payload is None
+            or source_plan_payload.get("artifact_type") != "repair_plan"
+            or source_plan_payload.get("artifact_version") != "v1"
+            or source_plan_payload.get("policy") != RepairPolicy.REPORT_FIRST.value
+            or str(source_plan_payload.get("created_from_job_id") or "") != self.workspace.job_id
+        ):
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "reason": "manual repair requires this job's report-only plan",
+                "mutation_performed": False,
+            }
+        if file_sha256(source_plan_record.path) != source_plan_record.content_hash:
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "reason": "source report-only plan bytes changed",
+                "mutation_performed": False,
+            }
+
+        draft_record, manifest_record, validation_record = self._canonical_inputs()
+        if any(
+            record is None or record.status != "ready"
+            for record in (draft_record, manifest_record, validation_record)
+        ):
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "reason": "current draft, citation manifest, and validation result are required",
+                "mutation_performed": False,
+            }
+        assert draft_record is not None and manifest_record is not None and validation_record is not None
+        for record in (draft_record, manifest_record, validation_record):
+            try:
+                actual_hash = file_sha256(record.path)
+            except OSError as exc:
+                return {
+                    "status": "blocked",
+                    "plan_id": source_plan_id,
+                    "reason": f"current repair input cannot be read: {record.artifact_id}: {exc}",
+                    "mutation_performed": False,
+                }
+            if actual_hash != record.content_hash:
+                return {
+                    "status": "blocked",
+                    "plan_id": source_plan_id,
+                    "reason": f"current repair input bytes changed: {record.artifact_id}",
+                    "mutation_performed": False,
+                }
+        if str(source_plan_payload.get("validation_report_id") or "") != validation_record.artifact_id:
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "reason": "source report-only plan names a different validation result",
+                "mutation_performed": False,
+            }
+        source_plan_metadata = source_plan_record.metadata or {}
+        if str(source_plan_metadata.get("closure_evidence_hash") or "") != closure.evidence_hash:
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "reason": "validation findings changed after report-only planning",
+                "mutation_performed": False,
+            }
+        if closure.blocking_issues:
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "reason": "current validation closure has unresolved structural blockers",
+                "blocking_issues": list(closure.blocking_issues),
+                "mutation_performed": False,
+            }
+        if closure.semantic_status not in {"findings", "needs_review"}:
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "reason": "manual repair requires current validation findings",
+                "validation_disposition": closure.semantic_status,
+                "mutation_performed": False,
+            }
+
+        dependency_bundle = source_plan_payload.get("dependency_hash_bundle")
+        if not isinstance(dependency_bundle, Mapping) or (
+            str(dependency_bundle.get("review_draft_hash") or "") != draft_record.content_hash
+            or str(dependency_bundle.get("citation_manifest_hash") or "") != manifest_record.content_hash
+        ):
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "reason": "report-only plan is not bound to the current draft and citation manifest",
+                "mutation_performed": False,
+            }
+        plan_dependencies = {item.artifact_id: item for item in source_plan_record.depends_on}
+        for record in (draft_record, manifest_record, validation_record):
+            dependency = plan_dependencies.get(record.artifact_id)
+            if dependency is None or dependency.content_hash != record.content_hash:
+                return {
+                    "status": "blocked",
+                    "plan_id": source_plan_id,
+                    "reason": f"report-only plan dependency changed: {record.artifact_id}",
+                    "mutation_performed": False,
+                }
+
+        try:
+            review_draft = _load_json(draft_record)
+            citation_manifest = _load_json(manifest_record)
+            validation_payload = _load_json(validation_record)
+            if review_draft is None or citation_manifest is None or validation_payload is None:
+                raise ValueError("current repair inputs are not readable JSON objects")
+            from validation.run_result import ValidationRunDisposition, ValidationRunResultV1
+
+            validation_result = ValidationRunResultV1.from_dict(validation_payload)
+            validation_result.validate()
+        except (OSError, UnicodeError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "reason": f"current validation result is invalid: {exc}",
+                "mutation_performed": False,
+            }
+        if (
+            not validation_result.contract_satisfied
+            or validation_result.validation_disposition
+            not in {ValidationRunDisposition.FINDINGS, ValidationRunDisposition.NEEDS_REVIEW}
+            or validation_result.input_artifacts.review_draft_id != draft_record.artifact_id
+            or validation_result.input_artifacts.review_draft_hash != draft_record.content_hash
+            or validation_result.input_artifacts.citation_manifest_id != manifest_record.artifact_id
+            or validation_result.input_artifacts.citation_manifest_hash != manifest_record.content_hash
+        ):
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "reason": "manual repair validation is not bound to the exact current canonical inputs",
+                "mutation_performed": False,
+            }
+
+        block_id = str(manual_proposal.get("block_id") or "").strip()
+        expected_anchor_hash = str(manual_proposal.get("expected_anchor_hash") or "").strip().lower()
+        replacement_text = str(manual_proposal.get("replacement_text") or "")
+        raw_source_evidence_ids = manual_proposal.get("source_evidence_ids")
+        if not isinstance(raw_source_evidence_ids, (list, tuple)):
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "reason": "source_evidence_ids must be an explicit array",
+                "mutation_performed": False,
+            }
+        source_evidence_ids = tuple(
+            dict.fromkeys(
+                str(item).strip()
+                for item in raw_source_evidence_ids
+                if str(item).strip()
+            )
+        )
+        if (
+            not block_id
+            or not replacement_text.strip()
+            or len(expected_anchor_hash) != 64
+            or any(char not in "0123456789abcdef" for char in expected_anchor_hash)
+            or not source_evidence_ids
+        ):
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "reason": "manual proposal needs a block, full anchor hash, replacement text, and source evidence",
+                "mutation_performed": False,
+            }
+        draft_block = _find_block(review_draft, block_id)
+        if not isinstance(draft_block, Mapping):
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "reason": "manual proposal target block is missing or ambiguous",
+                "mutation_performed": False,
+            }
+        original_text = str(draft_block.get("text") or "")
+        if (
+            not original_text
+            or original_text == replacement_text
+            or hashlib.sha256(original_text.encode("utf-8")).hexdigest() != expected_anchor_hash
+        ):
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "reason": "manual proposal anchor is stale or replacement text is unchanged",
+                "mutation_performed": False,
+            }
+
+        matching_claims = [
+            item
+            for item in validation_result.claim_results
+            if block_id in item.block_ids and item.verdict.value != "supported"
+        ]
+        if len(matching_claims) != 1:
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "reason": "manual proposal must resolve exactly one current validation finding",
+                "mutation_performed": False,
+            }
+        claim = matching_claims[0]
+        issues = [
+            item
+            for item in source_plan_payload.get("issues") or ()
+            if isinstance(item, Mapping) and str(item.get("block_id") or "") == block_id
+        ]
+        if not issues:
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "reason": "target block is not a finding in the report-only plan",
+                "mutation_performed": False,
+            }
+
+        paper_records = [
+            record
+            for record in self.registry.list_records()
+            if record.status == "ready"
+            and record.artifact_type in {"paper_artifact", "stage1_paper_artifact"}
+        ]
+        paper_payload_by_key: dict[str, dict[str, Any]] = {}
+        paper_record_by_key: dict[str, ArtifactRecord] = {}
+        for record in paper_records:
+            payload = _load_json(record)
+            identity = payload.get("paper_identity") if isinstance(payload, Mapping) else None
+            paper_key = str(
+                identity.get("canonical_paper_key") if isinstance(identity, Mapping) else ""
+            ).strip()
+            if paper_key and payload is not None:
+                paper_payload_by_key[paper_key] = payload
+                paper_record_by_key[paper_key] = record
+        if not set(source_evidence_ids).issubset(paper_payload_by_key):
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "reason": "manual proposal source evidence is not a ready current paper artifact",
+                "mutation_performed": False,
+            }
+
+        raw_mapping = manual_proposal.get("citation_mapping")
+        citation_mapping: CitationMappingCorrectionV1 | None = None
+        catalog_record: ArtifactRecord | None = None
+        catalog_payload: dict[str, Any] = {}
+        target_occurrence: dict[str, Any] | None = None
+        if raw_mapping is not None:
+            if not isinstance(raw_mapping, Mapping):
+                return {
+                    "status": "blocked",
+                    "plan_id": source_plan_id,
+                    "reason": "citation_mapping must be an occurrence-level object",
+                    "mutation_performed": False,
+                }
+            mapping_fields = {
+                "occurrence_id",
+                "expected_ref_id",
+                "expected_paper_id",
+                "replacement_ref_id",
+                "replacement_paper_id",
+            }
+            if set(raw_mapping) != mapping_fields:
+                return {
+                    "status": "blocked",
+                    "plan_id": source_plan_id,
+                    "reason": "citation_mapping must bind one occurrence and complete old/new identities",
+                    "mutation_performed": False,
+                }
+            citation_mapping = CitationMappingCorrectionV1(
+                occurrence_id=str(raw_mapping.get("occurrence_id") or ""),
+                expected_ref_id=str(raw_mapping.get("expected_ref_id") or ""),
+                expected_paper_id=str(raw_mapping.get("expected_paper_id") or ""),
+                replacement_ref_id=str(raw_mapping.get("replacement_ref_id") or ""),
+                replacement_paper_id=str(raw_mapping.get("replacement_paper_id") or ""),
+            )
+            try:
+                citation_mapping.validate()
+            except ValueError as exc:
+                return {
+                    "status": "blocked",
+                    "plan_id": source_plan_id,
+                    "reason": str(exc),
+                    "mutation_performed": False,
+                }
+            if claim.root_causes and _root_cause(claim.root_causes) is not RepairRootCause.CITATION_MAPPING_ERROR:
+                return {
+                    "status": "blocked",
+                    "plan_id": source_plan_id,
+                    "reason": "citation mapping approval does not match the validation root cause",
+                    "mutation_performed": False,
+                }
+            occurrences = citation_manifest.get("occurrences")
+            matching_occurrences = [
+                dict(item)
+                for item in occurrences or ()
+                if isinstance(item, Mapping)
+                and str(item.get("occurrence_id") or "") == citation_mapping.occurrence_id
+            ]
+            if (
+                not isinstance(occurrences, list)
+                or len(matching_occurrences) != 1
+                or str(matching_occurrences[0].get("block_id") or "") != block_id
+                or str(matching_occurrences[0].get("ref_id") or "") != citation_mapping.expected_ref_id
+                or str(
+                    matching_occurrences[0].get("canonical_paper_key")
+                    or matching_occurrences[0].get("paper_id")
+                    or ""
+                ) != citation_mapping.expected_paper_id
+            ):
+                return {
+                    "status": "blocked",
+                    "plan_id": source_plan_id,
+                    "reason": "citation occurrence identity or current mapping changed",
+                    "mutation_performed": False,
+                }
+            target_occurrence = matching_occurrences[0]
+            catalog_record = self.registry.get("citation_ref_catalog")
+            if catalog_record is None or catalog_record.status != "ready":
+                return {
+                    "status": "blocked",
+                    "plan_id": source_plan_id,
+                    "reason": "current citation reference catalog is required for mapping repair",
+                    "mutation_performed": False,
+                }
+            catalog_payload = _load_json(catalog_record) or {}
+            try:
+                validate_document_ref_catalog(catalog_payload)
+            except (TypeError, ValueError, KeyError) as exc:
+                return {
+                    "status": "blocked",
+                    "plan_id": source_plan_id,
+                    "reason": f"citation reference catalog is invalid: {exc}",
+                    "mutation_performed": False,
+                }
+            expected_entry = resolve_ref_id(catalog_payload, citation_mapping.expected_ref_id)
+            replacement_entry = resolve_ref_id(catalog_payload, citation_mapping.replacement_ref_id)
+            if (
+                expected_entry is None
+                or replacement_entry is None
+                or str(expected_entry.get("canonical_paper_key") or expected_entry.get("paper_id") or "")
+                != citation_mapping.expected_paper_id
+                or str(replacement_entry.get("canonical_paper_key") or replacement_entry.get("paper_id") or "")
+                != citation_mapping.replacement_paper_id
+                or citation_mapping.replacement_paper_id not in source_evidence_ids
+            ):
+                return {
+                    "status": "blocked",
+                    "plan_id": source_plan_id,
+                    "reason": "corrected citation must resolve through the current catalog to approved source evidence",
+                    "mutation_performed": False,
+                }
+        elif _root_cause(claim.root_causes) is RepairRootCause.CITATION_MAPPING_ERROR:
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "reason": "citation mapping findings require an explicit occurrence-level correction",
+                "mutation_performed": False,
+            }
+        elif not set(source_evidence_ids).intersection(set(claim.paper_ids)):
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "reason": "text correction source evidence must match the current validation finding",
+                "mutation_performed": False,
+            }
+
+        summary_record = self.registry.get("summary_file")
+        if summary_record is None or summary_record.status != "ready":
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "reason": "current Stage 1 summary source is required to rebuild citations",
+                "mutation_performed": False,
+            }
+        try:
+            summary_payload = json.loads(Path(summary_record.path).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "reason": f"current Stage 1 summary source is unreadable: {exc}",
+                "mutation_performed": False,
+            }
+        if not isinstance(summary_payload, list) or not summary_payload:
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "reason": "current Stage 1 summary source must be a non-empty array",
+                "mutation_performed": False,
+            }
+        if catalog_record is None:
+            catalog_record = self.registry.get("citation_ref_catalog")
+        if catalog_record is None or catalog_record.status != "ready":
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "reason": "current citation reference catalog is required to rebuild citations",
+                "mutation_performed": False,
+            }
+        if not catalog_payload:
+            catalog_payload = _load_json(catalog_record) or {}
+
+        # Bind the executable PatchProposal to exactly the selected source
+        # evidence. Normal auto-safe apply remains unavailable for this plan.
+        selected_papers = [paper_payload_by_key[key] for key in source_evidence_ids]
+        summary_bundle: dict[str, Any] = {}
+        for paper_payload in selected_papers:
+            analysis = paper_payload.get("analysis")
+            if isinstance(analysis, Mapping) and isinstance(analysis.get("ai_summary"), Mapping):
+                summary_bundle.update(dict(analysis["ai_summary"]))
+        primary_paper = selected_papers[0]
+        selected_visual_refs = (primary_paper.get("stage1_inputs") or {}).get("selected_visual_refs", [])
+        proposal_dependencies = DependencyHashBundle(
+            summary_hash=_repair_apply_hash(summary_bundle) if summary_bundle else NOT_APPLICABLE,
+            paper_artifact_hash=(
+                _repair_apply_hash(selected_papers if len(selected_papers) > 1 else selected_papers[0])
+            ),
+            visual_manifest_hash=NOT_APPLICABLE,
+            selected_visual_refs_hash=_repair_apply_hash(selected_visual_refs),
+            review_draft_hash=draft_record.content_hash,
+            citation_manifest_hash=manifest_record.content_hash,
+            outline_hash=str(dependency_bundle.get("outline_hash") or NOT_APPLICABLE),
+        )
+        original_hash_8 = hashlib.sha256(original_text.encode("utf-8")).hexdigest()[:8]
+        approval_seed = {
+            "source_report_plan_id": source_plan_record.artifact_id,
+            "source_report_plan_hash": source_plan_record.content_hash,
+            "canonical_input_ids": {
+                "review_draft": draft_record.artifact_id,
+                "citation_manifest": manifest_record.artifact_id,
+                "validation": validation_record.artifact_id,
+            },
+            "canonical_input_hashes": {
+                "review_draft": draft_record.content_hash,
+                "citation_manifest": manifest_record.content_hash,
+                "validation": validation_record.content_hash,
+            },
+            "actor": actor,
+            "reason": reason,
+            "claim_id": claim.claim_result_id,
+            "block_id": block_id,
+            "expected_anchor_hash": expected_anchor_hash,
+            "replacement_text": replacement_text,
+            "source_evidence_ids": list(source_evidence_ids),
+            "citation_mapping": citation_mapping.to_dict() if citation_mapping is not None else None,
+        }
+        approval_id = "manual-approval:" + _hash(approval_seed)[:24]
+        manual_plan_id = "manual-repair-plan:" + _hash({"approval_id": approval_id})[:24]
+        manual_plan_artifact_id = f"repair_plan:{manual_plan_id}"
+        manual_plan_record = self.registry.get(manual_plan_artifact_id)
+        approval: ManualRepairApprovalV1
+        if manual_plan_record is not None:
+            existing_plan = _load_json(manual_plan_record)
+            if not isinstance(existing_plan, Mapping):
+                return {
+                    "status": "blocked",
+                    "plan_id": source_plan_id,
+                    "reason": "existing manual repair plan payload is malformed",
+                    "mutation_performed": False,
+                }
+            existing_approval = existing_plan.get("manual_approval")
+            if not isinstance(existing_approval, Mapping):
+                return {
+                    "status": "blocked",
+                    "plan_id": source_plan_id,
+                    "reason": "existing manual approval payload is malformed",
+                    "mutation_performed": False,
+                }
+            existing_approval_seed = {
+                "source_report_plan_id": existing_approval.get("source_report_plan_id"),
+                "source_report_plan_hash": existing_approval.get("source_report_plan_hash"),
+                "canonical_input_ids": existing_approval.get("canonical_input_ids"),
+                "canonical_input_hashes": existing_approval.get("canonical_input_hashes"),
+                "actor": existing_approval.get("actor"),
+                "reason": existing_approval.get("reason"),
+                "claim_id": existing_approval.get("source_claim_id"),
+                "block_id": existing_approval.get("block_id"),
+                "expected_anchor_hash": existing_approval.get("expected_anchor_hash"),
+                "replacement_text": existing_approval.get("replacement_text"),
+                "source_evidence_ids": existing_approval.get("source_evidence_ids"),
+                "citation_mapping": existing_approval.get("citation_mapping"),
+            }
+            if (
+                manual_plan_record.status != "ready"
+                or _hash(existing_approval_seed) != _hash(approval_seed)
+            ):
+                return {
+                    "status": "blocked",
+                    "plan_id": source_plan_id,
+                    "reason": "existing manual approval identity conflicts with the current proposal",
+                    "mutation_performed": False,
+                }
+            raw_mapping = existing_approval.get("citation_mapping")
+            approval = ManualRepairApprovalV1(
+                approval_id=str(existing_approval.get("approval_id") or ""),
+                job_id=str(existing_approval.get("job_id") or ""),
+                source_report_plan_id=str(existing_approval.get("source_report_plan_id") or ""),
+                source_report_plan_hash=str(existing_approval.get("source_report_plan_hash") or ""),
+                actor=str(existing_approval.get("actor") or ""),
+                reason=str(existing_approval.get("reason") or ""),
+                source_claim_id=str(existing_approval.get("source_claim_id") or ""),
+                block_id=str(existing_approval.get("block_id") or ""),
+                expected_anchor_hash=str(existing_approval.get("expected_anchor_hash") or ""),
+                replacement_text=str(existing_approval.get("replacement_text") or ""),
+                source_evidence_ids=tuple(str(item) for item in existing_approval.get("source_evidence_ids") or ()),
+                canonical_input_ids=dict(existing_approval.get("canonical_input_ids") or {}),
+                canonical_input_hashes=dict(existing_approval.get("canonical_input_hashes") or {}),
+                citation_mapping=(
+                    CitationMappingCorrectionV1(**dict(raw_mapping))
+                    if isinstance(raw_mapping, Mapping)
+                    else None
+                ),
+                created_at=str(existing_approval.get("created_at") or ""),
+            )
+            approval.validate()
+        else:
+            approval = ManualRepairApprovalV1(
+                approval_id=approval_id,
+                job_id=self.workspace.job_id,
+                source_report_plan_id=source_plan_record.artifact_id,
+                source_report_plan_hash=source_plan_record.content_hash,
+                actor=actor,
+                reason=reason,
+                source_claim_id=claim.claim_result_id,
+                block_id=block_id,
+                expected_anchor_hash=expected_anchor_hash,
+                replacement_text=replacement_text,
+                source_evidence_ids=source_evidence_ids,
+                canonical_input_ids=dict(approval_seed["canonical_input_ids"]),
+                canonical_input_hashes=dict(approval_seed["canonical_input_hashes"]),
+                citation_mapping=citation_mapping,
+            )
+            approval.validate()
+
+        cell_citation_mapping: dict[str, Any] | None = None
+        if (
+            citation_mapping is not None
+            and target_occurrence is not None
+            and draft_block.get("cell_kind") == "factual_output_unit"
+        ):
+            old_spans = target_occurrence.get("spans") or []
+            old_span = old_spans[0] if old_spans and isinstance(old_spans[0], Mapping) else {}
+            start_offset = old_span.get("start_offset")
+            end_offset = old_span.get("end_offset")
+            if not isinstance(start_offset, int) or not isinstance(end_offset, int):
+                return {
+                    "status": "blocked",
+                    "plan_id": source_plan_id,
+                    "reason": "cell citation mapping requires exact cell-local occurrence spans",
+                    "mutation_performed": False,
+                }
+            expected_token = f"[[cite_ref:{citation_mapping.expected_ref_id}]]"
+            cell_citations = draft_block.get("citations")
+            matching_cell_citations = [
+                item
+                for item in cell_citations or ()
+                if isinstance(item, Mapping)
+                and str(item.get("ref_id") or "") == citation_mapping.expected_ref_id
+                and str(item.get("citation_token") or "") == expected_token
+                and item.get("span_start") == start_offset
+                and item.get("span_end") == end_offset
+            ]
+            if len(matching_cell_citations) != 1:
+                return {
+                    "status": "blocked",
+                    "plan_id": source_plan_id,
+                    "reason": "cell citation mapping does not resolve one structured local citation",
+                    "mutation_performed": False,
+                }
+            cell_citation_mapping = {
+                **citation_mapping.to_dict(),
+                "start_offset": start_offset,
+                "end_offset": end_offset,
+                "local_ref_id": str(matching_cell_citations[0].get("local_ref_id") or ""),
+            }
+            if not cell_citation_mapping["local_ref_id"]:
+                return {
+                    "status": "blocked",
+                    "plan_id": source_plan_id,
+                    "reason": "cell citation mapping has no stable local citation identity",
+                    "mutation_performed": False,
+                }
+
+        proposal = PatchProposal(
+            proposal_id=approval.approval_id,
+            citation_id=(
+                approval.citation_mapping.occurrence_id
+                if approval.citation_mapping is not None
+                else claim.claim_result_id
+            ),
+            root_cause=_root_cause(claim.root_causes),
+            granularity=PatchGranularity.BLOCK,
+            target=PatchTargetSignature(
+                block_id=block_id,
+                anchor_text=original_text[:80] + ("..." if len(original_text) > 80 else ""),
+                anchor_hash=original_hash_8,
+            ),
+            original_text=original_text,
+            proposed_text=replacement_text,
+            confidence=1.0,
+            fix_strategy="explicit_manual_replacement",
+            dependency_bundle=proposal_dependencies,
+            metadata={
+                "paper_ids": list(source_evidence_ids),
+                "manual_approval_id": approval.approval_id,
+                "source_claim_id": claim.claim_result_id,
+                "source_report_plan_id": source_plan_record.artifact_id,
+                "citation_occurrence_id": (
+                    approval.citation_mapping.occurrence_id
+                    if approval.citation_mapping is not None
+                    else ""
+                ),
+                **(
+                    {"citation_mapping": cell_citation_mapping}
+                    if cell_citation_mapping is not None
+                    else {}
+                ),
+            },
+        )
+        executable_plan = RepairPlan(
+            plan_id=manual_plan_id,
+            created_at=approval.created_at,
+            created_from_job_id=self.workspace.job_id,
+            validation_report_id=validation_record.artifact_id,
+            proposals=[proposal],
+            policy=RepairPolicy.REPORT_FIRST,
+            dependency_hash_bundle=self._dependency_bundle(closure),
+            issues=[],
+            manual_review_actions=[],
+        )
+        manual_plan_payload = executable_plan.to_dict()
+        manual_plan_payload["manual_approval"] = approval.to_dict()
+        manual_plan_payload["source_report_plan_hash"] = source_plan_record.content_hash
+
+        paper_artifacts_for_repair = list(paper_payload_by_key.values())
+        try:
+            guard_probe = run_repair_apply(
+                repair_plan=executable_plan,
+                review_draft=copy.deepcopy(review_draft),
+                citation_manifest=copy.deepcopy(citation_manifest),
+                paper_artifacts=paper_artifacts_for_repair,
+                job_id=self.workspace.job_id,
+                dry_run=True,
+                require_auto_safe=False,
+                visual_manifest={},
+            )
+            proposal_checks = list(guard_probe.get("proposal_checks") or ())
+            if not proposal_checks or any(not bool(item.get("can_apply")) for item in proposal_checks):
+                return {
+                    "status": "blocked",
+                    "plan_id": source_plan_id,
+                    "reason": "manual proposal did not pass current version, anchor, and source guards",
+                    "proposal_checks": proposal_checks,
+                    "mutation_performed": False,
+                }
+            apply_payload = run_repair_apply(
+                repair_plan=executable_plan,
+                review_draft=copy.deepcopy(review_draft),
+                citation_manifest=copy.deepcopy(citation_manifest),
+                paper_artifacts=paper_artifacts_for_repair,
+                job_id=self.workspace.job_id,
+                dry_run=False,
+                require_auto_safe=False,
+                visual_manifest={},
+            )
+        except (OSError, TypeError, ValueError, KeyError) as exc:
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "reason": f"manual repair guard execution failed: {exc}",
+                "mutation_performed": False,
+            }
+        for applied_record in apply_payload.get("applied_records") or ():
+            if isinstance(applied_record, dict):
+                applied_record["applied_at"] = approval.created_at
+        apply_result = dict(apply_payload.get("apply_result") or {})
+        if int(apply_result.get("applied_count") or 0) != 1:
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "reason": "manual proposal did not pass current version, anchor, and source guards",
+                "apply_result": apply_result,
+                "mutation_performed": False,
+            }
+        patched_draft = apply_payload.get("patched_review_draft")
+        if not isinstance(patched_draft, Mapping):
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "reason": "manual repair executor did not return a draft object",
+                "mutation_performed": False,
+            }
+        patched_draft = copy.deepcopy(dict(patched_draft))
+        repaired_content = patched_draft.get("content")
+        repaired_sections = repaired_content.get("sections") if isinstance(repaired_content, Mapping) else None
+        if isinstance(repaired_sections, list):
+            for section in repaired_sections:
+                if not isinstance(section, dict):
+                    continue
+                if str(section.get("title") or section.get("heading") or "").strip():
+                    continue
+                section_title = str(section.get("section_title") or "").strip()
+                if section_title:
+                    # Review v3 stores the heading as section_title; the repair
+                    # semantic closure consumes title/heading. Preserve both in
+                    # this derived candidate while leaving the canonical bytes intact.
+                    section["title"] = section_title
+
+        patched_block = _find_block(patched_draft, block_id)
+        if not isinstance(patched_block, dict):
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "reason": "patched draft no longer contains the approved target block",
+                "mutation_performed": False,
+            }
+        if citation_mapping is not None and target_occurrence is not None:
+            citations = patched_block.get("citations")
+            if not isinstance(citations, list):
+                return {
+                    "status": "blocked",
+                    "plan_id": source_plan_id,
+                    "reason": "citation mapping repair target block has no structured citations",
+                    "mutation_performed": False,
+                }
+            old_spans = target_occurrence.get("spans") or []
+            old_span = old_spans[0] if old_spans and isinstance(old_spans[0], Mapping) else {}
+            if cell_citation_mapping is not None:
+                local_ref_id = str(cell_citation_mapping.get("local_ref_id") or "")
+                matches = [
+                    item
+                    for item in citations
+                    if isinstance(item, dict)
+                    and str(item.get("local_ref_id") or "") == local_ref_id
+                    and str(item.get("ref_id") or "") == citation_mapping.replacement_ref_id
+                    and str(item.get("citation_token") or "")
+                    == f"[[cite_ref:{citation_mapping.replacement_ref_id}]]"
+                    and str(item.get("paper_id") or "") == citation_mapping.replacement_paper_id
+                ]
+                if len(matches) != 1:
+                    return {
+                        "status": "blocked",
+                        "plan_id": source_plan_id,
+                        "reason": "mapped factual cell citation no longer matches the approved occurrence",
+                        "mutation_performed": False,
+                    }
+            else:
+                matches = [
+                    item
+                    for item in citations
+                    if isinstance(item, dict)
+                    and str(item.get("ref_id") or "") == citation_mapping.expected_ref_id
+                    and str(item.get("citation_token") or "")
+                    == f"[[cite_ref:{citation_mapping.expected_ref_id}]]"
+                    and int(item.get("span_start") or -1) == int(old_span.get("start_offset") or -2)
+                    and int(item.get("span_end") or -1) == int(old_span.get("end_offset") or -2)
+                ]
+                if len(matches) != 1:
+                    return {
+                        "status": "blocked",
+                        "plan_id": source_plan_id,
+                        "reason": "citation block span does not uniquely match the approved occurrence",
+                        "mutation_performed": False,
+                    }
+                citation = matches[0]
+                citation["ref_id"] = citation_mapping.replacement_ref_id
+                citation["citation_token"] = f"[[cite_ref:{citation_mapping.replacement_ref_id}]]"
+                citation["raw_text"] = citation["citation_token"]
+                citation["paper_id"] = citation_mapping.replacement_paper_id
+                citation["paper_key"] = citation_mapping.replacement_paper_id
+                citation["canonical_paper_key"] = citation_mapping.replacement_paper_id
+            block_text = str(patched_block.get("text") or "")
+            if patched_block.get("cell_kind") == "factual_output_unit":
+                if not _refresh_factual_cell_offsets(patched_block, block_text):
+                    return {
+                        "status": "blocked",
+                        "plan_id": source_plan_id,
+                        "reason": "cell citation metadata does not match the approved replacement text",
+                        "mutation_performed": False,
+                    }
+            else:
+                cursor = 0
+                for item in sorted(
+                    (value for value in citations if isinstance(value, dict)),
+                    key=lambda value: int(value.get("span_start") or 0),
+                ):
+                    token = str(item.get("citation_token") or "")
+                    position = block_text.find(token, cursor) if token else -1
+                    if position < 0:
+                        return {
+                            "status": "blocked",
+                            "plan_id": source_plan_id,
+                            "reason": "citation metadata no longer matches the approved replacement text",
+                            "mutation_performed": False,
+                        }
+                    item["span_start"] = position
+                    item["span_end"] = position + len(token)
+                    item["raw_text"] = token
+                    cursor = position + len(token)
+            patched_block["anchor_text"] = (
+                block_text[:80] + ("..." if len(block_text) > 80 else "")
+            )
+            patched_block["anchor_hash"] = hashlib.sha256(block_text.encode("utf-8")).hexdigest()[:8]
+            if patched_block.get("cell_kind") != "factual_output_unit":
+                patched_block["span_map"] = {
+                    "segmenter_version": SENTENCE_SEGMENTER_VERSION,
+                    "sentences": [
+                        item.to_dict(sentence_index=index)
+                        for index, item in enumerate(segment_sentences(block_text), start=1)
+                    ],
+                }
+
+        tx_seed = {
+            "manual_plan": manual_plan_id,
+            "source_report_plan_hash": source_plan_record.content_hash,
+            "closure_hash": closure.evidence_hash,
+            "approval_id": approval.approval_id,
+            "patched_draft_hash": _hash(patched_draft),
+        }
+        transaction_id = "repair-tx:" + _hash(tx_seed)[:24]
+        tx_dir = Path(
+            self.workspace.artifact_path(
+                f"repair_transactions/{transaction_id.replace(':', '-') }"
+            )
+        )
+        derived_draft_path = tx_dir / "review_draft_repaired.json"
+        derived_manifest_path = tx_dir / "citation_manifest_repaired.json"
+        try:
+            manifest_model = build_citation_manifest_from_review_draft(
+                job_id=self.workspace.job_id,
+                project_name=self.workspace.project_name,
+                manifest_id=f"repaired:{approval.approval_id}",
+                review_draft_path=str(derived_draft_path),
+                review_word_path=self.workspace.artifact_path("review.docx"),
+                review_draft=patched_draft,
+                paper_summaries=[dict(item) for item in summary_payload if isinstance(item, Mapping)],
+                citation_ref_catalog=catalog_payload,
+                citation_ref_catalog_path=catalog_record.path,
+                citation_ref_catalog_hash=catalog_record.content_hash,
+                render_policy=(
+                    dict(citation_manifest.get("render_policy") or {})
+                    if isinstance(citation_manifest.get("render_policy"), Mapping)
+                    else None
+                ),
+            )
+            patched_manifest = manifest_model.to_dict()
+            patched_manifest.setdefault("repair_annotations", []).append(
+                {
+                    "approval_id": approval.approval_id,
+                    "source_report_plan_id": source_plan_record.artifact_id,
+                    "source_claim_id": approval.source_claim_id,
+                    "block_id": block_id,
+                    "occurrence_id": (
+                        citation_mapping.occurrence_id if citation_mapping is not None else ""
+                    ),
+                    "source_evidence_ids": list(source_evidence_ids),
+                    "approved_by": actor,
+                    "reason": reason,
+                    "original_block_hash": expected_anchor_hash,
+                    "replacement_block_hash": hashlib.sha256(
+                        replacement_text.encode("utf-8")
+                    ).hexdigest(),
+                    "citation_mapping": (
+                        citation_mapping.to_dict() if citation_mapping is not None else None
+                    ),
+                    "created_at": approval.created_at,
+                }
+            )
+        except (OSError, TypeError, ValueError, KeyError) as exc:
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "reason": f"citation manifest rebuild failed: {exc}",
+                "mutation_performed": False,
+            }
+        if citation_mapping is not None:
+            repaired_occurrences = [
+                item
+                for item in patched_manifest.get("occurrences") or []
+                if isinstance(item, Mapping)
+                and str(item.get("block_id") or "") == block_id
+                and str(item.get("ref_id") or "") == citation_mapping.replacement_ref_id
+                and str(item.get("paper_id") or "") == citation_mapping.replacement_paper_id
+            ]
+            if len(repaired_occurrences) != 1:
+                return {
+                    "status": "blocked",
+                    "plan_id": source_plan_id,
+                    "reason": "rebuilt manifest does not preserve the approved occurrence-to-source correction",
+                    "mutation_performed": False,
+                }
+
+        all_paper_artifacts = [
+            payload for payload in paper_payload_by_key.values()
+        ]
+        citation_ref_catalog = catalog_payload
+        targeted_revalidation = _targeted_revalidate(
+            patched_draft,
+            patched_manifest,
+            all_paper_artifacts,
+            citation_ref_catalog,
+        )
+        if not targeted_revalidation["passed"]:
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "targeted_revalidation": targeted_revalidation,
+                "reason": "manual correction failed citation and block structural checks",
+                "mutation_performed": False,
+            }
+        semantic_revalidation = run_semantic_revalidation(
+            patched_draft,
+            patched_manifest,
+            all_paper_artifacts,
+            citation_ref_catalog=citation_ref_catalog,
+        )
+        structural_closure = RepairStructuralClosure.from_results(
+            targeted_revalidation,
+            semantic_revalidation.to_dict(),
+            canonical_input_hashes={
+                record.artifact_id: record.content_hash
+                for record in (draft_record, manifest_record, validation_record)
+            },
+            derived_output_hashes={
+                "review_draft_repaired": _hash(patched_draft),
+                "citation_manifest_repaired": _hash(patched_manifest),
+            },
+        )
+        if not structural_closure.passed:
+            return {
+                "status": "blocked",
+                "plan_id": source_plan_id,
+                "repair_structural_closure": structural_closure.to_dict(),
+                "reason": "manual correction failed structural or semantic repair closure",
+                "mutation_performed": False,
+            }
+
+        existing_transaction = self.registry.get(transaction_id)
+        if (
+            existing_transaction is not None
+            and existing_transaction.status == "quarantined"
+            and existing_transaction.artifact_type == REPAIR_TRANSACTION_ARTIFACT_TYPE
+        ):
+            existing_transaction_payload = _load_json(existing_transaction) or {}
+            return {
+                "status": "already_applied",
+                "job_id": self.workspace.job_id,
+                "plan_id": manual_plan_id,
+                "source_report_plan_id": source_plan_record.artifact_id,
+                "transaction_id": transaction_id,
+                "applied_artifact_ids": list(existing_transaction_payload.get("applied_artifact_ids") or ()),
+                "canonical_replacement": False,
+                "mutation_performed": False,
+                "idempotent_replay": True,
+            }
+
+        if manual_plan_record is None:
+            dependencies = [source_plan_record, draft_record, manifest_record, validation_record]
+            dependencies.extend(
+                paper_record_by_key[key]
+                for key in source_evidence_ids
+                if key in paper_record_by_key
+            )
+            if catalog_record is not None:
+                dependencies.append(catalog_record)
+            if summary_record is not None:
+                dependencies.append(summary_record)
+            unique_dependencies = {
+                record.artifact_id: ArtifactDependencyRefV2.from_record(record)
+                for record in dependencies
+            }
+            manual_plan_path = Path(
+                self.workspace.artifact_path(
+                    f"repair_plans/{manual_plan_id.replace(':', '-')}.json"
+                )
+            )
+            manual_plan_record = self._publish_json(
+                manual_plan_path,
+                manual_plan_payload,
+                artifact_id=manual_plan_artifact_id,
+                artifact_role="repair_plan",
+                artifact_type="repair_plan",
+                artifact_version="v1",
+                producer="validation.repair_transaction.RepairTransactionService.apply_manual_proposal",
+                status="ready",
+                depends_on=list(unique_dependencies.values()),
+                metadata={
+                    "policy": RepairPolicy.REPORT_FIRST.value,
+                    "manual_approval_id": approval.approval_id,
+                    "source_report_plan_id": source_plan_record.artifact_id,
+                    "closure_evidence_hash": closure.evidence_hash,
+                },
+            )
+        else:
+            self.registry.reload()
+            manual_plan_record = self.registry.get(manual_plan_artifact_id)
+            if manual_plan_record is None or manual_plan_record.status != "ready":
+                return {
+                    "status": "blocked",
+                    "plan_id": source_plan_id,
+                    "reason": "persisted manual approval plan is no longer a ready Registry artifact",
+                    "mutation_performed": False,
+                }
+
+        tx_dir.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(str(derived_draft_path), patched_draft)
+        atomic_write_json(str(derived_manifest_path), patched_manifest)
+        base_dependencies = [source_plan_record, manual_plan_record, draft_record, manifest_record, validation_record]
+        base_dependency_refs = [ArtifactDependencyRefV2.from_record(item) for item in base_dependencies]
+        derived_draft_record = self._publish_json(
+            derived_draft_path,
+            patched_draft,
+            artifact_id=f"review_draft_repaired:{transaction_id}",
+            artifact_role="review_draft_repaired",
+            artifact_type="review_draft_repaired",
+            artifact_version="v1",
+            producer="validation.repair_transaction.RepairTransactionService.apply_manual_proposal",
+            status="quarantined",
+            depends_on=base_dependency_refs,
+            metadata={
+                "transaction_id": transaction_id,
+                "canonical_replacement": False,
+                "manual_approval_id": approval.approval_id,
+                "source_report_plan_id": source_plan_record.artifact_id,
+            },
+        )
+        derived_manifest_record = self._publish_json(
+            derived_manifest_path,
+            patched_manifest,
+            artifact_id=f"citation_manifest_repaired:{transaction_id}",
+            artifact_role="citation_manifest_repaired",
+            artifact_type="citation_manifest_repaired",
+            artifact_version="v1",
+            producer="validation.repair_transaction.RepairTransactionService.apply_manual_proposal",
+            status="quarantined",
+            depends_on=[
+                *base_dependency_refs,
+                ArtifactDependencyRefV2.from_record(derived_draft_record),
+            ],
+            metadata={
+                "transaction_id": transaction_id,
+                "canonical_replacement": False,
+                "manual_approval_id": approval.approval_id,
+                "source_report_plan_id": source_plan_record.artifact_id,
+            },
+        )
+        apply_payload.update(
+            {
+                "plan_id": manual_plan_id,
+                "applied_count": 1,
+                "rejected_count": int(apply_result.get("rejected_count") or 0),
+                "patched_review_draft": patched_draft,
+                "patched_citation_manifest": patched_manifest,
+                "manual_approval": approval.to_dict(),
+                "source_report_plan_id": source_plan_record.artifact_id,
+                "targeted_revalidation": targeted_revalidation,
+                "semantic_revalidation": semantic_revalidation.to_dict(),
+                "repair_structural_closure": structural_closure.to_dict(),
+            }
+        )
+        apply_result_path = tx_dir / "repair_apply_result.json"
+        apply_record = self._publish_json(
+            apply_result_path,
+            apply_payload,
+            artifact_id=f"repair_apply_result:{transaction_id}",
+            artifact_role="repair_apply_result",
+            artifact_type="repair_apply_result",
+            artifact_version="v1",
+            producer="validation.repair_transaction.RepairTransactionService.apply_manual_proposal",
+            status="quarantined",
+            depends_on=[
+                *base_dependency_refs,
+                ArtifactDependencyRefV2.from_record(derived_draft_record),
+                ArtifactDependencyRefV2.from_record(derived_manifest_record),
+            ],
+            metadata={
+                "transaction_id": transaction_id,
+                "manual_approval_id": approval.approval_id,
+                "canonical_replacement": False,
+            },
+        )
+        previous_records = self._dependency_records()
+        transaction = RepairTransactionRecord(
+            transaction_id=transaction_id,
+            job_id=self.workspace.job_id,
+            status="quarantined",
+            policy="manual_confirm",
+            plan_id=manual_plan_record.artifact_id,
+            validation_artifact_id=validation_record.artifact_id,
+            previous_artifact_ids=tuple(item.artifact_id for item in previous_records),
+            previous_artifact_hashes={item.artifact_id: item.content_hash for item in previous_records},
+            applied_artifact_ids=(
+                derived_draft_record.artifact_id,
+                derived_manifest_record.artifact_id,
+                apply_record.artifact_id,
+            ),
+            applied_patch_ids=(proposal.proposal_id,),
+            created_at=approval.created_at,
+            reason="explicit reviewer-approved correction was applied to quarantined derived inputs",
+        )
+        transaction_path = tx_dir / "repair_transaction.json"
+        transaction_record = self._publish_json(
+            transaction_path,
+            transaction.to_dict(),
+            artifact_id=transaction_id,
+            artifact_role="repair_transaction",
+            artifact_type=REPAIR_TRANSACTION_ARTIFACT_TYPE,
+            artifact_version=REPAIR_TRANSACTION_ARTIFACT_VERSION,
+            producer="validation.repair_transaction.RepairTransactionService.apply_manual_proposal",
+            status="quarantined",
+            depends_on=[
+                ArtifactDependencyRefV2.from_record(manual_plan_record),
+                ArtifactDependencyRefV2.from_record(source_plan_record),
+                ArtifactDependencyRefV2.from_record(apply_record),
+            ],
+            metadata={
+                "status": transaction.status,
+                "policy": transaction.policy,
+                "manual_approval_id": approval.approval_id,
+            },
+        )
+        self.registry.reload()
+        return {
+            "status": "quarantined",
+            "job_id": self.workspace.job_id,
+            "plan_id": manual_plan_id,
+            "manual_plan_artifact_id": manual_plan_record.artifact_id,
+            "source_report_plan_id": source_plan_record.artifact_id,
+            "transaction_id": transaction_record.artifact_id,
+            "applied_artifact_ids": list(transaction.applied_artifact_ids),
+            "applied_patch_ids": list(transaction.applied_patch_ids),
+            "apply_result": apply_result,
+            "approval_id": approval.approval_id,
+            "canonical_replacement": False,
+            "mutation_performed": True,
+            "repair_structural_closure": structural_closure.to_dict(),
+            "derived_hashes": {
+                "review_draft": derived_draft_record.content_hash,
+                "citation_manifest": derived_manifest_record.content_hash,
+            },
         }
 
     def apply_plan(self, plan_id: str) -> dict[str, Any]:

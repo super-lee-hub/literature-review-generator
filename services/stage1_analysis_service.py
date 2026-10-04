@@ -76,6 +76,7 @@ from services.stage1_output_budget import (
     stage1_semantic_retry_max_attempts,
 )
 from services.stage1_reuse import (
+    Stage1TypedManifestAuthorityV2,
     STAGE1_REUSE_POLICY,
     Stage1ReusableSummaryBindingV1,
     Stage1ReusableSummaryManifestV1,
@@ -286,6 +287,7 @@ class Stage1AnalysisService:
         existing_summaries: Sequence[Mapping[str, Any]] = (),
     ) -> Stage1AnalysisResult:
         bundle.validate()
+        self._freeze_source_scope(bundle)
         existing = self._index_existing(existing_summaries, bundle)
         summaries: list[dict[str, Any]] = []
         source_items: list[dict[str, Any]] = []
@@ -421,6 +423,71 @@ class Stage1AnalysisService:
             actual_provider_transport_count=actual_transport_count,
         )
 
+    def _freeze_source_scope(self, bundle: SourceBundle) -> ArtifactRecord:
+        """Inspect every PDF locally before any parser/model side effect."""
+        import fitz
+
+        papers: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in bundle.paper_work_items:
+            self._check_cancelled()
+            key = self._paper_key(item)
+            if key in seen:
+                raise RuntimeError("Stage 1 source scope has duplicate paper identity")
+            seen.add(key)
+            path = Path(item.source_pdf).expanduser().resolve()
+            try:
+                before_hash = file_sha256(path)
+                size = path.stat().st_size
+                with fitz.open(path) as document:
+                    if document.needs_pass or document.page_count <= 0:
+                        raise ValueError("encrypted or empty PDF")
+                    page_count = document.page_count
+                if file_sha256(path) != before_hash:
+                    raise ValueError("PDF changed during local inspection")
+            except Exception as exc:
+                raise RuntimeError(f"Stage 1 source scope cannot inspect PDF for {key}: {type(exc).__name__}") from exc
+            papers.append({"paper_key": key, "source_pdf": str(path), "source_pdf_sha256": before_hash,
+                           "size_bytes": size, "page_count": page_count})
+        source_bundle_hash, runtime_spec_hash = self._ensure_durable_input_records(bundle)
+        source_record = self.registry.get("source_bundle")
+        if source_record is None:
+            raise RuntimeError("Stage 1 source bundle authority is missing")
+        self.registry.verify_ready_artifact_closure(source_record)
+        stored_bundle = json.loads(Path(source_record.path).read_text(encoding="utf-8"))
+        if hash_json(stored_bundle) != hash_json(bundle.to_dict()):
+            raise RuntimeError("Stage 1 source bundle does not match the source scope input")
+        payload = {
+            "schema_version": "stage1-source-scope/v1", "job_id": self.job_id,
+            "source_bundle_hash": source_bundle_hash, "runtime_spec_hash": runtime_spec_hash,
+            "papers": sorted(papers, key=lambda item: item["paper_key"]),
+            "paper_count": len(papers), "page_count": sum(item["page_count"] for item in papers),
+            "reuse_status": "not_adjudicated_by_source_scope",
+            "model_request_bounds": "materialized_after_preprocessing_and_verified_reuse",
+        }
+        record = publish_json_artifact(
+            self.publication_context, self.registry,
+            self.workspace.artifact_path(f"stage1/source_scope_{hash_json(payload)}.json"), payload,
+            artifact_id="stage1_source_scope", artifact_role="stage1_source_scope",
+            artifact_type="stage1_source_scope", artifact_version="v1",
+            producer="services.stage1_analysis_service.Stage1AnalysisService",
+            depends_on=[ArtifactDependencyRefV2.from_record(source_record),
+                        ArtifactDependencyRefV2.from_record(self.registry.get("runtime_job_spec"))],
+        )
+        self._source_scope_record = record
+        self._source_scope_by_paper = {item["paper_key"]: item for item in papers}
+        return record
+
+    def _verify_source_scope_item(self, item: PaperWorkItem) -> None:
+        record = getattr(self, "_source_scope_record", None)
+        if record is None:
+            return  # Narrow direct component helpers do not run the full source preflight.
+        self.registry.verify_ready_artifact_closure(record)
+        scope = self._source_scope_by_paper.get(self._paper_key(item))
+        if (scope is None or str(Path(item.source_pdf).expanduser().resolve()) != scope["source_pdf"]
+                or file_sha256(item.source_pdf) != scope["source_pdf_sha256"]):
+            raise RuntimeError("Stage 1 source scope PDF binding changed before preprocessing")
+
     def prepare_empty_provider_receipt_closure(self, bundle: SourceBundle) -> None:
         """Persist an explicit zero-call graph for summary-source Stage 1 runs."""
 
@@ -437,6 +504,7 @@ class Stage1AnalysisService:
         *,
         predeclared_preprocess_authority: _PredeclaredPreprocessAuthority | None = None,
     ) -> _PreparedStage1Item:
+        self._verify_source_scope_item(item)
         source_pdf = str(item.source_pdf or "").strip()
         if not source_pdf or not Path(source_pdf).is_file():
             raise RuntimeError(
@@ -2345,6 +2413,7 @@ class Stage1AnalysisService:
         }
 
     def _publish_expected_call_graph(self) -> None:
+        source_scope = getattr(self, "_source_scope_record", None)
         graph_record = publish_json_artifact(
             self.publication_context,
             self.registry,
@@ -2359,6 +2428,9 @@ class Stage1AnalysisService:
                 "expected_call_graph_hash": self.expected_call_graph_hash,
                 "source_bundle_hash": self._expected_source_bundle_hash,
                 "runtime_spec_hash": self._expected_runtime_spec_hash,
+                **({"source_scope_artifact_id": source_scope.artifact_id,
+                    "source_scope_artifact_hash": source_scope.content_hash}
+                   if source_scope is not None else {}),
                 "expected_calls": [asdict(item) for item in self.expected_calls],
             },
             artifact_role="provider_expected_call_graph",
@@ -2366,6 +2438,7 @@ class Stage1AnalysisService:
             artifact_version="v1",
             producer="services.stage1_analysis_service.Stage1AnalysisService",
             artifact_id="stage1:provider_expected_call_graph",
+            depends_on=[ArtifactDependencyRefV2.from_record(source_scope)] if source_scope is not None else [],
             metadata={
                 "closure_epoch_id": self.closure_epoch_id,
                 "expected_call_graph_hash": self.expected_call_graph_hash,
@@ -4540,6 +4613,7 @@ class Stage1AnalysisService:
         typed_authority, typed_authority_reason = verify_stage1_typed_manifest_authority(
             previous,
             prior_binding,
+            external_registry_resolver=self.external_registry_resolver,
         )
         typed_authority_requested = (
             isinstance(prior_reuse_metadata, Mapping)
@@ -4576,6 +4650,7 @@ class Stage1AnalysisService:
         portable_manifest_record: ArtifactRecord | None = None
         portable_closure_record: ArtifactRecord | None = None
         portable_ledger_record: ArtifactRecord | None = None
+        owner_correction_records: dict[str, ArtifactRecord] = {}
         authority_kind = "parent_registry"
 
         if typed_authority is not None:
@@ -4628,6 +4703,32 @@ class Stage1AnalysisService:
                 runtime_dependency,
                 ArtifactDependencyRefV2.from_record(portable_source_record),
             ]
+            if isinstance(typed_authority, Stage1TypedManifestAuthorityV2):
+                authority_refs = typed_authority.manifest.owner_correction_authority
+                for label, ref_name, source_path in (
+                    ("origin_source", "origin_source", typed_authority.owner_correction_origin_source_path),
+                    ("prior_manifest", "origin_prior_manifest", typed_authority.owner_correction_prior_manifest_path),
+                    ("derived_summary_set", "derived_summary_set", typed_authority.owner_correction_derived_summary_path),
+                    ("adoption_receipt", "adoption_receipt", typed_authority.owner_correction_receipt_path),
+                ):
+                    original_ref = authority_refs[ref_name]
+                    if not isinstance(original_ref, Mapping):
+                        raise RuntimeError("owner correction authority reference is malformed")
+                    proof_record = self._publish_portable_authority_record(
+                        source_path=source_path,
+                        expected_hash=str(original_ref["content_hash"]),
+                        portable_kind=f"owner_correction_{label}",
+                        source_authority_job_id=str(original_ref["job_id"]),
+                        original_artifact_id=str(original_ref["artifact_id"]),
+                        dependencies=(runtime_dependency, *(
+                            ArtifactDependencyRefV2.from_record(item)
+                            for item in owner_correction_records.values()
+                        )),
+                        typed_manifest_artifact_id=typed_authority.manifest_artifact_id,
+                        typed_manifest_artifact_hash=typed_authority.manifest_file_hash,
+                    )
+                    owner_correction_records[label] = proof_record
+                    manifest_dependencies.append(ArtifactDependencyRefV2.from_record(proof_record))
             for portable_record in (
                 portable_closure_record,
                 portable_ledger_record,
@@ -4996,6 +5097,16 @@ class Stage1AnalysisService:
             "created_at": utc_now_iso(),
         }
         evidence["content_hash"] = hash_json(evidence)
+        if owner_correction_records:
+            if not isinstance(typed_authority, Stage1TypedManifestAuthorityV2):
+                raise RuntimeError("owner correction proof records have no verified V2 authority")
+            evidence.pop("content_hash")
+            evidence["owner_correction_authority"] = dict(typed_authority.manifest.owner_correction_authority)
+            evidence["portable_owner_correction_records"] = {
+                label: {"artifact_id": item.artifact_id, "content_hash": item.content_hash}
+                for label, item in owner_correction_records.items()
+            }
+            evidence["content_hash"] = hash_json(evidence)
         digest = str(evidence["content_hash"])[:24]
         path = self.workspace.artifact_path(f"stage1/reuse_records/{digest}.json")
         dependencies: list[ArtifactDependencyRefV2] = []
@@ -5008,6 +5119,7 @@ class Stage1AnalysisService:
             source_ledger,
             source_authority_record,
             source_authority_manifest,
+            *owner_correction_records.values(),
         ):
             if dependency_record is None or dependency_record.status != "ready":
                 continue

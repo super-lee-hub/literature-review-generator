@@ -1420,6 +1420,29 @@ class PersistentQueueService:
             self._save()
             return True
 
+    def lease_is_current(
+        self,
+        job_id: str,
+        *,
+        lease_id: str,
+        worker_id: str,
+        lease_generation: int,
+        fence_token: str,
+    ) -> bool:
+        """Read-only check that a queue worker still owns its active lease."""
+
+        with self._store_lock():
+            runtime = self._runtimes.get(str(job_id))
+            return bool(
+                self._lease_owned(
+                    runtime,
+                    lease_id=lease_id,
+                    worker_id=worker_id,
+                    lease_generation=lease_generation,
+                    fence_token=fence_token,
+                )
+            )
+
     def update_job_stage_with_lease(
         self,
         job_id: str,
@@ -2869,7 +2892,42 @@ class QueueRunner:
                 self._update_job_stage(job_spec.job_id, "executing")
                 
                 # 执行任务，传入cancel_token
-                result = self.job_runner.run(request, cancel_token=cancel_token)
+                from runtime.provider_runtime import (
+                    RuntimeControlIdentityV1,
+                    bind_runtime_control_context,
+                )
+                from services.artifact_registry import ArtifactRegistry
+                from services.job_workspace import JobWorkspace
+
+                workspace_obj = JobWorkspace(
+                    str(Path(workspace_path).parent),
+                    Path(workspace_path).name.rsplit("__", 1)[0],
+                    job_spec.job_id,
+                )
+                registry = ArtifactRegistry(
+                    workspace_obj.paths.registry_path,
+                    workspace_obj.job_id,
+                )
+                runtime_identity = RuntimeControlIdentityV1(
+                    job_id=job_spec.job_id,
+                    workspace_path=workspace_path,
+                    lease_id=lease.lease_id,
+                    lease_generation=lease.lease_generation,
+                )
+                with bind_runtime_control_context(
+                    runtime_identity,
+                    workspace=workspace_obj,
+                    registry=registry,
+                    lease_validator=lambda: self.queue_service.lease_is_current(
+                        job_spec.job_id,
+                        lease_id=lease.lease_id,
+                        worker_id=lease.worker_id,
+                        lease_generation=lease.lease_generation,
+                        fence_token=lease.fence_token,
+                    ),
+                    cancel_token=cancel_token,
+                ):
+                    result = self.job_runner.run(request, cancel_token=cancel_token)
             
             # 最后检查一次任务状态
             if self._lease_is_lost(job_spec.job_id):

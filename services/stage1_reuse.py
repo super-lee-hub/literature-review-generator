@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import json
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from services.artifact_registry import ArtifactRegistry, file_sha256
+from services.artifact_registry import ArtifactRecord, ArtifactRegistry, file_sha256
 from services.prompt_registry import PromptRegistry
 from services.stage1_visual_contract import (
     SELECTIVE_VISUAL_CONTRACT_VERSION,
@@ -29,6 +29,11 @@ from runtime.provider_runtime import hash_json
 
 STAGE1_REUSE_BINDING_VERSION = "v1"
 STAGE1_REUSE_POLICY = "exact_summary_reuse_v1"
+STAGE1_OWNER_CORRECTION_AUTHORITY_VERSION = "owner-correction-authority-v1"
+OWNER_APPROVED_SOURCE_CORRECTION_KIND = "owner_approved_source_correction"
+_PROVIDER_GENERATED_SOURCE_KINDS = frozenset(
+    {"stage1_provider_generated", "provider_generated", "runtime_stage1"}
+)
 
 _VISUAL_OMISSION_SCOPES = VISUAL_OMISSION_SCOPES
 
@@ -791,6 +796,159 @@ class Stage1ReusableSummaryManifestV1:
 
 
 @dataclass(frozen=True)
+class Stage1OwnerCorrectionAuthorityV1:
+    """Proof refs for a manually approved, owner-corrected Stage 1 summary."""
+
+    schema_version: str = STAGE1_OWNER_CORRECTION_AUTHORITY_VERSION
+    action_id: str = ""
+    owner_action: Mapping[str, Any] = field(default_factory=dict)
+    owner_action_created_at: str = ""
+    adoption_receipt: Mapping[str, Any] = field(default_factory=dict)
+    derived_summary_set: Mapping[str, Any] = field(default_factory=dict)
+    correction_registry: Mapping[str, Any] = field(default_factory=dict)
+    origin_registry: Mapping[str, Any] = field(default_factory=dict)
+    origin_source: Mapping[str, Any] = field(default_factory=dict)
+    origin_prior_manifest: Mapping[str, Any] = field(default_factory=dict)
+    candidate: Mapping[str, Any] = field(default_factory=dict)
+    proposal: Mapping[str, Any] = field(default_factory=dict)
+    target_canonical_paper_key: str = ""
+    source_summary_set_hash: str = ""
+    candidate_summary_set_hash: str = ""
+    prior_summary_payload_hash: str = ""
+    corrected_summary_payload_hash: str = ""
+    target_before_summary_hash: str = ""
+    target_after_summary_hash: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "action_id": self.action_id,
+            "owner_action": dict(self.owner_action),
+            "owner_action_created_at": self.owner_action_created_at,
+            "adoption_receipt": dict(self.adoption_receipt),
+            "derived_summary_set": dict(self.derived_summary_set),
+            "correction_registry": dict(self.correction_registry),
+            "origin_registry": dict(self.origin_registry),
+            "origin_source": dict(self.origin_source),
+            "origin_prior_manifest": dict(self.origin_prior_manifest),
+            "candidate": dict(self.candidate),
+            "proposal": dict(self.proposal),
+            "target_canonical_paper_key": self.target_canonical_paper_key,
+            "source_summary_set_hash": self.source_summary_set_hash,
+            "candidate_summary_set_hash": self.candidate_summary_set_hash,
+            "prior_summary_payload_hash": self.prior_summary_payload_hash,
+            "corrected_summary_payload_hash": self.corrected_summary_payload_hash,
+            "target_before_summary_hash": self.target_before_summary_hash,
+            "target_after_summary_hash": self.target_after_summary_hash,
+        }
+
+    @classmethod
+    def from_mapping(
+        cls, value: Mapping[str, Any] | None
+    ) -> "Stage1OwnerCorrectionAuthorityV1":
+        if not isinstance(value, Mapping):
+            raise ValueError("owner_correction_authority must be an object")
+        raw = dict(value)
+        reference_fields = (
+            "owner_action",
+            "adoption_receipt",
+            "derived_summary_set",
+            "correction_registry",
+            "origin_registry",
+            "origin_source",
+            "origin_prior_manifest",
+            "candidate",
+            "proposal",
+        )
+        required_fields = {
+            "schema_version",
+            "action_id",
+            "owner_action_created_at",
+            *reference_fields,
+            "target_canonical_paper_key",
+            "source_summary_set_hash",
+            "candidate_summary_set_hash",
+            "prior_summary_payload_hash",
+            "corrected_summary_payload_hash",
+            "target_before_summary_hash",
+            "target_after_summary_hash",
+        }
+        if set(raw) != required_fields:
+            raise ValueError("owner_correction_authority fields are incomplete or unknown")
+        references: dict[str, Mapping[str, Any]] = {}
+        for name in reference_fields:
+            reference = raw.get(name)
+            if not isinstance(reference, Mapping):
+                raise ValueError(f"owner_correction_authority.{name} must be an object")
+            references[name] = dict(reference)
+        values: dict[str, str] = {
+            name: _text(raw.get(name))
+            for name in (
+                "schema_version",
+                "action_id",
+                "owner_action_created_at",
+                "target_canonical_paper_key",
+                "source_summary_set_hash",
+                "candidate_summary_set_hash",
+                "prior_summary_payload_hash",
+                "corrected_summary_payload_hash",
+                "target_before_summary_hash",
+                "target_after_summary_hash",
+            )
+        }
+        return cls(
+            schema_version=values["schema_version"],
+            action_id=values["action_id"],
+            owner_action_created_at=values["owner_action_created_at"],
+            owner_action=references["owner_action"],
+            adoption_receipt=references["adoption_receipt"],
+            derived_summary_set=references["derived_summary_set"],
+            correction_registry=references["correction_registry"],
+            origin_registry=references["origin_registry"],
+            origin_source=references["origin_source"],
+            origin_prior_manifest=references["origin_prior_manifest"],
+            candidate=references["candidate"],
+            proposal=references["proposal"],
+            target_canonical_paper_key=values["target_canonical_paper_key"],
+            source_summary_set_hash=values["source_summary_set_hash"],
+            candidate_summary_set_hash=values["candidate_summary_set_hash"],
+            prior_summary_payload_hash=values["prior_summary_payload_hash"],
+            corrected_summary_payload_hash=values["corrected_summary_payload_hash"],
+            target_before_summary_hash=values["target_before_summary_hash"],
+            target_after_summary_hash=values["target_after_summary_hash"],
+        )
+
+
+@dataclass(frozen=True)
+class Stage1ReusableSummaryManifestV2(Stage1ReusableSummaryManifestV1):
+    """V1 common manifest fields plus explicit owner-correction authority."""
+
+    artifact_version: str = "v2"
+    authority_kind: str = ""
+    owner_correction_authority: Mapping[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["owner_correction_authority"] = dict(self.owner_correction_authority)
+        return payload
+
+    @classmethod
+    def from_mapping(
+        cls, value: Mapping[str, Any] | None
+    ) -> "Stage1ReusableSummaryManifestV2":
+        raw = dict(value or {})
+        common = Stage1ReusableSummaryManifestV1.from_mapping(raw).to_dict()
+        authority = Stage1OwnerCorrectionAuthorityV1.from_mapping(
+            raw.get("owner_correction_authority")
+        )
+        return cls(
+            **common,
+            authority_kind=_text(raw.get("authority_kind")),
+            owner_correction_authority=authority.to_dict(),
+        )
+
+
+@dataclass(frozen=True)
 class Stage1TypedManifestAuthorityV1:
     """Verified portable authority material resolved from a typed manifest."""
 
@@ -801,6 +959,73 @@ class Stage1TypedManifestAuthorityV1:
     source_summary_path: str
     provider_closure_path: str
     provider_ledger_path: str
+
+
+@dataclass(frozen=True)
+class Stage1TypedManifestAuthorityV2(Stage1TypedManifestAuthorityV1):
+    """Verified owner-correction provenance paths, with no borrowed closure."""
+
+    manifest: Stage1ReusableSummaryManifestV2
+    owner_correction_receipt_path: str = ""
+    owner_correction_derived_summary_path: str = ""
+    owner_correction_origin_source_path: str = ""
+    owner_correction_prior_manifest_path: str = ""
+
+
+def build_owner_corrected_stage1_binding(
+    prior_binding: Stage1ReusableSummaryBindingV1,
+    *,
+    summary_file: ArtifactRecord,
+    registry_revision: str,
+    summary_payload_hash: str,
+) -> Stage1ReusableSummaryBindingV1:
+    """Carry a verified V1 Stage 1 basis onto an owner-corrected summary.
+
+    Only authority locators, the corrected AI-summary hash, the explicit owner
+    source kind, and provider-transport claims change.  Provider/model,
+    preprocess, prompt, PDF, evidence, and visual facts remain exactly as
+    recorded by the prior manifest.
+    """
+
+    if summary_file.artifact_type != "summary_file" or summary_file.artifact_version != "v1":
+        raise ValueError("owner-corrected Stage 1 binding requires summary_file/v1 authority")
+    if summary_file.status != "ready" or not summary_file.content_hash:
+        raise ValueError("owner-corrected Stage 1 summary_file must be READY and hashed")
+    if not _is_sha256(summary_payload_hash):
+        raise ValueError("owner-corrected summary_payload_hash must be a SHA-256 digest")
+    if not str(registry_revision or "").strip():
+        raise ValueError("owner-corrected summary_file Registry revision is required")
+    extra = dict(prior_binding.extra)
+    extra["source_kind"] = OWNER_APPROVED_SOURCE_CORRECTION_KIND
+    extra["provider_transport_count"] = 0
+    return replace(
+        prior_binding,
+        source_kind=OWNER_APPROVED_SOURCE_CORRECTION_KIND,
+        normalized_summary_payload_hash=summary_payload_hash,
+        summary_payload_hash=summary_payload_hash,
+        provider_receipt_closure_id="",
+        provider_receipt_closure_hash="",
+        source_provider_receipt_closure_id="",
+        source_provider_receipt_closure_hash="",
+        source_provider_receipt_ledger_id="",
+        source_provider_receipt_ledger_hash="",
+        registered_source_artifact_id="",
+        registered_source_artifact_hash="",
+        registered_source_artifact_path="",
+        registry_file_hash=summary_file.content_hash,
+        source_summary_manifest_id="",
+        source_summary_manifest_hash="",
+        source_authority_job_id=summary_file.job_id,
+        source_authority_artifact_id=summary_file.artifact_id,
+        source_authority_artifact_hash=summary_file.content_hash,
+        source_authority_artifact_path=summary_file.path,
+        source_authority_registry_id=f"artifact-registry:{summary_file.job_id}",
+        source_authority_registry_revision=str(registry_revision),
+        source_authority_closure_id="",
+        source_authority_closure_hash="",
+        source_authority_registry_path="",
+        extra=extra,
+    )
 
 
 def _is_sha256(value: Any) -> bool:
@@ -879,7 +1104,7 @@ def _validate_manifest_self_binding(
     *,
     binding: Stage1ReusableSummaryBindingV1,
     previous_summary: Mapping[str, Any],
-) -> tuple[Stage1ReusableSummaryManifestV1 | None, str]:
+) -> tuple[Stage1ReusableSummaryManifestV1 | Stage1ReusableSummaryManifestV2 | None, str]:
     qualification_boundary_issues = (
         validate_current_visual_evidence_qualification_pair(payload)
     )
@@ -892,10 +1117,21 @@ def _validate_manifest_self_binding(
         ):
             return None, "typed_manifest_visual_evidence_qualification_invalid"
         return None, "typed_manifest_visual_evidence_qualification_missing"
-    manifest = Stage1ReusableSummaryManifestV1.from_mapping(payload)
+    manifest_version = _text(payload.get("artifact_version"))
+    if manifest_version == "v1":
+        manifest: Stage1ReusableSummaryManifestV1 | Stage1ReusableSummaryManifestV2 = (
+            Stage1ReusableSummaryManifestV1.from_mapping(payload)
+        )
+    elif manifest_version == "v2":
+        try:
+            manifest = Stage1ReusableSummaryManifestV2.from_mapping(payload)
+        except (TypeError, ValueError) as exc:
+            return None, f"typed_manifest_owner_correction_authority_invalid:{exc}"
+    else:
+        return None, "typed_manifest_version_invalid"
     if manifest.artifact_type != "stage1_reusable_summary_manifest":
         return None, "typed_manifest_type_invalid"
-    if manifest.artifact_version != "v1":
+    if manifest.artifact_version != manifest_version:
         return None, "typed_manifest_version_invalid"
     if manifest.stage_name != "stage1_analyze" or not manifest.job_id:
         return None, "typed_manifest_stage_identity_invalid"
@@ -913,6 +1149,71 @@ def _validate_manifest_self_binding(
         return None, "typed_manifest_imported_binding_mismatch"
 
     manifest_binding = Stage1ReusableSummaryBindingV1.from_mapping(manifest.binding)
+    if manifest_version == "v1":
+        provider_status, source_kind_reason = _v1_manifest_provider_status(
+            payload,
+            manifest_binding,
+            previous_summary,
+        )
+        if provider_status is None:
+            return None, source_kind_reason
+    elif manifest_version == "v2":
+        if not isinstance(manifest, Stage1ReusableSummaryManifestV2):
+            return None, "typed_manifest_owner_correction_authority_invalid"
+        binding_source_kind = _text(manifest_binding.source_kind) or _text(
+            _mapping(manifest_binding.extra).get("source_kind")
+        )
+        if (
+            manifest.authority_kind != OWNER_APPROVED_SOURCE_CORRECTION_KIND
+            or _text(manifest.source_kind) != OWNER_APPROVED_SOURCE_CORRECTION_KIND
+            or binding_source_kind != OWNER_APPROVED_SOURCE_CORRECTION_KIND
+        ):
+            return None, "typed_manifest_source_kind_untrusted"
+        try:
+            owner_authority = Stage1OwnerCorrectionAuthorityV1.from_mapping(
+                manifest.owner_correction_authority
+            )
+        except (TypeError, ValueError) as exc:
+            return None, f"typed_manifest_owner_correction_authority_invalid:{exc}"
+        if _manifest_has_provider_proof(payload, manifest_binding, previous_summary):
+            return None, "typed_manifest_owner_correction_provider_receipts_forbidden"
+        if any(
+            _text(getattr(manifest_binding, field_name))
+            for field_name in (
+                "source_provider_receipt_closure_id",
+                "source_provider_receipt_closure_hash",
+                "source_provider_receipt_ledger_id",
+                "source_provider_receipt_ledger_hash",
+                "source_authority_closure_id",
+                "source_authority_closure_hash",
+            )
+        ) or any(
+            _text(getattr(manifest, field_name))
+            for field_name in (
+                "provider_receipt_closure_id",
+                "provider_receipt_closure_hash",
+                "provider_receipt_closure_path",
+                "provider_receipt_ledger_id",
+                "provider_receipt_ledger_hash",
+                "provider_receipt_ledger_path",
+            )
+        ):
+            return None, "typed_manifest_owner_correction_provider_receipts_forbidden"
+        if (
+            owner_authority.schema_version != STAGE1_OWNER_CORRECTION_AUTHORITY_VERSION
+            or owner_authority.target_canonical_paper_key != manifest.canonical_paper_key
+            or owner_authority.corrected_summary_payload_hash
+            != manifest.normalized_summary_payload_hash
+            or owner_authority.corrected_summary_payload_hash
+            != manifest.summary_payload_hash
+            or not _is_sha256(owner_authority.source_summary_set_hash)
+            or not _is_sha256(owner_authority.candidate_summary_set_hash)
+            or not _is_sha256(owner_authority.prior_summary_payload_hash)
+            or not _is_sha256(owner_authority.corrected_summary_payload_hash)
+            or not _is_sha256(owner_authority.target_before_summary_hash)
+            or not _is_sha256(owner_authority.target_after_summary_hash)
+        ):
+            return None, "typed_manifest_owner_correction_authority_invalid"
     top_level_binding_fields = (
         "canonical_paper_key",
         "source_pdf_content_sha256",
@@ -984,6 +1285,115 @@ def _validate_manifest_self_binding(
     if _text(manifest.paper_info.get("canonical_paper_key")) != manifest.canonical_paper_key:
         return None, "typed_manifest_paper_payload_identity_mismatch"
     return manifest, "typed_manifest_self_binding_verified"
+
+
+def _legacy_manifest_has_current_markers(
+    payload: Mapping[str, Any],
+    binding: Stage1ReusableSummaryBindingV1,
+) -> bool:
+    """A blank V1 kind is legacy only before current Stage 1 contracts."""
+
+    if current_visual_contract_markers(payload) or current_visual_contract_markers(
+        binding.to_dict()
+    ):
+        return True
+    return any(
+        _text(getattr(binding, field_name))
+        for field_name in (
+            "source_pdf_content_sha256",
+            "stage1_extracted_text_hash",
+            "stage1_semantic_input_hash",
+            "preprocess_contract_hash",
+            "prompt_id",
+            "prompt_version",
+            "prompt_sha256",
+            "prompt_template_hash",
+            "input_builder_policy_hash",
+            "summary_schema_hash",
+            "visual_input_manifest_hash",
+            "visual_coverage_hash",
+            "visual_scan_schema_hash",
+            "provider_config_hash",
+            "runtime_spec_id",
+            "runtime_spec_hash",
+            "evidence_manifest_id",
+            "evidence_manifest_hash",
+            "expected_call_graph_id",
+            "expected_call_graph_hash",
+        )
+    )
+
+
+def _manifest_has_provider_proof(
+    payload: Mapping[str, Any],
+    binding: Stage1ReusableSummaryBindingV1,
+    previous_summary: Mapping[str, Any],
+) -> bool:
+    provider = _mapping(previous_summary.get("provider"))
+    extra = _mapping(binding.extra)
+    receipt_ids = provider.get("receipt_ids")
+    receipt_count = len(receipt_ids) if isinstance(receipt_ids, list) else 0
+    raw_count = extra.get("provider_transport_count")
+    if raw_count is None:
+        raw_count = provider.get("transport_count")
+    try:
+        transport_count = int(raw_count or 0)
+    except (TypeError, ValueError):
+        transport_count = 0
+    if receipt_count or transport_count > 0:
+        return True
+    for field_name in (
+        "provider_receipt_closure_id",
+        "provider_receipt_closure_hash",
+        "provider_receipt_closure_path",
+        "provider_receipt_ledger_id",
+        "provider_receipt_ledger_hash",
+        "provider_receipt_ledger_path",
+    ):
+        if _text(payload.get(field_name)):
+            return True
+    return any(
+        _text(getattr(binding, field_name))
+        for field_name in (
+            "source_provider_receipt_closure_id",
+            "source_provider_receipt_closure_hash",
+            "source_provider_receipt_ledger_id",
+            "source_provider_receipt_ledger_hash",
+        )
+    )
+
+
+def _v1_manifest_provider_status(
+    payload: Mapping[str, Any],
+    binding: Stage1ReusableSummaryBindingV1,
+    previous_summary: Mapping[str, Any],
+) -> tuple[bool | None, str]:
+    """Classify the closed V1 source-kind set and its genuine empty-kind legacy.
+
+    ``None`` means the V1 authority must be rejected.  V2 owner corrections
+    use their own explicit authority object and never enter this classifier.
+    """
+
+    manifest_kind = _text(payload.get("source_kind"))
+    binding_kind = _text(binding.source_kind) or _text(
+        _mapping(binding.extra).get("source_kind")
+    )
+    if manifest_kind and binding_kind and manifest_kind != binding_kind:
+        if not (
+            manifest_kind in _PROVIDER_GENERATED_SOURCE_KINDS
+            and binding_kind in _PROVIDER_GENERATED_SOURCE_KINDS
+        ):
+            return None, "typed_manifest_source_kind_mismatch"
+    source_kind = manifest_kind or binding_kind
+    if source_kind in _PROVIDER_GENERATED_SOURCE_KINDS:
+        return True, "typed_manifest_provider_generated"
+    if source_kind:
+        return None, "typed_manifest_source_kind_untrusted"
+    if _legacy_manifest_has_current_markers(payload, binding):
+        return None, "typed_manifest_source_kind_untrusted"
+    if _manifest_has_provider_proof(payload, binding, previous_summary):
+        return None, "typed_manifest_source_kind_untrusted"
+    return False, "typed_manifest_legacy_empty_source_kind"
 
 
 def _verify_visual_evidence_qualification(
@@ -1298,7 +1708,9 @@ def _verify_visual_evidence_qualification(
 def verify_stage1_typed_manifest_authority(
     previous_summary: Mapping[str, Any],
     binding: Stage1ReusableSummaryBindingV1,
-) -> tuple[Stage1TypedManifestAuthorityV1 | None, str]:
+    *,
+    external_registry_resolver: Callable[[str], ArtifactRegistry | None] | None = None,
+) -> tuple[Stage1TypedManifestAuthorityV1 | Stage1TypedManifestAuthorityV2 | None, str]:
     """Verify a portable manifest and every authority byte it binds."""
 
     manifest_path_text, manifest_artifact_id, expected_manifest_file_hash = (
@@ -1352,11 +1764,23 @@ def verify_stage1_typed_manifest_authority(
     if not payload_ok:
         return None, payload_reason.replace("registered_source", "typed_manifest_source")
 
-    provider_generated = manifest.source_kind in {
-        "stage1_provider_generated",
-        "provider_generated",
-        "runtime_stage1",
-    }
+    if isinstance(manifest, Stage1ReusableSummaryManifestV2):
+        from services.summary_correction_reuse import (
+            verify_owner_corrected_stage1_manifest_authority,
+        )
+
+        return verify_owner_corrected_stage1_manifest_authority(
+            manifest=manifest,
+            manifest_path=manifest_path,
+            manifest_file_hash=manifest_file_hash,
+            manifest_artifact_id=manifest_artifact_id,
+            source_summary_path=source_summary_path,
+            previous_summary=previous_summary,
+            binding=binding,
+            external_registry_resolver=external_registry_resolver,
+        )
+
+    provider_generated = manifest.source_kind in _PROVIDER_GENERATED_SOURCE_KINDS
     closure_path = _resolve_manifest_reference(
         manifest_path, manifest.provider_receipt_closure_path
     )
@@ -1538,6 +1962,7 @@ def _registered_source_is_verifiable(
         authority, reason = verify_stage1_typed_manifest_authority(
             previous_summary,
             binding,
+            external_registry_resolver=external_registry_resolver,
         )
         return authority is not None, reason
 
@@ -1635,7 +2060,7 @@ def _registered_source_is_verifiable(
     except (TypeError, ValueError):
         early_provider_count = 0
     if (
-        early_source_kind in {"stage1_provider_generated", "provider_generated", "runtime_stage1"}
+        early_source_kind in _PROVIDER_GENERATED_SOURCE_KINDS
         or early_provider_count > 0
     ) and not (
         _text(binding.source_provider_receipt_closure_id)
@@ -1737,7 +2162,11 @@ def _registered_source_is_verifiable(
     except (OSError, TypeError, ValueError, RuntimeError) as exc:
         return False, f"source_summary_manifest_dependencies_untrusted:{exc}"
 
-    source_kind = _text(binding.source_kind) or _text(_mapping(binding.extra).get("source_kind"))
+    source_kind = (
+        _text(binding.source_kind)
+        or _text(_mapping(binding.extra).get("source_kind"))
+        or _text(manifest_payload.get("source_kind"))
+    )
     provider = _mapping(previous_summary.get("provider"))
     raw_count = (
         _mapping(binding.extra).get("provider_transport_count")
@@ -1749,11 +2178,7 @@ def _registered_source_is_verifiable(
         provider_count = int(raw_count)
     except (TypeError, ValueError):
         provider_count = 0
-    provider_generated = source_kind in {
-        "stage1_provider_generated",
-        "provider_generated",
-        "runtime_stage1",
-    } or provider_count > 0
+    provider_generated = source_kind in _PROVIDER_GENERATED_SOURCE_KINDS or provider_count > 0
     closure_id = _text(binding.source_provider_receipt_closure_id)
     closure_hash = _text(binding.source_provider_receipt_closure_hash)
     ledger_id = _text(binding.source_provider_receipt_ledger_id)
@@ -1920,12 +2345,18 @@ def build_binding_hash(payload: Mapping[str, Any]) -> str:
 __all__ = [
     "STAGE1_REUSE_BINDING_VERSION",
     "STAGE1_REUSE_POLICY",
+    "STAGE1_OWNER_CORRECTION_AUTHORITY_VERSION",
+    "OWNER_APPROVED_SOURCE_CORRECTION_KIND",
     "Stage1VisualEvidenceQualificationV1",
     "Stage1ReusableSummaryBindingV1",
     "Stage1ReusableSummaryManifestV1",
+    "Stage1OwnerCorrectionAuthorityV1",
+    "Stage1ReusableSummaryManifestV2",
     "Stage1TypedManifestAuthorityV1",
+    "Stage1TypedManifestAuthorityV2",
     "Stage1ReuseEligibilityV1",
     "build_binding_hash",
+    "build_owner_corrected_stage1_binding",
     "evaluate_stage1_reuse",
     "verify_stage1_typed_manifest_authority",
 ]

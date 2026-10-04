@@ -207,6 +207,8 @@ class APIConfig(TypedDict):
     max_output_tokens: NotRequired[Any]
     max_completion_tokens: NotRequired[Any]
     max_context_tokens: NotRequired[Any]
+    provider_stream: NotRequired[Any]
+    provider_stream_include_usage: NotRequired[Any]
     force_highest_reasoning: NotRequired[Any]
     omit_temperature_when_reasoning: NotRequired[Any]
     # Native Anthropic Messages transport. These fields are optional because

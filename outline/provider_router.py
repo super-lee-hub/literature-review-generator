@@ -53,7 +53,7 @@ SETTING_ACCESSORS: dict[str, str] = {
     "arbitrator_model": "arbitrator_model",
 }
 
-_CANDIDATE_NODE_RE = re.compile(r"^candidate_\d+_provider_generation$")
+_CANDIDATE_NODE_RE = re.compile(r"^candidate_\d+_provider_generation(?:$|:)")
 
 GENERATION_ROLE = "candidate_provider_generation"
 ARBITRATION_ROLE = "arbitration"
@@ -99,6 +99,13 @@ _ROUTE_CONFIG_KEYS = frozenset(
         "safety_margin_tokens",
         "force_highest_reasoning",
         "omit_temperature_when_reasoning",
+        "provider_stream",
+        "provider_stream_include_usage",
+        "transport_retries",
+        "connect_timeout_seconds",
+        "read_timeout_seconds",
+        "total_timeout_seconds",
+        "first_token_timeout_seconds",
     }
 )
 
@@ -138,10 +145,20 @@ def safe_config_identity(config: Mapping[str, Any] | None) -> dict[str, str]:
         if key not in source:
             continue
         value = source.get(key)
+        if key == "provider_stream":
+            if isinstance(value, bool):
+                enabled = value
+            else:
+                enabled = str(value if value is not None else "").strip().casefold() in {
+                    "1", "true", "yes", "y", "on", "enabled", "enable",
+                }
+            if enabled:
+                identity[key] = "true"
+            continue
         if key == "api_base":
-            normalized = safe_endpoint(str(value or ""))
+            normalized = safe_endpoint(str(value if value is not None else ""))
         else:
-            normalized = str(value or "").strip()
+            normalized = str(value).strip() if value is not None else ""
         if normalized:
             identity[key] = normalized
     return identity
@@ -177,6 +194,18 @@ def semantic_role(node_id: str) -> str:
     node = str(node_id or "").strip()
     if _CANDIDATE_NODE_RE.match(node):
         return "candidate_provider_generation"
+    if node.startswith((
+        "topic_synthesis_provider:",
+        "cross_group_comparison_provider:",
+        "global_synthesis_provider:",
+    )) or node in {
+        "topic_synthesis_provider",
+        "cross_group_comparison_provider",
+        "global_synthesis_provider",
+    }:
+        return "candidate_provider_generation"
+    if node.startswith("relation_adjudication:"):
+        return "relation_adjudication"
     return node
 
 

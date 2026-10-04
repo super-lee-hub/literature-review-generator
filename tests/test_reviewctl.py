@@ -1,18 +1,24 @@
 from __future__ import annotations
 
+import configparser
 import json
 import os
 from pathlib import Path
 import re
 import time
 from dataclasses import replace
+from types import SimpleNamespace
+
+import pytest
 
 from reviewctl import main as reviewctl_main
-from runtime.control_plane import FORBIDDEN_ACTIONS, ReviewControlPlane
+from runtime.control_plane import ReviewControlPlane
+import runtime.control_plane as control_plane_module
 from runtime.outline_v3_dag import OutlineNodeStore
 from services.artifact_registry import ArtifactRegistry
 from services.credential_provenance import PREPROCESS_ENV_MAPPING
 from services.job_workspace import JobWorkspace
+from tests.test_outline_v3_semantic_execution import _summary
 
 
 def _spec(tmp_path: Path):
@@ -49,6 +55,534 @@ def test_reviewctl_plan_and_doctor_emit_machine_json(tmp_path: Path, capsys) -> 
     doctor = json.loads(capsys.readouterr().out)
     assert doctor["status"] == "fail"
     assert "dummy" not in json.dumps(doctor)
+
+
+@pytest.mark.parametrize("explicit_zero", [False, True])
+@pytest.mark.parametrize("output_tokens", [None, 4096])
+def test_public_plan_writer_reserves_match_the_writer_runtime(
+    tmp_path: Path, explicit_zero: bool, output_tokens: int | None,
+) -> None:
+    from config_loader import load_config
+    from runtime.provider_context import ProviderContextProfile
+    from services.model_selection import get_api_config_for_section
+
+    spec = replace(_spec(tmp_path), action="run_all",
+                   metadata={"requested_stages": ["analyze", "outline", "review", "validate"]})
+    parser = configparser.ConfigParser()
+    parser.read(Path(__file__).resolve().parents[1] / "config.ini.example", encoding="utf-8")
+    parser["Paths"]["output_path"] = str(tmp_path / "output")
+    for section in ("Primary_Reader_API", "Backup_Reader_API", "Writer_API", "Outline_API",
+                    "Free_Mode_API", "Validator_API"):
+        parser[section]["api_key"] = "local-fixture-only"
+        parser[section]["api_base"] = "http://127.0.0.1:1/v1"
+    writer = parser["Writer_API"]
+    if output_tokens is None:
+        writer.pop("max_output_tokens", None)
+    else:
+        writer["max_output_tokens"] = str(output_tokens)
+    writer["max_context_tokens"] = "128000"
+    writer["transport_retries"] = "0"
+    for key in ("reasoning_reserve_tokens", "safety_margin_tokens"):
+        if explicit_zero:
+            writer[key] = "0"
+        else:
+            writer.pop(key, None)
+    with Path(spec.config).open("w", encoding="utf-8") as handle:
+        parser.write(handle)
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(json.dumps(spec.to_dict()), encoding="utf-8")
+    plan = ReviewControlPlane().plan(str(spec_path))
+    exposures = [item for item in plan["full_stage_request_plan"]["unknown_exposures"]
+                 if item["stage_name"] == "review" and item["semantic_role"] == "writer"]
+    assert exposures
+    config = load_config(spec.config, action=spec.action,
+                         requested_stages=spec.metadata["requested_stages"], allow_template_credentials=False)
+    api_config = get_api_config_for_section(config, "Writer_API")
+    profile = ProviderContextProfile.from_api_config(
+        api_config, max_output_tokens=output_tokens or 32000, default_model="writer",
+    )
+    for exposure in exposures:
+        assert exposure["input_tokens_per_call_upper_bound"] == profile.input_budget
+        assert exposure["output_tokens_per_call_upper_bound"] == profile.max_output_tokens
+        assert exposure["reasoning_tokens_per_call_upper_bound"] == profile.reasoning_reserve
+        assert exposure["retry_attempts_per_call_upper_bound"] == 0
+    assert plan["full_stage_request_plan"]["boundary"]["no_provider_posts"] is True
+
+
+def test_reviewctl_plan_projects_all_reachable_provider_work_without_posting(
+    tmp_path: Path, capsys,
+) -> None:
+    spec = _spec(tmp_path)
+    spec = replace(
+        spec,
+        action="run_all",
+        metadata={
+            **dict(spec.metadata or {}),
+            "requested_stages": ["analyze", "outline", "review", "validate"],
+        },
+    )
+    config = Path(spec.config)
+    parser = configparser.ConfigParser()
+    parser.read(Path(__file__).resolve().parents[1] / "config.ini.example", encoding="utf-8")
+    parser["Paths"]["output_path"] = str(tmp_path / "output")
+    for section in (
+        "Primary_Reader_API",
+        "Backup_Reader_API",
+        "Writer_API",
+        "Outline_API",
+        "Free_Mode_API",
+        "Validator_API",
+    ):
+        parser[section]["api_key"] = "local-fixture-only"
+        parser[section]["api_base"] = "http://127.0.0.1:1/v1"
+    with config.open("w", encoding="utf-8") as handle:
+        parser.write(handle)
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(json.dumps(spec.to_dict()), encoding="utf-8")
+
+    assert reviewctl_main(["plan", "--spec", str(spec_path)]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    projection = plan["full_stage_request_plan"]
+    assert projection["schema_version"] == "full-stage-provider-request-plan-v1"
+    assert projection["limits"]["effective_provider_call_limit"] == 24
+    assert projection["totals"]["unknown_exposure_count"] >= 1
+    assert projection["budget_status"]["admission"] == "incomplete_unknown_exposure"
+    assert projection["boundary"]["no_provider_posts"] is True
+    expected_builder_roles = {
+        ("analyze", "backup_reader"),
+        ("outline", "relation_adjudication"),
+        ("outline", "structure_critique"),
+        ("outline", "coverage_critique"),
+        ("outline", "evidence_critique"),
+        ("outline", "arbitration"),
+    }
+    registered = {
+        (item["stage_name"], item["semantic_role"]): item
+        for item in projection["unknown_exposures"]
+        if item.get("request_builder_id")
+    }
+    assert expected_builder_roles <= set(registered)
+    assert all(
+        registered[role]["logical_calls_upper_bound"]
+        == (1 if role == ("outline", "arbitration") else None)
+        for role in expected_builder_roles
+    )
+    assert not any(
+        item["reason"] == "reachable_route_has_no_request_builder_inventory"
+        for item in projection["unknown_exposures"]
+    )
+    outline_exposures = [
+        item for item in projection["unknown_exposures"]
+        if item["stage_name"] == "outline"
+    ]
+    assert all(
+        item["input_tokens_per_call_upper_bound"] <= 32_000
+        for item in outline_exposures
+    )
+    assert all(
+        item["output_tokens_per_call_upper_bound"] <= 2_048
+        for item in outline_exposures
+        if item["semantic_role"] in {
+            "structure_critique", "coverage_critique", "evidence_critique",
+        }
+    )
+    semantic_repairs = [
+        item for item in outline_exposures
+        if str(item.get("request_builder_id") or "").endswith("_semantic_repair_candidate")
+    ]
+    assert len(semantic_repairs) == 1
+    assert semantic_repairs[0]["logical_calls_upper_bound"] == 5
+    assert not any("semantic_recheck" in item["reason"] for item in outline_exposures)
+    reducer_exposures = [
+        item
+        for item in outline_exposures
+        if item["reason"].startswith(("cross_group_request_", "global_request_"))
+    ]
+    assert len(reducer_exposures) == 2
+    assert {item["request_builder_id"] for item in reducer_exposures} == {
+        "outline.v3_executor.OutlineV3Executor._run_bounded_semantic_provider_call:cross_group_comparison",
+        "outline.v3_executor.OutlineV3Executor._run_bounded_semantic_provider_call:global_synthesis",
+    }
+    assert all(item["logical_calls_upper_bound"] == 25 for item in reducer_exposures)
+    assert all(item["physical_attempt_upper_bound"] == 75 for item in reducer_exposures)
+    arbitration = registered[("outline", "arbitration")]
+    assert arbitration["physical_attempt_upper_bound"] == 3
+    assert arbitration["conditional_on"] == "eligible_candidate_and_critique_outputs_materialized"
+    # Numeric call limits alone lack a verified cardinality basis and wall
+    # bound. The public pre-admission plan must keep them unbounded.
+    assert projection["totals"]["bounded_logical_call_exposure_count"] == 0
+    assert all(item["exposure_status"] == "unbounded" for item in projection["unknown_exposures"])
+    assert projection["totals"]["unbounded_logical_call_exposure_count"] > 0
+    exposure = projection["unknown_exposures"][0]
+    assert exposure["logical_calls_upper_bound"] is None
+    assert exposure["input_tokens_per_call_upper_bound"] > 0
+    assert exposure["output_tokens_per_call_upper_bound"] > 0
+    assert exposure["reasoning_tokens_per_call_upper_bound"] >= 0
+    assert exposure["retry_attempts_per_call_upper_bound"] >= 0
+    assert projection["totals"]["estimated_output_tokens_all_attempts"] is None
+    invalid_bounds = [
+        item
+        for item in projection["unknown_exposures"]
+        if item["reason"] != "reachable_required_route_is_unresolved"
+        and not (
+            item["logical_calls_upper_bound"]
+            == (
+                5
+                if str(item.get("request_builder_id") or "").endswith("_semantic_repair_candidate")
+                else 25
+                if item["reason"].startswith(("cross_group_request_", "global_request_"))
+                else 1
+                if item["semantic_role"] == "arbitration"
+                else None
+            )
+            and isinstance(item["input_tokens_per_call_upper_bound"], int)
+            and isinstance(item["output_tokens_per_call_upper_bound"], int)
+            and isinstance(item["reasoning_tokens_per_call_upper_bound"], int)
+            and isinstance(item["retry_attempts_per_call_upper_bound"], int)
+        )
+    ]
+    assert not invalid_bounds, [
+        (item["stage_name"], item["semantic_role"], item["reason"], item.get("request_builder_id"), item.get("input_tokens_per_call_upper_bound"), item.get("output_tokens_per_call_upper_bound"))
+        for item in invalid_bounds
+    ]
+    assert projection["aggregate_budget_source"] == (
+        "application_call_cap_projection_without_bound_acceptance_run"
+    )
+    assert plan["provider_admission_status"] == "incomplete_unknown_exposure"
+    assert plan["ready_for_provider_admission"] is False
+    assert "local-fixture-only" not in json.dumps(plan)
+
+
+def test_reuse_only_run_plan_removes_reader_calls_after_typed_authority_verification(
+    tmp_path: Path, capsys, monkeypatch,
+) -> None:
+    spec = _spec(tmp_path)
+    for pdf in Path(spec.source.pdf_folder).glob("*.pdf"):
+        pdf.unlink()
+    reuse_manifest = tmp_path / "typed-reuse-manifest.json"
+    reuse_manifest.write_text("{}", encoding="utf-8")
+    spec = replace(
+        spec,
+        action="run_all",
+        reuse_summary_files=(str(reuse_manifest),),
+        metadata={
+            **dict(spec.metadata or {}),
+            "requested_stages": ["analyze", "outline", "review", "validate"],
+        },
+    )
+    config = Path(spec.config)
+    parser = configparser.ConfigParser()
+    parser.read(Path(__file__).resolve().parents[1] / "config.ini.example", encoding="utf-8")
+    parser["Paths"]["output_path"] = str(tmp_path / "output")
+    for section in (
+        "Primary_Reader_API",
+        "Backup_Reader_API",
+        "Writer_API",
+        "Outline_API",
+        "Free_Mode_API",
+        "Validator_API",
+    ):
+        parser[section]["api_key"] = "local-fixture-only"
+        parser[section]["api_base"] = "http://127.0.0.1:1/v1"
+    with config.open("w", encoding="utf-8") as handle:
+        parser.write(handle)
+    row = {
+        "paper_info": {"canonical_paper_key": "paper-a"},
+        "ai_summary": {"summary": "verified fixture summary"},
+        "stage1_reuse": {
+            "authority_kind": "typed_manifest",
+            "binding": {"canonical_paper_key": "paper-a"},
+        },
+    }
+    monkeypatch.setattr(
+        control_plane_module.InternalStageExecutorRegistry,
+        "_summary_payloads_from_file",
+        lambda _path: [row],
+    )
+    monkeypatch.setattr(
+        control_plane_module,
+        "verify_stage1_typed_manifest_authority",
+        lambda _summary, _binding: (
+            SimpleNamespace(
+                manifest_file_hash="a" * 64,
+                manifest=SimpleNamespace(
+                    canonical_paper_key="paper-a",
+                    source_summary_artifact_hash="b" * 64,
+                ),
+            ),
+            "verified",
+        ),
+    )
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(json.dumps(spec.to_dict()), encoding="utf-8")
+
+    assert reviewctl_main(["plan", "--spec", str(spec_path)]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    projection = plan["full_stage_request_plan"]
+
+    assert projection["stage1_reuse_authority_status"] == "verified_typed_manifest_summary_only_input"
+    assert projection["stage1_reuse_authority"]["typed_manifest_authority_count"] == 1
+    assert projection["stage1_reuse_authority"]["paper_work_item_count"] == 0
+    assert projection["stage1_reuse_authority"]["current_binding_comparison"] == (
+        "not_run_no_stage1_paper_work_items"
+    )
+    assert projection["boundary"]["no_provider_posts"] is True
+    assert not any(
+        item["stage_name"] == "analyze"
+        for item in projection["unknown_exposures"]
+    )
+    assert projection["budget_status"]["admission"] == "incomplete_unknown_exposure"
+
+
+def test_chunk_plan_loads_summary_source_manifest_and_marks_navigation_scope(
+    tmp_path: Path,
+) -> None:
+    summary_path = tmp_path / "summaries.json"
+    summary_path.write_text(
+        json.dumps(
+            [
+                _summary("paper-a", "A", "A finding."),
+                _summary("paper-b", "B", "B finding."),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    manifest_path = tmp_path / "summary-source-manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "artifact_type": "summary_source_manifest",
+                "artifact_version": "v2",
+                "created_at": "2026-09-26T00:00:00Z",
+                "project_name": "chunk-plan-test",
+                "source_kind": "runtime_summary_source",
+                "source_path": str(summary_path),
+                "source_items": [],
+                "rejected_candidates": [],
+                "materialized_summary_file": summary_path.name,
+                "summary_count": 2,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = ReviewControlPlane(repo_root=tmp_path).chunk_plan([manifest_path])
+
+    assert result["source_summary_count"] == 2
+    assert result["provider_posts_emitted"] == 0
+    assert result["provider_call_budget_status"] == "NOT_PLANNED_END_TO_END"
+    assert result["provider_request_plan_status"] == "not_planned_config_missing"
+    assert result["semantic_chunk_plan"]["budgets"]["within_physical_call_limit"] is None
+    assert result["r1_request_workload_audit"]["source_scope"] == (
+        "provider_free_materialized_summary_projection"
+    )
+    assert result["r1_request_workload_audit"]["typed_manifest_authority_count"] == 0
+    workload = result["r1_request_workload_audit"]
+    assert workload["study_unit_count"] == 2
+    assert workload["study_unit_count_kind"] == "explicit_study_units_plus_paper_level_fallbacks"
+    assert workload["paper_level_fallback_unit_count"] == 2
+    assert workload["explicit_study_unit_count"] == 0
+    assert workload["study_level_source_claim_count"] == 0
+    assert workload["paper_level_source_claim_count"] == workload["source_claim_count_unique_by_paper"]
+    assert workload["source_field_ledger_total"] == sum(
+        workload["source_field_ledger_scope_counts"].values()
+    )
+    assert workload["source_field_ledger_total"] == sum(
+        workload["source_field_ledger_top_level_path_counts"].values()
+    )
+    assert workload["source_field_ledger_total"] == sum(
+        workload[key]
+        for key in (
+            "source_field_ledger_audit_metadata_count",
+            "source_field_ledger_bibliographic_count",
+            "source_field_ledger_summary_content_count",
+            "source_field_ledger_other_origin_count",
+        )
+    )
+    assert workload["unresolved_source_field_count"] == workload[
+        "source_field_ledger_scope_counts"
+    ].get("unresolved", 0)
+
+
+def test_chunk_plan_distinguishes_an_explicit_study_from_paper_fallback(
+    tmp_path: Path,
+) -> None:
+    explicit = _summary("paper-b", "B", "A within-study finding.")
+    explicit["specialized_details"]["empirical"]["study_results"] = [{
+        "study_id": "study:1",
+        "findings": "A within-study finding.",
+        "method": "A controlled comparison.",
+    }]
+    summary_path = tmp_path / "summaries.json"
+    summary_path.write_text(
+        json.dumps([
+            _summary("paper-a", "A", "A paper-level finding."),
+            explicit,
+        ]),
+        encoding="utf-8",
+    )
+
+    result = ReviewControlPlane(repo_root=tmp_path).chunk_plan([summary_path])
+
+    workload = result["r1_request_workload_audit"]
+    assert workload["study_unit_count"] == 2
+    assert workload["paper_level_fallback_unit_count"] == 1
+    assert workload["explicit_study_unit_count"] == 1
+
+
+def test_chunk_plan_builds_route_bound_semantic_request_plan_without_posts(
+    tmp_path: Path,
+) -> None:
+    summary_path = tmp_path / "summaries.json"
+    summary_path.write_text(
+        json.dumps(
+            [
+                _summary("paper-a", "A", "A finding."),
+                _summary("paper-b", "B", "B finding."),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "config.ini"
+    config_path.write_text(
+        "[Outline_API]\n"
+        "provider_family = anthropic\n"
+        "model = claude-opus-5\n"
+        "endpoint_type = anthropic\n"
+        "api_base = https://api.example.test\n"
+        "max_context_tokens = 32000\n"
+        "max_output_tokens = 4096\n\n"
+        "[OutlineModels]\n"
+            "outline_model = Outline_API\n"
+            "relation_adjudicator_model = Outline_API\n"
+            "structure_critic_model = Outline_API\n"
+            "coverage_critic_model = Outline_API\n"
+            "evidence_critic_model = Outline_API\n"
+            "arbitrator_model = Outline_API\n\n"
+        "[Outline]\n"
+        "candidate_count = 2\n\n"
+        "[OutlineStability]\n"
+        "mode = off\n"
+        "max_provider_calls = 24\n"
+        "max_source_prompt_tokens = 32000\n",
+        encoding="utf-8",
+    )
+
+    result = ReviewControlPlane(repo_root=tmp_path).chunk_plan(
+        [summary_path],
+        config_path=config_path,
+    )
+
+    assert result["provider_posts_emitted"] == 0
+    assert result["semantic_preflight_status"] == "rejected"
+    baseline_preflight = result["semantic_route_preflight_summary"]
+    assert baseline_preflight["rejection_reason"] == "max_provider_physical_attempts_exceeded"
+    assert baseline_preflight["max_provider_calls"] == 24
+    assert baseline_preflight["estimated_provider_physical_attempts_upper_bound"] == 51
+    assert result["provider_request_plan_status"] == "planned_semantic_request_graph"
+    assert result["semantic_request_plan"]
+    assert all(
+        "request_hash" in item
+        for item in result["semantic_request_plan"]
+        if "batch_id" in item
+    )
+    assert all(
+        item["physical_attempt_upper_bound"] == 3
+        for item in result["semantic_request_plan"]
+    )
+    assert result["semantic_request_physical_attempts_upper_bound"] is not None
+    assert result["end_to_end_provider_budget_status"] == "NOT_PLANNED"
+    assert result["topic_request_plan_identity_hash"]
+    assert result["r1_request_workload_audit"]["topic_request_plan_identity_hash"] == result[
+        "topic_request_plan_identity_hash"
+    ]
+    coverage = result["r1_request_workload_audit"]["topic_wire_coverage"]
+    assert coverage["status"] == "complete"
+    assert coverage["all_planned_unit_sets_equal_materialized_unit_sets"] is True
+    assert coverage["missing_source_claim_identity_count"] == 0
+    assert coverage["missing_source_evidence_identity_count"] == 0
+    assert coverage["extra_topic_wire_claim_identity_count"] == 0
+    assert coverage["extra_topic_wire_evidence_identity_count"] == 0
+    text_metrics = result["r1_request_workload_audit"]["topic_wire_text"]
+    assert text_metrics["request_count"] > 0
+    assert text_metrics["source_text_occurrence_count"] >= text_metrics[
+        "unique_source_text_identity_count_across_requests"
+    ]
+    assert text_metrics["repeated_occurrence_count_total"] == (
+        text_metrics["source_text_occurrence_count"]
+        - text_metrics["unique_source_text_identity_count_across_requests"]
+    )
+    assert "topic_merge_policy" in result["r1_request_workload_audit"]
+    assert "source_text_identity_records" not in json.dumps(result)
+
+    baseline_topic = next(
+        row for row in result["semantic_request_plan"]
+        if str(row.get("node_id") or "").startswith("topic_synthesis_provider:batch:")
+    )
+    updated_config = config_path.read_text(encoding="utf-8").replace(
+        "max_output_tokens = 4096", "max_output_tokens = 16384"
+    ).replace(
+        "candidate_count = 2", "candidate_count = 2\nsemantic_output_max_tokens = 8192"
+    )
+    config_path.write_text(updated_config, encoding="utf-8")
+    input_constrained = ReviewControlPlane(repo_root=tmp_path).chunk_plan(
+        [summary_path], config_path=config_path
+    )
+    assert input_constrained["semantic_preflight_status"] == "rejected"
+    assert input_constrained["semantic_route_preflight_summary"]["rejection_reason"] == (
+        "complete_evidence_unit_exceeds_effective_input_cap"
+    )
+    assert input_constrained["semantic_request_plan"] == []
+    assert input_constrained["provider_posts_emitted"] == 0
+
+    config_path.write_text(
+        updated_config.replace("max_context_tokens = 32000", "max_context_tokens = 64000").replace(
+            "max_provider_calls = 24", "max_provider_calls = 64"
+        ),
+        encoding="utf-8",
+    )
+    # The provider-free output comparison needs room for its 51 physical
+    # attempts; the 24-call baseline remains a separate rejected control.
+    increased = ReviewControlPlane(repo_root=tmp_path).chunk_plan(
+        [summary_path], config_path=config_path, physical_call_limit=64
+    )
+    assert increased["semantic_preflight_status"] == "accepted"
+    increased_topic = next(
+        row for row in increased["semantic_request_plan"]
+        if row["node_id"] == baseline_topic["node_id"]
+    )
+    assert baseline_topic["estimated_output_tokens"] == 4_096
+    assert increased_topic["estimated_output_tokens"] == 8_192
+    assert increased_topic["request_hash"] != baseline_topic["request_hash"]
+    assert increased["provider_posts_emitted"] == 0
+
+
+def test_config_migrate_cli_preserves_route_conflict_and_redacts_values(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    config_path = tmp_path / "legacy-route.ini"
+    original = (
+        "[Backup_Reader_API]\nmodel = backup-model\napi_key = backup-secret-placeholder\n"
+        "[Outline_GPT_API]\nmodel = old-model\napi_key = old-secret-placeholder\n"
+        "[OutlineModels]\nstructure_critic_model = Outline_GPT_API\n"
+    )
+    config_path.write_text(original, encoding="utf-8")
+
+    assert reviewctl_main([
+        "config-migrate",
+        "--config",
+        str(config_path),
+        "--dry-run",
+    ]) == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "error"
+    assert "model" in payload["error"]
+    assert "api_key" in payload["error"]
+    assert "backup-secret-placeholder" not in json.dumps(payload)
+    assert "old-secret-placeholder" not in json.dumps(payload)
+    assert config_path.read_text(encoding="utf-8") == original
+    assert list(tmp_path.glob("*.backup_before_*")) == []
 
 
 def test_reviewctl_run_domain_failure_is_machine_json(tmp_path: Path, capsys) -> None:

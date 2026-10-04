@@ -297,7 +297,18 @@ class ProviderReceiptClosure:
             if not candidates:
                 missing.append(call_id)
                 continue
-            current = max(candidates, key=lambda item: (item.attempts, item.sequence, item.finished_at))
+            # A resumed execution can append a fresh receipt with a lower
+            # per-transport attempt count than an older failed receipt. The
+            # newest finished receipt is the current outcome; internal retry
+            # count must not make an older failure win over a later success.
+            current = max(
+                candidates,
+                key=lambda item: (
+                    str(item.finished_at or ""),
+                    int(item.sequence),
+                    int(item.attempts),
+                ),
+            )
             variant_matches = [
                 variant
                 for variant in contract.request_variants

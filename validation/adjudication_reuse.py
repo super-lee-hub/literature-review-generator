@@ -12,13 +12,14 @@ import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from ai_interface import canonical_provider_request_payload
 from runtime.provider_runtime import (
     ProviderCallReceiptV1,
     _redact_mapping,
     hash_json,
     hash_text,
 )
-from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry, file_sha256
+from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry
 from validation.adjudication_checkpoint import ADJUDICATION_PROMPT_VERSION
 from validation.llm_adjudicator import (
     AdjudicationPacket,
@@ -95,14 +96,14 @@ def _request_payload(packet: AdjudicationPacket, api_config: Mapping[str, Any]) 
     else:
         max_tokens = base_max_tokens
         temperature = base_temperature
-    return {
-        "system": system_prompt,
-        "user": prompt,
-        "user_content": None,
-        "response_format": "json",
-        "max_output_tokens": int(max_tokens),
-        "temperature": temperature,
-    }
+    return canonical_provider_request_payload(
+        prompt=prompt,
+        system_prompt=system_prompt,
+        user_content=None,
+        response_format="json",
+        max_output_tokens=int(max_tokens),
+        temperature=temperature,
+    )
 
 
 def build_reuse_key(

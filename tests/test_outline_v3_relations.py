@@ -1,5 +1,7 @@
 """Tests for sparse v3 relation candidates and shared candidate plans."""
 
+import pytest
+
 from outline.v3_evidence import (
     build_coverage_contract,
     build_global_corpus_ledger,
@@ -11,9 +13,55 @@ from outline.v3_relations import (
     RELATION_TYPES,
     build_global_relation_map,
     build_outline_candidate_plans,
+    build_organizing_axes,
 )
 
 from tests.test_outline_v3_evidence import _summary
+
+
+@pytest.mark.parametrize("candidate_count", [0, -1, 13])
+def test_organizing_axes_reject_counts_outside_the_public_range(candidate_count):
+    with pytest.raises(ValueError, match="between 1 and 12"):
+        build_organizing_axes(candidate_count=candidate_count)
+
+
+def test_composed_axes_keep_the_preferred_primary_dimension_order():
+    intent = build_review_intent({"preferred_organizing_logic": "context_boundaries"})
+    axes = build_organizing_axes(intent, candidate_count=6)
+    primary = axes[0]
+    assert primary.axis_id == "context_boundaries"
+    assert axes[5].axis_id.startswith("context_boundaries_then_")
+    assert axes[5].preferred_dimensions[:len(primary.preferred_dimensions)] == primary.preferred_dimensions
+
+
+@pytest.mark.parametrize("candidate_count", [1, 3, 5, 6, 8, 12])
+def test_candidate_plan_cardinality_matches_the_requested_transport_graph(candidate_count):
+    evidence = build_outline_evidence_views([_relation_summary(
+        "10.1000/a", "A", "controlled context", "experiment", "The result supports a bounded effect.",
+    )])
+    ledger = build_global_corpus_ledger(evidence)
+    matrix = build_multi_view_matrix(evidence)
+    relation_map = build_global_relation_map(evidence, matrix, ledger)
+    intent = build_review_intent({})
+    coverage = build_coverage_contract(ledger, intent)
+    plans = build_outline_candidate_plans(
+        ledger, matrix, relation_map, intent, coverage, candidate_count=candidate_count,
+    )
+    assert len(plans.candidates) == candidate_count
+    assert [item.candidate_id for item in plans.candidates] == [
+        f"candidate_{index}" for index in range(1, candidate_count + 1)
+    ]
+    assert len({item.organizing_logic for item in plans.candidates}) == candidate_count
+    axes_by_id = {item.axis_id: item for item in plans.axes}
+    assert all(item.axis_id in axes_by_id for item in plans.candidates)
+    original_axes = build_organizing_axes(intent)
+    assert plans.axes[:min(5, candidate_count)] == original_axes[:min(5, candidate_count)]
+    for item in plans.axes[5:]:
+        primary, secondary = item.axis_id.split("_then_", 1)
+        assert primary != secondary
+        assert primary in {axis.axis_id for axis in original_axes}
+        assert secondary in {axis.axis_id for axis in original_axes}
+        assert item.rationale and "primary" in item.rationale
 
 
 def _relation_summary(doi: str, title: str, context: str, method: str, finding: str, *, paper_type: str = "empirical"):

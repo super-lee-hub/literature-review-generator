@@ -7,6 +7,8 @@ from pathlib import Path
 from threading import Thread
 from typing import Any, Mapping
 
+import pytest
+
 from outline.provider_router import OutlineProviderRouter, OutlineRoleRoute, collect_routing_diagnostics
 from outline.v3_executor import OutlineV3Executor
 from runtime.orchestrator import _OutlineProviderTransportAdapter
@@ -46,6 +48,7 @@ class _FormalLoopbackProvider:
                 except json.JSONDecodeError:
                     node_id, request = "", {}
                 request = request if isinstance(request, Mapping) else {}
+                owner.requests[-1].update({"node_id": node_id, "request": dict(request)})
                 response = dict(_configured_test_provider(node_id, request))
                 if node_id == "relation_adjudication":
                     relation_ids = [
@@ -95,7 +98,20 @@ class _FormalLoopbackProvider:
         self.thread.join(timeout=5)
 
 
-def test_formal_outline_adapter_uses_loopback_socket_and_real_audit(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("paper_count", "source_cap", "target_tokens", "call_cap", "transport_retries"),
+    [
+        (3, None, 1500, 24, 0), (3, None, 1500, 24, 2),
+        (6, None, 1500, 24, 2),
+        (3, 1000, 1500, 24, 2), (3, 1000, 0, 24, 2),
+        (3, None, 1500, 14, 2),
+    ],
+    ids=["admitted", "physical_retry_budget", "over_call_budget", "over_shard_input_cap", "over_flat_input_cap", "candidate_shard_call_cap"],
+)
+def test_formal_outline_adapter_uses_loopback_socket_and_real_audit(
+    tmp_path: Path, paper_count: int, source_cap: int | None,
+    target_tokens: int, call_cap: int, transport_retries: int,
+) -> None:
     with _FormalLoopbackProvider() as provider:
         profile = ProviderContextProfile.conservative(
             provider="loopback",
@@ -112,7 +128,7 @@ def test_formal_outline_adapter_uses_loopback_socket_and_real_audit(tmp_path: Pa
                 "provider_family": "loopback",
                 "endpoint_type": "chat_completions",
                 "proxy_mode": "direct",
-                "transport_retries": "2",
+                "transport_retries": str(transport_retries),
                 "total_timeout_seconds": "10",
             },
             profile=profile,
@@ -128,7 +144,7 @@ def test_formal_outline_adapter_uses_loopback_socket_and_real_audit(tmp_path: Pa
             profile=profile,
             transport=adapter,
             api_base=provider.base_url,
-            config_identity={"api_base": provider.base_url, "transport_retries": "2"},
+            config_identity={"api_base": provider.base_url, "transport_retries": str(transport_retries)},
         )
         routes = {role: route for role in (
             "relation_adjudication",
@@ -150,15 +166,16 @@ def test_formal_outline_adapter_uses_loopback_socket_and_real_audit(tmp_path: Pa
                     _summary("paper-d", "Study D", "The treatment improved the outcome."),
                     _summary("paper-e", "Study E", "The effect held under a different context."),
                     _summary("paper-f", "Study F", "A boundary condition limits the effect."),
-            ],
+                ][:paper_count],
             workspace=workspace,
             artifact_registry=registry,
             provider=lambda *_args: (_ for _ in ()).throw(AssertionError("legacy provider used")),
             provider_router=router,
             candidate_count=1,
             stability_mode="off",
-            technical_shard_target_tokens=1500,
-            max_provider_calls=80,
+            technical_shard_target_tokens=target_tokens,
+            max_provider_calls=call_cap,
+            max_source_prompt_tokens=source_cap,
             pricing_source="tests:explicit-rates-v1",
             input_cost_per_1k_tokens=0.0,
             output_cost_per_1k_tokens=0.001,
@@ -167,6 +184,45 @@ def test_formal_outline_adapter_uses_loopback_socket_and_real_audit(tmp_path: Pa
             cache_write_cost_per_1k_tokens=0.0,
         )
         result = executor.run()
+
+    if transport_retries and paper_count == 3 and source_cap is None and call_cap == 24:
+        assert result.status == "blocked"
+        assert provider.requests == []
+        preflight_path = next(tmp_path.rglob("stability_preflight_*.json"))
+        preflight = json.loads(preflight_path.read_text(encoding="utf-8"))
+        assert preflight["estimated_provider_calls"] <= 24
+        assert preflight["estimated_provider_physical_attempts_upper_bound"] > 24
+        assert preflight["rejection_reason"] == "max_provider_physical_attempts_exceeded"
+        return
+    if paper_count == 6:
+        assert result.status == "blocked"
+        assert provider.requests == []
+        preflight_path = next(tmp_path.rglob("stability_preflight_*.json"))
+        preflight = json.loads(preflight_path.read_text(encoding="utf-8"))
+        assert preflight["rejection_reason"] == "max_provider_calls_exceeded"
+        assert preflight["estimated_provider_calls"] > preflight["max_provider_calls"] == 24
+        assert preflight["hierarchical_relation_shard_calls"] > 0
+        return
+    if call_cap == 14:
+        assert result.status == "blocked"
+        assert provider.requests == []
+        preflight_path = next(tmp_path.rglob("stability_preflight_*.json"))
+        preflight = json.loads(preflight_path.read_text(encoding="utf-8"))
+        assert preflight["rejection_reason"] == "max_provider_calls_exceeded"
+        assert preflight["hierarchical_candidate_shard_calls"] > 0
+        assert len([row for row in preflight["provider_call_plans"] if row["transport_expected"]]) <= call_cap
+        assert preflight["hierarchical_relation_shard_calls"] > 0
+        assert preflight["hierarchical_candidate_shard_calls"] > 0
+        assert call_cap < preflight["estimated_provider_calls"]
+        return
+    if source_cap is not None:
+        assert result.status == "blocked"
+        assert provider.requests == []
+        preflight_path = next(tmp_path.rglob("stability_preflight_*.json"))
+        preflight = json.loads(preflight_path.read_text(encoding="utf-8"))
+        assert preflight["rejection_reason"] == "complete_relation_request_exceeds_effective_input_cap"
+        assert preflight["transport_posts_emitted"] == 0
+        return
 
     assert result.ok is True, result
     assert len(provider.requests) >= 8
@@ -177,8 +233,73 @@ def test_formal_outline_adapter_uses_loopback_socket_and_real_audit(tmp_path: Pa
     assert audit_rows
     assert all(row["mock_live"] == "live" for row in audit_rows)
     assert all(row["provider_invoked"] for row in audit_rows)
-    assert any(row["role"] == "relation_adjudication" and row["shard_ids"] for row in audit_rows)
+    assert any(
+        row["role"] == "relation_adjudication"
+        and row["node_id"].startswith("relation_adjudication:batch_")
+        and row["relation_candidate_ids"]
+        for row in audit_rows
+    )
     assert all(row["receipt_ids"] for row in audit_rows)
+    cross_requests = [
+        item["request"] for item in provider.requests
+        if item["node_id"].startswith("relation_adjudication:batch_")
+    ]
+    assert cross_requests
+    assert all(request["relation_evidence_bundles"] for request in cross_requests)
+    assert all(
+        "digest_type" not in view
+        for request in cross_requests for view in request["evidence_views"]
+    )
+    assert any(
+        "The treatment improved the outcome." in json.dumps(request, ensure_ascii=False)
+        for request in cross_requests
+    )
+    preflight_path = next(tmp_path.rglob("stability_preflight_*.json"))
+    preflight = json.loads(preflight_path.read_text(encoding="utf-8"))
+    assert len(provider.requests) <= preflight["estimated_provider_calls"]
+    candidate_posts = sum(
+        "candidate_1_provider_generation" in item["node_id"]
+        for item in provider.requests
+    )
+    assert candidate_posts == 1 + preflight["hierarchical_candidate_shard_calls"]
+    base_attempts = sum(
+        int(row["physical_attempt_upper_bound"])
+        for row in preflight["provider_call_plans"] if row["transport_expected"]
+    )
+    relation_plan = next(
+        row for row in preflight["provider_call_plans"]
+        if row["node_id"] == "relation_adjudication"
+    )
+    extra_attempts = (
+        preflight["hierarchical_relation_shard_calls"]
+        * relation_plan["physical_attempt_upper_bound"]
+    )
+    candidate_plan = next(
+        row for row in preflight["provider_call_plans"]
+        if row["node_id"] == "candidate_1_provider_generation"
+    )
+    candidate_extra_attempts = (
+        preflight["hierarchical_candidate_shard_calls"]
+        * candidate_plan["physical_attempt_upper_bound"]
+    )
+    critique_plan = next(
+        row for row in preflight["provider_call_plans"]
+        if row["node_id"] == "structure_critique"
+    )
+    critique_extra_attempts = (
+        preflight["hierarchical_critique_shard_calls"]
+        * critique_plan["physical_attempt_upper_bound"]
+    )
+    assert preflight["hierarchical_relation_physical_attempts_upper_bound"] == extra_attempts
+    assert preflight["hierarchical_candidate_physical_attempts_upper_bound"] == candidate_extra_attempts
+    assert preflight["estimated_provider_physical_attempts_upper_bound"] == (
+        base_attempts + extra_attempts + candidate_extra_attempts + critique_extra_attempts
+    )
+    assert preflight["estimated_input_tokens"] >= (
+        extra_attempts + candidate_extra_attempts + critique_extra_attempts
+    ) * 32_000
+    assert preflight["monetary_ceiling_enforced"] is False
+    assert preflight["cost_status"] == "unknown"
     graph = json.loads(Path(result.artifacts["hierarchical_call_graph"]).read_text(encoding="utf-8"))
     assert len(graph["provider_calls"]) == len(audit_rows)
     assert any(edge["kind"] == "provider_input" for edge in graph["edges"])

@@ -25,12 +25,13 @@ from runtime.reconcile import (
     RuntimeReconciler,
     validate_review_batch_manifest_for_bootstrap,
 )
-from runtime.stage_contracts import SourceBundle, StageResult
+from runtime.stage_contracts import SourceBundle, StageArtifactRef, StageResult
 from runtime.stage_terminal import StageTerminalStore, TerminalStageRecordV1
 from services.artifact_registry import (
     ArtifactDependencyRefV2,
     ArtifactRecord,
     ArtifactRegistry,
+    CurrentArtifactSetV1,
     RegistryError,
     file_sha256,
 )
@@ -84,6 +85,8 @@ class RuntimeExecutionResult:
 def _evaluate_runtime_completion(
     outcome: JobOutcomeV1,
     registry: ArtifactRegistry,
+    *,
+    external_registry_resolver: Callable[[str], ArtifactRegistry | None] | None = None,
 ) -> CompletionEvaluationV1:
     """Read and verify the durable evidence used by status projections."""
 
@@ -112,7 +115,7 @@ def _evaluate_runtime_completion(
             validation_record = validation_record or record.artifact_type == "validation_run_result"
         from validation.closure import resolve_current_stage_closure_map
 
-        current_stage_closure_map = resolve_current_stage_closure_map(registry).to_dict()
+        current_stage_closure_map = resolve_current_stage_closure_map(registry, external_registry_resolver=external_registry_resolver).to_dict()
         provider_entries = current_stage_closure_map.get("provider_closures_by_stage")
         if required_provider_stages:
             if not isinstance(provider_entries, Mapping):
@@ -478,7 +481,7 @@ class AgentRuntimeRunner:
         from runtime.test_dependencies import current_runtime_test_dependencies
         from runtime.trust_admission import (
             ExternalHostAdmissionError,
-            build_external_host_policy,
+            build_runtime_external_host_policy,
             validate_external_host_acknowledgement,
         )
 
@@ -515,7 +518,7 @@ class AgentRuntimeRunner:
             # external-host acknowledgement.  Ordinary environment variables
             # are never an authority boundary for production run/resume.
             if test_dependencies is None:
-                policy = build_external_host_policy(
+                policy = build_runtime_external_host_policy(
                     resolved_config,
                     build_reachable_provider_route_plan(
                         resolved_config,
@@ -524,6 +527,8 @@ class AgentRuntimeRunner:
                         free_mode_enabled=free_mode_enabled,
                         stage_plan=plan,
                     ),
+                    requested_stages=requested_stages,
+                    outline_pilot=metadata.get("outline_pilot"),
                 )
                 validate_external_host_acknowledgement(
                     policy,
@@ -986,14 +991,276 @@ class AgentRuntimeRunner:
             prepared_promotion_record=promotion_record,
         )
 
+    @staticmethod
+    def _recover_promoted_repair_validation(
+        session: AgentRuntimeSession,
+    ) -> StageResult | None:
+        """Rehydrate an approved repair's completed validation without a new call."""
+
+        from validation.run_result import (
+            ValidationExecutionStatus,
+            ValidationRunDisposition,
+            ValidationRunResultV1,
+        )
+
+        registry = session.context.registry
+        current_set = registry.resolve_current_artifact_set()
+        if current_set is None:
+            return None
+        # A validation run may have committed a new set over a promoted
+        # repair just before the process crashed. Traverse immutable parent
+        # sets so that recovery still recognizes the repaired lineage.
+        lineage = current_set
+        repaired_lineage = False
+        seen_set_ids: set[str] = set()
+        for _depth in range(32):
+            if lineage.set_id in seen_set_ids:
+                raise RuntimeRunnerError("current artifact set lineage is cyclic")
+            seen_set_ids.add(lineage.set_id)
+            if lineage.promotion_transaction_id.startswith("repair-promotion:"):
+                repaired_lineage = True
+                break
+            if not lineage.promotion_transaction_id.startswith("runtime-validation:"):
+                break
+            if not lineage.previous_set_id:
+                break
+            parent_record = registry.get(lineage.previous_set_id)
+            if parent_record is None or parent_record.status != "ready":
+                raise RuntimeRunnerError("repaired validation parent set is missing")
+            registry.verify_ready_artifact_closure(parent_record)
+            parent = CurrentArtifactSetV1.from_dict(
+                json.loads(Path(parent_record.path).read_text(encoding="utf-8"))
+            )
+            if (
+                parent.job_id != current_set.job_id
+                or parent.set_id != lineage.previous_set_id
+                or parent.content_addressed_id() != parent.set_id
+                or any(
+                    getattr(parent, name) != getattr(current_set, name)
+                    for name in (
+                        "review_draft_artifact_id",
+                        "review_draft_artifact_hash",
+                        "citation_manifest_artifact_id",
+                        "citation_manifest_artifact_hash",
+                        "review_docx_artifact_id",
+                        "review_docx_artifact_hash",
+                    )
+                )
+            ):
+                raise RuntimeRunnerError(
+                    "runtime validation changed the repaired current input lineage"
+                )
+            lineage = parent
+        else:
+            raise RuntimeRunnerError(
+                "repaired current artifact set lineage exceeds the recovery bound"
+            )
+        if not repaired_lineage:
+            return None
+        if current_set.validation_status != "clean":
+            raise RuntimeRunnerError(
+                "promoted repair has no clean current validation result"
+            )
+        required = {
+            "review_draft": (
+                current_set.review_draft_artifact_id,
+                current_set.review_draft_artifact_hash,
+            ),
+            "citation_manifest": (
+                current_set.citation_manifest_artifact_id,
+                current_set.citation_manifest_artifact_hash,
+            ),
+            "review_docx": (
+                current_set.review_docx_artifact_id,
+                current_set.review_docx_artifact_hash,
+            ),
+            "validation": (
+                current_set.validation_run_result_artifact_id,
+                current_set.validation_run_result_artifact_hash,
+            ),
+            "receipt_closure": (
+                current_set.validation_receipt_closure_artifact_id,
+                current_set.validation_receipt_closure_artifact_hash,
+            ),
+            "current_set": (current_set.set_id, ""),
+            "promotion": (current_set.promotion_transaction_id, ""),
+        }
+        records: dict[str, ArtifactRecord] = {}
+        for role, (artifact_id, expected_hash) in required.items():
+            record = registry.get(artifact_id)
+            if (
+                record is None
+                or record.status != "ready"
+                or (expected_hash and record.content_hash != expected_hash)
+            ):
+                raise RuntimeRunnerError(
+                    f"promoted repair {role} is missing or changed"
+                )
+            registry.verify_ready_artifact_closure(record)
+            records[role] = record
+        closure_record = records["receipt_closure"]
+        if closure_record.metadata.get("complete") is not True:
+            raise RuntimeRunnerError(
+                "promoted repair validation receipt closure is incomplete"
+            )
+        validation = ValidationRunResultV1.from_dict(
+            json.loads(Path(records["validation"].path).read_text(encoding="utf-8"))
+        )
+        if (
+            validation.job_id != session.context.workspace.job_id
+            or validation.execution_status is not ValidationExecutionStatus.SUCCEEDED
+            or validation.validation_disposition is not ValidationRunDisposition.CLEAN
+            or not validation.contract_satisfied
+            or validation.input_artifacts.review_draft_id
+            != records["review_draft"].artifact_id
+            or validation.input_artifacts.review_draft_hash
+            != records["review_draft"].content_hash
+            or validation.input_artifacts.citation_manifest_id
+            != records["citation_manifest"].artifact_id
+            or validation.input_artifacts.citation_manifest_hash
+            != records["citation_manifest"].content_hash
+        ):
+            raise RuntimeRunnerError(
+                "promoted repair validation is not bound to the current draft and manifest"
+            )
+        closure_payload = json.loads(
+            Path(closure_record.path).read_text(encoding="utf-8")
+        )
+        receipt_counts = closure_payload.get("payload")
+        if not isinstance(receipt_counts, Mapping) or receipt_counts.get("complete") is not True:
+            raise RuntimeRunnerError(
+                "promoted repair receipt closure payload is incomplete"
+            )
+        record_id = "stage-terminal-repair-" + hash_json(
+            {
+                "current_set_id": current_set.set_id,
+                "validation_hash": records["validation"].content_hash,
+            }
+        )[:24]
+        terminal_store = StageTerminalStore(
+            session.context.workspace,
+            registry,
+            publication_context=session.context.publication_context,
+        )
+        observed = {
+            str(item) for item in receipt_counts.get("observed_call_ids") or ()
+            if str(item)
+        }
+        reused = {
+            str(item) for item in receipt_counts.get("verified_reuse_call_ids") or ()
+            if str(item)
+        }
+        model_call_count = len(observed - reused)
+        input_refs = tuple(
+            ArtifactDependencyRefV2.from_record(records[role])
+            for role in ("review_draft", "citation_manifest", "review_docx")
+        )
+        output_refs = tuple(
+            ArtifactDependencyRefV2.from_record(records[role])
+            for role in ("validation", "receipt_closure", "current_set")
+        )
+        recovery_producer = "runtime.runner.AgentRuntimeRunner.recover_promoted_repair"
+        existing = registry.get(record_id)
+        if existing is None:
+            terminal = TerminalStageRecordV1.create(
+                job_id=session.context.workspace.job_id,
+                attempt_id=validation.attempt_id,
+                stage_name="validate",
+                status="succeeded",
+                producer=recovery_producer,
+                input_artifact_refs=input_refs,
+                output_artifact_refs=output_refs,
+                model_call_count=model_call_count,
+                terminal_reason="verified promoted repair revalidation reused without provider call",
+                reconstructed_by_reconcile=True,
+                record_id=record_id,
+            )
+            terminal_store.persist(terminal)
+        else:
+            registry.verify_ready_artifact_closure(existing)
+            terminal = TerminalStageRecordV1.from_dict(
+                json.loads(Path(existing.path).read_text(encoding="utf-8"))
+            )
+            if (
+                existing.artifact_id != record_id
+                or existing.artifact_type != "runtime_stage_terminal"
+                or existing.artifact_version != "v1"
+                or existing.artifact_role != "runtime_stage_terminal"
+                or existing.job_id != session.context.workspace.job_id
+                or existing.status != "ready"
+                or tuple(existing.depends_on) != output_refs
+                or Path(existing.path).resolve().parent
+                != terminal_store.path_for(terminal).resolve().parent
+                or not Path(existing.path).name.startswith(
+                    terminal_store.path_for(terminal).stem + "__"
+                )
+                or terminal.record_id != record_id
+                or terminal.job_id != session.context.workspace.job_id
+                or terminal.attempt_id != validation.attempt_id
+                or terminal.stage_name != "validate"
+                or terminal.status != "succeeded"
+                or terminal.producer != recovery_producer
+                or tuple(terminal.input_artifact_refs) != input_refs
+                or tuple(terminal.output_artifact_refs) != output_refs
+                or terminal.model_call_count != model_call_count
+                or not terminal.reconstructed_by_reconcile
+                or existing.metadata.get("stage_name") != "validate"
+                or existing.metadata.get("stage_status") != "succeeded"
+                or existing.metadata.get("attempt_id") != validation.attempt_id
+                or existing.metadata.get("model_call_count") != model_call_count
+                or existing.metadata.get("reconstructed_by_reconcile") is not True
+            ):
+                raise RuntimeRunnerError(
+                    "promoted repair recovery terminal has conflicting identity"
+                )
+        return StageResult(
+            stage_name="validate",
+            success=True,
+            artifacts=[
+                StageArtifactRef(
+                    artifact_role=record.artifact_role,
+                    artifact_type=record.artifact_type,
+                    artifact_version=record.artifact_version,
+                    path=record.path,
+                    artifact_id=record.artifact_id,
+                )
+                for role in ("validation", "receipt_closure", "current_set")
+                for record in (records[role],)
+            ],
+            metadata={
+                "validation_disposition": "clean",
+                "validation_run_id": validation.validation_run_id,
+                "execution_status": "succeeded",
+                "recovered_from_terminal": record_id,
+                "model_call_count_this_attempt": 0,
+            },
+        )
+
     def run(self) -> RuntimeExecutionResult:
-        return self._execute(resume=False)
+        from runtime.provider_runtime import current_runtime_control_context, runtime_control_lifecycle
+
+        if current_runtime_control_context() is not None:
+            return self._execute(resume=False)
+        with runtime_control_lifecycle():
+            return self._execute(resume=False)
 
     def resume(self) -> RuntimeExecutionResult:
-        return self._execute(resume=True)
+        from runtime.provider_runtime import current_runtime_control_context, runtime_control_lifecycle
+
+        if current_runtime_control_context() is not None:
+            return self._execute(resume=True)
+        with runtime_control_lifecycle():
+            return self._execute(resume=True)
 
     def _execute(self, *, resume: bool) -> RuntimeExecutionResult:
+        config_source_id = str(Path(self.job_spec.config).expanduser().resolve())
+        try:
+            config_source_sha256 = file_sha256(config_source_id)
+        except OSError as exc:
+            raise RuntimeRunnerError("configuration source cannot be read") from exc
         spec = self._normalized_spec(resume=resume)
+        if file_sha256(config_source_id) != config_source_sha256:
+            raise RuntimeRunnerError("configuration source changed during runtime normalization")
         batch_spec = self._review_batch_spec(spec)
         if spec.action == "derive_review_batch" and batch_spec is None:
             raise RuntimeRunnerError("derive_review_batch action requires a review batch spec")
@@ -1064,6 +1331,8 @@ class AgentRuntimeRunner:
                 workspace_preflight=workspace_preflight,
                 publish_running_state=False,
             )
+            if file_sha256(config_source_id) != config_source_sha256:
+                raise RuntimeRunnerError("configuration source changed during runtime bootstrap")
         except BaseException as exc:
             if execution_lease is not None:
                 execution_lease.release()
@@ -1079,25 +1348,60 @@ class AgentRuntimeRunner:
             except AttemptAlreadyRunningError as exc:
                 raise RuntimeRunnerError(f"run rejected: {exc}") from exc
         try:
-            from runtime.provider_runtime import provider_budget_controller_from_environment
+            from runtime.provider_runtime import (
+                RuntimeControlIdentityV1,
+                acceptance_execution_context_from_environment,
+                bind_runtime_control_context,
+                current_acceptance_execution_context,
+                provider_budget_controller_from_environment,
+            )
 
+            acceptance_context = (
+                current_acceptance_execution_context()
+                or acceptance_execution_context_from_environment()
+            )
             acceptance_budget = provider_budget_controller_from_environment()
             if acceptance_budget is not None:
                 acceptance_state_path = _acceptance_budget_state_path(
                     session.context.workspace
                 )
                 acceptance_budget.bind_state_path(
-                    acceptance_state_path
+                    acceptance_state_path,
+                    acceptance_run_id=(
+                        acceptance_context.acceptance_run_id if acceptance_context else ""
+                    ),
+                    state_started=bool(
+                        acceptance_context
+                        and acceptance_context.provider_budget_state_started
+                    ),
                 )
-            return self._execute_with_lease(
-                session=session,
-                spec=spec,
-                bridge=bridge,
-                batch_spec=batch_spec,
-                validated_batch_parent_registry_path=validated_batch_parent_registry_path,
-                resume=resume,
-                normalized_spec_payload=normalized_spec_payload,
+            control_identity = RuntimeControlIdentityV1(
+                job_id=session.context.workspace.job_id,
+                workspace_path=str(session.context.workspace.root_dir),
+                acceptance_run_id=(
+                    acceptance_context.acceptance_run_id if acceptance_context else ""
+                ),
+                provider_budget_started=bool(
+                    acceptance_context
+                    and acceptance_context.provider_budget_state_started
+                ),
             )
+            with bind_runtime_control_context(
+                control_identity,
+                workspace=session.context.workspace,
+                registry=session.context.registry,
+            ):
+                return self._execute_with_lease(
+                    session=session,
+                    spec=spec,
+                    bridge=bridge,
+                    batch_spec=batch_spec,
+                    validated_batch_parent_registry_path=validated_batch_parent_registry_path,
+                    resume=resume,
+                    normalized_spec_payload=normalized_spec_payload,
+                    config_source_id=config_source_id,
+                    config_source_sha256=config_source_sha256,
+                )
         finally:
             execution_lease.release()
 
@@ -1111,7 +1415,11 @@ class AgentRuntimeRunner:
         validated_batch_parent_registry_path: str | None,
         resume: bool,
         normalized_spec_payload: Mapping[str, Any],
+        config_source_id: str,
+        config_source_sha256: str,
     ) -> RuntimeExecutionResult:
+        if file_sha256(config_source_id) != config_source_sha256:
+            raise RuntimeRunnerError("configuration source changed before runtime publication")
         normalized_spec_path = session.context.workspace.artifact_path("runtime_job_spec_v1.json")
         attempt_store = AttemptStore(session.context.workspace, session.context.registry)
         started = attempt_store.start(
@@ -1161,6 +1469,13 @@ class AgentRuntimeRunner:
                     "stage_plan_hash": str(
                         (normalized_spec_payload.get("metadata") or {}).get("stage_plan_hash") or ""
                     ),
+                    "config_snapshot_binding": {
+                        "schema_version": "runtime-config-source/v1",
+                        "config_source_id": config_source_id,
+                        "config_source_sha256": config_source_sha256,
+                        "effective_config_sha256": str(session.context.fingerprint_bundle["config_hash"]),
+                        "normalized_spec_payload_sha256": hash_json(normalized_spec_payload),
+                    },
                 },
             )
         self._fault("after_artifact_write_before_registry", artifact_type="runtime_job_spec")
@@ -1280,6 +1595,14 @@ class AgentRuntimeRunner:
                 if stage in results:
                     continue
                 if resume:
+                    if stage == "validate":
+                        promoted_validation = self._recover_promoted_repair_validation(
+                            session
+                        )
+                        if promoted_validation is not None:
+                            results[stage] = promoted_validation
+                            completed.append(stage)
+                            continue
                     recovered_result = reconciler.load_completed_stage_result(stage)
                     if recovered_result is not None:
                         results[stage] = recovered_result
@@ -1299,12 +1622,48 @@ class AgentRuntimeRunner:
                 self._persist_terminal(
                     session,
                     attempt_id=running_attempt.attempt_id,
-                    stage_name=stage,
+                    stage_name=(
+                        "outline_topic_pilot"
+                        if stage == "outline" and result.metadata.get("pilot_checkpoint_complete")
+                        else stage
+                    ),
                     result=result,
                     started_at=started_at,
                     model_call_count=model_calls,
                     external_registry_resolver=external_registry_resolver,
                 )
+                if stage == "outline" and result.metadata.get("pilot_checkpoint_complete"):
+                    if (
+                        not isinstance(spec.metadata.get("outline_pilot"), Mapping)
+                        or not result.success
+                        or result.stage_name != "outline_topic_pilot"
+                        or result.metadata.get("outline_v3_status") != "topic_pilot_complete"
+                    ):
+                        raise RuntimeRunnerError("topic pilot stage result has an invalid terminal shape")
+                    checkpoint_id = str(result.metadata.get("pilot_checkpoint_artifact_id") or "")
+                    checkpoint = session.context.registry.get(checkpoint_id)
+                    if (
+                        checkpoint is None
+                        or checkpoint.status != "ready"
+                        or checkpoint.content_hash != result.metadata.get("pilot_checkpoint_hash")
+                        or checkpoint_id == "outline-v3:final_outline"
+                    ):
+                        raise RuntimeRunnerError("topic pilot checkpoint is not ready or has drifted")
+                    reason = (
+                        "selected topic pilot checkpoint complete; Outline remains incomplete "
+                        "and requires separate approval before continuation"
+                    )
+                    attempt_store.finish(running_attempt, "succeeded", reason=reason)
+                    return self._finalize_result(
+                        session,
+                        status="completed",
+                        disposition="needs_review",
+                        canonical_ready=False,
+                        completed=(*completed, "outline_topic_pilot"),
+                        failed_stage=None,
+                        requires_attention=True,
+                        message=reason,
+                    )
                 if not result.success:
                     validation_required = bool(
                         session.context.readiness_policy_snapshot.get("validation_required", False)
@@ -1466,7 +1825,12 @@ class AgentRuntimeRunner:
             raise RuntimeRunnerError(
                 f"canonical job outcome is invalid after finalization: {exc}"
             ) from exc
-        evaluation = _evaluate_runtime_completion(outcome, session.context.registry)
+        evaluation = _evaluate_runtime_completion(
+            outcome, session.context.registry,
+            external_registry_resolver=self._external_registry_resolver(
+                session.context.workspace, registry_paths=self._review_batch_registry_paths(session.context.registry),
+            ),
+        )
         stage1_projection = _stage1_status_projection(session.context.registry)
         return RuntimeExecutionResult(
             job_id=outcome.job_id,
@@ -1560,7 +1924,10 @@ class AgentRuntimeRunner:
         outcome_path = Path(outcome_record.path)
         if outcome.job_id != workspace.job_id:
             raise RuntimeRunnerError("job outcome belongs to another workspace")
-        evaluation = _evaluate_runtime_completion(outcome, _registry)
+        evaluation = _evaluate_runtime_completion(
+            outcome, _registry,
+            external_registry_resolver=cls._external_registry_resolver(workspace, registry_paths=cls._review_batch_registry_paths(_registry)),
+        )
         stage1_projection = _stage1_status_projection(_registry)
         return RuntimeExecutionResult(
             job_id=outcome.job_id,

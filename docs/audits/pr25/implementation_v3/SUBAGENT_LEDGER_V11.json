@@ -1,0 +1,57 @@
+{
+  "schema_version": "pr25-subagent-ledger-v11",
+  "coordination": {
+    "requested_main": "Sol Ultra",
+    "main_runtime_model_and_effort_verified": false,
+    "requested_leaf_model": "gpt-6-luna",
+    "requested_leaf_effort": "max",
+    "actual_leaf_model_variant_and_effort_verified": false,
+    "recursive_spawns": 0,
+    "max_parallel_children": 4
+  },
+  "agents": [
+    {
+      "name": "/root/budget_runtime_audit",
+      "role": "budget/runtime audit and implementation",
+      "requested_model_effort": "gpt-6-luna/max",
+      "actual_model_effort": "not exposed by runtime metadata",
+      "files_owned": [
+        "runtime/provider_runtime.py",
+        "runtime/release_acceptance.py",
+        "runtime/stage_planning.py",
+        "tests/test_pr25_final_hardening_regressions.py"
+      ],
+      "result": "strict V2 budget semantics and V1 compatibility; tests reported 38 passed before leader added one zero-limit regression"
+    },
+    {
+      "name": "/root/evidence_pipeline_audit",
+      "role": "Writer-to-draft lineage implementation",
+      "requested_model_effort": "gpt-6-luna/max",
+      "actual_model_effort": "not exposed by runtime metadata",
+      "files_owned": [
+        "services/review_draft.py",
+        "runtime/orchestrator.py",
+        "runtime/artifact_validators.py",
+        "tests/test_review_draft_v3_lineage.py"
+      ],
+      "result": "draft lineage implemented; focused tests 5 passed after leader added reconcile validation"
+    },
+    {
+      "name": "/root/semantic_planner_audit",
+      "role": "read-only cross-review of topic, numeric-zero, and source-field wire fixes",
+      "requested_model_effort": "gpt-6-luna/max",
+      "actual_model_effort": "GPT-6 family reported; exact variant and effort unavailable",
+      "files_owned": [],
+      "result": "cross-review confirmed topic membership, zero preservation, and source-field provenance behavior; 25 selected tests passed before final coverage expansion"
+    },
+    {
+      "name": "/root/cleanup_security_inventory",
+      "role": "read-only cleanup/security inventory and pytest-scratch preflight",
+      "requested_model_effort": "gpt-6-luna/max",
+      "actual_model_effort": "not exposed by runtime metadata",
+      "files_owned": [],
+      "result": "preflighted reversible quarantine candidate; no file content or secrets were read by the agent"
+    }
+  ],
+  "leadership_note": "The actual model/effort of the coordinator and leaves cannot be claimed from available runtime readback. All edits and final verification were integrated by the leader."
+}

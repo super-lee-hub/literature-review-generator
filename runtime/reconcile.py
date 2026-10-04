@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import re
 import json
 import os
 from pathlib import Path
@@ -157,6 +158,55 @@ def _validate_source_bundle(_record: ArtifactRecord, path: Path) -> None:
         raise ReconcileValidationError("source bundle collections have invalid types")
 
 
+def _validate_stage1_source_scope(record: ArtifactRecord, path: Path) -> None:
+    payload = _read_json_object(path)
+    if set(payload) != {"schema_version", "job_id", "source_bundle_hash", "runtime_spec_hash", "papers",
+                       "paper_count", "page_count", "reuse_status", "model_request_bounds"}:
+        raise ReconcileValidationError("Stage 1 source scope schema fields are invalid")
+    if payload.get("schema_version") != "stage1-source-scope/v1" or payload.get("job_id") != record.job_id:
+        raise ReconcileValidationError("Stage 1 source scope identity is invalid")
+    papers = payload.get("papers")
+    if not isinstance(papers, list):
+        raise ReconcileValidationError("Stage 1 source scope papers must be an array")
+    keys: set[str] = set()
+    pages = 0
+    for paper in papers:
+        if (not isinstance(paper, Mapping) or set(paper) != {"paper_key", "source_pdf", "source_pdf_sha256", "size_bytes", "page_count"}
+                or not isinstance(paper.get("paper_key"), str) or not paper["paper_key"]
+                or not isinstance(paper.get("source_pdf"), str) or not paper["source_pdf"] or paper["paper_key"] in keys):
+            raise ReconcileValidationError("Stage 1 source scope paper identity is invalid")
+        keys.add(paper["paper_key"])
+        if (type(paper.get("page_count")) is not int or paper["page_count"] <= 0
+                or type(paper.get("size_bytes")) is not int or paper["size_bytes"] < 0
+                or not re.fullmatch(r"[0-9a-f]{64}", str(paper.get("source_pdf_sha256") or ""))):
+            raise ReconcileValidationError("Stage 1 source scope PDF dimensions are invalid")
+        pages += paper["page_count"]
+    if payload.get("paper_count") != len(papers) or payload.get("page_count") != pages:
+        raise ReconcileValidationError("Stage 1 source scope totals are invalid")
+    for kind, hash_key in (("source_bundle", "source_bundle_hash"), ("runtime_job_spec", "runtime_spec_hash")):
+        dependencies = [ref for ref in record.depends_on if ref.artifact_type == kind]
+        if (len(dependencies) != 1 or not re.fullmatch(r"[0-9a-f]{64}", str(payload.get(hash_key) or ""))
+                or dependencies[0].content_hash != payload[hash_key]):
+            raise ReconcileValidationError("Stage 1 source scope input dependency is invalid")
+        if kind == "source_bundle":
+            bundle = _read_json_object(Path(dependencies[0].path))
+            declared = {(str(item.get("canonical_paper_key") or ""), str(Path(str(item.get("source_pdf") or "")).resolve()))
+                        for item in bundle.get("paper_work_items", ()) if isinstance(item, Mapping)}
+            observed = {(paper["paper_key"], str(Path(paper["source_pdf"]).resolve())) for paper in papers}
+            if declared != observed:
+                raise ReconcileValidationError("Stage 1 source scope papers do not match its source bundle")
+
+
+def _validate_validator_pretransport_inventory(_record: ArtifactRecord, path: Path) -> None:
+    from runtime.provider_runtime import hash_json
+
+    payload = _read_json_object(path)
+    if (payload.get("schema_version") != "validator-pretransport-inventory/v1"
+            or payload.get("inventory_hash") != hash_json({key: value for key, value in payload.items() if key != "inventory_hash"})
+            or not isinstance(payload.get("requests"), list)):
+        raise ReconcileValidationError("Validator pretransport inventory schema or identity is invalid")
+
+
 def validate_canonical_ai_summary(payload: Any, *, label: str) -> Mapping[str, Any]:
     if not isinstance(payload, Mapping):
         raise ReconcileValidationError(f"{label} must be a JSON object")
@@ -245,6 +295,19 @@ def _validate_summary_source_manifest(record: ArtifactRecord, path: Path) -> Non
         artifact_type="summary_source_manifest",
         versions=("v2",),
     )
+    load_summary_source_manifest(path)
+
+
+def load_summary_source_manifest(path: str | Path) -> tuple[Mapping[str, Any], Path, list[Any]]:
+    """Load and validate a public summary-source manifest and its materialized array."""
+
+    target = Path(path).expanduser().resolve()
+    payload = _read_json_object(target)
+    if (
+        payload.get("artifact_type") != "summary_source_manifest"
+        or payload.get("artifact_version") != "v2"
+    ):
+        raise ReconcileValidationError("unsupported summary_source_manifest contract")
     _require_fields(
         payload,
         (
@@ -263,9 +326,7 @@ def _validate_summary_source_manifest(record: ArtifactRecord, path: Path) -> Non
     _require_nonempty_string(payload.get("project_name"), label="summary manifest project_name")
     _require_nonempty_string(payload.get("source_kind"), label="summary manifest source_kind")
     source_items = _require_list(payload.get("source_items"), label="summary manifest source_items")
-    rejected = _require_list(
-        payload.get("rejected_candidates"), label="summary manifest rejected_candidates"
-    )
+    rejected = _require_list(payload.get("rejected_candidates"), label="summary manifest rejected_candidates")
     if any(not isinstance(item, Mapping) for item in (*source_items, *rejected)):
         raise ReconcileValidationError("summary manifest candidates must be JSON objects")
     summary_path = Path(
@@ -275,19 +336,20 @@ def _validate_summary_source_manifest(record: ArtifactRecord, path: Path) -> Non
         )
     ).expanduser()
     if not summary_path.is_absolute():
-        summary_path = path.parent / summary_path
+        summary_path = target.parent / summary_path
     summary_path = summary_path.resolve()
     try:
         summaries = json.loads(summary_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ReconcileValidationError(f"summary manifest target is unavailable: {exc}") from exc
-    if not isinstance(summaries, list):
-        raise ReconcileValidationError("summary manifest target must be a JSON array")
+    if not isinstance(summaries, list) or any(not isinstance(item, Mapping) for item in summaries):
+        raise ReconcileValidationError("summary manifest target must be an array of objects")
     summary_count = payload.get("summary_count")
     if isinstance(summary_count, bool) or not isinstance(summary_count, int) or summary_count < 0:
         raise ReconcileValidationError("summary manifest summary_count must be a non-negative integer")
     if summary_count != len(summaries):
         raise ReconcileValidationError("summary manifest summary_count is inconsistent")
+    return payload, summary_path, summaries
 
 
 def _validate_stage1_reusable_summary_manifest(record: ArtifactRecord, path: Path) -> None:
@@ -296,7 +358,7 @@ def _validate_stage1_reusable_summary_manifest(record: ArtifactRecord, path: Pat
         record,
         payload,
         artifact_type="stage1_reusable_summary_manifest",
-        versions=("v1",),
+        versions=("v1", "v2"),
     )
     _require_owned_job(record, payload, field="job_id")
     _require_fields(
@@ -357,6 +419,22 @@ def _validate_stage1_reusable_summary_manifest(record: ArtifactRecord, path: Pat
             raise ReconcileValidationError(
                 f"stage1_reusable_summary_manifest.{hash_label} is not a SHA-256 digest"
             )
+    if payload.get("artifact_version") == "v2":
+        from runtime.artifact_validators import ArtifactSchemaError, _validate_owner_corrected_manifest_shape
+
+        try:
+            _validate_owner_corrected_manifest_shape(payload)
+        except ArtifactSchemaError as exc:
+            raise ReconcileValidationError(str(exc)) from exc
+
+
+def _validate_stage1_portable_owner_correction(record: ArtifactRecord, path: Path) -> None:
+    from runtime.artifact_validators import ArtifactSchemaError, _validate_stage1_portable_owner_correction as validate_shape
+
+    try:
+        validate_shape(record, path, _read_json_object(path))
+    except ArtifactSchemaError as exc:
+        raise ReconcileValidationError(str(exc)) from exc
 
 
 def _validate_nonempty_text(_record: ArtifactRecord, path: Path) -> None:
@@ -694,7 +772,7 @@ def _validate_paper_artifact(record: ArtifactRecord, path: Path) -> None:
 
 
 def _validate_review_draft(record: ArtifactRecord, path: Path) -> None:
-    from services.review_draft import ReviewDraft
+    from services.review_draft import ReviewDraft, validate_review_section_writer_scope
 
     payload = _read_json_object(path)
     _require_contract_header(
@@ -749,7 +827,19 @@ def _validate_review_draft(record: ArtifactRecord, path: Path) -> None:
         for block in blocks:
             block_data = _require_mapping(block, label="review block")
             _require_nonempty_string(block_data.get("block_id"), label="review block_id")
-            _require_nonempty_string(block_data.get("text"), label="review block text")
+        try:
+            text_blocks = validate_review_section_writer_scope(section_data)
+        except (TypeError, ValueError, KeyError) as exc:
+            raise ReconcileValidationError(f"review section source/layout contract is invalid: {exc}") from exc
+        for block_data in text_blocks:
+            _require_nonempty_string(block_data.get("block_id"), label="review text block_id")
+            _require_nonempty_string(block_data.get("text"), label="review text block text")
+
+    if draft.generation_context.get("generation_mode") == "outline_v3":
+        # The focused compatibility checks above predate Outline v3 lineage.
+        # Reuse the Registry's strict validator for this production mode so
+        # reconciliation applies the same lineage contract as publication.
+        _validate_current_production_artifact(record, path)
 
 
 def _validate_citation_manifest(record: ArtifactRecord, path: Path) -> None:
@@ -1640,6 +1730,8 @@ DEFAULT_SCHEMA_VALIDATORS: dict[str, SchemaValidator] = {
     "job_outcome": _validate_job_outcome,
     STAGE_TERMINAL_ARTIFACT_TYPE: _validate_stage_terminal,
     "source_bundle": _validate_source_bundle,
+    "stage1_source_scope": _validate_stage1_source_scope,
+    "validator_pretransport_inventory": _validate_validator_pretransport_inventory,
     "summary_file": _validate_summary_file,
     "review_docx": _validate_docx,
     "source_pdf": _validate_pdf,
@@ -1654,6 +1746,10 @@ DEFAULT_SCHEMA_VALIDATORS: dict[str, SchemaValidator] = {
     "stage1_progress_snapshot": _validate_json_object,
     "summary_source_manifest": _validate_summary_source_manifest,
     "stage1_reusable_summary_manifest": _validate_stage1_reusable_summary_manifest,
+    "stage1_portable_owner_correction_origin_source": _validate_stage1_portable_owner_correction,
+    "stage1_portable_owner_correction_prior_manifest": _validate_stage1_portable_owner_correction,
+    "stage1_portable_owner_correction_derived_summary_set": _validate_stage1_portable_owner_correction,
+    "stage1_portable_owner_correction_adoption_receipt": _validate_stage1_portable_owner_correction,
     "summary_selection": _validate_summary_selection,
     "review_batch_manifest": _validate_review_batch_manifest,
     "paper_artifact": _validate_paper_artifact,

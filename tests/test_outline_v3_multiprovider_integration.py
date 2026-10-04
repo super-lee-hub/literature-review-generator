@@ -11,10 +11,9 @@ is the real implementation.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping
-
-import pytest
 
 from outline.provider_router import (
     OutlineProviderRouter,
@@ -52,6 +51,7 @@ CONFIG: dict[str, dict[str, str]] = {
         "provider_family": "openai_responses",
         "max_context_tokens": "200000",
         "max_output_tokens": "32000",
+        "transport_retries": "0",
     },
     "Outline_API": {
         "model": "claude-opus-5",
@@ -60,6 +60,7 @@ CONFIG: dict[str, dict[str, str]] = {
         "provider_family": "anthropic",
         "max_context_tokens": "200000",
         "max_output_tokens": "16000",
+        "transport_retries": "0",
     },
     "Free_Mode_API": {
         "model": "deepseek-v4-pro",
@@ -68,6 +69,7 @@ CONFIG: dict[str, dict[str, str]] = {
         "provider_family": "deepseek",
         "max_context_tokens": "128000",
         "max_output_tokens": "16000",
+        "transport_retries": "0",
     },
     "OutlineModels": {
         "outline_model": "Outline_API",
@@ -150,6 +152,7 @@ def _resolve_route(role: str, section_name: str) -> OutlineRoleRoute | None:
         profile=profile,
         transport=None,  # attached below, so the api_config is recorded with it
         api_base=str(api_config.get("api_base") or "").strip(),
+        config_identity=api_config,
     )
 
 
@@ -182,6 +185,7 @@ def _build() -> tuple[OutlineProviderRouter, dict[str, RecordingTransport]]:
             profile=route.profile,
             transport=transport,
             api_base=route.api_base,
+            config_identity=route.config_identity,
         )
 
     # build_outline_provider_router passes the semantic role, which is the only
@@ -243,6 +247,27 @@ def test_executor_runs_each_role_on_its_own_provider_config(tmp_path: Path) -> N
     for role, transport in executed.items():
         for node_id in transport.invocations:
             assert semantic_role(node_id) == role, f"{node_id} ran on the {role} provider"
+
+
+def test_unknown_external_retry_reserve_blocks_before_any_role_transport(tmp_path: Path) -> None:
+    router, transports = _build()
+    unknown_routes = {
+        role: replace(route, config_identity={})
+        for role, route in router.routes.items()
+    }
+    unknown_router = OutlineProviderRouter(
+        routes=unknown_routes,
+        diagnostics=collect_routing_diagnostics(unknown_routes),
+    )
+    executor = _executor(tmp_path, router=unknown_router)
+
+    result = executor.run()
+
+    assert result.status == "blocked"
+    assert executor.stability_preflight["estimated_provider_calls"] <= 24
+    assert executor.stability_preflight["estimated_provider_physical_attempts_upper_bound"] is None
+    assert executor.stability_preflight["rejection_reason"] == "provider_physical_attempt_bound_unknown"
+    assert not any(transport.invocations for transport in transports.values())
 
 
 def test_receipts_record_three_distinct_provider_identities(tmp_path: Path) -> None:

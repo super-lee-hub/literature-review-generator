@@ -2,28 +2,47 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 import logging
-from pathlib import Path
 import re
-from typing import Any, Callable, Mapping, Sequence, cast
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path
+from typing import Any, cast
 
 from models import APIConfig
 from runtime.provider_completion import ProviderCompletionEvaluator
+from runtime.provider_receipt_closure import (
+    ExpectedProviderCall,
+    ProviderReceiptClosure,
+)
+from runtime.provider_routes import build_reachable_provider_route_plan
 from runtime.provider_runtime import (
-    ProviderBudgetV1,
+    ProviderAggregateBudgetV2,
     ProviderBudgetExceeded,
+    ProviderBudgetV1,
     ProviderRuntime,
     ProviderRuntimeLedger,
     _redact_mapping,
+    canonical_provider_request_payload,
     compute_closure_epoch_id,
     hash_json,
     hash_text,
+    provider_budget_controller_from_environment,
 )
-from runtime.provider_receipt_closure import ExpectedProviderCall, ProviderReceiptClosure
-from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry, file_sha256
+from runtime.stage_planning import (
+    ProviderRequestPlanRowV1,
+    ProviderStageRequestInventoryV1,
+    VerifiedProviderReuseAuthorityV1,
+    build_full_stage_request_plan_v1,
+    build_provider_request_plan_row_v1,
+)
+from services.artifact_registry import (
+    ArtifactDependencyRefV2,
+    ArtifactRegistry,
+    file_sha256,
+)
 from services.citation_ref_catalog import (
     build_document_ref_catalog,
     extract_ref_ids_from_token,
@@ -35,10 +54,9 @@ from services.job_workspace import (
     publish_bytes_artifact,
     publish_json_artifact,
 )
-from services.settings import ApplicationSettings
-from services.queue_service import LocalPublicationContext
 from services.prompt_registry import PromptRegistry, PromptRegistryError
-
+from services.queue_service import LocalPublicationContext
+from services.settings import ApplicationSettings
 
 WriterCallable = Callable[..., Mapping[str, Any]]
 
@@ -50,6 +68,21 @@ class ReviewGenerationResult:
     citation_ref_catalog_path: str
     receipt_ids: tuple[str, ...]
     receipt_ledger_path: str
+
+
+@dataclass(frozen=True)
+class _PreparedWriterSection:
+    section_number: int
+    section_id: str
+    section: Mapping[str, Any]
+    packet: Mapping[str, Any]
+    allowed_ref_ids: tuple[str, ...]
+    runtime: ProviderRuntime
+    prompt: str
+    request_payload: dict[str, Any]
+    binding: dict[str, Any]
+    persisted: dict[str, Any] | None
+    writer_task_scope: dict[str, Any] | None
 
 
 class ReviewGenerationService:
@@ -95,8 +128,10 @@ class ReviewGenerationService:
         )
         self.receipt_ledger_path = ""
         self._expected_provider_calls: dict[str, ExpectedProviderCall] = {}
+        self._verified_reuse_proofs: dict[str, dict[str, str]] = {}
         self.expected_call_graph_hash = ""
         self.closure_epoch_id = ""
+        self.provider_request_inventory: ProviderStageRequestInventoryV1 | None = None
 
     def run(
         self,
@@ -106,6 +141,12 @@ class ReviewGenerationService:
         free_mode_context: Mapping[str, Any] | None = None,
     ) -> ReviewGenerationResult:
         self.free_mode_context = dict(free_mode_context or {})
+        self._expected_provider_calls = {}
+        self._verified_reuse_proofs = {}
+        self.provider_request_inventory = None
+        from services.writer_source_inventory import load_writer_source_inventory_v1
+
+        source_inventory = load_writer_source_inventory_v1(self.registry)
         catalog, catalog_path = self._build_and_persist_catalog()
         packet_by_section = {
             str(packet.get("section_id") or "").strip(): dict(packet)
@@ -125,6 +166,14 @@ class ReviewGenerationService:
         if not section_ids:
             raise RuntimeError("Review v3 outline contains no executable sections")
         writer_config_for_epoch = dict(self.settings.section("Writer_API"))
+        writer_system_prompt = self._system_prompt()
+        writer_max_output_tokens = self._max_output_tokens(writer_config_for_epoch)
+        if "transport_retries" in writer_config_for_epoch:
+            from ai_interface import _load_api_runtime_settings
+
+            writer_transport_attempt_limit = _load_api_runtime_settings(writer_config_for_epoch)[1]
+        else:
+            writer_transport_attempt_limit = int(self.settings.runtime.transport_retries)
         self.expected_call_graph_hash = hash_json(
             {
                 "stage_name": "stage3_review",
@@ -148,9 +197,9 @@ class ReviewGenerationService:
             schema_version="review-v3",
         )
 
-        # Predeclare the complete section graph before the first Writer
-        # transport.  Resume may later fill output hashes from an existing
-        # section replay, but it cannot change the expected call set.
+        # Prepare the complete section graph, request bodies, and verified
+        # resume state before the first Writer transport.
+        prepared_sections: list[_PreparedWriterSection] = []
         for number, raw_section in enumerate(raw_sections, start=1):
             if not isinstance(raw_section, Mapping):
                 continue
@@ -160,9 +209,28 @@ class ReviewGenerationService:
                 raise RuntimeError(f"Review v3 has no evidence packet for section {section_id}")
             self._require_nonempty_packet(packet, section_id)
             allowed_ref_ids = self._allowed_ref_ids(packet, catalog)
-            runtime = self._new_runtime(section_id)
-            prompt = self._prompt(raw_section, packet, catalog, allowed_ref_ids)
-            request_payload = self._writer_request_payload(prompt)
+            task_scope = None
+            if source_inventory is not None:
+                from services.writer_task_scope import build_writer_task_scope_v1
+
+                task_scope = build_writer_task_scope_v1(packet, catalog, source_inventory=source_inventory)
+                if task_scope.get("usable_for_provider_admission") is not True:
+                    reasons = sorted({reason for task in task_scope["tasks"] for reason in task["reason_codes"]})
+                    raise RuntimeError(f"Writer source task scope for {section_id} requires review: {', '.join(reasons)}")
+                if "writer_table_plan" in raw_section:
+                    from services.writer_table_plan import bind_writer_table_plan_v1
+
+                    task_scope = bind_writer_table_plan_v1(task_scope, packet, raw_section["writer_table_plan"])
+            runtime = self._new_runtime(
+                section_id,
+                writer_config=writer_config_for_epoch,
+            )
+            prompt = self._prompt(raw_section, packet, catalog, allowed_ref_ids, writer_task_scope=task_scope)
+            request_payload = self._writer_request_payload(
+                prompt,
+                system_prompt=writer_system_prompt,
+                max_output_tokens=writer_max_output_tokens,
+            )
             binding = self._section_binding(
                 section_id=section_id,
                 raw_section=raw_section,
@@ -192,51 +260,6 @@ class ReviewGenerationService:
                 usage_required=str(writer_config_for_epoch.get("endpoint_type") or "responses")
                 not in {"internal", "fixture"},
             )
-
-        for number, raw_section in enumerate(raw_sections, start=1):
-            self._check_cancelled()
-            if not isinstance(raw_section, Mapping):
-                continue
-            section_id = str(raw_section.get("section_id") or f"section_{number}").strip()
-            packet = packet_by_section.get(section_id)
-            if packet is None:
-                raise RuntimeError(f"Review v3 has no evidence packet for section {section_id}")
-            self._require_nonempty_packet(packet, section_id)
-            allowed_ref_ids = self._allowed_ref_ids(packet, catalog)
-            runtime = self._new_runtime(section_id)
-            call_id = f"review:{section_id}"
-            writer_config = dict(self.settings.section("Writer_API"))
-            prompt = self._prompt(raw_section, packet, catalog, allowed_ref_ids)
-            request_payload = self._writer_request_payload(prompt)
-            binding = self._section_binding(
-                section_id=section_id,
-                raw_section=raw_section,
-                packet=packet,
-                catalog=catalog,
-                request_payload=request_payload,
-                runtime=runtime,
-                writer_config=writer_config,
-            )
-            self._expected_provider_calls[call_id] = ExpectedProviderCall(
-                call_id=call_id,
-                job_id=self.job_id,
-                attempt_id=runtime.attempt_id,
-                stage_name=runtime.stage_name,
-                node_id=section_id,
-                closure_epoch_id=self.closure_epoch_id,
-                logical_attempt_identity=self.attempt_id,
-                expected_call_graph_hash=self.expected_call_graph_hash,
-                prompt_id=self._review_prompt_identity.prompt_id,
-                prompt_version=self._review_prompt_identity.version,
-                prompt_sha256=self._review_prompt_identity.sha256,
-                prompt_hash=str(binding["prompt_hash"]),
-                input_hash=str(binding["prompt_payload_hash"]),
-                config_hash=str(binding["writer_config_hash"]),
-                schema_hash=runtime.schema_hash,
-                max_attempts=max(1, self.settings.runtime.node_retry_limit + 1),
-                usage_required=str(writer_config.get("endpoint_type") or "responses")
-                not in {"internal", "fixture"},
-            )
             persisted = self._load_section(
                 section_id,
                 raw_section=raw_section,
@@ -244,8 +267,49 @@ class ReviewGenerationService:
                 catalog=catalog,
                 binding=binding,
             )
-            if persisted is not None:
-                sections.append(persisted)
+            prepared_sections.append(
+                _PreparedWriterSection(
+                    section_number=number,
+                    section_id=section_id,
+                    section=dict(raw_section),
+                    packet=dict(packet),
+                    allowed_ref_ids=allowed_ref_ids,
+                    runtime=runtime,
+                    prompt=prompt,
+                    request_payload=request_payload,
+                    binding=binding,
+                    persisted=persisted,
+                    writer_task_scope=task_scope,
+                )
+            )
+
+        (
+            self.provider_request_inventory,
+            writer_route_plan,
+        ) = self._build_provider_request_inventory(
+            prepared_sections,
+            writer_config=writer_config_for_epoch,
+            max_output_tokens=writer_max_output_tokens,
+            transport_attempt_limit=writer_transport_attempt_limit,
+        )
+        self._preflight_provider_request_inventory(
+            self.provider_request_inventory,
+            writer_route_plan,
+        )
+
+        for prepared in prepared_sections:
+            self._check_cancelled()
+            number = prepared.section_number
+            section_id = prepared.section_id
+            raw_section = prepared.section
+            packet = prepared.packet
+            allowed_ref_ids = prepared.allowed_ref_ids
+            runtime = prepared.runtime
+            prompt = prepared.prompt
+            request_payload = prepared.request_payload
+            binding = prepared.binding
+            if prepared.persisted is not None:
+                sections.append(prepared.persisted)
                 continue
             provider_result = self._call_writer(
                 section_number=number,
@@ -254,18 +318,38 @@ class ReviewGenerationService:
                 catalog=catalog,
                 allowed_ref_ids=allowed_ref_ids,
                 runtime=runtime,
+                prompt=prompt,
+                system_prompt=writer_system_prompt,
+                writer_config=writer_config_for_epoch,
+                max_output_tokens=writer_max_output_tokens,
+                transport_attempt_limit=writer_transport_attempt_limit,
+                expected_input_hash=str(binding["prompt_payload_hash"]),
             )
             self._ensure_receipt(
                 runtime,
                 prompt=prompt,
                 input_payload=request_payload,
                 result=provider_result,
+                api_config=writer_config_for_epoch,
             )
+            if prepared.writer_task_scope is not None:
+                from services.writer_task_scope import validate_writer_task_output_v1
+
+                content = provider_result.get("content", provider_result)
+                if isinstance(content, str):
+                    content = json.loads(content)
+                if not isinstance(content, Mapping):
+                    raise RuntimeError("Writer section content must be an object")
+                scoped_output = validate_writer_task_output_v1(prepared.writer_task_scope, content)
+                if scoped_output["scope_status"] != "ready":
+                    self._persist_writer_review_disposition(prepared, scoped_output, provider_result)
+                    raise RuntimeError(f"Writer section {section_id} requires source review; disposition saved")
             blocks = self._normalize_blocks(
                 provider_result,
                 section_number=number,
                 allowed_ref_ids=allowed_ref_ids,
                 catalog=catalog,
+                writer_task_scope=prepared.writer_task_scope,
             )
             section_payload = {
                     "section_number": number,
@@ -276,6 +360,12 @@ class ReviewGenerationService:
                     "evidence_packet_id": section_id,
                     "provider_receipt_ids": [receipt.receipt_id for receipt in runtime.receipts],
                 }
+            if prepared.writer_task_scope is not None:
+                content = provider_result.get("content", provider_result)
+                if isinstance(content, str):
+                    content = json.loads(content)
+                section_payload["writer_task_scope"] = prepared.writer_task_scope
+                section_payload["writer_task_dispositions"] = content["task_dispositions"]
             section_record = self._persist_section(
                 section_id,
                 section_payload,
@@ -319,6 +409,39 @@ class ReviewGenerationService:
             citation_ref_catalog_path=str(catalog_path),
             receipt_ids=tuple(receipt.receipt_id for receipt in self.receipt_ledger.list_receipts()),
             receipt_ledger_path=self.receipt_ledger_path,
+        )
+
+    def _persist_writer_review_disposition(
+        self,
+        prepared: _PreparedWriterSection,
+        scoped_output: Mapping[str, Any],
+        provider_result: Mapping[str, Any],
+    ) -> None:
+        self._register_receipt_ledger()
+        dependencies = []
+        for identifier in ("outline-v3:outline_content_layers", "review_provider_receipts"):
+            record = self.registry.get(identifier)
+            if record is None or record.status != "ready":
+                raise RuntimeError("Writer review disposition lost its source or receipt authority")
+            dependencies.append(ArtifactDependencyRefV2.from_record(record))
+        payload = {
+            "artifact_type": "review_writer_review_disposition", "artifact_version": "v1",
+            "job_id": self.job_id, "section_id": prepared.section_id,
+            "status": "needs_review", "canonical_ready": False,
+            "request_hash": hash_json(prepared.request_payload),
+            "writer_task_scope": prepared.writer_task_scope,
+            "validated_output": dict(scoped_output),
+            "provider_result_hash": hash_json(provider_result),
+            "provider_receipt_ids": [item.receipt_id for item in prepared.runtime.receipts],
+        }
+        digest = hash_json(payload)
+        publish_json_artifact(
+            self.publication_context, self.registry,
+            self.workspace.artifact_path(f"review_source_review/{digest[:24]}.json"), payload,
+            artifact_id=f"review:source_review:{digest[:24]}", artifact_role="review_source_review",
+            artifact_type="review_writer_review_disposition", artifact_version="v1",
+            producer="services.review_generation_service.ReviewGenerationService",
+            status="quarantined", depends_on=dependencies,
         )
 
     def _build_and_persist_catalog(self) -> tuple[dict[str, Any], Path]:
@@ -400,7 +523,7 @@ class ReviewGenerationService:
         runtime: ProviderRuntime,
         writer_config: Mapping[str, Any],
     ) -> dict[str, Any]:
-        profile = self._provider_context_profile()
+        profile = self._provider_context_profile(writer_config)
         adoption = self._current_adoption_binding()
         free_mode = self.free_mode_context
         return {
@@ -425,7 +548,7 @@ class ReviewGenerationService:
             "writer_model": str(writer_config.get("model") or ""),
             "writer_endpoint": str(writer_config.get("endpoint_type") or "responses"),
             "writer_config_hash": hash_json(_redact_mapping(dict(writer_config))),
-            "system_prompt_hash": hash_text(self._system_prompt()),
+            "system_prompt_hash": hash_text(str(request_payload.get("system") or "")),
             "prompt_id": self._review_prompt_identity.prompt_id,
             "prompt_version": self._review_prompt_identity.version,
             "prompt_sha256": self._review_prompt_identity.sha256,
@@ -577,6 +700,16 @@ class ReviewGenerationService:
         replay = self._load_review_replay(section_id=section_id, binding=binding)
         if replay is None:
             return None
+        replay_epoch_id = str(replay.get("closure_epoch_id") or "")
+        if (
+            str(replay.get("job_id") or "") != self.job_id
+            or str(replay.get("stage_name") or "") != "stage3_review"
+            or not replay_epoch_id
+        ):
+            return None
+        reuse_record = self.registry.get("review_replay")
+        if reuse_record is None or reuse_record.status != "ready":
+            return None
         receipt_id = str(replay.get("receipt_id") or "")
         receipt = next(
             (item for item in self.receipt_ledger.list_receipts() if item.receipt_id == receipt_id),
@@ -585,12 +718,15 @@ class ReviewGenerationService:
         expected = self._expected_provider_calls.get(f"review:{section_id}")
         if expected is None or receipt is None or receipt.status != "success":
             return None
+        if receipt.test_only and not self._fixture_context_enabled():
+            return None
         if (
             receipt.job_id != self.job_id
             or receipt.attempt_id != expected.attempt_id
             or receipt.stage_name != expected.stage_name
             or receipt.node_id != expected.node_id
             or receipt.call_id != expected.call_id
+            or receipt.closure_epoch_id != replay_epoch_id
             or receipt.prompt_hash != expected.prompt_hash
             or receipt.input_hash != expected.input_hash
             or receipt.config_hash != expected.config_hash
@@ -615,7 +751,34 @@ class ReviewGenerationService:
             registered_artifact_hash=section_hash,
             replay_output_hash=receipt.response_hash or "",
             node_output_hash=section_hash,
+            verified_reuse=True,
+            reuse_evidence_artifact_id=reuse_record.artifact_id,
+            reuse_evidence_artifact_hash=reuse_record.content_hash,
+            reuse_evidence_record_hash=hash_json(replay),
         )
+        receipt_hash = hash_json(receipt.to_dict())
+        self._verified_reuse_proofs[expected.call_id] = {
+            "receipt_hash": receipt_hash,
+            "output_hash": receipt.response_hash or "",
+            "reuse_evidence_artifact_id": reuse_record.artifact_id,
+            "reuse_evidence_artifact_hash": reuse_record.content_hash,
+            "reuse_evidence_record_hash": hash_json(replay),
+            "authority_hash": hash_json(
+                {
+                    "authority_version": "review-section-replay-authority-v1",
+                    "call_id": expected.call_id,
+                    "binding_hash": expected_binding_hash,
+                    "receipt_id": receipt.receipt_id,
+                    "receipt_hash": receipt_hash,
+                    "reuse_evidence_artifact_id": reuse_record.artifact_id,
+                    "reuse_evidence_artifact_hash": reuse_record.content_hash,
+                    "reuse_evidence_record_hash": hash_json(replay),
+                    "artifact_id": record.artifact_id,
+                    "artifact_content_hash": section_hash,
+                    "registry_file_hash": record.content_hash,
+                }
+            ),
+        }
         return dict(payload)
 
     @staticmethod
@@ -699,6 +862,17 @@ class ReviewGenerationService:
         return immutable_record
 
     def _persist_receipt_closure(self) -> None:
+        reuse_record = self.registry.get("review_replay")
+        if reuse_record is not None and reuse_record.status == "ready":
+            for call_id, proof in self._verified_reuse_proofs.items():
+                expected = self._expected_provider_calls.get(call_id)
+                if expected is not None and expected.verified_reuse:
+                    self._expected_provider_calls[call_id] = replace(
+                        expected,
+                        reuse_evidence_artifact_id=reuse_record.artifact_id,
+                        reuse_evidence_artifact_hash=reuse_record.content_hash,
+                        reuse_evidence_record_hash=proof["reuse_evidence_record_hash"],
+                    )
         all_receipts = list(self.receipt_ledger.list_receipts())
         scoped_receipts = [
             receipt
@@ -712,6 +886,7 @@ class ReviewGenerationService:
             out_of_scope=out_of_scope_receipts,
         )
         path = Path(self.workspace.artifact_path("review_provider_receipt_closure.json"))
+        test_only = any(receipt.test_only for receipt in scoped_receipts)
         closure_payload = {
             **closure.to_dict(),
             "job_id": self.job_id,
@@ -720,6 +895,8 @@ class ReviewGenerationService:
             "logical_attempt_identity": self.attempt_id,
             "closure_epoch_id": self.closure_epoch_id,
             "expected_call_graph_hash": self.expected_call_graph_hash,
+            "test_only": test_only,
+            "authority_scope": "offline_fixture" if test_only else "provider_transport",
             "expected_calls": [
                 asdict(expected)
                 for expected in self._expected_provider_calls.values()
@@ -733,6 +910,7 @@ class ReviewGenerationService:
             "attempt_id": self.attempt_id,
             "closure_epoch_id": self.closure_epoch_id,
             "expected_call_graph_hash": self.expected_call_graph_hash,
+            "test_only": test_only,
             "payload": closure_payload,
         }
         dependencies: list[ArtifactDependencyRefV2] = []
@@ -789,6 +967,7 @@ class ReviewGenerationService:
                 "expected_call_graph_hash": self.expected_call_graph_hash,
                 "closure_hash": closure.closure_hash,
                 "complete": closure.complete,
+                "test_only": test_only,
             },
         )
 
@@ -801,36 +980,70 @@ class ReviewGenerationService:
         catalog: Mapping[str, Any],
         allowed_ref_ids: Sequence[str],
         runtime: ProviderRuntime,
+        prompt: str,
+        system_prompt: str,
+        writer_config: Mapping[str, Any],
+        max_output_tokens: int,
+        transport_attempt_limit: int,
+        expected_input_hash: str,
     ) -> Mapping[str, Any]:
-        prompt = self._prompt(section, packet, catalog, allowed_ref_ids)
-        writer_config = dict(self.settings.section("Writer_API"))
+        frozen_config = dict(writer_config)
+        request_payload = self._writer_request_payload(
+            prompt,
+            system_prompt=system_prompt,
+            max_output_tokens=max_output_tokens,
+        )
+        if hash_json(request_payload) != expected_input_hash:
+            raise RuntimeError("Review v3 Writer request changed after preflight")
         if self.writer is not None:
-            value = self.writer(
-                prompt_text=prompt,
-                writer_api_config=writer_config,
-                provider_runtime=runtime,
-                section_number=section_number,
-                section=dict(section),
-                evidence_packet=dict(packet),
-                citation_ref_catalog=dict(catalog),
+            if not self._fixture_context_enabled():
+                raise RuntimeError("Opaque Writer callbacks require explicit in-process test dependencies; production transport is service-owned")
+            runtime.test_only = True
+            profile = self._provider_context_profile(frozen_config)
+            estimate = profile.estimate_request(request_payload)
+            admission = runtime.admit(
+                estimated_tokens=max(1, int(estimate["estimated_input_tokens"])),
+                requested_output_tokens=max_output_tokens,
+                requested_retry_attempts=0,
             )
-            if not isinstance(value, Mapping):
-                raise RuntimeError("Writer returned a non-object")
+            try:
+                value = self.writer(
+                    prompt_text=prompt,
+                    writer_api_config=frozen_config,
+                    section_number=section_number,
+                    section=dict(section),
+                    evidence_packet=dict(packet),
+                    citation_ref_catalog=dict(catalog),
+                )
+                attempts = value.get("attempts", 1) if isinstance(value, Mapping) else None
+                if not isinstance(value, Mapping) or isinstance(attempts, bool) or not isinstance(attempts, int) or attempts != 1:
+                    raise RuntimeError("Offline Writer callback must return one fixture result without transport retries")
+            except Exception:
+                runtime.complete(
+                    admission=admission, prompt=prompt, input_payload=request_payload, api_config=frozen_config,
+                    result={"status": "failed", "error_kind": "invalid_response", "attempts": 1},
+                    metadata={"execution_mode": "offline_fixture_callback", "transport_started": False},
+                )
+                raise
+            runtime.complete(
+                admission=admission, prompt=prompt, input_payload=request_payload, api_config=frozen_config,
+                result=value, metadata={"execution_mode": "offline_fixture_callback", "transport_started": False},
+            )
             return dict(value)
 
         from ai_interface import _call_ai_api_detailed
 
-        if not str(writer_config.get("api_key") or "").strip() or not str(writer_config.get("model") or "").strip():
+        if not str(frozen_config.get("api_key") or "").strip() or not str(frozen_config.get("model") or "").strip():
             raise RuntimeError("Writer_API is not configured for Review v3")
         result = _call_ai_api_detailed(
             prompt,
-            cast(APIConfig, writer_config),
-            self._system_prompt(),
-            max_tokens=self._max_output_tokens(),
+            cast(APIConfig, frozen_config),
+            system_prompt,
+            max_tokens=max_output_tokens,
             temperature=0.2,
             response_format="json",
             logger=self.logger,
-            retry_attempts=self.settings.runtime.transport_retries,
+            retry_attempts=transport_attempt_limit,
             provider_runtime=runtime,
         )
         completion = ProviderCompletionEvaluator.evaluate(
@@ -861,6 +1074,7 @@ class ReviewGenerationService:
         section_number: int,
         allowed_ref_ids: Sequence[str],
         catalog: Mapping[str, Any],
+        writer_task_scope: Mapping[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         if str(provider_result.get("status") or "success").strip().lower() != "success":
             raise RuntimeError(
@@ -874,6 +1088,18 @@ class ReviewGenerationService:
                 raise RuntimeError("Writer returned non-JSON section content") from exc
         if not isinstance(content, Mapping):
             raise RuntimeError("Writer section content must be an object")
+        if writer_task_scope is not None:
+            from services.writer_task_scope import validate_writer_task_output_v1
+
+            scoped_output = validate_writer_task_output_v1(writer_task_scope, content)
+            if scoped_output.get("scope_status") != "ready":
+                raise RuntimeError("Writer returned non-adoptable source tasks requiring review")
+            if writer_task_scope.get("schema_version") == "writer_task_scope/v2":
+                return self._normalize_table_projection(
+                    scoped_output, scope=writer_task_scope, section_number=section_number,
+                    allowed_ref_ids=allowed_ref_ids, catalog=catalog,
+                )
+            content = scoped_output
         raw_blocks = content.get("blocks")
         if not isinstance(raw_blocks, list):
             raise RuntimeError("Writer section content must contain a blocks array")
@@ -948,8 +1174,52 @@ class ReviewGenerationService:
                     "block_source": "writer_v3",
                 }
             )
+            if writer_task_scope is not None:
+                blocks[-1].update({
+                    name: raw_block[name]
+                    for name in ("writer_task_id", "writer_output_unit_id", "writer_task_basis_hash")
+                })
         if not blocks:
             raise RuntimeError(f"Writer produced no blocks for section {section_number}")
+        return blocks
+
+    def _normalize_table_projection(
+        self, validated_output: Mapping[str, Any], *, scope: Mapping[str, Any],
+        section_number: int, allowed_ref_ids: Sequence[str], catalog: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        from services.writer_table_layout import project_writer_table_layouts_v1
+
+        normalized_units = self._normalize_blocks(
+            {"status": "success", "content": {"blocks": validated_output["blocks"]}},
+            section_number=section_number, allowed_ref_ids=allowed_ref_ids, catalog=catalog,
+        )
+        normalized_by_unit = {
+            raw["writer_output_unit_id"]: normalized
+            for raw, normalized in zip(validated_output["blocks"], normalized_units)
+        }
+        projected = project_writer_table_layouts_v1(scope, validated_output)["blocks"]
+
+        def normalize_unit(unit):
+            normalized = dict(normalized_by_unit[unit["writer_output_unit_id"]])
+            normalized.update({key: value for key, value in unit.items() if key != "text"})
+            for index, citation in enumerate(normalized["citations"], start=1):
+                citation["local_ref_id"] = f"{unit['block_id']}_cite_{index}"
+            return normalized
+
+        blocks = []
+        for order, block in enumerate(projected, start=1):
+            if block["block_kind"] == "table":
+                normalized = {**block, "text": "", "citations": [], "block_source": "writer_v3_local_table_projection"}
+                normalized["rows"] = [{
+                    "row_id": row["row_id"], "cells": [
+                        normalize_unit(cell) if cell["cell_kind"] == "factual_output_unit" else dict(cell)
+                        for cell in row["cells"]
+                    ],
+                } for row in block["rows"]]
+            else:
+                normalized = normalize_unit(block)
+            normalized["block_order"] = order
+            blocks.append(normalized)
         return blocks
 
     def _allowed_ref_ids(
@@ -999,6 +1269,8 @@ class ReviewGenerationService:
         packet: Mapping[str, Any],
         catalog: Mapping[str, Any],
         allowed_ref_ids: Sequence[str],
+        *,
+        writer_task_scope: Mapping[str, Any] | None = None,
     ) -> str:
         evidence = self._summaries_for_packet(packet)
         payload = {
@@ -1018,6 +1290,26 @@ class ReviewGenerationService:
             },
             "free_mode_context": dict(self.free_mode_context) if self.free_mode_context else None,
         }
+        if writer_task_scope is not None:
+            from services.writer_wire_projection import project_writer_scope_for_provider_v1
+
+            payload["writer_task_scope"] = project_writer_scope_for_provider_v1(writer_task_scope)
+            payload.pop("source_evidence")
+            payload["section_context"] = {
+                name: packet[name]
+                for name in (
+                    "section_goal", "research_question_link", "paper_roles", "paper_keys",
+                    "must_use_paper_keys", "relation_ids", "contradictions", "boundary_conditions", "gaps",
+                ) if name in packet
+            }
+            payload.pop("evidence_packet")
+            payload["output_contract"] = {
+                **dict(writer_task_scope["output_contract"]),
+                "schema_version": writer_task_scope["schema_version"],
+                "requires_one_disposition_per_task": True,
+                "requires_primary_unit_for_covered_task": True,
+                "requires_exact_task_unit_and_basis_ids": True,
+            }
         return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
     def _summaries_for_packet(self, packet: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -1051,8 +1343,17 @@ class ReviewGenerationService:
             raise RuntimeError(f"section evidence packet {packet.get('section_id')} has no source summaries")
         return selected
 
-    def _new_runtime(self, section_id: str) -> ProviderRuntime:
-        config = dict(self.settings.section("Writer_API"))
+    def _new_runtime(
+        self,
+        section_id: str,
+        *,
+        writer_config: Mapping[str, Any] | None = None,
+    ) -> ProviderRuntime:
+        config = dict(
+            writer_config
+            if writer_config is not None
+            else self.settings.section("Writer_API")
+        )
         return ProviderRuntime(
             budget=ProviderBudgetV1(
                 max_calls=max(1, self.settings.runtime.node_retry_limit + 1),
@@ -1070,11 +1371,173 @@ class ReviewGenerationService:
             closure_epoch_id=self.closure_epoch_id,
             logical_attempt_identity=self.attempt_id,
             endpoint_type=str(config.get("endpoint_type") or "responses"),
+            test_only=self.writer is not None,
             schema_hash=hashlib.sha256(b"review_draft_v3_writer_section").hexdigest(),
             prompt_id=self._review_prompt_identity.prompt_id,
             prompt_version=self._review_prompt_identity.version,
             prompt_sha256=self._review_prompt_identity.sha256,
         )
+
+    def _build_provider_request_inventory(
+        self,
+        prepared_sections: Sequence[_PreparedWriterSection],
+        *,
+        writer_config: Mapping[str, Any],
+        max_output_tokens: int,
+        transport_attempt_limit: int,
+    ) -> tuple[ProviderStageRequestInventoryV1, Any]:
+        from runtime.provider_context import ProviderContextProfile
+
+        route_config = dict(self.settings.sections)
+        route_config["Writer_API"] = dict(writer_config)
+        route_plan = build_reachable_provider_route_plan(
+            route_config,
+            action="generate_review",
+            requested_stages=("review",),
+            free_mode_enabled=bool(self.free_mode_context),
+        )
+        route = route_plan.route_for_role("writer")
+        if not route.resolved:
+            raise RuntimeError("Review v3 Writer route is unresolved before request inventory")
+
+        bound_profile = self._provider_context_profile(writer_config)
+        profile = ProviderContextProfile.conservative(
+            provider=route.provider_family,
+            model=route.model,
+            endpoint_type=route.endpoint_type,
+            model_context_limit=bound_profile.model_context_limit,
+            max_output_tokens=max_output_tokens,
+            reasoning_reserve=bound_profile.reasoning_reserve,
+            safety_margin=bound_profile.safety_margin,
+            tokenizer_strategy=bound_profile.tokenizer_strategy,
+        )
+        wall_seconds = self._writer_total_timeout_seconds(writer_config)
+        rows: list[ProviderRequestPlanRowV1] = []
+        for prepared in prepared_sections:
+            call_id = f"review:{prepared.section_id}"
+            request_hash = hash_json(prepared.request_payload)
+            if request_hash != str(prepared.binding.get("prompt_payload_hash") or ""):
+                raise RuntimeError(
+                    f"Review v3 Writer request identity changed before inventory for {call_id}"
+                )
+            verified_reuse: VerifiedProviderReuseAuthorityV1 | None = None
+            reuse_proof = self._verified_reuse_proofs.get(call_id)
+            if prepared.persisted is not None:
+                if reuse_proof is None:
+                    raise RuntimeError(
+                        f"Review v3 Writer replay lacks verified receipt authority for {call_id}"
+                    )
+                verified_reuse = VerifiedProviderReuseAuthorityV1(
+                    request_hash=request_hash,
+                    route_identity=route.identity,
+                    receipt_hash=reuse_proof["receipt_hash"],
+                    output_hash=reuse_proof["output_hash"],
+                    authority_hash=reuse_proof["authority_hash"],
+                )
+            requested_attempts = prepared.runtime.max_attempts_for_call(
+                transport_attempt_limit
+            )
+            rows.append(
+                build_provider_request_plan_row_v1(
+                    stage_name="review",
+                    request_id=call_id,
+                    source_builder=(
+                        "services.review_generation_service.ReviewGenerationService._writer_request_payload"
+                    ),
+                    route=route,
+                    request_payload=prepared.request_payload,
+                    profile=profile,
+                    retry_attempts=max(0, requested_attempts - 1),
+                    retry_policy="shared_optional",
+                    requested_output_tokens=max_output_tokens,
+                    reasoning_reserve_tokens=profile.reasoning_reserve,
+                    verified_reuse=verified_reuse,
+                    wall_seconds_upper_bound=wall_seconds,
+                )
+            )
+
+        return (
+            ProviderStageRequestInventoryV1(
+                stage_name="review",
+                source_builder="services.review_generation_service writer request builder",
+                requests=tuple(rows),
+            ),
+            route_plan,
+        )
+
+    @staticmethod
+    def _writer_total_timeout_seconds(writer_config: Mapping[str, Any]) -> float:
+        # This is the same request-level configuration path used by
+        # _call_ai_api_detailed; its transport loop shares one total deadline
+        # across all retries and bounds response reads by that deadline.
+        from ai_interface import _load_api_runtime_settings
+
+        request_timeout, _ = _load_api_runtime_settings(cast(APIConfig, writer_config))
+        try:
+            configured_total = int(
+                str(writer_config.get("total_timeout_seconds") or "").strip()
+            )
+        except (TypeError, ValueError):
+            configured_total = 0
+        return float(configured_total if configured_total > 0 else max(1, int(request_timeout)))
+
+    def _preflight_provider_request_inventory(
+        self,
+        inventory: ProviderStageRequestInventoryV1,
+        route_plan: Any,
+    ) -> None:
+        fresh_rows = [row for row in inventory.requests if not row.verified_reuse]
+        over_context = [
+            row
+            for row in fresh_rows
+            if not row.request_estimate.within_input_budget
+            or not row.request_estimate.within_context_budget
+        ]
+        if over_context:
+            call_id_hashes = ", ".join(row.request_key_hash for row in over_context)
+            raise ProviderBudgetExceeded(
+                "Writer stage preflight exceeds the provider request context budget: "
+                + call_id_hashes
+            )
+
+        controller = provider_budget_controller_from_environment()
+        if controller is None or not isinstance(controller.budget, ProviderAggregateBudgetV2):
+            return
+
+        snapshot = controller.snapshot()
+        budget = controller.budget
+        def remaining(field: str, limit: int) -> int:
+            return max(
+                0,
+                limit - int(snapshot[f"{field}_used"]) - int(snapshot[f"{field}_reserved"]),
+            )
+
+        remaining_budget = ProviderAggregateBudgetV2(
+            max_provider_calls_total=remaining("calls", budget.max_provider_calls_total),
+            max_output_tokens_total=remaining("output_tokens", budget.max_output_tokens_total),
+            max_retry_attempts_total=remaining("retry_attempts", budget.max_retry_attempts_total),
+            max_wall_seconds=max(
+                0.0,
+                budget.max_wall_seconds - float(snapshot["elapsed_seconds"]),
+            ),
+        )
+        projection = build_full_stage_request_plan_v1(
+            stage_plan=route_plan.stage_plan,
+            reachable_route_plan=route_plan,
+            stage_inventories=(inventory,),
+            aggregate_budget=remaining_budget,
+        )
+        budget_status = projection["budget_status"]
+        for key, label in (
+            ("provider_calls", "provider call"),
+            ("requested_output_tokens", "output token"),
+            ("provider_retries", "retry"),
+            ("wall_time", "wall-time"),
+        ):
+            if budget_status.get(key) == "exceeded":
+                raise ProviderBudgetExceeded(
+                    f"Writer stage preflight exceeds remaining aggregate {label} budget"
+                )
 
     def _ensure_receipt(
         self,
@@ -1083,12 +1546,16 @@ class ReviewGenerationService:
         prompt: str,
         input_payload: Mapping[str, Any],
         result: Mapping[str, Any],
+        api_config: Mapping[str, Any],
     ) -> None:
         if runtime.receipts:
             return
+        if not self._fixture_context_enabled():
+            raise RuntimeError("Writer transport returned no instrumented provider receipt")
+        runtime.test_only = True
         try:
             request = dict(input_payload)
-            profile = self._provider_context_profile()
+            profile = self._provider_context_profile(api_config)
             estimate = profile.estimate_request(request)
             admission = runtime.admit(
                 estimated_tokens=max(1, int(estimate["estimated_input_tokens"])),
@@ -1099,36 +1566,44 @@ class ReviewGenerationService:
                 admission=admission,
                 prompt=prompt,
                 input_payload=input_payload,
-                api_config=dict(self.settings.section("Writer_API")),
+                api_config=dict(api_config),
                 result=result,
-                metadata={"execution_mode": "injected_writer"},
+                metadata={"execution_mode": "offline_mocked_transport", "transport_started": False},
             )
         except ProviderBudgetExceeded:
             runtime.blocked_receipt(
                 prompt=prompt,
                 input_payload=input_payload,
-                api_config=dict(self.settings.section("Writer_API")),
+                api_config=dict(api_config),
                 message="Writer did not produce a provider receipt before its budget closed",
             )
+            raise
 
-    def _provider_context_profile(self) -> Any:
+    @staticmethod
+    def _fixture_context_enabled() -> bool:
+        from runtime.test_dependencies import current_runtime_test_dependencies
+
+        dependencies = current_runtime_test_dependencies()
+        if dependencies is None:
+            return False
+        dependencies.validate()
+        return True
+
+    def _provider_context_profile(
+        self,
+        writer_config: Mapping[str, Any] | None = None,
+    ) -> Any:
         from runtime.provider_context import ProviderContextProfile
 
-        config = dict(self.settings.section("Writer_API"))
-        try:
-            context_limit = max(1, int(config.get("max_context_tokens") or 128_000))
-        except (TypeError, ValueError):
-            context_limit = 128_000
-        try:
-            output_tokens = max(1, int(config.get("max_output_tokens") or self._max_output_tokens()))
-        except (TypeError, ValueError):
-            output_tokens = self._max_output_tokens()
-        return ProviderContextProfile.conservative(
-            provider=str(config.get("provider_family") or "configured"),
-            model=str(config.get("model") or "writer"),
-            endpoint_type=str(config.get("endpoint_type") or "responses"),
-            model_context_limit=context_limit,
-            max_output_tokens=output_tokens,
+        config = dict(
+            writer_config
+            if writer_config is not None
+            else self.settings.section("Writer_API")
+        )
+        return ProviderContextProfile.from_api_config(
+            config,
+            max_output_tokens=self._max_output_tokens(config),
+            default_model="writer",
         )
 
     def _register_receipt_ledger(self) -> None:
@@ -1156,24 +1631,40 @@ class ReviewGenerationService:
         if self.cancellation_checker is not None:
             self.cancellation_checker()
 
-    def _max_output_tokens(self) -> int:
-        raw = self.settings.section("Writer_API").get("max_output_tokens") or 32000
-        try:
-            return max(256, int(raw))
-        except (TypeError, ValueError):
-            return 32000
+    def _max_output_tokens(
+        self,
+        writer_config: Mapping[str, Any] | None = None,
+    ) -> int:
+        config = (
+            writer_config
+            if writer_config is not None
+            else self.settings.section("Writer_API")
+        )
+        from runtime.provider_context import writer_output_token_limit
 
-    def _writer_request_payload(self, prompt: str) -> dict[str, Any]:
-        """Build the exact payload hashed by the bound provider runtime."""
+        return writer_output_token_limit(config)
 
-        return {
-            "system": self._system_prompt(),
-            "user": prompt,
-            "user_content": None,
-            "response_format": "json",
-            "max_output_tokens": self._max_output_tokens(),
-            "temperature": 0.2,
-        }
+    def _writer_request_payload(
+        self,
+        prompt: str,
+        *,
+        system_prompt: str | None = None,
+        max_output_tokens: int | None = None,
+    ) -> dict[str, Any]:
+        """Build the same canonical request identity used by provider transport."""
+
+        return canonical_provider_request_payload(
+            prompt=prompt,
+            system_prompt=system_prompt if system_prompt is not None else self._system_prompt(),
+            user_content=None,
+            response_format="json",
+            max_output_tokens=(
+                self._max_output_tokens()
+                if max_output_tokens is None
+                else int(max_output_tokens)
+            ),
+            temperature=0.2,
+        )
 
     @staticmethod
     def _system_prompt() -> str:

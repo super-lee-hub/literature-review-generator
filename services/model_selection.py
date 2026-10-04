@@ -23,6 +23,8 @@ _API_CONFIG_OPTIONAL_FIELDS = (
     "read_timeout_seconds",
     "total_timeout_seconds",
     "first_token_timeout_seconds",
+    "provider_stream",
+    "provider_stream_include_usage",
     "transport_retries",
     "reasoning_reserve_tokens",
     "safety_margin_tokens",
@@ -43,12 +45,20 @@ _API_CONFIG_OPTIONAL_FIELDS = (
 
 
 def _normalize_text(value: Any) -> str:
-    return str(value or "").strip()
+    return "" if value is None else str(value).strip()
 
 
 def _has_meaningful_api_key(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
     api_key = _normalize_text(value)
     return bool(api_key) and not _API_KEY_PLACEHOLDER_RE.fullmatch(api_key)
+
+
+def _has_config_value(value: Any) -> bool:
+    """Treat numeric zero and boolean false as explicit typed values."""
+
+    return value is not None and not (isinstance(value, str) and not value.strip())
 
 
 def has_complete_api_route(section: Mapping[str, Any] | None) -> bool:
@@ -66,7 +76,9 @@ def has_complete_api_route(section: Mapping[str, Any] | None) -> bool:
     section = section or {}
     return (
         _has_meaningful_api_key(section.get("api_key"))
+        and isinstance(section.get("model"), str)
         and bool(_normalize_text(section.get("model")))
+        and isinstance(section.get("api_base"), str)
         and bool(_normalize_text(section.get("api_base")))
     )
 
@@ -79,17 +91,27 @@ def _section_has_effective_route(section: Dict[str, Any] | None) -> bool:
 
 def _section_to_api_config(section: Dict[str, Any] | None) -> APIConfig:
     section = section or {}
-    api_key = _normalize_text(section.get("api_key"))
-    if not _has_meaningful_api_key(api_key):
-        api_key = ""
+    raw_api_key = section.get("api_key")
+    api_key = _normalize_text(raw_api_key) if _has_meaningful_api_key(raw_api_key) else ""
+    raw_model = section.get("model")
+    raw_api_base = section.get("api_base")
+    raw_proxy_mode = section.get("proxy_mode")
     api_config: Dict[str, Any] = {
         "api_key": api_key,
-        "model": _normalize_text(section.get("model")),
-        "api_base": _normalize_text(section.get("api_base")) or "https://api.openai.com/v1",
-        "proxy_mode": _normalize_text(section.get("proxy_mode")) or "environment",
+        "model": _normalize_text(raw_model) if isinstance(raw_model, str) else "",
+        "api_base": (
+            _normalize_text(raw_api_base)
+            if isinstance(raw_api_base, str) and _normalize_text(raw_api_base)
+            else "https://api.openai.com/v1"
+        ),
+        "proxy_mode": (
+            _normalize_text(raw_proxy_mode)
+            if isinstance(raw_proxy_mode, str) and _normalize_text(raw_proxy_mode)
+            else "environment"
+        ),
     }
     for field in _API_CONFIG_OPTIONAL_FIELDS:
-        if field in section and _normalize_text(section.get(field)):
+        if field in section and _has_config_value(section.get(field)):
             api_config[field] = section.get(field)
     return cast(APIConfig, api_config)
 
