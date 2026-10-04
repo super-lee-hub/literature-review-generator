@@ -1378,6 +1378,9 @@ def _adjudicate(
     results: Sequence[CitationValidationResult],
     *,
     scope: str = "primary_validation",
+    input_records: Sequence[Any] | None = None,
+    paper_records: Sequence[Any] | None = None,
+    repair_transaction_record: Any | None = None,
 ) -> list[CitationValidationResult]:
     config = get_validator_api_config(
         {"Validator_API": dict(service.settings.section("Validator_API"))}
@@ -1479,6 +1482,60 @@ def _adjudicate(
         controller=aggregate_controller,
         verified_reuse=verified_reuse,
     )
+    dependencies = list(input_records) if input_records is not None else [
+        getattr(service, "review_draft_record", None), getattr(service, "citation_manifest_record", None),
+    ]
+    dependencies.extend(paper_records if paper_records is not None else getattr(service, "paper_artifact_records", ()) or ())
+    dependencies.extend(getattr(service, "visual_artifact_records", ()) or ())
+    dependencies.append(getattr(service, "validation_source_binding_record", None))
+    unique_dependencies = {record.artifact_id: record for record in dependencies if record is not None}
+    provisional = False
+    for record in unique_dependencies.values():
+        if (scope == "repair_revalidation" and record.status == "quarantined"
+                and record.artifact_type in {"review_draft", "citation_manifest"}
+                and record.metadata.get("repair_validation_candidate") is True):
+            current = service.artifact_registry.get(record.artifact_id)
+            source = service.artifact_registry.get(str(record.metadata.get("source_artifact_id") or ""))
+            transaction = repair_transaction_record
+            if (transaction is None or transaction.job_id != service.job_id
+                    or transaction.artifact_type != "repair_transaction" or transaction.status != "quarantined"
+                    or service.artifact_registry.get(transaction.artifact_id) != transaction
+                    or file_sha256(transaction.path) != transaction.content_hash):
+                raise RuntimeError("provisional repair input lacks its bound repair transaction")
+            transaction_payload = _read_json(transaction.path)
+            if (not isinstance(transaction_payload, Mapping) or transaction_payload.get("status") != "quarantined"
+                    or transaction_payload.get("job_id") != service.job_id or source is None
+                    or source.artifact_id not in transaction_payload.get("applied_artifact_ids", ())):
+                raise RuntimeError("provisional repair source is outside its repair transaction")
+            if (current != record or record.job_id != service.job_id or file_sha256(record.path) != record.content_hash
+                    or source is None or source.job_id != service.job_id or source.content_hash != record.content_hash
+                    or file_sha256(source.path) != source.content_hash):
+                raise RuntimeError("provisional repair input binding changed before Validator inventory")
+            provisional = True
+        else:
+            service.artifact_registry.verify_ready_artifact_closure(record)
+    if provisional:
+        if repair_transaction_record is None:
+            raise RuntimeError("provisional Validator inventory has no repair transaction")
+        unique_dependencies[repair_transaction_record.artifact_id] = repair_transaction_record
+    inventory["input_artifacts"] = [
+        {"artifact_id": record.artifact_id, "artifact_hash": record.content_hash, "status": record.status}
+        for record in sorted(unique_dependencies.values(), key=lambda record: record.artifact_id)
+    ]
+    inventory["validation_source_authority_hash"] = str(
+        getattr(service, "validation_source_authority_hash", "") or ""
+    )
+    inventory["inventory_hash"] = hash_json({key: value for key, value in inventory.items() if key != "inventory_hash"})
+    inventory_record = publish_json_artifact(
+        service.publication_context, service.artifact_registry,
+        service.workspace.artifact_path(f"validation/pretransport_{inventory['inventory_hash']}.json"),
+        dict(inventory), artifact_id=f"validator-pretransport:{inventory['inventory_hash']}",
+        artifact_role="validator_pretransport_inventory", artifact_type="validator_pretransport_inventory",
+        artifact_version="v1", producer="validation.current_validation",
+        status="quarantined" if provisional else "ready",
+        depends_on=[ArtifactDependencyRefV2.from_record(record) for record in unique_dependencies.values()],
+    )
+    service._validator_stage_pretransport_inventory_record = inventory_record
     output: list[CitationValidationResult] = []
     outcomes: list[dict[str, str]] = []
     for item in planned:
@@ -1878,6 +1935,7 @@ def run_current_validation(
     result_artifact_id: str = "",
     result_artifact_type: str = "validation_run_result",
     result_artifact_role: str = "validation",
+    repair_transaction_record: Any | None = None,
 ) -> dict[str, Any]:
     """Execute current review validation from durable service-owned inputs.
 
@@ -2091,6 +2149,13 @@ def run_current_validation(
         service,
         base_report.citation_results,
         scope=validation_scope,
+        input_records=(review_draft_record_override or service.review_draft_record,
+                       citation_manifest_record_override or service.citation_manifest_record)
+        if review_draft_record_override is not None or citation_manifest_record_override is not None else None,
+        paper_records=[service.artifact_registry.get(str(item.get("_registry_artifact_id") or ""))
+                       for item in paper_artifacts]
+        if paper_artifacts_override is not None else None,
+        repair_transaction_record=repair_transaction_record,
     )
     report = _build_report(results)
     result = ValidationRunResultV1.from_report(

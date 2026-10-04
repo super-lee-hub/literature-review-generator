@@ -174,6 +174,14 @@ def test_validator_pretransport_inventory_binds_only_eligible_requests_before_ca
         observed_service: Any, api_config: Mapping[str, Any], packet: Any
     ) -> Mapping[str, Any]:
         inventory = observed_service._validator_stage_pretransport_inventory
+        record = observed_service.artifact_registry.get(
+            f"validator-pretransport:{inventory['inventory_hash']}"
+        )
+        assert record is not None
+        observed_service.artifact_registry.verify_ready_artifact_closure(record)
+        persisted = json.loads(Path(record.path).read_text(encoding="utf-8"))
+        assert persisted["inventory_hash"] == inventory["inventory_hash"]
+        assert persisted["request_plan_hash"] == inventory["request_plan_hash"]
         assert inventory["provider_posts_emitted_at_plan"] == 0
         assert inventory["status"] == "materialized_upper_bound"
         row = next(
@@ -225,6 +233,79 @@ def test_validator_pretransport_inventory_binds_only_eligible_requests_before_ca
     assert "Sensitive claim A." not in encoded
     assert "Sensitive claim B." not in encoded
     assert "local-fixture-only" not in encoded
+
+
+def test_validator_inventory_binds_explicit_repair_records_before_dispatch(tmp_path, monkeypatch):
+    from services.job_workspace import publish_json_artifact
+
+    service = _service(tmp_path)
+    _bind_fixture_reuse_miss(service, monkeypatch)
+    records = [publish_json_artifact(
+        service.publication_context, service.artifact_registry,
+        service.workspace.artifact_path(f"input/{kind}.json"), {"revision": "repaired"},
+        artifact_id=f"fixture-repaired:{kind}", artifact_role="fixture", artifact_type="fixture",
+        artifact_version="v1", producer="test",
+    ) for kind in ("draft", "manifest")]
+
+    def provider(observed_service, api_config, packet):
+        inventory = observed_service._validator_stage_pretransport_inventory
+        assert {item["artifact_id"] for item in inventory["input_artifacts"]} == {
+            record.artifact_id for record in records
+        }
+        saved = observed_service._validator_stage_pretransport_inventory_record
+        observed_service.artifact_registry.verify_ready_artifact_closure(saved)
+        return {"status": "supported", "confidence": 0.99}
+
+    monkeypatch.setattr(current_validation, "run_adjudication_stage", provider)
+    current_validation._adjudicate(service, [_citation_result("set", "paper", "A bounded claim.")],
+                                  scope="repair_revalidation", input_records=records)
+
+
+@pytest.mark.parametrize("failure", [None, "tampered", "foreign_transaction"])
+def test_provisional_repair_inventory_preserves_quarantine_and_rejects_drift(tmp_path, monkeypatch, failure):
+    from services.job_workspace import publish_json_artifact
+
+    service = _service(tmp_path)
+    _bind_fixture_reuse_miss(service, monkeypatch)
+    path = service.workspace.artifact_path("repair/draft.json")
+    source = publish_json_artifact(
+        service.publication_context, service.artifact_registry, path, {"repair": "candidate"},
+        artifact_id="repair-derived-draft", artifact_role="repair", artifact_type="fixture",
+        artifact_version="v1", producer="test", status="quarantined",
+    )
+    candidate = service.artifact_registry.register_file(
+        path=source.path, artifact_id="repair-validation-draft", artifact_role="repair_validation_candidate_review_draft",
+        artifact_type="review_draft", artifact_version="v3", producer="test", status="quarantined",
+        metadata={"repair_validation_candidate": True, "source_artifact_id": source.artifact_id},
+    )
+    transaction = publish_json_artifact(
+        service.publication_context, service.artifact_registry,
+        service.workspace.artifact_path("repair/transaction.json"),
+        {"status": "quarantined", "job_id": service.job_id,
+         "applied_artifact_ids": [source.artifact_id] if failure != "foreign_transaction" else []},
+        artifact_id="repair-transaction", artifact_role="repair", artifact_type="repair_transaction",
+        artifact_version="v1", producer="test", status="quarantined",
+    )
+    sends = []
+
+    def provider(observed_service, api_config, packet):
+        sends.append(packet)
+        assert observed_service._validator_stage_pretransport_inventory_record.status == "quarantined"
+        assert all(item["status"] == "quarantined" for item in observed_service._validator_stage_pretransport_inventory["input_artifacts"])
+        return {"status": "supported", "confidence": 0.99}
+
+    monkeypatch.setattr(current_validation, "run_adjudication_stage", provider)
+    if failure == "tampered":
+        Path(candidate.path).write_text('{"tampered":true}', encoding="utf-8")
+    if failure:
+        with pytest.raises(RuntimeError, match="binding changed|outside its repair transaction"):
+            current_validation._adjudicate(service, [_citation_result("set", "paper", "A bounded claim.")],
+                                          scope="repair_revalidation", input_records=[candidate], repair_transaction_record=transaction)
+        assert sends == []
+    else:
+        current_validation._adjudicate(service, [_citation_result("set", "paper", "A bounded claim.")],
+                                      scope="repair_revalidation", input_records=[candidate], repair_transaction_record=transaction)
+        assert len(sends) == 1
 
 
 def test_validator_scope_budget_blocks_before_first_transport_when_one_call_is_short(
@@ -521,7 +602,7 @@ def test_output_dir_does_not_infer_repair_revalidation_scope(
     monkeypatch.setattr(
         current_validation,
         "_adjudicate",
-        lambda _service, results, *, scope: observed_scopes.append(scope) or list(results),
+        lambda _service, results, *, scope, input_records=None, paper_records=None, repair_transaction_record=None: observed_scopes.append(scope) or list(results),
     )
 
     class EmptyValidator:

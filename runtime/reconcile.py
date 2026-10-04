@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import re
 import json
 import os
 from pathlib import Path
@@ -155,6 +156,55 @@ def _validate_source_bundle(_record: ArtifactRecord, path: Path) -> None:
         raise ReconcileValidationError(f"source bundle is missing fields: {sorted(required - payload.keys())}")
     if not isinstance(payload["paper_work_items"], list) or not isinstance(payload["source_snapshot"], dict):
         raise ReconcileValidationError("source bundle collections have invalid types")
+
+
+def _validate_stage1_source_scope(record: ArtifactRecord, path: Path) -> None:
+    payload = _read_json_object(path)
+    if set(payload) != {"schema_version", "job_id", "source_bundle_hash", "runtime_spec_hash", "papers",
+                       "paper_count", "page_count", "reuse_status", "model_request_bounds"}:
+        raise ReconcileValidationError("Stage 1 source scope schema fields are invalid")
+    if payload.get("schema_version") != "stage1-source-scope/v1" or payload.get("job_id") != record.job_id:
+        raise ReconcileValidationError("Stage 1 source scope identity is invalid")
+    papers = payload.get("papers")
+    if not isinstance(papers, list):
+        raise ReconcileValidationError("Stage 1 source scope papers must be an array")
+    keys: set[str] = set()
+    pages = 0
+    for paper in papers:
+        if (not isinstance(paper, Mapping) or set(paper) != {"paper_key", "source_pdf", "source_pdf_sha256", "size_bytes", "page_count"}
+                or not isinstance(paper.get("paper_key"), str) or not paper["paper_key"]
+                or not isinstance(paper.get("source_pdf"), str) or not paper["source_pdf"] or paper["paper_key"] in keys):
+            raise ReconcileValidationError("Stage 1 source scope paper identity is invalid")
+        keys.add(paper["paper_key"])
+        if (type(paper.get("page_count")) is not int or paper["page_count"] <= 0
+                or type(paper.get("size_bytes")) is not int or paper["size_bytes"] < 0
+                or not re.fullmatch(r"[0-9a-f]{64}", str(paper.get("source_pdf_sha256") or ""))):
+            raise ReconcileValidationError("Stage 1 source scope PDF dimensions are invalid")
+        pages += paper["page_count"]
+    if payload.get("paper_count") != len(papers) or payload.get("page_count") != pages:
+        raise ReconcileValidationError("Stage 1 source scope totals are invalid")
+    for kind, hash_key in (("source_bundle", "source_bundle_hash"), ("runtime_job_spec", "runtime_spec_hash")):
+        dependencies = [ref for ref in record.depends_on if ref.artifact_type == kind]
+        if (len(dependencies) != 1 or not re.fullmatch(r"[0-9a-f]{64}", str(payload.get(hash_key) or ""))
+                or dependencies[0].content_hash != payload[hash_key]):
+            raise ReconcileValidationError("Stage 1 source scope input dependency is invalid")
+        if kind == "source_bundle":
+            bundle = _read_json_object(Path(dependencies[0].path))
+            declared = {(str(item.get("canonical_paper_key") or ""), str(Path(str(item.get("source_pdf") or "")).resolve()))
+                        for item in bundle.get("paper_work_items", ()) if isinstance(item, Mapping)}
+            observed = {(paper["paper_key"], str(Path(paper["source_pdf"]).resolve())) for paper in papers}
+            if declared != observed:
+                raise ReconcileValidationError("Stage 1 source scope papers do not match its source bundle")
+
+
+def _validate_validator_pretransport_inventory(_record: ArtifactRecord, path: Path) -> None:
+    from runtime.provider_runtime import hash_json
+
+    payload = _read_json_object(path)
+    if (payload.get("schema_version") != "validator-pretransport-inventory/v1"
+            or payload.get("inventory_hash") != hash_json({key: value for key, value in payload.items() if key != "inventory_hash"})
+            or not isinstance(payload.get("requests"), list)):
+        raise ReconcileValidationError("Validator pretransport inventory schema or identity is invalid")
 
 
 def validate_canonical_ai_summary(payload: Any, *, label: str) -> Mapping[str, Any]:
@@ -1680,6 +1730,8 @@ DEFAULT_SCHEMA_VALIDATORS: dict[str, SchemaValidator] = {
     "job_outcome": _validate_job_outcome,
     STAGE_TERMINAL_ARTIFACT_TYPE: _validate_stage_terminal,
     "source_bundle": _validate_source_bundle,
+    "stage1_source_scope": _validate_stage1_source_scope,
+    "validator_pretransport_inventory": _validate_validator_pretransport_inventory,
     "summary_file": _validate_summary_file,
     "review_docx": _validate_docx,
     "source_pdf": _validate_pdf,

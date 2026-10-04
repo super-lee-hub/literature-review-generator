@@ -6569,6 +6569,7 @@ class ReviewControlPlane:
                 citation_manifest_record=validated_manifest,
                 output_dir=revalidation_dir,
                 result_artifact_id=revalidation_id,
+                repair_transaction_record=source_record,
             )
             session.context.registry.reload()
             revalidation_record = session.context.registry.get(revalidation_id)

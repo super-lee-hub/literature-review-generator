@@ -937,6 +937,7 @@ class ValidationExecutionService:
         output_dir: str,
         result_artifact_id: str,
         paper_artifact_records: Sequence[ArtifactRecord] | None = None,
+        repair_transaction_record: ArtifactRecord | None = None,
     ) -> dict[str, Any]:
         """Run the current validator against explicit repaired artifacts.
 
@@ -963,7 +964,9 @@ class ValidationExecutionService:
                 continue
             payload = json.loads(Path(record.path).read_text(encoding="utf-8"))
             if isinstance(payload, Mapping):
-                paper_payloads.append(dict(payload))
+                paper_payloads.append({**dict(payload), "_registry_artifact_id": record.artifact_id,
+                                       "_registry_artifact_hash": record.content_hash,
+                                       "_registry_path": record.path})
         result: dict[str, Any] | None = None
         try:
             result = run_current_validation(
@@ -975,6 +978,7 @@ class ValidationExecutionService:
                 citation_manifest_record_override=citation_manifest_record,
                 output_dir=output_dir,
                 validation_scope="repair_revalidation",
+                repair_transaction_record=repair_transaction_record,
                 result_artifact_id=result_artifact_id,
                 result_artifact_type="validation_run_result_repaired",
                 result_artifact_role="validation_run_result_repaired",
