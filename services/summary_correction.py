@@ -1442,5 +1442,3 @@ __all__ = [
     "prepare_source_summary_correction_candidate",
     "verify_source_summary_correction_candidate",
 ]
-
-

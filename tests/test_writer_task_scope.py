@@ -268,4 +268,3 @@ def test_paragraph_unit_cannot_bypass_bound_layout_with_a_markdown_table() -> No
     ))
     with pytest.raises(WriterTaskScopeError, match="bound table layout"):
         validate_writer_task_output_v1(scope, payload)
-

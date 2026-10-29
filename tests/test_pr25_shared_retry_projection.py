@@ -408,5 +408,3 @@ def test_v2_shared_retry_cap_respects_each_requests_retry_ceiling() -> None:
             rows, lambda row: row.request_estimate.requested_output_tokens, 3
         )
     )
-
-

@@ -402,4 +402,3 @@ def test_actual_cross_topic_bridge_claim_gets_one_group_with_each_paper_closure(
     }
     with pytest.raises(CandidateOutputScopeError, match="cannot be split"):
         scope.validate(split_group)
-
