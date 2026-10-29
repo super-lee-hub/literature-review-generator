@@ -31,7 +31,7 @@ from services.model_capabilities import (
 from services.proxy_policy import should_bypass_environment_proxy
 from services.credential_provenance import is_template_credential
 from services.prompt_registry import default_prompt_registry
-from runtime.provider_context import ProviderContextProfile
+from runtime.provider_context import ProviderContextProfile, configured_output_token_limit
 from runtime.provider_runtime import (
     ProviderBudgetExceeded,
     ProviderRuntime,
@@ -654,6 +654,37 @@ def _configured_positive_int(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return parsed if parsed > 0 else default
+
+
+def _transport_output_token_target(
+    api_config: Mapping[str, Any], capability: ModelCapability, max_tokens: int
+) -> int:
+    """Mirror the selected payload builder's effective output field."""
+    if capability.endpoint_type == "anthropic":
+        target = _configured_positive_int(api_config.get("max_tokens"), max_tokens)
+        target = _configured_positive_int(api_config.get("max_output_tokens"), target)
+        if capability.anthropic_thinking_mode == "manual":
+            thinking_budget = _configured_positive_int(
+                api_config.get("thinking_budget_tokens"), 0
+            )
+            if thinking_budget:
+                target = max(target, thinking_budget + 1)
+        return target
+    if capability.endpoint_type == "responses":
+        return _configured_positive_int(api_config.get("max_output_tokens"), max_tokens)
+    target = _configured_positive_int(api_config.get("max_completion_tokens"), max_tokens)
+    return _configured_positive_int(api_config.get("max_tokens"), target)
+
+
+def _payload_config_with_output_override(
+    api_config: APIConfig, wire_output_tokens: Optional[int]
+) -> APIConfig:
+    if wire_output_tokens is None:
+        return api_config
+    payload_config = dict(api_config)
+    for output_field in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
+        payload_config[output_field] = int(wire_output_tokens)
+    return cast(APIConfig, payload_config)
 
 
 def _extract_response_output_text(response_data: Dict[str, Any]) -> str:
@@ -3194,6 +3225,7 @@ def _call_ai_api_detailed_uninstrumented(
     max_request_image_bytes: Optional[int] = None,
     primary_raw_response_retention_callback: PrimaryRawResponseRetentionCallback | None = None,
     primary_provider_attempt_started_callback: PrimaryProviderAttemptStartedCallback | None = None,
+    wire_output_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Call a configured AI API transport and retain failure details."""
     attempts_used = 0
@@ -3226,6 +3258,9 @@ def _call_ai_api_detailed_uninstrumented(
         api_base = api_config.get('api_base', 'https://api.openai.com/v1') or 'https://api.openai.com/v1'
         request_started_epoch = time.time()
         capability = resolve_model_capability(api_config)
+        payload_api_config = _payload_config_with_output_override(
+            api_config, wire_output_tokens
+        )
 
         if not api_key or is_template_credential(api_key) or not model_name:
             message = "API config is missing a real api_key or model"
@@ -3368,7 +3403,7 @@ def _call_ai_api_detailed_uninstrumented(
         if capability.endpoint_type == "anthropic":
             payload = build_anthropic_messages_payload(
                 prompt,
-                api_config,
+                payload_api_config,
                 system_prompt,
                 max_tokens=max_tokens,
                 temperature=temperature,
@@ -3383,7 +3418,7 @@ def _call_ai_api_detailed_uninstrumented(
         elif capability.endpoint_type == "responses":
             payload = build_responses_payload(
                 prompt,
-                api_config,
+                payload_api_config,
                 system_prompt,
                 max_tokens=max_tokens,
                 temperature=temperature,
@@ -3398,7 +3433,7 @@ def _call_ai_api_detailed_uninstrumented(
         else:
             payload = build_chat_completions_payload(
                 prompt,
-                api_config,
+                payload_api_config,
                 system_prompt,
                 max_tokens=max_tokens,
                 temperature=temperature,
@@ -4040,7 +4075,7 @@ def _call_ai_api_detailed(
     prompt: str,
     api_config: APIConfig,
     system_prompt: str,
-    max_tokens: int = 4000,
+    max_tokens: Optional[int] = None,
     temperature: float = 0.3,
     response_format: str = "json",
     logger: Any = None,
@@ -4053,6 +4088,7 @@ def _call_ai_api_detailed(
     max_request_image_bytes: Optional[int] = None,
     primary_raw_response_retention_callback: PrimaryRawResponseRetentionCallback | None = None,
     primary_provider_attempt_started_callback: PrimaryProviderAttemptStartedCallback | None = None,
+    wire_output_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Call the transport only after bound-runtime and complete-budget admission."""
 
@@ -4062,6 +4098,28 @@ def _call_ai_api_detailed(
             error_kind="fatal_config_or_auth",
             message="a bound ProviderRuntime is required for production model calls",
         )
+
+    capability = resolve_model_capability(api_config)
+    try:
+        if max_tokens is None:
+            resolved_max_tokens = (
+                int(wire_output_tokens)
+                if wire_output_tokens is not None
+                else _transport_output_token_target(api_config, capability, 4_000)
+            )
+        elif isinstance(max_tokens, bool):
+            raise ValueError("requested output token limit must be a positive integer")
+        else:
+            resolved_max_tokens = int(str(max_tokens).strip())
+        if resolved_max_tokens <= 0:
+            raise ValueError("requested output token limit must be a positive integer")
+    except (TypeError, ValueError) as exc:
+        return _api_result(
+            status="failed",
+            error_kind="fatal_config_or_auth",
+            message=str(exc),
+        )
+    max_tokens = resolved_max_tokens
 
     admitted_user_content, admission_omissions = _admit_local_images_to_budget(
         user_content,
@@ -4093,7 +4151,48 @@ def _call_ai_api_detailed(
         )
         blocked["provider_receipt"] = receipt.to_dict()
         return blocked
-    capability = resolve_model_capability(api_config)
+    wire_api_config: APIConfig = api_config
+    wire_output_tokens_per_attempt = int(max_tokens)
+    output_contract_error = ""
+    try:
+        if wire_output_tokens is not None:
+            if isinstance(wire_output_tokens, bool) or int(wire_output_tokens) != int(max_tokens):
+                raise ValueError("provider wire output limit differs from the admitted request")
+            wire_api_config = cast(APIConfig, dict(api_config))
+            for output_field in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
+                wire_api_config[output_field] = int(wire_output_tokens)
+        wire_output_tokens_per_attempt = _transport_output_token_target(
+            wire_api_config, capability, int(max_tokens)
+        )
+        if wire_output_tokens_per_attempt > int(max_tokens):
+            raise ValueError("provider wire output limit exceeds the admitted request reservation")
+        if wire_output_tokens is not None and wire_output_tokens_per_attempt != int(max_tokens):
+            raise ValueError("provider wire output limit differs from the admitted Validator request")
+        hard_output_limit = configured_output_token_limit(
+            api_config, wire_output_tokens_per_attempt
+        )
+        if wire_output_tokens_per_attempt > hard_output_limit:
+            raise ValueError("provider wire output limit exceeds an explicit route ceiling")
+    except (TypeError, ValueError) as exc:
+        output_contract_error = str(exc)
+    if output_contract_error:
+        receipt = provider_runtime.blocked_receipt(
+            prompt=prompt,
+            input_payload=request_payload,
+            api_config=api_config,
+            message=output_contract_error,
+            route=provider_route,
+        )
+        blocked = _api_result(
+            status="failed",
+            error_kind="budget_exhausted",
+            message=output_contract_error,
+        )
+        blocked["provider_receipt"] = receipt.to_dict()
+        blocked["provider_http_attempt_started"] = False
+        blocked["provider_http_attempts_started"] = 0
+        return blocked
+
     profile = ProviderContextProfile.from_api_config(
         api_config,
         max_output_tokens=max(1, int(max_tokens)),
@@ -4188,6 +4287,9 @@ def _call_ai_api_detailed(
             transport_api_config["raw_response_dir"] = str(
                 Path(str(ledger_path)).resolve().parent / "raw_responses"
             )
+    transport_call_kwargs: dict[str, Any] = {}
+    if wire_output_tokens is not None:
+        transport_call_kwargs["wire_output_tokens"] = int(wire_output_tokens)
     result = _call_ai_api_detailed_uninstrumented(
         prompt,
         cast(APIConfig, transport_api_config),
@@ -4205,6 +4307,7 @@ def _call_ai_api_detailed(
         max_request_image_bytes=max_request_image_bytes,
         primary_raw_response_retention_callback=primary_raw_response_retention_callback,
         primary_provider_attempt_started_callback=primary_provider_attempt_started_callback,
+        **transport_call_kwargs,
     )
     _normalized_content, transport_report = _normalize_user_message_content_with_report(
         prompt,
@@ -4334,6 +4437,7 @@ def _call_ai_api_detailed(
         "proxy_mode": str(api_config.get("proxy_mode") or "environment"),
         "trust_env": not should_bypass_environment_proxy(api_config),
         "request_route": request_route,
+        "requested_output_tokens_per_attempt": int(wire_output_tokens_per_attempt),
         "request_byte_estimate": len(
             json.dumps(
                 request_payload,
@@ -4377,6 +4481,7 @@ def _call_ai_api_detailed(
         metadata={
             "request_budget": budget,
             "requested_output_tokens": int(max_tokens),
+            "requested_output_tokens_per_attempt": int(wire_output_tokens_per_attempt),
             "transport_config": transport_config,
             "config_section": str(provider_runtime.route or "")
             if str(provider_runtime.route or "").endswith("_API")
@@ -4424,6 +4529,7 @@ def probe_provider_connection(
             response_format="text",
             logger=logger,
             provider_runtime=runtime,
+            wire_output_tokens=1,
         )
     finally:
         try:
@@ -4433,15 +4539,19 @@ def probe_provider_connection(
             pass
 
 
-def _call_ai_api(prompt: str, api_config: APIConfig, system_prompt: str, max_tokens: int = 4000,
+def _call_ai_api(prompt: str, api_config: APIConfig, system_prompt: str, max_tokens: Optional[int] = None,
                  temperature: float = 0.3, response_format: str = "json", logger: Any = None,
                  user_content: Any = None, retry_attempts: Optional[int] = None,
                  timeout_seconds: Optional[int] = None,
-                 provider_runtime: Optional[ProviderRuntime] = None) -> Optional[Dict[str, Any]]:
+                 provider_runtime: Optional[ProviderRuntime] = None,
+                 wire_output_tokens: Optional[int] = None) -> Optional[Dict[str, Any]]:
     """
     Backward-compatible wrapper: existing callers receive parsed content only.
     Use _call_ai_api_detailed when transport failure kind is needed.
     """
+    call_kwargs: dict[str, Any] = {}
+    if wire_output_tokens is not None:
+        call_kwargs["wire_output_tokens"] = wire_output_tokens
     result = _call_ai_api_detailed(
         prompt,
         api_config,
@@ -4454,6 +4564,7 @@ def _call_ai_api(prompt: str, api_config: APIConfig, system_prompt: str, max_tok
         retry_attempts=retry_attempts,
         timeout_seconds=timeout_seconds,
         provider_runtime=provider_runtime,
+        **call_kwargs,
     )
     if result.get("status") == "success":
         return result.get("content")
@@ -4464,7 +4575,7 @@ def _call_ai_api_text_detailed(
     prompt: str,
     api_config: APIConfig,
     system_prompt: str,
-    max_tokens: int = 4000,
+    max_tokens: Optional[int] = None,
     temperature: float = 0.3,
     logger: Any = None,
     user_content: Any = None,

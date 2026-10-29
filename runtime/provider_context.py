@@ -31,6 +31,37 @@ def _configured_output_target(api_config: Mapping[str, Any], target: int) -> int
     return target
 
 
+def configured_output_token_limit(api_config: Mapping[str, Any], target: int) -> int:
+    """Apply only explicit output ceilings to a positive per-call target."""
+    if isinstance(target, bool):
+        raise ValueError("output token target must be a positive integer")
+    try:
+        output = int(str(target).strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError("output token target must be a positive integer") from exc
+    if output <= 0:
+        raise ValueError("output token target must be a positive integer")
+    return _configured_output_target(api_config, output)
+
+
+def validator_output_token_limit(api_config: Mapping[str, Any], stage: str) -> int:
+    """Resolve Validator's per-packet output target, then apply explicit caps."""
+    raw = api_config.get("max_output_tokens", 4_096)
+    if raw is None or str(raw).strip() == "":
+        base = 4_096
+    elif isinstance(raw, bool):
+        raise ValueError("Validator max_output_tokens must be a positive integer")
+    else:
+        try:
+            base = int(str(raw).strip())
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Validator max_output_tokens must be a positive integer") from exc
+        if base <= 0:
+            raise ValueError("Validator max_output_tokens must be a positive integer")
+    target = max(base, 6_144) if str(stage) == "stronger" else base
+    return configured_output_token_limit(api_config, target)
+
+
 def writer_output_token_limit(api_config: Mapping[str, Any]) -> int:
     """Apply the production Writer's output default and minimum consistently."""
 
@@ -282,4 +313,10 @@ class ProviderContextProfile:
         )
 
 
-__all__ = ["ProviderContextProfile", "ProviderRequestEstimateV1", "writer_output_token_limit"]
+__all__ = [
+    "ProviderContextProfile",
+    "ProviderRequestEstimateV1",
+    "configured_output_token_limit",
+    "validator_output_token_limit",
+    "writer_output_token_limit",
+]

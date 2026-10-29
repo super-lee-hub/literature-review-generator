@@ -1248,23 +1248,21 @@ def _preflight_validator_aggregate_scope(
 
     capability = resolve_model_capability(api_config)
     try:
-        model_context_limit = max(1, int(api_config.get("max_context_tokens") or 128_000))
-    except (TypeError, ValueError):
-        model_context_limit = 128_000
-    try:
         configured_output_tokens = max(1, int(api_config.get("max_output_tokens") or 4_096))
     except (TypeError, ValueError):
         configured_output_tokens = 4_096
-    profile = ProviderContextProfile.conservative(
-        provider=str(api_config.get("provider_family") or capability.provider_family),
-        model=str(api_config.get("model") or ""),
-        endpoint_type=str(api_config.get("endpoint_type") or capability.endpoint_type),
-        model_context_limit=model_context_limit,
-        max_output_tokens=configured_output_tokens,
-        reasoning_reserve=_nonnegative_setting(
-            api_config.get("reasoning_reserve_tokens"), 0
-        ),
-        safety_margin=_positive_setting(api_config.get("safety_margin_tokens"), 256),
+    profile_output_tokens = max(
+        max(1, int(payload.get("max_output_tokens") or configured_output_tokens))
+        for _result, _packet, payload in planned_requests
+    )
+    profile = ProviderContextProfile.from_api_config(
+        api_config,
+        max_output_tokens=profile_output_tokens,
+        default_provider=capability.provider_family,
+        default_model=str(api_config.get("model") or ""),
+        default_endpoint_type=capability.endpoint_type,
+        default_reasoning_reserve=0,
+        default_safety_margin=256,
     )
     inventory_rows = {
         str(item["call_id"]): item for item in inventory.get("requests") or ()

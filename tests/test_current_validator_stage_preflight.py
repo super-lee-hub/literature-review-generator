@@ -21,8 +21,9 @@ from services.artifact_registry import ArtifactRegistry
 from services.job_workspace import JobWorkspace
 from services.settings import ApplicationSettings
 from validation import current_validation
-from validation.adjudication_reuse import _request_payload
+from validation.adjudication_reuse import _request_payload, adjudication_call_id
 from validation.execution_service import ValidationExecutionService
+from validation.llm_adjudicator import AdjudicationPacket
 
 
 def _service(
@@ -678,3 +679,69 @@ def test_repair_revalidation_passes_explicit_inventory_scope(
 
     assert observed_kwargs["validation_scope"] == "repair_revalidation"
     assert outcome["provider_receipt_closure_record_id"] == "closure-record"
+
+
+@pytest.mark.parametrize("output_budget", [6_144, 6_143])
+def test_strict_v2_preflight_profiles_the_actual_stronger_packet_output(
+    tmp_path: Path, output_budget: int
+) -> None:
+    service = _service(tmp_path, validation_retry_limit=0)
+    api_config = dict(service.settings.sections["Validator_API"])
+    api_config["max_output_tokens"] = "4096"
+    packet = AdjudicationPacket(
+        citation_set_key="set-stronger-output",
+        stage="stronger",
+        claim_text="The cited result is supported.",
+        claim_context="",
+        block_context="",
+        claim_type="result",
+        claim_type_confidence=0.9,
+        claim_type_rationale="",
+        paper_ids=["paper-1"],
+        claim_units=[],
+        target_claim_unit={},
+        claim_unit_results=[],
+        paper_identity_hints={},
+        per_paper_evidence_packets={},
+        evidence_excerpt_list=[],
+        trimmed_candidate_counts={},
+        evidence_status="evidence_gap",
+        disposition="manual_review",
+    )
+    payload = _request_payload(packet, api_config)
+    assert payload["max_output_tokens"] == 6_144
+
+    controller = ProviderBudgetController(
+        ProviderAggregateBudgetV2(
+            max_provider_calls_total=1,
+            max_output_tokens_total=output_budget,
+            max_retry_attempts_total=0,
+            max_wall_seconds=120,
+        )
+    )
+    inventory = {
+        "requests": [
+            {
+                "call_id": adjudication_call_id(packet),
+                "attempts_upper_bound": 1,
+                "total_timeout_seconds": 9,
+            }
+        ]
+    }
+    def run_preflight() -> None:
+        current_validation._preflight_validator_aggregate_scope(
+            service,
+            [(None, packet, payload)],
+            api_config,
+            inventory,
+            controller=controller,
+            verified_reuse={},
+        )
+
+    if output_budget < 6_144:
+        with pytest.raises(ProviderBudgetExceeded):
+            run_preflight()
+    else:
+        run_preflight()
+        assert inventory["aggregate_preflight"]["status"] == "within_budget"
+        assert inventory["aggregate_preflight"]["totals"]["aggregate_output_tokens_reserved"] == 6_144
