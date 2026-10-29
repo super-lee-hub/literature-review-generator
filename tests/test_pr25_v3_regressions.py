@@ -97,7 +97,7 @@ def test_v3_01_preflight_uses_effective_cap_when_choosing_hierarchical_relation_
     assert details["hierarchical_needed"] is True
 
 
-def test_v3_01_effective_cap_never_exceeds_transport_hard_ceiling(tmp_path) -> None:
+def test_v3_01_effective_cap_honors_work_target_and_route_budget(tmp_path) -> None:
     executor = _executor(
         tmp_path,
         stability_mode="off",
@@ -112,14 +112,16 @@ def test_v3_01_effective_cap_never_exceeds_transport_hard_ceiling(tmp_path) -> N
     )
 
     assert profile.input_budget > 64_000
+    assert executor._effective_input_cap(profile) == 48_000
+    executor.max_source_prompt_tokens = 32_000
     assert executor._effective_input_cap(profile) == 32_000
 
 
-def test_v3_01_candidate_shard_runner_enforces_the_transport_hard_cap(tmp_path, monkeypatch) -> None:
+def test_v3_01_candidate_shard_runner_enforces_explicit_conservative_target(tmp_path, monkeypatch) -> None:
     executor = _executor(
         tmp_path,
         stability_mode="off",
-        max_source_prompt_tokens=48_000,
+        max_source_prompt_tokens=32_000,
     )
     profile = SimpleNamespace(
         input_budget=100_000,
@@ -153,11 +155,11 @@ def test_v3_01_candidate_shard_runner_enforces_the_transport_hard_cap(tmp_path, 
         )
 
 
-def test_v3_01_relation_adjudicator_enforces_the_transport_hard_cap(tmp_path, monkeypatch) -> None:
+def test_v3_01_relation_adjudicator_enforces_explicit_conservative_target(tmp_path, monkeypatch) -> None:
     executor = _executor(
         tmp_path,
         stability_mode="off",
-        max_source_prompt_tokens=48_000,
+        max_source_prompt_tokens=32_000,
     )
     profile = SimpleNamespace(
         input_budget=100_000,

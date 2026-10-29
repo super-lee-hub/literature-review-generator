@@ -525,7 +525,7 @@ class OutlineSettings:
     evidence_critique_enabled: bool = True
     require_explicit_adoption: bool = True
     technical_shard_target_tokens: int = 0
-    semantic_output_max_tokens: int = 4_096
+    semantic_output_max_tokens: int = 0
     allow_bibliometric_provider: bool = False
 
     @classmethod
@@ -533,18 +533,18 @@ class OutlineSettings:
         section = _section(config, "Outline")
         raw_semantic_output = section.get("semantic_output_max_tokens")
         if raw_semantic_output is None or str(raw_semantic_output).strip() == "":
-            semantic_output_max_tokens = 4_096
+            semantic_output_max_tokens = 0
         else:
             if isinstance(raw_semantic_output, bool):
-                raise ValueError("Outline.semantic_output_max_tokens must be a positive integer")
+                raise ValueError("Outline.semantic_output_max_tokens must be a non-negative integer (0 uses the route target)")
             try:
                 semantic_output_max_tokens = int(str(raw_semantic_output).strip())
             except ValueError as exc:
                 raise ValueError(
-                    "Outline.semantic_output_max_tokens must be a positive integer"
+                    "Outline.semantic_output_max_tokens must be a non-negative integer (0 uses the route target)"
                 ) from exc
-            if semantic_output_max_tokens <= 0:
-                raise ValueError("Outline.semantic_output_max_tokens must be a positive integer")
+            if semantic_output_max_tokens < 0:
+                raise ValueError("Outline.semantic_output_max_tokens must be a non-negative integer (0 uses the route target)")
         return cls(
             candidate_count=_int(section.get("candidate_count"), 5),
             relation_adjudication_enabled=_bool(section.get("relation_adjudication_enabled"), True),
@@ -581,6 +581,18 @@ class OutlineStabilitySettings:
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> "OutlineStabilitySettings":
         section = _section(config, "OutlineStability")
+        raw_source_target = section.get("max_source_prompt_tokens")
+        if raw_source_target is None or str(raw_source_target).strip() == "":
+            source_target = 0
+        else:
+            if isinstance(raw_source_target, bool):
+                raise ValueError("OutlineStability.max_source_prompt_tokens must be a non-negative integer")
+            try:
+                source_target = int(str(raw_source_target).strip())
+            except ValueError as exc:
+                raise ValueError("OutlineStability.max_source_prompt_tokens must be a non-negative integer") from exc
+            if source_target < 0:
+                raise ValueError("OutlineStability.max_source_prompt_tokens must be a non-negative integer")
         mode = str(section.get("mode") or "smoke").strip().lower()
         if mode not in {"off", "smoke", "full"}:
             mode = "smoke"
@@ -606,7 +618,7 @@ class OutlineStabilitySettings:
             cache_read_cost_per_1k_tokens=_optional_float(section.get("cache_read_cost_per_1k_tokens")),
             cache_write_cost_per_1k_tokens=_optional_float(section.get("cache_write_cost_per_1k_tokens")),
             max_smoke_overhead_ratio=max(1.0, _float(section.get("max_smoke_overhead_ratio"), 2.0)),
-            max_source_prompt_tokens=max(0, _int(section.get("max_source_prompt_tokens"), 0)),
+            max_source_prompt_tokens=source_target,
         )
 
 

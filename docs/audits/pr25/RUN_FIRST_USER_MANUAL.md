@@ -4,6 +4,32 @@
 
 此恢复包不包含私人全文、密钥、运行账本、已付款缓存或项目工作区，也不授予新的外部调用额度。恢复包所列 Git SHA 只标识包内源码快照，不代表已推送 PR、当前工作区或完整运行已验收。
 
+## 容量与质量边界（2026-10-30）
+
+先按研究问题确定必要证据、比较双方、study 归属、限定条件和可读输出，再选择工作窗口与分块。应用窗口不是模型物理能力；模型名称也不能证明第三方网关支持相同上限。
+
+| 设置或证据 | 含义 |
+| --- | --- |
+| `OutlineStability.max_source_prompt_tokens` | 正值是显式输入工作目标；0/未设置使用对应路由 profile 的输入预算，不再隐式截到 32k。显式 32000 可继续作为保守档。 |
+| `Outline.technical_shard_target_tokens` | 正值是较小的分块软目标；0/未设置按路由与任务预算规划。 |
+| `Outline.semantic_output_max_tokens` | 正值是 topic/cross/global 的任务输出目标；0/未设置使用生成路由的输出目标。角色或结构化请求的实际限额以计划、序列化请求和回执为准。 |
+| API section 的 `max_output_tokens` | 默认请求目标；Stage1 另有 scan/synthesis 初始值和 length-retry ceiling，可能覆盖它。硬输出约束使用现有 `provider_max_output_tokens` / `max_output_tokens_limit`。 |
+| profile 的 `verified_context_limit` | 兼容字段名，当前由声明 context 的 0.8 推导，是应用安全预算，不是网关实测。 |
+| token estimate | UTF-8 字节数/3 加结构开销的启发式；不是模型 tokenizer，也不是数学上界。旧 strategy ID 为兼容而保留。网关 tokenizer 与估计误差未校准时须标 unknown。 |
+| 每轮 `metadata.provider_budget` | 有限的调用数、输出总额、重试、时长授权；容量变大不扩大该额度。每次实际发送仍经原子预留和 JIT 校验。 |
+
+`reviewctl doctor` 脱敏打印 API 默认工作预算、推导来源、Outline 目标以及 `network_probe=false`。预计能完成、允许最多花多少、条件分支最坏情况必须分开；未知的未来调用量不是已经消费的请求。
+
+官方文档核对日期为 2026-10-29：[GPT-5.6 Sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol) 列出 1,050,000 context / 128,000 max output；[Claude Opus 5.5](https://platform.claude.com/docs/en/models/opus-5-5/overview) 和 [Fable 5.1](https://platform.claude.com/docs/en/models/fable-5-1/migration-guide) 列出 1M / 128K；[DeepSeek 模型列表](https://api-docs.deepseek.com/api/list-models/)列出 1,048,576 / 393,216。这些是相应官方模型/接口规格，不是任意代理 host 的能力证明。真实部署要分别保留配置声明、官方文档、网关文档、已有匹配回执和校准证据；缺失项写 unknown，不填大数字冒充验证。
+
+[OpenAI 的输出上限](https://developers.openai.com/api/docs/guides/token-counting)包含可见内容、reasoning 和非可见格式 token；不能把整个 `max_output_tokens` 当作可读正文空间，也不能把已包含的 reasoning 再当作实际用量计费。其他 provider 和兼容网关按其实际协议核对。现有 reasoning/safety reserve 是规划缓冲，不是已经发生的 token 用量。
+
+已合法且能装入适用工作窗口的直接请求优先。先减少长身份、重复闭包、重复 schema 和账本传输，映射留在本地精确保存；完整学术证据和必要语境仍须送到当前任务。窗口确实不足或质量/稳定性试验不适合时再分层。不能用哈希、ID 并集或引用句全正确来证明重要机制、限定或反证没有遗漏。模型无法访问本地路径；声称回取时必须验证实际后续请求含对应原文内容。
+
+分别记录未发送的容量拒绝、HTTP context/size 错误、输出 length/incomplete、代理/读取/总时长超时、HTTP 200 后语义失败和本地 CPU/Registry 耗时。连接、首 body、首语义内容、流 idle、总时长和代理时限不能混为一项。当前上游 SSE 请求与面向用户的增量流不是同一功能；开启 stream 不解除上游总时长和输出限额。
+
+本地 fixture 只验证工程链。真实材料的已知答案、study/条件反转、重要反证遗漏和原文回取另列质量验收。未经实际质量校准，不声称“论文信息不会丢失”。历史 63/F1、旧授权卡与原始账本保留，但不是通用产品发布的前置；过期额度不得续期或换 ID 重发。
+
 ## 1. 入口、源码和 Python
 
 生产运行前必须使用维护者确认的最终干净 SHA、匹配的 Python 3.11 环境和该源码版本的生产依赖锁。当前 dirty checkout、旧 `.bat` 路由或开发入口本身都不是发布验收证据。不要切换到已删除的 `main.py` 直接参数流程。

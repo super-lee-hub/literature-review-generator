@@ -487,8 +487,8 @@ def execute_arbitration_overflow_pipeline(
         if type(cap) is not int:
             raise OverflowExecutionError(f"navigation input cap for {kind} must be an exact integer")
         normalized_input_caps[kind] = cap
-    if any(cap < 1 or cap > 32_000 for cap in normalized_input_caps.values()):
-        raise OverflowExecutionError("navigation effective input caps must be in [1, 32000]")
+    if any(cap < 1 for cap in normalized_input_caps.values()):
+        raise OverflowExecutionError("navigation effective input caps must be positive")
     if not isinstance(navigation_context_reserve, Mapping):
         raise OverflowExecutionError("navigation requires explicit route context and output reserves")
     navigation_output_caps: dict[str, int] = {}

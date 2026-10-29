@@ -176,8 +176,8 @@ def test_real_http_arbitration_overflow_survives_publish_crash_and_finishes_runt
         )
         arbitration_route = route_readback.route_for("arbitration")
         generation_route = route_readback.route_for("candidate_provider_generation")
-        effective_arbitration_cap = min(32_000, arbitration_route.profile.input_budget, global_source_cap)
-        effective_generation_cap = min(32_000, generation_route.profile.input_budget, global_source_cap)
+        effective_arbitration_cap = min(arbitration_route.profile.input_budget, global_source_cap)
+        effective_generation_cap = min(generation_route.profile.input_budget, global_source_cap)
         assert effective_arbitration_cap == int(case["effective_input_cap"]), {
             "route": arbitration_route.to_dict(),
             "effective_input_cap": effective_arbitration_cap,

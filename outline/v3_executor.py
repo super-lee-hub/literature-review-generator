@@ -160,7 +160,9 @@ from services.prompt_registry import PromptRegistry
 Provider = Callable[[str, Mapping[str, Any]], Any]
 FaultInjector = Callable[[str, Mapping[str, Any]], None]
 INTERPRETATION_CONTRACT_VERSION = "source-qualifier-dependency-v1"
-SEMANTIC_SYNTHESIS_OUTPUT_LIMIT = 4_096
+# Zero selects the configured route's output target; positive values are
+# explicit task targets. The transport and aggregate run budget still bound it.
+SEMANTIC_SYNTHESIS_OUTPUT_LIMIT = 0
 SHARED_SYNTHESIS_CONTRACT_VERSION = "v1"
 MAX_SEMANTIC_REDUCTION_LEVELS = 4
 MAX_SEMANTIC_REDUCER_CALLS_PER_STAGE = 24
@@ -672,9 +674,9 @@ class OutlineV3Executor:
         if (
             isinstance(semantic_output_max_tokens, bool)
             or not isinstance(semantic_output_max_tokens, int)
-            or semantic_output_max_tokens <= 0
+            or semantic_output_max_tokens < 0
         ):
-            raise ValueError("semantic_output_max_tokens must be a positive integer")
+            raise ValueError("semantic_output_max_tokens must be a non-negative integer (0 uses the route target)")
         self.semantic_output_max_tokens = semantic_output_max_tokens
         if semantic_transport_retries is not None and int(semantic_transport_retries) < 0:
             raise ValueError("semantic_transport_retries cannot be negative")
@@ -3372,7 +3374,9 @@ class OutlineV3Executor:
             "hierarchy": {
                 "level": "topic_synthesis",
                 "batch_id": f"topic_batch_{batch_index}",
-                "target_tokens": self.technical_shard_target_tokens or 30_000,
+                "target_tokens": self.technical_shard_target_tokens or self._effective_input_cap(
+                    self._node_route("candidate_1_provider_generation").profile,
+                ),
             },
             "topics": topic_rows,
             "evidence_units": evidence_units,
@@ -3529,14 +3533,7 @@ class OutlineV3Executor:
     ) -> tuple[list[TopicSynthesis], list[list[TopicSynthesis]], list[dict[str, Any]]]:
         """Build the same serialized topic batches used by preflight and run."""
 
-        input_limit = max(
-            1,
-            min(
-                32_000,
-                int(self.max_source_prompt_tokens or 32_000),
-                int(profile.input_budget or 32_000),
-            ),
-        )
+        input_limit = self._effective_input_cap(profile)
         content_layers_hash = str(getattr(content_layers_model, "content_hash", ""))
         expanded = self._split_topic_plan_for_budget(
             topic_plan,
@@ -4245,9 +4242,17 @@ class OutlineV3Executor:
         return excerpts
 
     def _effective_input_cap(self, profile: ProviderContextProfile) -> int:
-        """The same input ceiling must govern planning and transport."""
+        """Apply one configured work target to planning and transport.
 
-        return min(32_000, int(profile.input_budget), int(self.max_source_prompt_tokens or 32_000))
+        The route budget is derived from declared configuration, not a gateway
+        measurement. Zero/omitted application targets do not add a 32k ceiling.
+        """
+
+        route_budget = int(profile.input_budget)
+        if route_budget < 1:
+            raise OutlineV3ExecutionError("route has no positive input work budget")
+        configured = self.max_source_prompt_tokens
+        return min(route_budget, int(configured)) if configured is not None and int(configured) > 0 else route_budget
 
     def _relation_packing_target(self, profile: ProviderContextProfile) -> int:
         """Reserve room for the complete task, schema, and prompt authority.
@@ -7055,14 +7060,7 @@ class OutlineV3Executor:
             )
             semantic_required_stage_output_tokens = 2 * semantic_output
             semantic_required_stage_reasoning_tokens = 2 * semantic_reasoning
-            input_limit = max(
-                1,
-                min(
-                    32_000,
-                    int(self.max_source_prompt_tokens or 32_000),
-                    int(semantic_route.profile.input_budget or 32_000),
-                ),
-            )
+            input_limit = self._effective_input_cap(semantic_route.profile)
             reducer_output_tokens = max(1, min(semantic_output, input_limit // 4))
 
             def plan_bounded_stage(
@@ -12689,7 +12687,8 @@ class OutlineV3Executor:
         second copy of the source dossier. A truncated result fails closed.
         """
 
-        limit = min(self.semantic_output_max_tokens, max(1, int(profile.max_output_tokens)))
+        route_target = max(1, int(profile.max_output_tokens))
+        limit = min(self.semantic_output_max_tokens, route_target) if self.semantic_output_max_tokens > 0 else route_target
         if str(profile.endpoint_type or "").casefold() == "anthropic":
             from services.model_capabilities import anthropic_thinking_mode
 
@@ -13585,14 +13584,7 @@ class OutlineV3Executor:
         """Reduce oversized topic context in bounded, evidence-linked layers."""
 
         profile = self._node_route("candidate_1_provider_generation").profile
-        input_limit = max(
-            1,
-            min(
-                32_000,
-                int(self.max_source_prompt_tokens or 32_000),
-                int(profile.input_budget or 32_000),
-            ),
-        )
+        input_limit = self._effective_input_cap(profile)
         output_limit = self._semantic_output_token_limit(profile)
         logical_stage = (
             "cross_group_comparison"
@@ -16801,9 +16793,7 @@ class OutlineV3Executor:
                 self._pilot_verify_source_identity(acceptance)
         profile = route.profile
         budget = profile.estimate_request(request)
-        configured_cap = int(self.max_source_prompt_tokens or 32000)
-        route_cap = int(profile.input_budget or configured_cap)
-        effective_cap = max(1, min(32000, configured_cap, route_cap))
+        effective_cap = self._effective_input_cap(profile)
         estimated_input = int(budget.get("estimated_input_tokens") or profile.estimate_tokens(request))
         if estimated_input > effective_cap:
             raise OutlineV3ExecutionError(

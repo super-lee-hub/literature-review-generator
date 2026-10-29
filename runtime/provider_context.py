@@ -1,4 +1,10 @@
-"""Provider context budgets with conservative, request-complete estimation."""
+"""Declared-context work budgets with request-complete heuristic estimation.
+
+The legacy ``verified_context_limit`` field is an application-derived safety
+allowance, not a measured gateway capacity. ``conservative_wordpiece_estimator``
+is retained as a compatibility identifier; the algorithm is UTF-8 bytes/3 plus
+structural overhead, not a tokenizer or a mathematical upper bound.
+"""
 
 from __future__ import annotations
 

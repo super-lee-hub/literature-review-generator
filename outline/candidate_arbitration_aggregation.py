@@ -141,7 +141,7 @@ def _selector_artifact_payload(value: Any, kind: str) -> tuple[dict[str, Any], s
 
 @dataclass(frozen=True, slots=True)
 class ArbitrationSerializationCaps:
-    """Verified route and finite response-text limits for a pure compiler."""
+    """Declared route budgets and finite response-text targets for a compiler."""
 
     effective_input_cap: int
     verified_context_limit: int
@@ -165,8 +165,8 @@ class ArbitrationSerializationCaps:
             value = getattr(self, field)
             if type(value) is not int or value < 0:
                 raise ArbitrationAggregationError(f"{field} must be a non-negative integer")
-        if self.effective_input_cap < 1 or self.effective_input_cap > 32_000:
-            raise ArbitrationAggregationError("effective_input_cap must be between 1 and 32000")
+        if self.effective_input_cap < 1:
+            raise ArbitrationAggregationError("effective_input_cap must be positive")
         if type(self.assessment_wire_enabled) is not bool:
             raise ArbitrationAggregationError("assessment_wire_enabled must be a boolean")
         if self.verified_context_limit < 1 or self.route_max_output < 1:

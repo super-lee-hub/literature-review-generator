@@ -211,7 +211,7 @@ def _estimate_request(
         measured = {}
         estimate = raw
     estimate = _integer(estimate, f"{kind}.estimated_input_tokens", minimum=1)
-    cap = min(32_000, input_cap, int(context.get("effective_input_cap", 32_000)))
+    cap = min(input_cap, int(context.get("effective_input_cap", input_cap)))
     if estimate > cap:
         raise SelectedNavigationError(
             f"{kind} request {node_id} is over the effective input cap before POST "
@@ -773,7 +773,7 @@ def compile_selected_candidate_navigation_plan(
         "source_section_hashes": {row["section_id"]: row["section_hash"] for row in scopes},
         "emax": emax,
         "fnav_max": fnav_max,
-        "input_cap": min(input_cap, 32_000),
+        "input_cap": input_cap,
         "requires_coordination": len(scopes) > 1,
         "intent_span_manifest": [],
         "layout_extraction_requests": [],

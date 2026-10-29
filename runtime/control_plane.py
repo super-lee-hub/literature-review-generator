@@ -845,20 +845,12 @@ class ReviewControlPlane:
                     output_tokens_per_call_upper_bound = min(
                         output_tokens_per_call_upper_bound, 2_048
                     )
-                profile = ProviderContextProfile.conservative(
-                    provider=capability.provider_family,
-                    model=model,
-                    endpoint_type=capability.endpoint_type,
-                    model_context_limit=max(
-                        1, int(api_config.get("max_context_tokens") or 128_000),
-                    ),
+                profile = ProviderContextProfile.from_api_config(
+                    api_config,
                     max_output_tokens=profile_output_tokens,
-                    reasoning_reserve=max(
-                        0, int(api_config.get("reasoning_reserve_tokens") or 2_048),
-                    ),
-                    safety_margin=max(
-                        0, int(api_config.get("safety_margin_tokens") or 1_024),
-                    ),
+                    default_provider=capability.provider_family,
+                    default_model=model,
+                    default_endpoint_type=capability.endpoint_type,
                 )
                 if stage_name == "review" and semantic_role == "writer":
                     from runtime.provider_context import writer_output_token_limit
@@ -8056,6 +8048,9 @@ class ReviewControlPlane:
         return payload
 
     def doctor(self, *, config_path: str | Path | None = None, workspace: str | Path | None = None) -> dict[str, Any]:
+        from runtime.provider_context import ProviderContextProfile
+        from services.model_selection import get_api_config_for_section
+
         checks: list[dict[str, Any]] = []
 
         def add(name: str, status: str, details: Any) -> None:
@@ -8108,12 +8103,41 @@ class ReviewControlPlane:
             has_key = bool(raw_key) and not is_template_credential(raw_key)
             if not has_key and section_name in {"Primary_Reader_API", "Backup_Reader_API", "Writer_API"}:
                 missing_keys.append(section_name)
+            context_work_budget: dict[str, Any] = {
+                "gateway_capacity": "unknown_not_probed",
+                "network_probe": False,
+            }
+            if capability is not None:
+                try:
+                    api_config = get_api_config_for_section(dict(normalized_config), section_name)
+                    output_target = int(api_config.get("max_output_tokens") or 0)
+                    if output_target > 0:
+                        profile = ProviderContextProfile.from_api_config(
+                            api_config, max_output_tokens=output_target,
+                            default_provider=capability.provider_family,
+                            default_endpoint_type=capability.endpoint_type,
+                        )
+                        context_work_budget.update({
+                            "configured_context_tokens": api_config.get("max_context_tokens"),
+                            "derived_context_allowance": profile.verified_context_limit,
+                            "derived_input_budget": profile.input_budget,
+                            "api_default_output_target": profile.max_output_tokens,
+                            "additional_reasoning_buffer": profile.reasoning_reserve,
+                            "safety_margin": profile.safety_margin,
+                            "context_basis": "declared context times 0.8; not gateway verification",
+                            "estimate_method": "UTF-8 bytes/3 plus structural overhead; heuristic, not tokenizer or upper bound",
+                        })
+                    else:
+                        context_work_budget["output_target"] = "role_specific_default_not_resolved_here"
+                except (TypeError, ValueError) as exc:
+                    context_work_budget["error"] = str(exc)
             provider_details.append(
                 {
                     "section": section_name,
                     "api_key_present": has_key,
                     "model_configured": bool(str(section.get("model") or "").strip()),
                     "api_base_configured": bool(str(section.get("api_base") or "").strip()),
+                    "context_work_budget": context_work_budget,
                     "endpoint_classification": (
                         classify_provider_endpoint(
                             str(section.get("api_base") or ""),
@@ -8168,6 +8192,14 @@ class ReviewControlPlane:
                 ),
             }
             add("stage1_budget", "pass", stage1_budget_details)
+            add("outline_working_targets", "pass", {
+                "input_target": stage1_settings.outline_stability.max_source_prompt_tokens,
+                "semantic_output_target": stage1_settings.outline.semantic_output_max_tokens,
+                "technical_shard_target": stage1_settings.outline.technical_shard_target_tokens,
+                "zero_or_unset": "use the configured role route budget; no universal 32k input or 4k output ceiling",
+                "capacity_is_not_authorization": True,
+                "network_probe": False,
+            })
         except Exception as exc:
             add("stage1_budget", "fail", {"error": str(exc)})
 

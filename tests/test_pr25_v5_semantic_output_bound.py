@@ -39,7 +39,7 @@ def _executor(tmp_path: Path, **kwargs: object) -> OutlineV3Executor:
 
 
 def test_outline_semantic_output_bound_defaults_and_configures(tmp_path: Path) -> None:
-    assert ApplicationSettings.from_config({}).outline.semantic_output_max_tokens == 4_096
+    assert ApplicationSettings.from_config({}).outline.semantic_output_max_tokens == 0
     settings = ApplicationSettings.from_config(
         {"Outline": {"semantic_output_max_tokens": "8192"}}
     )
@@ -50,7 +50,7 @@ def test_outline_semantic_output_bound_defaults_and_configures(tmp_path: Path) -
         tmp_path / "configured",
         semantic_output_max_tokens=settings.outline.semantic_output_max_tokens,
     )
-    assert default._semantic_output_token_limit(default.profile) == 4_096
+    assert default._semantic_output_token_limit(default.profile) == default.profile.max_output_tokens
     assert configured._semantic_output_token_limit(configured.profile) == 8_192
     assert (
         default.build_current_node_binding("topic_synthesis")["relevant_runtime_config_hash"]
@@ -58,7 +58,7 @@ def test_outline_semantic_output_bound_defaults_and_configures(tmp_path: Path) -
     )
 
 
-@pytest.mark.parametrize("invalid", [0, -1, True, "bogus"])
+@pytest.mark.parametrize("invalid", [-1, True, False, "bogus", 1.5])
 def test_outline_semantic_output_bound_rejects_invalid_values(
     tmp_path: Path, invalid: object
 ) -> None:
