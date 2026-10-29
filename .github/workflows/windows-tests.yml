@@ -93,7 +93,8 @@ jobs:
                     "test_gui_playwright.py",
                     "test_gate_i_production_local_integration.py",
                     "test_deepseek_vision_smoke.py",
-                    "test_runtime_bridge_helpers.py"
+                    "test_runtime_bridge_helpers.py",
+                    "test_run_first_explicit_typed_import_ordinary_process.py"
                   ))
                 ) {
                   $allTestFiles[$index].FullName

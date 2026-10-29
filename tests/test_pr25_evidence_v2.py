@@ -304,6 +304,7 @@ def test_source_field_and_dependency_wire_models_round_trip_and_reject_fake_owne
         )
 
 
+@pytest.mark.optional
 @pytest.mark.parametrize("row_index", [0, 1], ids=["R1-row-001", "R1-row-002"])
 def test_actual_r1_raw_summary_pdf_authority_reaches_current_evidence_builder(row_index: int):
     summaries_path = PRIVATE_R1 / "summaries.json"

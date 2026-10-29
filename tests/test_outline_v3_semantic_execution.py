@@ -24,6 +24,7 @@ from outline.semantic_chunking import (
 from outline.v3_models import EvidenceClaim, PaperEvidenceDossier, ResearchUnit, TopicSynthesis
 from runtime.provider_runtime import ProviderRuntimeLedger, hash_json, hash_text
 from runtime.provider_context import ProviderContextProfile
+from outline.topic_materialization_snapshot import _SnapshotPaperContentLayers
 from services.artifact_registry import ArtifactRegistry
 from services.job_workspace import JobWorkspace
 from summary_schema import normalize_ai_summary
@@ -781,6 +782,7 @@ def test_oversized_cross_relation_blocks_before_any_local_provider_call(tmp_path
         provider=provider,
         stability_mode="off",
         technical_shard_target_tokens=500,
+        max_source_prompt_tokens=32_000,
     )
     evidence = build_outline_evidence_views(executor.summaries, executor.job_id)
     paper_a, paper_b = [view.paper_key for view in evidence.views]
@@ -1440,14 +1442,26 @@ def test_topic_batch_planning_groups_same_paper_tasks_before_other_papers(
     }
     content_hash_getter = type(layers).content_hash.fget
     assert content_hash_getter is not None
-    content_hash_reads = 0
+    live_content_hash_reads = 0
 
-    def counted_content_hash(model: Any) -> str:
-        nonlocal content_hash_reads
-        content_hash_reads += 1
+    def counted_live_content_hash(model: Any) -> str:
+        nonlocal live_content_hash_reads
+        live_content_hash_reads += 1
         return content_hash_getter(model)
 
-    monkeypatch.setattr(type(layers), "content_hash", property(counted_content_hash))
+    monkeypatch.setattr(type(layers), "content_hash", property(counted_live_content_hash))
+    snapshot_content_hash_reads = 0
+    original_snapshot_getattribute = _SnapshotPaperContentLayers.__getattribute__
+
+    def counted_snapshot_hash_read(model: Any, name: str) -> Any:
+        nonlocal snapshot_content_hash_reads
+        if name == "content_hash":
+            snapshot_content_hash_reads += 1
+        return original_snapshot_getattribute(model, name)
+
+    monkeypatch.setattr(
+        _SnapshotPaperContentLayers, "__getattribute__", counted_snapshot_hash_read
+    )
     expanded, batches, request_plan = executor._plan_topic_provider_batches(
         topic_plan,
         topic_routes=topic_routes,
@@ -1455,7 +1469,8 @@ def test_topic_batch_planning_groups_same_paper_tasks_before_other_papers(
         content_layers_model=layers,
         profile=executor.profile,
     )
-    assert content_hash_reads == 1
+    assert live_content_hash_reads + snapshot_content_hash_reads == 1
+    assert snapshot_content_hash_reads == 1
 
     assert [tuple(item.paper_ids) for item in expanded] == [
         ("paper-a",),
@@ -2417,6 +2432,8 @@ def test_semantic_preflight_accounts_for_input_output_and_retry_reserves(
     tmp_path: Path,
 ) -> None:
     executor = _executor(tmp_path, stability_mode="off")
+    # Pin this test's conservative semantic output ceiling; 0 inherits the route target.
+    executor.semantic_output_max_tokens = 16_384
     executor.profile = ProviderContextProfile.conservative(
         provider="openai_responses",
         model="test-output-cap",
@@ -2833,9 +2850,11 @@ def test_outline_preflight_counts_hierarchical_relation_calls(tmp_path: Path) ->
         technical_shard_target_tokens=1,
         review_intent=review_intent,
         summaries=_purposeful_relation_summaries(),
+        max_estimated_total_tokens=5_500_000,
     )
     required_relation_ids = _selected_required_relation_ids(executor)
     executor._preflight_stability_budget()
+    assert executor.stability_preflight["estimated_total_tokens"] <= 5_500_000
 
     assert required_relation_ids
     assert executor.stability_preflight["hierarchical_relation_shard_calls"] > 0
@@ -2967,6 +2986,7 @@ def test_twelve_candidate_graph_keeps_all_nodes_when_request_capacity_blocks(tmp
     executor = _executor(
         tmp_path, provider=provider, candidate_count=12, stability_mode="off",
         review_intent=review_intent,
+        max_source_prompt_tokens=32_000,
     )
     required_relation_ids = _selected_required_relation_ids(executor)
     with pytest.raises(OutlineV3ExecutionError, match="source_prompt_exceeds_effective_input_cap"):
