@@ -41,7 +41,7 @@ from summary_schema import get_ai_summary
 SEMANTIC_CHUNK_PLAN_ARTIFACT_TYPE = "semantic_chunk_plan"
 SEMANTIC_CHUNK_PLAN_ARTIFACT_VERSION = "v1"
 SEMANTIC_CHUNK_PLAN_SCHEMA_VERSION = "semantic-chunk-plan-v1"
-_TOPIC_FAMILY_GROUPING_VERSION = "method-theory-paper-pairs-v3"
+_TOPIC_FAMILY_GROUPING_VERSION = "method-theory-full-membership-v4"
 
 _METHOD_TOPIC_FAMILIES: Tuple[Tuple[str, str, Tuple[str, ...]], ...] = (
     ("mixed_methods", "mixed-method designs", ("mixed method", "mixed-method")),
@@ -218,6 +218,22 @@ def _method_theory_topic_family(
         if any(term in normalized_label for term in terms):
             return family_id, family_label
     return None
+
+
+def _topic_value_candidates(
+    values: Iterable[Any],
+    *,
+    max_chars: int = 120,
+    max_words: int = 12,
+) -> List[str]:
+    """Keep concise typed labels for navigation; full values stay in dossiers."""
+
+    return _stable_unique(
+        text
+        for value in values
+        for text in _text_values(value)
+        if len(text) <= max_chars and len(text.split()) <= max_words
+    )
 
 
 def _topic_label_identity_rows(
@@ -976,6 +992,7 @@ def _required_relation_fields(candidate: RelationCandidate) -> Dict[str, Tuple[s
 def build_relation_evidence_bundle(
     candidate: RelationCandidate | Mapping[str, Any],
     content_layers: PaperContentLayers,
+    *, comparison_question: str | None = None,
 ) -> RelationEvidenceBundle:
     """Materialize an evidence-complete bundle without making a judgment."""
 
@@ -1021,7 +1038,7 @@ def build_relation_evidence_bundle(
     missing = _stable_unique(missing)
     return RelationEvidenceBundle(
         relation_id=item.relation_id,
-        comparison_question=(
+        comparison_question=comparison_question or (
             f"Can the recorded {item.relation_type} relation be compared for "
             f"{', '.join(item.paper_keys)} without ignoring findings or boundaries?"
         ),
@@ -1258,6 +1275,7 @@ class SemanticChunkPlan:
 
 def _topic_candidates(content_layers: PaperContentLayers) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, List[str]]]:
     cards = {card.paper_id: card for card in content_layers.index_cards}
+    dossiers = content_layers.dossier_by_paper
     occurrences: Dict[Tuple[str, str], set[str]] = {}
     generic_labels = {
         "about", "across", "based", "case", "data", "effect", "effects",
@@ -1267,26 +1285,74 @@ def _topic_candidates(content_layers: PaperContentLayers) -> Tuple[Dict[str, Dic
         "experiments", "experiment", "theory", "method", "methods", "token",
         "that", "state", "were", "only", "sampled", "the", "and", "for",
     }
-    for card in cards.values():
+    ledger_dimension = {
+        "theories": "theory",
+        "theoretical_framework": "theory",
+        "theoretical_derivation": "theory",
+        "constructs": "construct",
+        "concept_definitions": "construct",
+        "operationalizations": "construct",
+        "mechanisms": "mechanism",
+        "mechanism_evidence": "mechanism",
+        "method": "method",
+        "methodology": "method",
+        "analysis_technique": "method",
+        "sample_or_context": "context",
+        "context": "context",
+        "moderators_boundaries": "context",
+    }
+    for card in sorted(cards.values(), key=lambda item: item.paper_id):
+        dossier = dossiers.get(card.paper_id)
+        units = list(getattr(dossier, "research_units", []) or []) if dossier is not None else []
+        unit_definitions = [
+            _text_values(getattr(unit, "definitions_and_operationalizations", {}))
+            for unit in units
+        ]
+        values_by_dimension: Dict[str, List[str]] = {
+            "theory": [
+                *list(card.theories),
+                *list(getattr(dossier, "theoretical_derivation", []) or []),
+                *[value for unit in units for value in getattr(unit, "theoretical_derivation", []) or []],
+            ],
+            "construct": [
+                *list(card.key_constructs),
+                *list(getattr(dossier, "concept_definitions", []) or []),
+                *[value for row in unit_definitions for value in row],
+            ],
+            "mechanism": [
+                *list(card.mechanisms),
+                *list(getattr(dossier, "mechanism_evidence", []) or []),
+                *[value for unit in units for value in getattr(unit, "mechanism_evidence", []) or []],
+            ],
+            "method": [
+                card.method_category,
+                *[value for unit in units for value in getattr(unit, "method", []) or []],
+            ],
+            "context": [
+                *list(card.key_boundaries),
+                *list(getattr(dossier, "overall_context", []) or []),
+                *list(getattr(dossier, "moderators_boundaries", []) or []),
+                *[value for unit in units for value in getattr(unit, "sample_or_context", []) or []],
+            ],
+        }
+        if dossier is not None:
+            for entry in getattr(dossier, "source_field_ledger", []) or []:
+                if str(getattr(entry, "disposition", "") or "").casefold() not in {"exact", "normalized"}:
+                    continue
+                dimension = ledger_dimension.get(
+                    str(getattr(entry, "canonical_field", "") or "").casefold()
+                )
+                if dimension:
+                    values_by_dimension[dimension].append(
+                        str(getattr(entry, "derived_value", "") or getattr(entry, "source_value", "") or "")
+                    )
         for dimension, field_name in _TOPIC_DIMENSIONS:
-            if field_name == "theories":
-                values = card.theories
-            elif field_name == "constructs":
-                values = card.key_constructs
-            elif field_name == "mechanisms":
-                values = card.mechanisms
-            elif field_name == "method":
-                values = [card.method_category]
-            elif field_name == "sample_or_context":
-                # A long limitation sentence is evidence, not a reusable topic
-                # label. Only concise, explicit context terms may route papers.
-                values = [
-                    item for item in card.key_boundaries
-                    if len(str(item).strip()) <= 80 and len(str(item).split()) <= 5
-                ]
+            dimension_values = values_by_dimension.get(dimension, [])
+            if dimension == "context":
+                labels = _topic_value_candidates(dimension_values, max_chars=80, max_words=5)
             else:
-                values = []
-            for value in values:
+                labels = _topic_value_candidates(dimension_values)
+            for value in labels:
                 label = _normalise_label(value)
                 if not label or label in generic_labels:
                     continue
@@ -1303,11 +1369,11 @@ def _topic_candidates(content_layers: PaperContentLayers) -> Tuple[Dict[str, Dic
         family_display[key] = display
         family_labels.setdefault(key, {})[label] = set(paper_ids)
 
-    # Family labels are retained as cross-paper navigation metadata. They do
-    # not become broad provider tasks: method and theory records are paired
-    # within each paper so one read can answer both dimensions independently.
+    # Preserve complete family membership as an executable shared topic. A
+    # paper can belong to more than one family and to construct, mechanism and
+    # context topics at the same time; physical batching later unions repeated
+    # evidence units without collapsing these logical questions.
     family_metadata: Dict[Tuple[str, str], Dict[str, Any]] = {}
-    family_keys_by_paper: Dict[str, set[Tuple[str, str]]] = {}
     family_keys_by_label: Dict[Tuple[str, str], set[Tuple[str, str]]] = {}
     for key, labels in family_labels.items():
         dimension, family_id = key
@@ -1342,31 +1408,8 @@ def _topic_candidates(content_layers: PaperContentLayers) -> Tuple[Dict[str, Dic
             "source_label_identity_set_hash": compute_v3_hash(label_rows),
         }
         family_metadata[key] = metadata
-        for paper_id in paper_ids:
-            family_keys_by_paper.setdefault(paper_id, set()).add(key)
-
-    labels_by_paper_dimension: Dict[str, Dict[str, set[str]]] = {}
-    for (dimension, label), paper_ids in occurrences.items():
-        if dimension not in {"method", "theory"}:
-            continue
-        for paper_id in paper_ids:
-            labels_by_paper_dimension.setdefault(paper_id, {}).setdefault(dimension, set()).add(label)
-    paired_papers = {
-        paper_id
-        for paper_id, dimensions in labels_by_paper_dimension.items()
-        if dimensions.get("method") and dimensions.get("theory")
-    }
-
-    residual_occurrences: Dict[Tuple[str, str], set[str]] = {}
-    for (dimension, label), paper_ids in occurrences.items():
-        # Pairing method and theory creates one paper-local task for those two
-        # dimensions. It must not remove the same papers from independent
-        # construct, mechanism, or context tasks.
-        residual_papers = paper_ids - paired_papers if dimension in {"method", "theory"} else paper_ids
-        if residual_papers:
-            residual_occurrences[(dimension, label)] = residual_papers
     residual_family_labels: Dict[Tuple[str, str], Dict[str, set[str]]] = {}
-    for (dimension, label), paper_ids in residual_occurrences.items():
+    for (dimension, label), paper_ids in occurrences.items():
         family = _method_theory_topic_family(dimension, label)
         if family is None:
             continue
@@ -1382,7 +1425,7 @@ def _topic_candidates(content_layers: PaperContentLayers) -> Tuple[Dict[str, Dic
     shared_exact = sorted(
         (
             (dimension, label, sorted(papers))
-            for (dimension, label), papers in residual_occurrences.items()
+            for (dimension, label), papers in occurrences.items()
             if len(papers) >= 2 and (dimension, label) not in folded_labels
         ),
         key=lambda item: (-len(item[2]), item[0], item[1]),
@@ -1432,7 +1475,7 @@ def _topic_candidates(content_layers: PaperContentLayers) -> Tuple[Dict[str, Dic
     singleton_exact = sorted(
         (
             (dimension, label, sorted(papers))
-            for (dimension, label), papers in residual_occurrences.items()
+            for (dimension, label), papers in occurrences.items()
             if len(papers) == 1 and (dimension, label) not in folded_labels
         ),
         key=lambda item: (item[0], item[1]),
@@ -1440,38 +1483,6 @@ def _topic_candidates(content_layers: PaperContentLayers) -> Tuple[Dict[str, Dic
     exact_rows = [*shared_exact, *singleton_exact]
     topic_data: Dict[str, Dict[str, Any]] = {}
     paper_topics: Dict[str, List[str]] = {paper_id: [] for paper_id in cards}
-
-    for paper_id in sorted(paired_papers):
-        dimensions = labels_by_paper_dimension[paper_id]
-        method_labels = sorted(dimensions["method"])
-        theory_labels = sorted(dimensions["theory"])
-        source_rows = sorted(
-            [*(('method', paper_id, label) for label in method_labels),
-             *(('theory', paper_id, label) for label in theory_labels)]
-        )
-        topic_id = f"topic:method_theory:paper:{hashlib.sha256(paper_id.encode('utf-8')).hexdigest()[:12]}"
-        memberships = [
-            family_metadata[key]
-            for key in sorted(family_keys_by_paper.get(paper_id, set()))
-            if key in family_metadata
-        ]
-        topic_data[topic_id] = {
-            "dimension": "method_theory",
-            "dimensions": ["method", "theory"],
-            "label": "paper-specific method and theory",
-            "paper_ids": [paper_id],
-            "label_frequency": "paper_pair",
-            "family_grouped": False,
-            "paired_dimensions": True,
-            "method_labels": method_labels,
-            "theory_labels": theory_labels,
-            "source_labels_by_paper": {paper_id: [*method_labels, *theory_labels]},
-            "source_label_count": len(set([*method_labels, *theory_labels])),
-            "source_label_occurrence_count": len(source_rows),
-            "source_label_identity_set_hash": compute_v3_hash(source_rows),
-            "family_memberships": memberships,
-        }
-        paper_topics.setdefault(paper_id, []).append(topic_id)
 
     for topic_id, data in family_groups:
         dimension = str(data["dimension"])
@@ -1506,6 +1517,347 @@ def _topic_candidates(content_layers: PaperContentLayers) -> Tuple[Dict[str, Dic
         for paper_id in paper_ids:
             paper_topics.setdefault(paper_id, []).append(topic_id)
     return topic_data, paper_topics
+
+
+def _topic_unit_source_claim_selection(
+    content_layers: PaperContentLayers,
+    topics: Sequence[TopicRoute],
+) -> Dict[str, Any]:
+    """Resolve topic-selected claims and their active qualifier dependencies.
+
+    Whole-dossier claims that remain outside the materialized topic units are
+    returned as explicit local deferrals. The helper never edits topics or
+    removes evidence from a dossier.
+    """
+
+    dossiers = content_layers.dossier_by_paper
+    claims_by_paper: Dict[str, Dict[str, EvidenceClaim]] = {}
+    evidence_by_paper: Dict[str, set[str]] = {}
+    evidence_fields_by_paper: Dict[str, Dict[str, set[str]]] = {}
+    units_by_paper: Dict[str, List[Dict[str, Any]]] = {}
+    topic_ids_by_paper: Dict[str, set[str]] = {}
+    topic_dimensions_by_paper: Dict[str, set[str]] = {}
+    selected_claim_ids_by_paper: Dict[str, set[str]] = {}
+    selected_evidence_by_paper: Dict[str, set[str]] = {}
+
+    for paper_id, dossier in sorted(dossiers.items()):
+        claim_map: Dict[str, EvidenceClaim] = {}
+        evidence_ids = {str(value) for value in dossier.evidence_ids if str(value)}
+        field_map: Dict[str, set[str]] = {}
+
+        def add_claim(raw_claim: Any) -> None:
+            if isinstance(raw_claim, EvidenceClaim):
+                claim = raw_claim
+            elif isinstance(raw_claim, Mapping):
+                claim = EvidenceClaim.from_dict(raw_claim)
+            elif hasattr(raw_claim, "to_dict"):
+                claim = EvidenceClaim.from_dict(raw_claim.to_dict())
+            else:
+                return
+            claim_id = str(claim.claim_id)
+            prior = claim_map.get(claim_id)
+            if prior is not None and prior.to_dict() != claim.to_dict():
+                raise ValueError(
+                    f"source claim identity has conflicting contents: {paper_id}:{claim_id}"
+                )
+            claim_map[claim_id] = claim
+            evidence_ids.update(str(value) for value in claim.evidence_ids if str(value))
+
+        for claim in dossier.claims:
+            add_claim(claim)
+
+        unit_rows: List[Dict[str, Any]] = []
+        for raw_unit in dossier.research_units:
+            if isinstance(raw_unit, ResearchUnit):
+                unit = raw_unit
+            elif isinstance(raw_unit, Mapping):
+                unit = ResearchUnit.from_dict(raw_unit)
+            elif hasattr(raw_unit, "to_dict"):
+                unit = ResearchUnit.from_dict(raw_unit.to_dict())
+            else:
+                continue
+            unit_claims: Dict[str, EvidenceClaim] = {}
+            for raw_claim in unit.claims:
+                add_claim(raw_claim)
+                if isinstance(raw_claim, EvidenceClaim):
+                    claim = raw_claim
+                elif isinstance(raw_claim, Mapping):
+                    claim = EvidenceClaim.from_dict(raw_claim)
+                else:
+                    continue
+                unit_claims[str(claim.claim_id)] = claim
+            evidence_ids.update(str(value) for value in unit.evidence_ids if str(value))
+            dependencies: Dict[str, InterpretationDependency] = {}
+            for raw_dependency in unit.interpretation_dependencies:
+                dependency = (
+                    raw_dependency
+                    if isinstance(raw_dependency, InterpretationDependency)
+                    else InterpretationDependency.from_dict(raw_dependency)
+                )
+                dependencies[compute_v3_hash(dependency.to_dict())] = dependency
+            for dependency in derive_interpretation_dependencies(
+                unit, dossier.source_field_ledger
+            ):
+                dependencies[compute_v3_hash(dependency.to_dict())] = dependency
+            unit_fields = {
+                entry.source_field_id: entry
+                for entry in derive_unit_source_field_ledger(
+                    unit, dossier.source_field_ledger
+                )
+            }
+            unit_rows.append(
+                {
+                    "unit": unit,
+                    "claims": unit_claims,
+                    "dependencies": dependencies,
+                    "fields": unit_fields,
+                }
+            )
+
+        for field_name, values in dossier.evidence_ids_by_field.items():
+            for value in values:
+                evidence_id = str(value)
+                if evidence_id:
+                    evidence_ids.add(evidence_id)
+                    field_map.setdefault(evidence_id, set()).add(str(field_name))
+
+        claims_by_paper[paper_id] = claim_map
+        evidence_by_paper[paper_id] = evidence_ids
+        evidence_fields_by_paper[paper_id] = field_map
+        units_by_paper[paper_id] = unit_rows
+        selected_claim_ids_by_paper[paper_id] = set()
+        selected_evidence_by_paper[paper_id] = set()
+
+    for topic in sorted(topics, key=lambda item: str(item.topic_id)):
+        topic_id = str(topic.topic_id)
+        required_evidence_ids = {
+            str(value) for value in topic.required_evidence_ids if str(value)
+        }
+        for paper_id in sorted({str(value) for value in topic.paper_ids if str(value)}):
+            if paper_id not in dossiers:
+                continue
+            topic_ids_by_paper.setdefault(paper_id, set()).add(topic_id)
+            topic_dimensions_by_paper.setdefault(paper_id, set()).update(
+                str(value) for value in topic.dimensions if str(value)
+            )
+            selected_evidence_by_paper[paper_id].update(
+                required_evidence_ids.intersection(evidence_by_paper[paper_id])
+            )
+            selected_claim_ids = selected_claim_ids_by_paper[paper_id]
+            for claim_id, claim in claims_by_paper[paper_id].items():
+                claim_evidence_ids = {
+                    str(value) for value in claim.evidence_ids if str(value)
+                }
+                if claim_evidence_ids.intersection(required_evidence_ids) or (
+                    not claim_evidence_ids and topic.include_unbound_claims
+                ):
+                    selected_claim_ids.add(claim_id)
+
+            # Mirror the runtime topic materializer: a selected primary finding
+            # brings its same-unit qualifier claims and evidence into the unit.
+            changed = True
+            while changed:
+                changed = False
+                for unit_row in units_by_paper[paper_id]:
+                    unit: ResearchUnit = unit_row["unit"]
+                    unit_claims: Dict[str, EvidenceClaim] = unit_row["claims"]
+                    dependencies: Dict[str, InterpretationDependency] = unit_row[
+                        "dependencies"
+                    ]
+                    active_claim_ids = selected_claim_ids.intersection(unit_claims)
+                    for dependency in sorted(
+                        dependencies.values(),
+                        key=lambda item: (item.primary_claim_id, item.scope, item.reason),
+                    ):
+                        if dependency.primary_claim_id not in active_claim_ids:
+                            continue
+                        if (
+                            dependency.scope == "explicit_study"
+                            and dependency.study_id != unit.study_id
+                        ):
+                            raise ValueError(
+                                "selected source claim has an interpretation dependency "
+                                "outside its explicit study"
+                            )
+                        unit_evidence_ids = {
+                            str(value) for value in unit.evidence_ids if str(value)
+                        }
+                        for unit_claim in unit_claims.values():
+                            unit_evidence_ids.update(
+                                str(value)
+                                for value in unit_claim.evidence_ids
+                                if str(value)
+                            )
+                        missing_dependency_evidence = set(
+                            str(value)
+                            for value in dependency.required_evidence_ids
+                            if str(value)
+                        ) - unit_evidence_ids
+                        if missing_dependency_evidence:
+                            raise ValueError(
+                                "selected source claim has an interpretation dependency "
+                                "without same-unit evidence: "
+                                + ", ".join(sorted(missing_dependency_evidence))
+                            )
+                        missing_qualifier_claims = set(
+                            str(value)
+                            for value in dependency.required_source_claim_ids
+                            if str(value)
+                        ) - set(unit_claims)
+                        if missing_qualifier_claims:
+                            raise ValueError(
+                                "selected source claim has an interpretation dependency "
+                                "without same-unit qualifier claims: "
+                                + ", ".join(sorted(missing_qualifier_claims))
+                            )
+                        for field_id in dependency.required_source_field_ids:
+                            field = unit_row["fields"].get(str(field_id))
+                            if field is None or not field.source_value.strip():
+                                raise ValueError(
+                                    "selected source claim has an interpretation dependency "
+                                    "without its source field: " + str(field_id)
+                                )
+                            if dependency.scope == "explicit_study" and (
+                                field.scope != "explicit_study"
+                                or field.study_id != str(unit.source_study_id or "")
+                            ):
+                                raise ValueError(
+                                    "selected source claim has an interpretation dependency "
+                                    "outside its explicit-study source field"
+                                )
+                        selected_evidence_by_paper[paper_id].update(
+                            str(value)
+                            for value in dependency.required_evidence_ids
+                            if str(value) in evidence_by_paper[paper_id]
+                        )
+                        for qualifier_id in dependency.required_source_claim_ids:
+                            claim_id = str(qualifier_id)
+                            qualifier = unit_claims.get(claim_id)
+                            if qualifier is None:
+                                continue
+                            selected_evidence_by_paper[paper_id].update(
+                                str(value)
+                                for value in qualifier.evidence_ids
+                                if str(value) in evidence_by_paper[paper_id]
+                            )
+                            if claim_id not in selected_claim_ids:
+                                selected_claim_ids.add(claim_id)
+                                changed = True
+
+            for claim_id in selected_claim_ids:
+                claim = claims_by_paper[paper_id].get(claim_id)
+                if claim is not None:
+                    selected_evidence_by_paper[paper_id].update(
+                        str(value)
+                        for value in claim.evidence_ids
+                        if str(value) in evidence_by_paper[paper_id]
+                    )
+
+    whole_source_identity_rows = [
+        {"paper_key": paper_id, "claim_id": claim_id}
+        for paper_id, claim_map in sorted(claims_by_paper.items())
+        for claim_id in sorted(claim_map)
+    ]
+    topic_unit_identity_rows = [
+        {"paper_key": paper_id, "claim_id": claim_id}
+        for paper_id, claim_ids in sorted(selected_claim_ids_by_paper.items())
+        for claim_id in sorted(claim_ids)
+        if claim_id in claims_by_paper.get(paper_id, {})
+    ]
+    deferred_claim_rows: List[Dict[str, Any]] = []
+    for paper_id, claim_map in sorted(claims_by_paper.items()):
+        for claim_id, claim in sorted(claim_map.items()):
+            if claim_id in selected_claim_ids_by_paper[paper_id]:
+                continue
+            claim_evidence_ids = sorted(
+                {str(value) for value in claim.evidence_ids if str(value)}
+            )
+            source_field_names = sorted(
+                {
+                    field_name
+                    for evidence_id in claim_evidence_ids
+                    for field_name in evidence_fields_by_paper[paper_id].get(
+                        evidence_id, set()
+                    )
+                }
+            )
+            if claim.claim_type == "author_proposed_gap" and set(source_field_names).intersection(
+                {"research_gaps", "future_directions"}
+            ):
+                reason_code = "author_proposed_gap_not_selected_by_topic_dimensions"
+                reason = (
+                    "The author-proposed gap is not required by any selected topic dimension; "
+                    "the complete source dossier retains it for directed retrieval."
+                )
+            elif not claim_evidence_ids:
+                reason_code = "unbound_claim_not_selected_by_topic_units"
+                reason = (
+                    "The unbound source claim is not selected by a topic unit; its full dossier "
+                    "record remains available for directed retrieval."
+                )
+            else:
+                reason_code = "claim_evidence_not_selected_by_topic_units"
+                reason = (
+                    "The claim's evidence IDs are outside every topic route and active "
+                    "interpretation-dependency closure; the complete source dossier retains it "
+                    "for directed retrieval."
+                )
+            deferred_claim_rows.append(
+                {
+                    "paper_key": paper_id,
+                    "claim_id": claim_id,
+                    "claim_type": claim.claim_type,
+                    "study_id": claim.study_id,
+                    "source_locator": claim.source_locator,
+                    "source_summary_hash": claim.source_summary_hash,
+                    "evidence_ids": claim_evidence_ids,
+                    "source_field_names": source_field_names,
+                    "source_claim_identity_hash": compute_v3_hash(
+                        {"paper_key": paper_id, "claim_id": claim_id}
+                    ),
+                    "evidence_identity_hashes": [
+                        compute_v3_hash(
+                            {"paper_key": paper_id, "evidence_id": evidence_id}
+                        )
+                        for evidence_id in claim_evidence_ids
+                    ],
+                    "topic_ids_considered": sorted(topic_ids_by_paper.get(paper_id, set())),
+                    "topic_dimensions_considered": sorted(
+                        topic_dimensions_by_paper.get(paper_id, set())
+                    ),
+                    "deferred_reason_code": reason_code,
+                    "deferred_reason": reason,
+                    "retained_in_local_dossier": True,
+                }
+            )
+
+    deferred_claim_identity_rows = [
+        {"paper_key": str(row["paper_key"]), "claim_id": str(row["claim_id"])}
+        for row in deferred_claim_rows
+    ]
+    deferred_claim_evidence_rows = sorted(
+        {
+            (str(row["paper_key"]), str(evidence_id))
+            for row in deferred_claim_rows
+            for evidence_id in row["evidence_ids"]
+            if str(evidence_id)
+        }
+    )
+    deferred_evidence_identity_rows = sorted(
+        (paper_id, evidence_id)
+        for paper_id, source_ids in sorted(evidence_by_paper.items())
+        for evidence_id in sorted(source_ids - selected_evidence_by_paper[paper_id])
+    )
+    return {
+        "source_evidence_by_paper": evidence_by_paper,
+        "topic_unit_evidence_ids_by_paper": selected_evidence_by_paper,
+        "whole_source_claim_identity_rows": whole_source_identity_rows,
+        "topic_unit_claim_identity_rows": topic_unit_identity_rows,
+        "deferred_source_claims": deferred_claim_rows,
+        "deferred_source_claim_identity_rows": deferred_claim_identity_rows,
+        "deferred_source_claim_evidence_identity_rows": deferred_claim_evidence_rows,
+        "deferred_source_evidence_identity_rows": deferred_evidence_identity_rows,
+    }
 
 
 def _build_topics(content_layers: PaperContentLayers) -> Tuple[List[TopicRoute], List[str], Dict[str, Any]]:
@@ -1632,23 +1984,13 @@ def _build_topics(content_layers: PaperContentLayers) -> Tuple[List[TopicRoute],
                 "output_schema": "TopicSynthesis",
             }),
         ))
-    covered_evidence_by_paper: Dict[str, set[str]] = {paper_id: set() for paper_id in dossiers}
-    for topic in topics:
-        for paper_id in topic.paper_ids:
-            dossier = dossiers.get(paper_id)
-            if dossier is not None:
-                dossier_ids = {str(value) for value in dossier.evidence_ids if str(value)}
-                covered_evidence_by_paper.setdefault(paper_id, set()).update(
-                    str(value)
-                    for value in topic.required_evidence_ids
-                    if str(value) in dossier_ids
-                )
+    topic_selection = _topic_unit_source_claim_selection(content_layers, topics)
     uncovered_evidence_by_paper = {
         paper_id: sorted(
-            {str(value) for value in dossier.evidence_ids if str(value)}
-            - covered_evidence_by_paper.get(paper_id, set())
+            source_ids
+            - topic_selection["topic_unit_evidence_ids_by_paper"].get(paper_id, set())
         )
-        for paper_id, dossier in dossiers.items()
+        for paper_id, source_ids in topic_selection["source_evidence_by_paper"].items()
     }
     papers_with_unbound_claims: set[str] = set()
     for paper_id, dossier in dossiers.items():
@@ -1667,12 +2009,13 @@ def _build_topics(content_layers: PaperContentLayers) -> Tuple[List[TopicRoute],
             for claim in claims
         ):
             papers_with_unbound_claims.add(paper_id)
+    # Unselected source facts remain complete and addressable in their local
+    # dossier. They are not whole-paper outliers merely because the review has
+    # not selected every field for topic synthesis.
     outliers = sorted(
         paper_id
         for paper_id in cards
-        if not paper_topics.get(paper_id)
-        or uncovered_evidence_by_paper.get(paper_id)
-        or paper_id in papers_with_unbound_claims
+        if not paper_topics.get(paper_id) or paper_id in papers_with_unbound_claims
     )
     if outliers:
         topics.append(TopicRoute(
@@ -1762,6 +2105,15 @@ def _build_topics(content_layers: PaperContentLayers) -> Tuple[List[TopicRoute],
             seen_questions.add(normalized)
             ordered_questions.append(_safe_text(question))
     cross_group_questions = ordered_questions[:5]
+    # Re-evaluate after any explicit outlier route is materialized so its
+    # required evidence and unbound claims count as planned topic-unit work.
+    topic_selection = _topic_unit_source_claim_selection(content_layers, topics)
+    deferred_evidence_identity_rows = topic_selection[
+        "deferred_source_evidence_identity_rows"
+    ]
+    family_task_count = sum(
+        bool(item.get("family_grouped")) for item in topic_data.values()
+    )
     coverage = {
         "input_paper_count": len(content_layers.index_cards),
         "routed_paper_count": len({paper_id for topic in topics for paper_id in topic.paper_ids}),
@@ -1769,6 +2121,64 @@ def _build_topics(content_layers: PaperContentLayers) -> Tuple[List[TopicRoute],
         "outlier_paper_ids": outliers,
         "bridge_paper_ids": bridge_papers,
         "unrouted_paper_ids": sorted(set(paper_topics) - {paper_id for topic in topics for paper_id in topic.paper_ids}),
+        "topic_routing": {
+            "policy": "full_multidimension_membership_v1",
+            "mode": "shared_family_and_exact_membership",
+            "logical_topic_count": len(topic_data),
+            "family_topic_count": family_task_count,
+            "paired_method_theory_task_count": 0,
+        },
+        "deferred_source_evidence_count": len(deferred_evidence_identity_rows),
+        "deferred_source_evidence_identity_hash": compute_v3_hash(deferred_evidence_identity_rows),
+        "deferred_source_evidence_scope": (
+            "dossier_evidence_outside_topic_required_ids_and_active_interpretation_dependency_closure"
+        ),
+        "deferred_source_evidence_policy": (
+            "complete_dossiers_remain_locally_available_for_directed_retrieval"
+        ),
+        "whole_source_claim_identity_count": len(
+            topic_selection["whole_source_claim_identity_rows"]
+        ),
+        "whole_source_claim_identity_hash": compute_v3_hash(
+            topic_selection["whole_source_claim_identity_rows"]
+        ),
+        "topic_unit_source_claim_identity_count": len(
+            topic_selection["topic_unit_claim_identity_rows"]
+        ),
+        "topic_unit_source_claim_identity_hash": compute_v3_hash(
+            topic_selection["topic_unit_claim_identity_rows"]
+        ),
+        "deferred_source_claim_count": len(topic_selection["deferred_source_claims"]),
+        "deferred_source_claim_identity_hash": compute_v3_hash(
+            topic_selection["deferred_source_claim_identity_rows"]
+        ),
+        "deferred_source_claim_evidence_identity_count": len(
+            topic_selection["deferred_source_claim_evidence_identity_rows"]
+        ),
+        "deferred_source_claim_evidence_identity_hash": compute_v3_hash(
+            topic_selection["deferred_source_claim_evidence_identity_rows"]
+        ),
+        "deferred_source_claims": topic_selection["deferred_source_claims"],
+        "source_claim_disposition_status": (
+            "complete"
+            if len(topic_selection["topic_unit_claim_identity_rows"])
+            + len(topic_selection["deferred_source_claim_identity_rows"])
+            == len(topic_selection["whole_source_claim_identity_rows"])
+            else "incomplete"
+        ),
+        "source_claim_disposition_scope": (
+            "all_top_level_and_research_unit_claims_deduplicated_by_paper_and_claim_id"
+        ),
+        "topic_unit_source_claim_selection_scope": (
+            "topic_required_evidence_plus_outlier_unbound_claims_and_active_interpretation_dependency_closure"
+        ),
+        "whole_source_claim_coverage_meaning": (
+            "complete_local_dossier_claim_inventory_with_selected_or_deferred_dispositions; "
+            "deferred claims are not asserted as topic-wire dependencies"
+        ),
+        "deferred_source_claim_policy": (
+            "complete_dossiers_remain_locally_available_for_directed_retrieval"
+        ),
         "topic_family_grouping": {
             "version": _TOPIC_FAMILY_GROUPING_VERSION,
             "family_group_count": len(family_group_rows),
@@ -1948,10 +2358,16 @@ def _select_relation_bundles(
     bundles: Sequence[RelationEvidenceBundle],
     *,
     target_tokens: int = 24000,
+    required_relation_ids: Sequence[str] = (),
 ) -> Tuple[List[RelationEvidenceBundle], List[str]]:
     """Select a bounded, high-risk relation set for the next provider node."""
 
+    required_ids = set(required_relation_ids)
+    missing_required = required_ids - {bundle.relation_id for bundle in bundles}
+    if missing_required:
+        raise ValueError("required comparison has no source bundle: " + ", ".join(sorted(missing_required)))
     priority = {
+        "reported_magnitude_contrast": 0,
         "contradicts": 0,
         "explains_discrepancy": 1,
         "qualifies": 2,
@@ -1963,6 +2379,7 @@ def _select_relation_bundles(
     ordered = sorted(
         bundles,
         key=lambda item: (
+            0 if item.relation_id in required_ids else 1,
             priority.get(item.relation_type, 9),
             0 if item.is_complete else 1,
             -len(item.missing_evidence_ids),
@@ -1973,6 +2390,10 @@ def _select_relation_bundles(
     selected_tokens = 0
     for bundle in ordered:
         estimate = _token_estimate(bundle.to_dict())
+        if bundle.relation_id in required_ids:
+            selected.append(bundle)
+            selected_tokens += estimate
+            continue
         if estimate > target_tokens:
             continue
         if selected and selected_tokens + estimate > target_tokens:
@@ -2004,11 +2425,22 @@ def build_semantic_chunk_plan(
         raise ValueError("physical_call_limit cannot be negative")
     physical_call_limit = authorized_provider_call_limit(physical_call_limit)
     topics, cross_group_questions, coverage = _build_topics(content_layers)
+    required_rows = (relation_map.comparison_coverage.get("required_comparisons") or ()) if relation_map is not None else ()
+    required_questions = {
+        str(row["relation_id"]): str(row["question"])
+        for row in required_rows
+        if isinstance(row, Mapping) and row.get("relation_id") and row.get("question")
+    }
     relation_bundles = [
-        build_relation_evidence_bundle(candidate, content_layers)
+        build_relation_evidence_bundle(
+            candidate, content_layers,
+            comparison_question=required_questions.get(candidate.relation_id),
+        )
         for candidate in (relation_map.relations if relation_map is not None else [])
     ]
-    selected_relation_bundles, selected_relation_ids = _select_relation_bundles(relation_bundles)
+    selected_relation_bundles, selected_relation_ids = _select_relation_bundles(
+        relation_bundles, required_relation_ids=tuple(required_questions),
+    )
     calls, budgets = _call_plan(
         content_layers=content_layers,
         topics=topics,

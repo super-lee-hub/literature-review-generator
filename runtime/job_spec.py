@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 from typing import Any, Dict, Literal, Mapping, cast
 
-from services.job_runner import JobRunRequest, resolve_stage1_reuse, validate_free_mode_options
+from services.job_runner import JobRunRequest, STAGE1_REUSE_ACTIONS, resolve_stage1_reuse, validate_free_mode_options
 
 
 SourceMode = Literal["direct", "zotero"]
@@ -36,11 +36,13 @@ _RUNTIME_JOB_FIELDS = frozenset({
     "metadata",
 })
 _RUNTIME_METADATA_FIELDS = frozenset({
+    "stage1_summary_input_mode",
     "review_batch_spec",
     "requested_stages",
     "free_mode_input",
     "free_mode_context",
     "review_intent",
+    "provider_budget",
     "validation_required",
     "require_clean_validation",
     "allow_unvalidated_when_validation_optional",
@@ -53,6 +55,8 @@ _RUNTIME_METADATA_FIELDS = frozenset({
     "outline_pilot",
     "f1_corpus_binding",
     "f1_d_modality_policy",
+    "provider_semantic_contract_version",
+    "source_revision_plan",
 })
 _RUNTIME_COMPATIBILITY_FIELDS = frozenset(
     {
@@ -323,6 +327,26 @@ class RuntimeJobSpec:
         if not isinstance(self.metadata, Mapping):
             raise ValueError("metadata must be a JSON object")
         _reject_unknown_fields(self.metadata, _RUNTIME_METADATA_FIELDS, label="metadata")
+        if any(key in self.metadata for key in (
+            "provider_semantic_contract_version", "source_revision_plan",
+        )):
+            from runtime.source_revision import validate_source_revision_metadata
+
+            validate_source_revision_metadata(self.metadata)
+        if "stage1_summary_input_mode" in self.metadata:
+            if self.metadata["stage1_summary_input_mode"] != "explicit_typed_import":
+                raise ValueError("metadata.stage1_summary_input_mode must be 'explicit_typed_import'")
+            if self.action not in STAGE1_REUSE_ACTIONS:
+                raise ValueError("explicit typed Stage 1 import requires an analysis action")
+            if self.reuse_stage1 is not True or not self.reuse_summary_files:
+                raise ValueError("explicit typed Stage 1 import requires reuse_stage1=true and reuse_summary_files")
+            if self.summary_file or self.summary_sources:
+                raise ValueError("explicit typed Stage 1 import cannot mix summary_file or summary_sources")
+            requested = self.metadata.get("requested_stages")
+            if requested is not None and (
+                not isinstance(requested, (list, tuple)) or "analyze" not in requested
+            ):
+                raise ValueError("explicit typed Stage 1 import requires Analyze in requested_stages")
         allowed_actions = {
             "analyze",
             "derive_review_batch",
@@ -566,6 +590,9 @@ class RuntimeJobSpec:
             retry_failed=self.action == "retry_failed",
             retry_review_failed=self.action == "retry_review_failed",
             progress_tracker=None,
+            provider_budget=(dict(self.metadata["provider_budget"])
+                             if isinstance(self.metadata.get("provider_budget"), Mapping)
+                             else self.metadata.get("provider_budget")),
             gui=False,
             source_mode=self.source.mode,
             zotero_report=self.source.zotero_report or None,
@@ -585,6 +612,7 @@ class RuntimeJobSpec:
                 self.metadata.get("allow_partial_source_quarantine", False)
             ),
             derived_summary_source=bool(self.metadata.get("review_batch_spec")),
+            runtime_spec_payload=self.to_dict(),
         )
 
     def to_dict(self) -> Dict[str, Any]:

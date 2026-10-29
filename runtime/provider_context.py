@@ -162,11 +162,21 @@ class ProviderContextProfile:
         return max(1, (len(text.encode("utf-8")) + 2) // 3)
 
     def estimate_request(self, request: Mapping[str, Any]) -> dict[str, Any]:
-        # Estimate the exact canonical request object.  Do not project a
-        # caller-selected subset: evidence packets, relation candidates,
-        # citation catalogs, visual references, and future request fields all
-        # participate in admission automatically.
-        input_tokens = self.estimate_tokens(request)
+        # The v1 identity retains prompt text in both `user` and the normalized
+        # `user_content`. Text-only transport sends the latter once. Count the
+        # exact duplicate once without changing the request/replay identity.
+        # Every other field, including unknown future fields, still participates
+        # in admission; differing or multimodal content gets no such discount.
+        estimation_request = request
+        user = request.get("user")
+        if (
+            request.get("identity_version") == "provider_request_identity/v1"
+            and isinstance(user, str)
+            and bool(user)
+            and request.get("user_content") == [{"type": "text", "text": user}]
+        ):
+            estimation_request = {key: value for key, value in request.items() if key != "user"}
+        input_tokens = self.estimate_tokens(estimation_request)
         total_reserved = input_tokens + self.max_output_tokens + self.reasoning_reserve + self.safety_margin
         return {
             "estimated_input_tokens": input_tokens,

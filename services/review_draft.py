@@ -154,6 +154,14 @@ def validate_review_section_writer_scope(section: Mapping[str, Any]) -> List[Map
     """Recheck factual units and the locally projected layout before adoption."""
     text_blocks = list(iter_review_text_blocks(section))
     scope = section.get("writer_task_scope")
+    from runtime.source_revision import PROVIDER_SEMANTIC_CONTRACT_V2
+
+    contract = section.get("provider_semantic_contract_version")
+    if "provider_semantic_contract_version" in section:
+        if contract != PROVIDER_SEMANTIC_CONTRACT_V2 or not isinstance(scope, Mapping):
+            raise ValueError("Review section has an unsupported or unbound provider semantic contract")
+    if isinstance(scope, Mapping) and scope.get("provider_semantic_contract_version") != contract:
+        raise ValueError("Review section contract differs from its bound Writer task scope")
     has_native_table = any(block.get("table_layout_schema_version") for block in section.get("blocks", []))
     if not scope:
         if has_native_table:
@@ -166,7 +174,7 @@ def validate_review_section_writer_scope(section: Mapping[str, Any]) -> List[Map
             "writer_task_id", "writer_output_unit_id", "writer_task_basis_hash", "text"
         )} for block in text_blocks],
         "task_dispositions": section.get("writer_task_dispositions"),
-    })
+    }, provider_semantic_contract_version=contract)
     if (
         validated.get("scope_status") != "ready"
         or validated.get("usable_for_provider_admission") is not True
@@ -240,6 +248,7 @@ class ReviewSection:
     blocks: List[ReviewBlock]
     writer_task_scope: Dict[str, Any] = field(default_factory=dict)
     writer_task_dispositions: List[Dict[str, Any]] = field(default_factory=list)
+    provider_semantic_contract_version: str | None = None
 
     def to_dict(self) -> Dict[str, Any]:
         payload = {
@@ -250,6 +259,12 @@ class ReviewSection:
         if self.writer_task_scope:
             payload["writer_task_scope"] = self.writer_task_scope
             payload["writer_task_dispositions"] = self.writer_task_dispositions
+        if self.provider_semantic_contract_version is not None:
+            from runtime.source_revision import PROVIDER_SEMANTIC_CONTRACT_V2
+
+            if self.provider_semantic_contract_version != PROVIDER_SEMANTIC_CONTRACT_V2:
+                raise ValueError("Review section provider semantic contract is unsupported")
+            payload["provider_semantic_contract_version"] = self.provider_semantic_contract_version
         return payload
 
 
@@ -532,7 +547,10 @@ def build_review_draft(
         content = str(section.get("content") or "").strip()
 
         existing_blocks = section.get("blocks", [])
-        if any(block.get("table_layout_schema_version") for block in existing_blocks):
+        if ("provider_semantic_contract_version" in section
+                or (isinstance(section.get("writer_task_scope"), Mapping)
+                    and "provider_semantic_contract_version" in section["writer_task_scope"])
+                or any(block.get("table_layout_schema_version") for block in existing_blocks)):
             validate_review_section_writer_scope(section)
         if existing_blocks:
             blocks: List[ReviewBlock] = []
@@ -603,6 +621,7 @@ def build_review_draft(
                 blocks=blocks,
                 writer_task_scope=dict(section.get("writer_task_scope") or {}),
                 writer_task_dispositions=[dict(item) for item in section.get("writer_task_dispositions") or []],
+                provider_semantic_contract_version=section.get("provider_semantic_contract_version"),
             )
         )
 

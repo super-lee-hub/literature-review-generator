@@ -5,17 +5,22 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import re
+import zipfile
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-import re
-from typing import Any, Mapping, Sequence
-import zipfile
+from typing import Any
 
-from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRecord, ArtifactRegistry, RegistryError
-from services.job_workspace import JobWorkspace, atomic_write_json, utc_now_iso
-from services.queue_service import LocalPublicationContext
 from runtime.provider_runtime import hash_json
-
+from services.artifact_registry import (
+    ArtifactDependencyRefV2,
+    ArtifactRecord,
+    ArtifactRegistry,
+    RegistryError,
+)
+from services.job_workspace import JobWorkspace, utc_now_iso
+from services.queue_service import LocalPublicationContext
 
 EXPORT_BUNDLE_ARTIFACT_TYPE = "export_bundle"
 EXPORT_BUNDLE_ARTIFACT_VERSION = "v1"
@@ -42,7 +47,7 @@ class ExportBundleSpecV1:
     export_mode: str = "canonical"
 
     @classmethod
-    def from_mapping(cls, payload: Mapping[str, Any] | None) -> "ExportBundleSpecV1":
+    def from_mapping(cls, payload: Mapping[str, Any] | None) -> ExportBundleSpecV1:
         value = payload or {}
         mode = str(value.get("export_mode") or "canonical").strip().lower()
         if mode not in {"canonical", "forensic"}:
@@ -104,9 +109,7 @@ def _matches(record: ArtifactRecord, spec: ExportBundleSpecV1) -> bool:
         return False
     if spec.include_artifact_types and record.artifact_type not in spec.include_artifact_types:
         return False
-    if spec.include_artifact_roles and record.artifact_role not in spec.include_artifact_roles:
-        return False
-    return True
+    return not spec.include_artifact_roles or record.artifact_role in spec.include_artifact_roles
 
 
 def _json_payload(record: ArtifactRecord) -> Mapping[str, Any] | None:
@@ -120,12 +123,200 @@ def _json_payload(record: ArtifactRecord) -> Mapping[str, Any] | None:
     return None
 
 
-def _current_pointer_targets(registry: ArtifactRegistry) -> tuple[set[str], dict[str, str]]:
-    """Read current repair pointers without selecting stale versions."""
+def _decode_zip_json(archive: zipfile.ZipFile, name: str) -> Mapping[str, Any]:
+    try:
+        value = json.loads(archive.read(name).decode("utf-8"))
+    except (KeyError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RegistryError(f"cached export bundle is missing valid {name}") from exc
+    if not isinstance(value, Mapping):
+        raise RegistryError(f"cached export bundle {name} must be an object")
+    return value
 
+
+def _without_export_observations(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove only wall-clock/observation fields from an export comparison."""
+
+    normalized = dict(value)
+    for field in ("created_at", "resolved_at", "checked_at", "completion_evidence_hash"):
+        normalized.pop(field, None)
+    for section, field in (
+        ("completion_manifest", "completion_evidence_hash"),
+        ("validation_closure", "checked_at"),
+        ("current_stage_closure_map", "resolved_at"),
+    ):
+        nested = normalized.get(section)
+        if isinstance(nested, Mapping):
+            stable_nested = dict(nested)
+            stable_nested.pop(field, None)
+            normalized[section] = stable_nested
+    return normalized
+
+
+def _export_identity_payload(
+    *,
+    job_id: str,
+    spec: ExportBundleSpecV1,
+    records: Sequence[Mapping[str, Any]],
+    completion: Mapping[str, Any],
+    closure: Mapping[str, Any],
+    receipt_closure: Mapping[str, Any],
+    current_artifact_set: Mapping[str, Any],
+    current_stage_closure_map: Mapping[str, Any],
+    requested_stages: Sequence[str],
+    spec_hash: str,
+    adoption: Mapping[str, Any],
+    validation_policy: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind identity to immutable canonical evidence, not inspection clocks."""
+
+    return {
+        "job_id": job_id,
+        "spec": spec.to_dict(),
+        "records": list(records),
+        "completion": _without_export_observations(completion),
+        "closure": _without_export_observations(closure),
+        "receipt_closure": dict(receipt_closure),
+        "current_artifact_set": dict(current_artifact_set),
+        "current_stage_closure_map": _without_export_observations(current_stage_closure_map),
+        "requested_stages": list(requested_stages),
+        "spec_hash": spec_hash,
+        "adoption": dict(adoption),
+        "validation_policy": dict(validation_policy),
+    }
+
+
+def _verify_cached_export_bundle(
+    registry: ArtifactRegistry,
+    record: ArtifactRecord,
+    *,
+    bundle_id: str,
+    bundle_path: Path,
+    bundle_status: str,
+    spec: ExportBundleSpecV1,
+    manifest: Mapping[str, Any],
+    ready_records: Sequence[ArtifactRecord],
+    ready_payloads: Mapping[str, bytes],
+    checksums: Mapping[str, str],
+    export_status_text: str,
+    external_registry_resolver: Any | None = None,
+) -> tuple[ArtifactRecord, Mapping[str, Any]]:
+    """Verify a prior same-identity canonical ZIP before reusing its bytes.
+
+    The logical bundle ID is derived from current Registry and completion
+    evidence, while ``created_at`` and ZIP member timestamps are materialized
+    values.  Reuse is safe only if the registered immutable file, dependency
+    closure, and embedded payloads still match the newly derived evidence.
+    """
+
+    expected_artifact_id = f"export_bundle:{bundle_id}"
+    if (
+        record.artifact_id != expected_artifact_id
+        or record.job_id != registry.job_id
+        or record.artifact_role != "export_bundle"
+        or record.artifact_type != EXPORT_BUNDLE_ARTIFACT_TYPE
+        or record.artifact_version != EXPORT_BUNDLE_ARTIFACT_VERSION
+        or record.status != "ready"
+    ):
+        raise RegistryError("cached export bundle Registry identity is invalid")
+
+    try:
+        verified = registry.verify_ready_artifact_closure(
+            record, external_registry_resolver=external_registry_resolver,
+        )
+    except (OSError, RegistryError, ValueError, TypeError) as exc:
+        raise RegistryError(f"cached export bundle dependency closure is invalid: {exc}") from exc
+
+    expected_dependencies = [
+        ArtifactDependencyRefV2.from_record(dependency).to_dict()
+        for dependency in ready_records
+    ]
+    actual_dependencies = [dependency.to_dict() for dependency in verified.depends_on]
+    if actual_dependencies != expected_dependencies:
+        raise RegistryError("cached export bundle dependency set is stale")
+
+    actual_path = Path(verified.path).resolve()
+    expected_dir = bundle_path.resolve().parent
+    filename_stem = bundle_path.stem
+    if (
+        actual_path.parent != expected_dir
+        or actual_path.suffix.lower() != ".zip"
+        or not (
+            actual_path.stem == filename_stem
+            or actual_path.stem.startswith(filename_stem + "__")
+        )
+    ):
+        raise RegistryError("cached export bundle path is outside its immutable export location")
+
+    if verified.metadata.get("bundle_status") != bundle_status:
+        raise RegistryError("cached export bundle Registry status does not match current evidence")
+    if verified.metadata.get("validation_status") != str(manifest.get("validation_status") or ""):
+        raise RegistryError("cached export bundle validation status is stale")
+    if verified.metadata.get("issue_count") != len(manifest.get("issues") or ()):
+        raise RegistryError("cached export bundle issue count is stale")
+
+    expected_manifest = _without_export_observations(manifest)
+    expected_members: dict[str, bytes] = {
+        f"artifacts/{_safe_name(item.artifact_id)}": ready_payloads[item.artifact_id]
+        for item in ready_records
+    }
+    expected_names = {
+        *expected_members,
+        "provenance_manifest.json",
+        "checksums.json",
+        "completion_manifest.json",
+        "validation_closure.json",
+        "provider_receipt_closure.json",
+        "EXPORT_STATUS.txt",
+    }
+    try:
+        with zipfile.ZipFile(actual_path) as archive:
+            names = archive.namelist()
+            if len(names) != len(set(names)) or set(names) != expected_names:
+                raise RegistryError("cached export bundle member set does not match current evidence")
+            cached_manifest = _decode_zip_json(archive, "provenance_manifest.json")
+            normalized_cached_manifest = _without_export_observations(cached_manifest)
+            if normalized_cached_manifest != expected_manifest:
+                raise RegistryError("cached export bundle provenance is stale")
+            if _decode_zip_json(archive, "checksums.json") != dict(checksums):
+                raise RegistryError("cached export bundle checksums do not match current artifacts")
+            if _without_export_observations(
+                _decode_zip_json(archive, "completion_manifest.json")
+            ) != _without_export_observations(dict(manifest.get("completion_manifest") or {})):
+                raise RegistryError("cached export bundle completion evidence is stale")
+            if _without_export_observations(
+                _decode_zip_json(archive, "validation_closure.json")
+            ) != _without_export_observations(dict(manifest.get("validation_closure") or {})):
+                raise RegistryError("cached export bundle validation evidence is stale")
+            if _decode_zip_json(archive, "provider_receipt_closure.json") != dict(
+                manifest.get("provider_receipt_closure") or {}
+            ):
+                raise RegistryError("cached export bundle receipt evidence is stale")
+            if archive.read("EXPORT_STATUS.txt").decode("utf-8") != export_status_text:
+                raise RegistryError("cached export bundle status document is stale")
+            for member_name, expected_payload in expected_members.items():
+                if archive.read(member_name) != expected_payload:
+                    raise RegistryError(
+                        f"cached export bundle artifact payload changed: {member_name}"
+                    )
+    except (OSError, UnicodeError, zipfile.BadZipFile, KeyError) as exc:
+        raise RegistryError(f"cached export bundle cannot be verified: {exc}") from exc
+
+    if cached_manifest.get("bundle_id") != bundle_id or cached_manifest.get("spec") != spec.to_dict():
+        raise RegistryError("cached export bundle identity or export spec is stale")
+    return verified, cached_manifest
+
+
+def _current_pointer_targets(
+    registry: ArtifactRegistry,
+    records_snapshot: Sequence[ArtifactRecord] | None = None,
+    current_artifact_set: Mapping[str, Any] | None = None,
+) -> tuple[set[str], dict[str, str]]:
+    """Read current pointers from the caller's operation record snapshot."""
+    records = records_snapshot if records_snapshot is not None else registry.list_records()
+    records_by_id = {record.artifact_id: record for record in records}
     targets: set[str] = set()
     pointer_kinds: dict[str, str] = {}
-    for pointer in registry.list_records():
+    for pointer in records:
         if pointer.status != "ready" or pointer.artifact_type != "current_artifact_pointer":
             continue
         payload = _json_payload(pointer)
@@ -134,7 +325,7 @@ def _current_pointer_targets(registry: ArtifactRegistry) -> tuple[set[str], dict
         kind = str(payload.get("pointer_kind") or "").strip()
         target_id = str(payload.get("target_artifact_id") or "").strip()
         target_hash = str(payload.get("target_content_hash") or "").strip()
-        target = registry.get(target_id) if target_id else None
+        target = records_by_id.get(target_id) if target_id else None
         if (
             not kind
             or target is None
@@ -145,32 +336,65 @@ def _current_pointer_targets(registry: ArtifactRegistry) -> tuple[set[str], dict
             continue
         targets.add(target_id)
         pointer_kinds[kind] = target_id
-    try:
-        current_set = registry.resolve_current_artifact_set()
-    except (OSError, RegistryError, ValueError, TypeError):
-        current_set = None
-    if current_set is not None:
+
+    current_set_payload: Mapping[str, Any] = current_artifact_set or {}
+    if current_artifact_set is None:
+        try:
+            current_set = registry.resolve_current_artifact_set()
+        except (OSError, RegistryError, ValueError, TypeError):
+            current_set = None
+        if current_set is not None:
+            current_set_payload = current_set.to_dict()
+    if current_set_payload:
+        validation_status = str(current_set_payload.get("validation_status") or "")
         current_targets = {
-            "review_draft": current_set.review_draft_artifact_id,
-            "citation_manifest": current_set.citation_manifest_artifact_id,
-            "review_docx": current_set.review_docx_artifact_id,
+            "review_draft": (
+                current_set_payload.get("review_draft_artifact_id"),
+                current_set_payload.get("review_draft_artifact_hash"),
+            ),
+            "citation_manifest": (
+                current_set_payload.get("citation_manifest_artifact_id"),
+                current_set_payload.get("citation_manifest_artifact_hash"),
+            ),
+            "review_docx": (
+                current_set_payload.get("review_docx_artifact_id"),
+                current_set_payload.get("review_docx_artifact_hash"),
+            ),
             (
                 "validation_disposition"
-                if current_set.validation_status == "not_requested"
+                if validation_status == "not_requested"
                 else "validation_run_result"
             ): (
-                current_set.validation_disposition_artifact_id
-                if current_set.validation_status == "not_requested"
-                else current_set.validation_run_result_artifact_id
+                current_set_payload.get(
+                    "validation_disposition_artifact_id"
+                    if validation_status == "not_requested"
+                    else "validation_run_result_artifact_id"
+                ),
+                current_set_payload.get(
+                    "validation_disposition_artifact_hash"
+                    if validation_status == "not_requested"
+                    else "validation_run_result_artifact_hash"
+                ),
             ),
-            "provider_receipt_closure": current_set.validation_receipt_closure_artifact_id,
+            "provider_receipt_closure": (
+                current_set_payload.get("validation_receipt_closure_artifact_id"),
+                current_set_payload.get("validation_receipt_closure_artifact_hash"),
+            ),
         }
-        for kind, target_id in current_targets.items():
-            if target_id:
+        for kind, (raw_target_id, raw_target_hash) in current_targets.items():
+            target_id = str(raw_target_id or "").strip()
+            target_hash = str(raw_target_hash or "").strip()
+            target = records_by_id.get(target_id) if target_id else None
+            if (
+                target is not None
+                and target.status == "ready"
+                and target.job_id == registry.job_id
+                and target_hash
+                and target.content_hash == target_hash
+            ):
                 targets.add(target_id)
                 pointer_kinds[kind] = target_id
     return targets, pointer_kinds
-
 
 def _is_current_canonical_record(
     record: ArtifactRecord,
@@ -200,9 +424,136 @@ def _is_current_canonical_record(
     return True
 
 
+def _export_dependency_issues(
+    registry: ArtifactRegistry,
+    owner_records: Sequence[ArtifactRecord],
+    external_registry_resolver: Any | None,
+    *,
+    expected_snapshot_revision: int | None = None,
+) -> list[str]:
+    """Map one batched direct-dependency check to export diagnostics."""
+    try:
+        failures = registry.verify_ready_artifact_dependency_sets(
+            owner_records,
+            external_registry_resolver=external_registry_resolver,
+            complete_ready_set_excluding=(
+                EXPORT_BUNDLE_ARTIFACT_TYPE,
+                FORENSIC_ATTESTATION_ARTIFACT_TYPE,
+            ),
+            expected_snapshot_revision=expected_snapshot_revision,
+        )
+    except (OSError, RegistryError, ValueError, TypeError) as exc:
+        return [f"Registry direct-dependency snapshot:{exc}"]
+    return [
+        f"{record.artifact_id}:{error}"
+        for record in owner_records
+        if (error := failures.get(record.artifact_id)) is not None
+    ]
+
+
+def _resolve_export_validation_policy(
+    registry: ArtifactRegistry,
+    *,
+    records_snapshot: Sequence[ArtifactRecord],
+    spec_hash: str,
+    closure: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project policy from the hash-bound durable plan, independently of verdicts."""
+
+    record = next((item for item in records_snapshot if item.artifact_id == "runtime_job_spec"), None)
+    metadata: Mapping[str, Any] = {}
+    if record is not None:
+        if (
+            record.job_id != registry.job_id
+            or record.artifact_type != "runtime_job_spec"
+            or record.artifact_role != "runtime_spec"
+            or record.artifact_version != "v1"
+            or record.status != "ready"
+        ):
+            raise RegistryError("export validation policy runtime spec binding mismatch")
+        ArtifactRegistry._verify_ready_artifact(record)
+        data = Path(record.path).read_bytes()
+        if hashlib.sha256(data).hexdigest() != record.content_hash:
+            raise RegistryError("export validation policy runtime spec bytes changed")
+        payload = json.loads(data)
+        if not isinstance(payload, Mapping) or payload.get("job_id") != registry.job_id:
+            raise RegistryError("export validation policy runtime spec job mismatch")
+        if _hash(payload) != spec_hash:
+            raise RegistryError("export validation policy runtime spec semantic hash mismatch")
+        metadata = payload.get("metadata", {})
+        if not isinstance(metadata, Mapping):
+            raise RegistryError("export validation policy runtime spec metadata is invalid")
+        if "stage_plan" in metadata:
+            from runtime.stage_planning import build_stage_plan
+
+            raw = metadata["stage_plan"]
+            bool_fields = (
+                "validation_enabled", "validation_required", "require_clean_validation",
+                "allow_unvalidated_when_validation_optional", "current_artifact_set_required",
+            )
+            if (
+                not isinstance(raw, Mapping)
+                or any(type(raw.get(field)) is not bool for field in bool_fields)
+                or any(
+                    not isinstance(raw.get(field), list)
+                    or any(not isinstance(item, str) or not item for item in raw[field])
+                    for field in ("requested_stages", "required_stages")
+                )
+                or raw.get("action") != payload.get("action")
+                or not isinstance(raw.get("action"), str)
+                or not raw["action"]
+            ):
+                raise RegistryError("export validation policy stage plan is malformed")
+            plan = build_stage_plan(
+                action=raw["action"], requested_stages=raw["requested_stages"],
+                validation_enabled=raw["validation_enabled"],
+                validation_required=raw["validation_required"],
+                require_clean_validation=raw["require_clean_validation"],
+                allow_unvalidated_when_validation_optional=raw["allow_unvalidated_when_validation_optional"],
+            )
+            if dict(raw) != plan.to_dict():
+                raise RegistryError("export validation policy stage plan is inconsistent")
+            for field in (
+                "requested_stages", "required_stages", "validation_required", "require_clean_validation",
+                "allow_unvalidated_when_validation_optional",
+            ):
+                if field in metadata and (
+                    type(metadata[field]) is not type(raw[field]) or metadata[field] != raw[field]
+                ):
+                    raise RegistryError(f"export validation policy metadata disagrees with stage plan: {field}")
+            return {
+                "projection_version": "export-validation-policy-v1",
+                "source": "runtime_stage_plan",
+                "runtime_spec_hash": record.content_hash,
+                "stage_plan_hash": hash_json(raw),
+                **{field: raw[field] for field in bool_fields if field != "current_artifact_set_required"},
+            }
+    elif spec_hash:
+        raise RegistryError("export validation policy runtime spec is missing")
+
+    # Older workspaces may genuinely predate StagePlan. Never infer policy
+    # from a clean verdict, or use this fallback for a present but invalid plan.
+    semantic = closure.get("semantic")
+    semantic = semantic if isinstance(semantic, Mapping) else {}
+    return {
+        "projection_version": "export-validation-policy-v1",
+        "source": "legacy_validation_closure",
+        "runtime_spec_hash": record.content_hash if record is not None else "",
+        "stage_plan_hash": str(semantic.get("stage_plan_hash") or ""),
+        "validation_enabled": bool(semantic.get("validation_enabled", False)),
+        "validation_required": bool(closure.get("validation_required", semantic.get("validation_required", False))),
+        "require_clean_validation": bool(semantic.get("require_clean_validation", False)),
+        "allow_unvalidated_when_validation_optional": bool(semantic.get("allow_unvalidated", False)),
+    }
+
+
 def _derive_current_evidence(
     workspace: JobWorkspace,
     registry: ArtifactRegistry,
+    *,
+    records_snapshot: Sequence[ArtifactRecord] | None = None,
+    expected_snapshot_revision: int | None = None,
+    records_snapshot_error: str | None = None,
 ) -> dict[str, Any]:
     """Derive export trust facts from the current runtime and Registry.
 
@@ -211,7 +562,18 @@ def _derive_current_evidence(
     a forged ``complete``/``clean`` mapping can never make a ZIP canonical.
     """
 
+    if records_snapshot is None and records_snapshot_error is None:
+        try:
+            expected_snapshot_revision, records_snapshot = registry.capture_record_snapshot()
+        except (OSError, RegistryError, ValueError, TypeError) as exc:
+            records_snapshot_error = str(exc)
+            records_snapshot = ()
+    if records_snapshot is None:
+        records_snapshot = ()
+
     issues: list[str] = []
+    if records_snapshot_error:
+        issues.append(f"Registry record snapshot:{records_snapshot_error}")
     completion: dict[str, Any]
     try:
         from runtime.runner import AgentRuntimeRunner
@@ -237,8 +599,12 @@ def _derive_current_evidence(
 
     try:
         from validation.closure import ValidationClosureService
+        from runtime.runner import AgentRuntimeRunner
 
-        validation = ValidationClosureService(workspace, registry).inspect()
+        validation = ValidationClosureService(
+            workspace, registry,
+            external_registry_resolver=AgentRuntimeRunner._external_registry_resolver(workspace),
+        ).inspect()
         closure = validation.to_dict()
         if validation.status not in {"clean", "not_requested"}:
             issues.append(f"validation_closure_not_clean:{validation.status}")
@@ -301,6 +667,7 @@ def _derive_current_evidence(
 
     closure_records: list[ArtifactRecord] = []
     closure_payloads: list[Mapping[str, Any]] = []
+    external_registry_resolver = None
     stage_map_payload: Mapping[str, Any] = {
         "artifact_type": "current_stage_closure_map",
         "artifact_version": "v1",
@@ -313,14 +680,14 @@ def _derive_current_evidence(
         "blocking_issues": ["current_stage_closure_map_unavailable"],
     }
     try:
-        from validation.closure import resolve_current_stage_closure_map
         from runtime.runner import AgentRuntimeRunner
+        from validation.closure import resolve_current_stage_closure_map
 
+        external_registry_resolver = AgentRuntimeRunner._external_registry_resolver(
+            workspace, registry_paths=AgentRuntimeRunner._review_batch_registry_paths(registry),
+        )
         stage_map = resolve_current_stage_closure_map(
-            registry,
-            external_registry_resolver=AgentRuntimeRunner._external_registry_resolver(
-                workspace, registry_paths=AgentRuntimeRunner._review_batch_registry_paths(registry),
-            ),
+            registry, external_registry_resolver=external_registry_resolver,
         )
         stage_map_payload = stage_map.to_dict()
         current_receipt_id = str(
@@ -354,7 +721,7 @@ def _derive_current_evidence(
 
     ready_final_outline = any(
         record.status == "ready" and record.artifact_type == "final_outline"
-        for record in registry.list_records()
+        for record in records_snapshot
     )
     from outline.adoption_transaction import current_adoption_record
 
@@ -379,15 +746,32 @@ def _derive_current_evidence(
     ):
         issues.append("outline_adoption_audit_incomplete")
 
-    dependency_issues: list[str] = []
-    for record in registry.list_records():
-        if record.status != "ready":
-            continue
-        try:
-            ArtifactRegistry._verify_ready_artifact(record)
-            registry.verify_ready_dependencies(record.depends_on, owner_record=record)
-        except (OSError, RegistryError, ValueError, TypeError) as exc:
-            dependency_issues.append(f"{record.artifact_id}:{exc}")
+    try:
+        validation_policy = _resolve_export_validation_policy(
+            registry, records_snapshot=records_snapshot,
+            spec_hash=str(stage_map_payload.get("spec_hash") or ""), closure=closure,
+        )
+    except (OSError, UnicodeError, RegistryError, ValueError, TypeError) as exc:
+        validation_policy = {"projection_version": "export-validation-policy-v1", "source": "unavailable"}
+        issues.append(f"export_validation_policy_unavailable:{exc}")
+
+    # Existing exports and attestations describe earlier operational snapshots;
+    # their dependency checks belong to explicit reuse and attestation.
+    dependency_owners = [
+        record
+        for record in records_snapshot
+        if record.status == "ready"
+        and record.artifact_type not in {
+            EXPORT_BUNDLE_ARTIFACT_TYPE,
+            FORENSIC_ATTESTATION_ARTIFACT_TYPE,
+        }
+    ]
+    dependency_issues = _export_dependency_issues(
+        registry,
+        dependency_owners,
+        external_registry_resolver,
+        expected_snapshot_revision=expected_snapshot_revision,
+    )
     if dependency_issues:
         issues.extend(f"dependency_closure:{item}" for item in dependency_issues)
 
@@ -400,6 +784,7 @@ def _derive_current_evidence(
         "spec_hash": str(stage_map_payload.get("spec_hash") or ""),
         "current_artifact_set": dict(current_set_payload),
         "adoption": adoption,
+        "validation_policy": validation_policy,
         "issues": sorted(set(issues)),
     }
 
@@ -448,14 +833,41 @@ class ExportBundleService:
         closure: Mapping[str, Any] | None = None,
     ) -> ExportBundleResultV1:
         export_spec = spec if isinstance(spec, ExportBundleSpecV1) else ExportBundleSpecV1.from_mapping(spec)
-        derived = _derive_current_evidence(self.workspace, self.registry)
+        from runtime.runner import AgentRuntimeRunner
+
+        external_registry_resolver = AgentRuntimeRunner._external_registry_resolver(self.workspace)
+        records_snapshot_error = None
+        try:
+            expected_snapshot_revision, records_snapshot = self.registry.capture_record_snapshot()
+        except (OSError, RegistryError, ValueError, TypeError) as exc:
+            expected_snapshot_revision = None
+            records_snapshot = []
+            records_snapshot_error = str(exc)
+        derived = _derive_current_evidence(
+            self.workspace,
+            self.registry,
+            records_snapshot=records_snapshot,
+            expected_snapshot_revision=expected_snapshot_revision,
+            records_snapshot_error=records_snapshot_error,
+        )
         # These parameters remain accepted only so older callers fail closed
         # at the same API boundary.  They are never used as trust evidence.
         caller_claims_supplied = completion is not None or closure is not None
-        pointer_targets, pointer_kinds = _current_pointer_targets(self.registry)
+        pointer_targets, pointer_kinds = _current_pointer_targets(
+            self.registry, records_snapshot, derived.get("current_artifact_set"),
+        )
         records = [
             record
-            for record in self.registry.list_records()
+            for record in records_snapshot
+            # JobOutcome is a mutable operational singleton.  Completion and
+            # current canonical state are already captured by the verified
+            # completion and CurrentArtifactSet manifests below; embedding its
+            # changing bytes would make a same-set resume change export
+            # identity and leave prior bundles depending on stale paths.
+            if not (
+                export_spec.export_mode == "canonical"
+                and record.artifact_type == "job_outcome"
+            )
             if _matches(record, export_spec)
             and _is_current_canonical_record(
                 record,
@@ -474,6 +886,12 @@ class ExportBundleService:
         ]
         records.sort(key=lambda item: (item.artifact_type, item.artifact_id))
         issues: list[str] = list(derived["issues"])
+        if export_spec.export_mode == "canonical" and (
+            "job_outcome" in export_spec.include_artifact_ids
+            or "job_outcome" in export_spec.include_artifact_types
+            or "job_outcome" in export_spec.include_artifact_roles
+        ):
+            issues.append("job_outcome_is_operational_snapshot_use_forensic_export")
         if caller_claims_supplied:
             issues.append("caller_completion_or_closure_ignored")
         file_entries: list[dict[str, Any]] = []
@@ -491,6 +909,8 @@ class ExportBundleService:
                 "depends_on": [dependency.to_dict() for dependency in record.depends_on],
                 "metadata": dict(record.metadata),
             }
+            if record.artifact_type == "job_outcome":
+                entry["temporal_scope"] = "forensic_snapshot_at_export"
             if record.status == "ready":
                 try:
                     ArtifactRegistry._verify_ready_artifact(record)
@@ -518,6 +938,7 @@ class ExportBundleService:
         closure_manifest = dict(derived["closure"])
         receipt_closure_manifest = dict(derived["receipt_closure"])
         adoption_manifest = dict(derived["adoption"])
+        validation_policy = dict(derived.get("validation_policy") or {})
         completion_status = str(completion_manifest.get("completion_status") or "unknown")
         closure_status = str(closure_manifest.get("status") or "unknown")
         validation_semantic = closure_manifest.get("semantic")
@@ -529,6 +950,9 @@ class ExportBundleService:
             and not bool(closure_manifest.get("validation_required", False))
             and not bool(validation_semantic.get("validation_enabled", False))
             and not bool(validation_semantic.get("validation_required", False))
+            and not bool(validation_policy.get("validation_required", False))
+            and not bool(validation_policy.get("validation_enabled", False))
+            and bool(validation_policy.get("allow_unvalidated_when_validation_optional", True))
         )
         closure_trust_ready = closure_status == "clean" or (
             closure_status == "not_requested" and unvalidated_allowed
@@ -558,20 +982,36 @@ class ExportBundleService:
             "manual_repaired" if not issues and manual_modified else "untrusted"
             )
         )
-        bundle_id = "export:" + _hash(
-            {
-                "job_id": self.workspace.job_id,
-                "spec": export_spec.to_dict(),
-                "records": file_entries,
-                "completion": completion_manifest,
-                "closure": closure_manifest,
-                "receipt_closure": receipt_closure_manifest,
-                "current_stage_closure_map": dict(derived["current_stage_closure_map"]),
-                "requested_stages": list(derived["requested_stages"]),
-                "spec_hash": str(derived["spec_hash"]),
-                "adoption": adoption_manifest,
-            }
-        )[:24]
+        identity_fields = {
+            "job_id": self.workspace.job_id,
+            "spec": export_spec.to_dict(),
+            "records": file_entries,
+            "completion": completion_manifest,
+            "closure": closure_manifest,
+            "receipt_closure": receipt_closure_manifest,
+            "current_artifact_set": dict(derived.get("current_artifact_set") or {}),
+            "current_stage_closure_map": dict(derived["current_stage_closure_map"]),
+            "requested_stages": list(derived["requested_stages"]),
+            "spec_hash": str(derived["spec_hash"]),
+            "adoption": adoption_manifest,
+            "validation_policy": validation_policy,
+        }
+        if export_spec.export_mode == "canonical":
+            identity_fields = _export_identity_payload(
+                job_id=self.workspace.job_id,
+                spec=export_spec,
+                records=file_entries,
+                completion=completion_manifest,
+                closure=closure_manifest,
+                receipt_closure=receipt_closure_manifest,
+                current_artifact_set=dict(derived.get("current_artifact_set") or {}),
+                current_stage_closure_map=dict(derived["current_stage_closure_map"]),
+                requested_stages=list(derived["requested_stages"]),
+                spec_hash=str(derived["spec_hash"]),
+                adoption=adoption_manifest,
+                validation_policy=validation_policy,
+            )
+        bundle_id = "export:" + _hash(identity_fields)[:24]
         # ``bundle_id`` is a logical identifier and uses ``:`` as its
         # namespace separator.  Keep the identifier stable, but use a
         # Windows-safe filename for the materialized ZIP.
@@ -589,7 +1029,16 @@ class ExportBundleService:
             "records": file_entries,
             "completion_manifest": completion_manifest,
             "validation_closure": closure_manifest,
+            "current_artifact_set": dict(derived.get("current_artifact_set") or {}),
+            "operational_snapshot_policy": {
+                "job_outcome": (
+                    "excluded_from_canonical_bundle_identity"
+                    if export_spec.export_mode == "canonical"
+                    else "included_as_forensic_snapshot_at_export"
+                )
+            },
             "validation_status": closure_status,
+            "validation_policy": validation_policy,
             "validation_not_requested": bool(closure_status == "not_requested"),
             "unvalidated_policy": {
                 "allowed": unvalidated_allowed,
@@ -610,8 +1059,8 @@ class ExportBundleService:
         disposition_hash = str(
             disposition_record.get("content_hash") or semantic.get("disposition_hash") or ""
         )
-        validation_required = bool(closure_manifest.get("validation_required", False))
-        validation_enabled = bool(semantic.get("validation_enabled", False))
+        validation_required = bool(validation_policy.get("validation_required", False))
+        validation_enabled = bool(validation_policy.get("validation_enabled", False))
         unvalidated_warning = (
             "WARNING: semantic validation was not performed; this bundle is canonical_unvalidated."
             if bundle_status == "canonical_unvalidated"
@@ -624,8 +1073,8 @@ class ExportBundleService:
                 "allow_unvalidated": unvalidated_allowed,
                 "validation_disposition_artifact_id": disposition_id,
                 "validation_disposition_artifact_hash": disposition_hash,
-                "stage_plan_hash": str(semantic.get("stage_plan_hash") or ""),
-                "runtime_spec_hash": str(derived["spec_hash"]),
+                "stage_plan_hash": str(validation_policy.get("stage_plan_hash") or ""),
+                "runtime_spec_hash": str(validation_policy.get("runtime_spec_hash") or ""),
                 "validation_warning": unvalidated_warning,
             }
         )
@@ -642,14 +1091,72 @@ class ExportBundleService:
                 manifest=manifest,
                 issues=tuple(sorted(set(issues))),
             )
-        checksums: dict[str, str] = {}
+        checksums = {
+            f"artifacts/{_safe_name(record.artifact_id)}": hashlib.sha256(
+                ready_payloads[record.artifact_id]
+            ).hexdigest()
+            for record in ready_records
+        }
+        status_text = (
+            "status=" + str(manifest["status"]) + "\n"
+            + "validation_status=" + closure_status + "\n"
+            + "validation_required=" + str(validation_required).lower() + "\n"
+            + "validation_enabled=" + str(validation_enabled).lower() + "\n"
+            + "allow_unvalidated=" + str(unvalidated_allowed).lower() + "\n"
+            + "validation_disposition_artifact_id=" + disposition_id + "\n"
+            + "validation_disposition_artifact_hash=" + disposition_hash + "\n"
+            + "stage_plan_hash=" + str(manifest.get("stage_plan_hash") or "") + "\n"
+            + "runtime_spec_hash=" + str(manifest.get("runtime_spec_hash") or "") + "\n"
+            + (unvalidated_warning + "\n" if unvalidated_warning else "")
+        )
+        artifact_id = f"export_bundle:{bundle_id}"
+        if export_spec.export_mode == "canonical":
+            existing_bundle = self.registry.get(artifact_id)
+            if existing_bundle is not None:
+                try:
+                    verified_bundle, cached_manifest = _verify_cached_export_bundle(
+                        self.registry,
+                        existing_bundle,
+                        bundle_id=bundle_id,
+                        bundle_path=bundle_path,
+                        bundle_status=bundle_status,
+                        spec=export_spec,
+                        manifest=manifest,
+                        ready_records=ready_records,
+                        ready_payloads=ready_payloads,
+                        checksums=checksums,
+                        export_status_text=status_text,
+                        external_registry_resolver=external_registry_resolver,
+                    )
+                except (OSError, RegistryError, ValueError, TypeError) as exc:
+                    cache_issue = f"cached_export_bundle_rejected:{exc}"
+                    issues.append(cache_issue)
+                    manifest["status"] = "untrusted"
+                    manifest["issues"] = sorted(set(issues))
+                    return ExportBundleResultV1(
+                        job_id=self.workspace.job_id,
+                        status="untrusted",
+                        bundle_id=bundle_id,
+                        bundle_path="",
+                        artifact_id="",
+                        manifest=manifest,
+                        issues=tuple(sorted(set(issues))),
+                    )
+                return ExportBundleResultV1(
+                    job_id=self.workspace.job_id,
+                    status=bundle_status,
+                    bundle_id=bundle_id,
+                    bundle_path=verified_bundle.path,
+                    artifact_id=verified_bundle.artifact_id,
+                    manifest=cached_manifest,
+                    issues=tuple(sorted(set(issues))),
+                )
         bundle_buffer = io.BytesIO()
         with zipfile.ZipFile(bundle_buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for record in ready_records:
                 data = ready_payloads[record.artifact_id]
                 arcname = f"artifacts/{_safe_name(record.artifact_id)}"
                 archive.writestr(arcname, data)
-                checksums[arcname] = hashlib.sha256(data).hexdigest()
             manifest["issues"] = sorted(set(issues))
             archive.writestr("provenance_manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
             archive.writestr("checksums.json", json.dumps(checksums, ensure_ascii=False, indent=2, sort_keys=True))
@@ -665,23 +1172,10 @@ class ExportBundleService:
                 "provider_receipt_closure.json",
                 json.dumps(receipt_closure_manifest, ensure_ascii=False, indent=2),
             )
-            archive.writestr(
-                "EXPORT_STATUS.txt",
-                "status=" + str(manifest["status"]) + "\n"
-                + "validation_status=" + closure_status + "\n"
-                + "validation_required=" + str(bool(closure_manifest.get("validation_required", False))).lower() + "\n"
-                + "validation_enabled=" + str(validation_enabled).lower() + "\n"
-                + "allow_unvalidated=" + str(unvalidated_allowed).lower() + "\n"
-                + "validation_disposition_artifact_id=" + disposition_id + "\n"
-                + "validation_disposition_artifact_hash=" + disposition_hash + "\n"
-                + "stage_plan_hash=" + str(manifest.get("stage_plan_hash") or "") + "\n"
-                + "runtime_spec_hash=" + str(manifest.get("runtime_spec_hash") or "") + "\n"
-                + (unvalidated_warning + "\n" if unvalidated_warning else ""),
-            )
+            archive.writestr("EXPORT_STATUS.txt", status_text)
         bundle_payload = bundle_buffer.getvalue()
         if not zipfile.is_zipfile(io.BytesIO(bundle_payload)):
             raise RegistryError("in-memory export bundle failed ZIP verification")
-        artifact_id = f"export_bundle:{bundle_id}"
         registration_error = ""
         try:
             publication_context = getattr(self.registry, "publication_context", None) or LocalPublicationContext()
@@ -696,6 +1190,7 @@ class ExportBundleService:
                     "artifact_version": EXPORT_BUNDLE_ARTIFACT_VERSION,
                     "producer": "runtime.export_bundle.ExportBundleService",
                     "depends_on": [ArtifactDependencyRefV2.from_record(record) for record in ready_records],
+                    "external_registry_resolver": external_registry_resolver,
                     "metadata": {
                         # GUI and API consumers historically used ``status``;
                         # retain the explicit bundle name for newer callers.
@@ -741,7 +1236,20 @@ class ForensicAttestationService:
         closure: Mapping[str, Any] | None = None,
         persist: bool = True,
     ) -> ForensicAttestationResultV1:
-        derived = _derive_current_evidence(self.workspace, self.registry)
+        records_snapshot_error = None
+        try:
+            expected_snapshot_revision, records_snapshot = self.registry.capture_record_snapshot()
+        except (OSError, RegistryError, ValueError, TypeError) as exc:
+            expected_snapshot_revision = None
+            records_snapshot = []
+            records_snapshot_error = str(exc)
+        derived = _derive_current_evidence(
+            self.workspace,
+            self.registry,
+            records_snapshot=records_snapshot,
+            expected_snapshot_revision=expected_snapshot_revision,
+            records_snapshot_error=records_snapshot_error,
+        )
         # Caller claims are deliberately ignored.  Keep an audit marker so a
         # forensic report explains why the supplied values did not affect the
         # attestation.
@@ -752,7 +1260,7 @@ class ForensicAttestationService:
         verified: list[str] = []
         manual: list[str] = []
         graph: dict[str, Sequence[str]] = {}
-        records = self.registry.list_records()
+        records = records_snapshot
         for record in records:
             graph[record.artifact_id] = tuple(
                 dependency.artifact_id for dependency in record.depends_on if dependency.artifact_id

@@ -4,7 +4,11 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
-from tests.test_outline_v3_semantic_execution import _configured_test_provider, _executor
+from tests.test_outline_v3_semantic_execution import (
+    _configured_test_provider,
+    _executor,
+    _purposeful_relation_summaries,
+)
 
 
 def test_full_stability_keeps_equivalent_candidates_eligible_across_execution_order(
@@ -22,7 +26,7 @@ def test_full_stability_keeps_equivalent_candidates_eligible_across_execution_or
     relation_decisions: list[tuple[list[str], list[str]]] = []
 
     def provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
-        if node_id == "relation_adjudication":
+        if "relation_adjudication" in node_id:
             relation_ids = [
                 str(item.get("relation_id") or "")
                 for item in request.get("relation_candidates") or ()
@@ -76,13 +80,40 @@ def test_full_stability_keeps_equivalent_candidates_eligible_across_execution_or
             }
         return _configured_test_provider(node_id, request)
 
-    executor = _executor(tmp_path, provider=provider, stability_mode="full")
+    # Reuse two existing source-bound records with an explicit contrast in
+    # findings and study context. The relation task is therefore supported by
+    # the summaries' own fields rather than shared labels alone.
+    source_rows = _purposeful_relation_summaries()
+    source_contrast_summaries = [source_rows[0], source_rows[3]]
+    executor = _executor(
+        tmp_path,
+        provider=provider,
+        stability_mode="full",
+        summaries=source_contrast_summaries,
+    )
     result = executor.run()
 
     assert result.ok is True
     assert result.status == "ready_for_adoption"
     assert relation_decisions
     assert any(rejected for _confirmed, rejected in relation_decisions)
+    relation_record = executor.registry.get("outline-v3:relation_candidates")
+    assert relation_record is not None and relation_record.status == "ready"
+    relation_map = json.loads(Path(relation_record.path).read_text(encoding="utf-8"))["payload"]
+    source_relation_rows = relation_map.get("relations") or []
+    assert source_relation_rows
+    assert all(
+        row.get("evidence_fields") and row.get("source_fields")
+        for row in source_relation_rows
+    )
+    adjudicated_relation_ids = {
+        relation_id
+        for confirmed, rejected in relation_decisions
+        for relation_id in (*confirmed, *rejected)
+    }
+    assert {str(row["relation_id"]) for row in source_relation_rows}.issubset(
+        adjudicated_relation_ids
+    )
 
     stability_path = Path(result.artifacts["stability_audit"])
     stability = json.loads(stability_path.read_text(encoding="utf-8"))["payload"]

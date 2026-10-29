@@ -7,27 +7,22 @@ import pytest
 from datetime import datetime
 
 from validation.repair_models import (
-    AppliedPatchRecord,
     ApplyGuardResult,
     DependencyHashBundle,
     PatchGranularity,
     PatchProposal,
     PatchTargetSignature,
-    RepairApplyResult,
     RepairPlan,
     RepairPolicy,
-    RepairReport,
     RepairRootCause,
 )
 from validation.repair_planner import (
     RepairPlanner,
     _compute_hash,
     _build_dependency_bundle,
-    _map_validation_root_cause,
     run_repair_planning,
 )
 from validation.repair_apply import (
-    RepairApplier,
     check_apply_guards,
     _compute_anchor_hash,
     run_repair_apply,

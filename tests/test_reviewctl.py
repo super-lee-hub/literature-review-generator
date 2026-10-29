@@ -163,8 +163,7 @@ def test_reviewctl_plan_projects_all_reachable_provider_work_without_posting(
     }
     assert expected_builder_roles <= set(registered)
     assert all(
-        registered[role]["logical_calls_upper_bound"]
-        == (1 if role == ("outline", "arbitration") else None)
+        registered[role]["logical_calls_upper_bound"] is None
         for role in expected_builder_roles
     )
     assert not any(
@@ -203,10 +202,15 @@ def test_reviewctl_plan_projects_all_reachable_provider_work_without_posting(
         "outline.v3_executor.OutlineV3Executor._run_bounded_semantic_provider_call:cross_group_comparison",
         "outline.v3_executor.OutlineV3Executor._run_bounded_semantic_provider_call:global_synthesis",
     }
-    assert all(item["logical_calls_upper_bound"] == 25 for item in reducer_exposures)
-    assert all(item["physical_attempt_upper_bound"] == 75 for item in reducer_exposures)
+    # The executor derives reducer capacity from the materialized tree, which
+    # can legitimately exceed its fallback limit. Until that tree exists, the
+    # fallback plus final call is not a future-work upper bound.
+    assert all(item["logical_calls_upper_bound"] is None for item in reducer_exposures)
+    assert all(item["physical_attempt_upper_bound"] is None for item in reducer_exposures)
     arbitration = registered[("outline", "arbitration")]
-    assert arbitration["physical_attempt_upper_bound"] == 3
+    # Hierarchical arbitration can add source-bound leaf requests; its count
+    # is known only after candidate and critique outputs are materialized.
+    assert arbitration["physical_attempt_upper_bound"] is None
     assert arbitration["conditional_on"] == "eligible_candidate_and_critique_outputs_materialized"
     # Numeric call limits alone lack a verified cardinality basis and wall
     # bound. The public pre-admission plan must keep them unbounded.
@@ -229,10 +233,6 @@ def test_reviewctl_plan_projects_all_reachable_provider_work_without_posting(
             == (
                 5
                 if str(item.get("request_builder_id") or "").endswith("_semantic_repair_candidate")
-                else 25
-                if item["reason"].startswith(("cross_group_request_", "global_request_"))
-                else 1
-                if item["semantic_role"] == "arbitration"
                 else None
             )
             and isinstance(item["input_tokens_per_call_upper_bound"], int)
@@ -246,8 +246,11 @@ def test_reviewctl_plan_projects_all_reachable_provider_work_without_posting(
         for item in invalid_bounds
     ]
     assert projection["aggregate_budget_source"] == (
-        "application_call_cap_projection_without_bound_acceptance_run"
+        "documented_finite_run_default"
     )
+    assert projection["run_resource_limits_finite"] is True
+    assert projection["jit_request_admission_required"] is True
+    assert projection["aggregate_budget"]["schema_version"] == "provider-aggregate-budget-contract-v2"
     assert plan["provider_admission_status"] == "incomplete_unknown_exposure"
     assert plan["ready_for_provider_admission"] is False
     assert "local-fixture-only" not in json.dumps(plan)
@@ -326,11 +329,23 @@ def test_reuse_only_run_plan_removes_reader_calls_after_typed_authority_verifica
     assert projection["stage1_reuse_authority"]["current_binding_comparison"] == (
         "not_run_no_stage1_paper_work_items"
     )
+    assert projection["totals"]["logical_calls_known_lower_bound"] == 0
+    assert projection["totals"]["physical_attempts_known_lower_bound"] == 0
     assert projection["boundary"]["no_provider_posts"] is True
     assert not any(
         item["stage_name"] == "analyze"
         for item in projection["unknown_exposures"]
     )
+    for stage_name, semantic_role in (("review", "writer"), ("validate", "validator")):
+        future = [
+            item
+            for item in projection["unknown_exposures"]
+            if item["stage_name"] == stage_name
+            and item["semantic_role"] == semantic_role
+        ]
+        assert future
+        assert all(item["logical_calls_upper_bound"] is None for item in future)
+        assert all(item["logical_calls_known_lower_bound"] == 0 for item in future)
     assert projection["budget_status"]["admission"] == "incomplete_unknown_exposure"
 
 
@@ -474,11 +489,17 @@ def test_chunk_plan_builds_route_bound_semantic_request_plan_without_posts(
     )
 
     assert result["provider_posts_emitted"] == 0
-    assert result["semantic_preflight_status"] == "rejected"
+    # Candidate/critic bodies are future inputs. Their projected extra call
+    # is visible, but must not be treated as an already-required transport.
+    assert result["semantic_preflight_status"] == "awaiting_exact_future_request_materialization"
     baseline_preflight = result["semantic_route_preflight_summary"]
-    assert baseline_preflight["rejection_reason"] == "max_provider_physical_attempts_exceeded"
+    assert not baseline_preflight.get("rejection_reason")
     assert baseline_preflight["max_provider_calls"] == 24
-    assert baseline_preflight["estimated_provider_physical_attempts_upper_bound"] == 51
+    assert baseline_preflight["aggregate_retry_pool_remaining"] == 2
+    assert baseline_preflight["known_provider_calls_lower_bound"] + 2 <= 24
+    assert baseline_preflight["estimated_provider_physical_attempts_upper_bound"] == (
+        baseline_preflight["estimated_provider_calls"] + 2
+    ) == 25
     assert result["provider_request_plan_status"] == "planned_semantic_request_graph"
     assert result["semantic_request_plan"]
     assert all(
@@ -497,10 +518,23 @@ def test_chunk_plan_builds_route_bound_semantic_request_plan_without_posts(
         "topic_request_plan_identity_hash"
     ]
     coverage = result["r1_request_workload_audit"]["topic_wire_coverage"]
-    assert coverage["status"] == "complete"
+    # The selected topic units are complete; two author-proposed research
+    # gaps remain in local dossiers with exact, visible deferral records.
+    assert coverage["status"] == "incomplete"
     assert coverage["all_planned_unit_sets_equal_materialized_unit_sets"] is True
-    assert coverage["missing_source_claim_identity_count"] == 0
-    assert coverage["missing_source_evidence_identity_count"] == 0
+    assert coverage["missing_source_claim_identity_count"] == 2
+    assert coverage["missing_source_evidence_identity_count"] == 2
+    dispositions = result["semantic_chunk_plan"]["coverage"]
+    assert dispositions["source_claim_disposition_status"] == "complete"
+    assert [(row["paper_key"], row["claim_id"], row["deferred_reason_code"])
+            for row in dispositions["deferred_source_claims"]] == [
+        ("paper-a", "claim:paper-a:research_gaps:2d7560a664a6523b",
+         "author_proposed_gap_not_selected_by_topic_dimensions"),
+        ("paper-b", "claim:paper-b:research_gaps:2d7560a664a6523b",
+         "author_proposed_gap_not_selected_by_topic_dimensions"),
+    ]
+    assert all(row["retained_in_local_dossier"] and row["evidence_ids"]
+               for row in dispositions["deferred_source_claims"])
     assert coverage["extra_topic_wire_claim_identity_count"] == 0
     assert coverage["extra_topic_wire_evidence_identity_count"] == 0
     text_metrics = result["r1_request_workload_audit"]["topic_wire_text"]
@@ -541,12 +575,12 @@ def test_chunk_plan_builds_route_bound_semantic_request_plan_without_posts(
         ),
         encoding="utf-8",
     )
-    # The provider-free output comparison needs room for its 51 physical
-    # attempts; the 24-call baseline remains a separate rejected control.
+    # A larger quota preserves future materialization status while allowing
+    # comparison of exact topic requests at the changed output reserve.
     increased = ReviewControlPlane(repo_root=tmp_path).chunk_plan(
         [summary_path], config_path=config_path, physical_call_limit=64
     )
-    assert increased["semantic_preflight_status"] == "accepted"
+    assert increased["semantic_preflight_status"] == "awaiting_exact_future_request_materialization"
     increased_topic = next(
         row for row in increased["semantic_request_plan"]
         if row["node_id"] == baseline_topic["node_id"]

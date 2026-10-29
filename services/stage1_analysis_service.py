@@ -17,10 +17,12 @@ import re
 import shutil
 import tempfile
 import uuid
-from contextlib import contextmanager
+from contextlib import closing, contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence, cast
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Callable, Generator, Iterable, Iterator, Mapping, Sequence, cast
 
 from models import APIConfig
 from preprocess.service import MineruRemoteBudget, PreprocessManager
@@ -33,6 +35,7 @@ from runtime.provider_runtime import (
     ProviderBudgetExceeded,
     ProviderBudgetV1,
     ProviderCallReceiptV1,
+    ProviderResponseSnapshotSink,
     ProviderRuntime,
     ProviderRuntimeLedger,
     PROVIDER_RECEIPT_ARTIFACT_VERSION,
@@ -50,6 +53,7 @@ from services.artifact_registry import (
     RegistryError,
     file_sha256,
 )
+from services.stage1_source_scope_verification import Stage1SourceScopeVerification
 from services.config_values import parse_strict_bool
 from services.durable_io import atomic_replace_with_retry
 from services.evidence_manifest import build_evidence_manifest_v1
@@ -63,7 +67,7 @@ from services.job_workspace import (
 )
 from services.multimodal_capability import detect_multimodal_capability
 from services.prompt_registry import PromptRegistry
-from services.settings import ApplicationSettings
+from services.settings import ApplicationSettings, resolve_preprocess_parser_policy
 from services.stage1_input_builder import Stage1InputBuilder
 from services.stage1_input_completeness import (
     build_completeness_metrics,
@@ -76,6 +80,8 @@ from services.stage1_output_budget import (
     stage1_semantic_retry_max_attempts,
 )
 from services.stage1_reuse import (
+    _TypedManifestVerificationScope,
+    Stage1TypedManifestAuthorityV1,
     Stage1TypedManifestAuthorityV2,
     STAGE1_REUSE_POLICY,
     Stage1ReusableSummaryBindingV1,
@@ -112,6 +118,11 @@ from summary_schema import (
 )
 
 ReaderCallable = Callable[..., Mapping[str, Any]]
+if TYPE_CHECKING:
+    from services.explicit_stage1_typed_import import ExplicitTypedImportPlan
+_PREDECLARATION_SOURCE_SCOPE: ContextVar[tuple[object, object, list[bool]] | None] = ContextVar(
+    "stage1_predeclaration_source_scope", default=None,
+)
 
 _PLACEHOLDER_RE = re.compile(
     r"(?:^|\b)(?:dummy|placeholder|not\s+provided|not\s+available|unknown|n/?a|\.\.\.)"
@@ -145,6 +156,7 @@ class Stage1AnalysisResult:
     reuse_evidence_ids: tuple[str, ...] = ()
     expected_provider_transport_count: int = 0
     actual_provider_transport_count: int = 0
+    imported_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -208,6 +220,7 @@ class Stage1AnalysisService:
         reader: ReaderCallable | None = None,
         publication_context: Any | None = None,
         external_registry_resolver: Callable[[str], ArtifactRegistry | None] | None = None,
+        response_snapshot_sink: ProviderResponseSnapshotSink | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self.job_id = str(job_id)
@@ -231,6 +244,7 @@ class Stage1AnalysisService:
         self.cancellation_checker = cancellation_checker
         self.reader = reader
         self.external_registry_resolver = external_registry_resolver
+        self.response_snapshot_sink = response_snapshot_sink
         from services.queue_service import LocalPublicationContext
 
         self.publication_context = (
@@ -259,6 +273,14 @@ class Stage1AnalysisService:
         self.receipt_closure_path = ""
         self.receipt_closure_hash = ""
         self.reuse_evidence_ids: list[str] = []
+        self._explicit_import_plan: ExplicitTypedImportPlan | None = None
+        self._explicit_import_rows: tuple[Mapping[str, Any], ...] = ()
+        self._explicit_import_bundle: SourceBundle | None = None
+        self._explicit_import_spec_signature = ""
+        self._explicit_import_carriers: tuple[ArtifactRecord, ...] = ()
+        self._explicit_import_source_items: tuple[dict[str, Any], ...] = ()
+        self._explicit_import_require_complete_visual_coverage = True
+        self._explicit_import_registry_resolver: Callable[[str], ArtifactRegistry | None] | None = None
         self._generated_authorities: dict[
             str, tuple[ArtifactRecord, Stage1ReusableSummaryBindingV1, Mapping[str, Any]]
         ] = {}
@@ -285,10 +307,32 @@ class Stage1AnalysisService:
         bundle: SourceBundle,
         *,
         existing_summaries: Sequence[Mapping[str, Any]] = (),
+        explicit_typed_imports: Sequence[Mapping[str, Any]] | None = None,
+    ) -> Stage1AnalysisResult:
+        with _TypedManifestVerificationScope() as verification_scope:
+            return self._run_with_verification_scope(
+                bundle,
+                existing_summaries=existing_summaries,
+                explicit_typed_imports=explicit_typed_imports,
+                _verification_scope=verification_scope,
+            )
+
+    def _run_with_verification_scope(
+        self,
+        bundle: SourceBundle,
+        *,
+        existing_summaries: Sequence[Mapping[str, Any]] = (),
+        explicit_typed_imports: Sequence[Mapping[str, Any]] | None = None,
+        _verification_scope: _TypedManifestVerificationScope,
     ) -> Stage1AnalysisResult:
         bundle.validate()
+        if explicit_typed_imports is not None:
+            self._start_explicit_imports(bundle, explicit_typed_imports, _verification_scope)
         self._freeze_source_scope(bundle)
         existing = self._index_existing(existing_summaries, bundle)
+        imports = self._explicit_import_plan
+        if imports is not None and set(existing).intersection(entry.paper_key for entry in imports.imports):
+            raise RuntimeError("explicit typed imports overlap ordinary cache candidates")
         summaries: list[dict[str, Any]] = []
         source_items: list[dict[str, Any]] = []
         reused_count = 0
@@ -298,13 +342,11 @@ class Stage1AnalysisService:
         # while retaining only lightweight declarations.  Each heavy
         # ``_PreparedStage1Item`` produced by the generator is released as
         # soon as its call identities have been projected into the graph.
-        declarations = self._predeclare_expected_calls(
-            bundle,
-            (
-                self._prepare_item(item, existing.get(self._paper_key(item)))
-                for item in bundle.paper_work_items
-            ),
-        )
+        pending_keys = set(imports.pending_keys) if imports is not None else None
+        with closing(self._prepare_predeclared_items(
+            bundle, existing, _verification_scope=_verification_scope, pending_keys=pending_keys,
+        )) as prepared_items:
+            declarations = self._predeclare_expected_calls(bundle, prepared_items)
         declarations = tuple(
             replace(
                 declaration,
@@ -312,60 +354,49 @@ class Stage1AnalysisService:
             )
             for declaration in declarations
         )
-        for declaration in declarations:
-            self._check_cancelled()
-            # Reuse adjudication already happened during predeclaration.  The
-            # JIT pass rebuilds the provider input from the immutable
-            # job-owned preprocess snapshot, rather than rerunning an expensive
-            # parser under force_rebuild. It then restores the frozen reuse
-            # adjudication before the provider/reuse executor runs.
-            prepared = self._prepare_item(
-                declaration.item,
-                None,
-                predeclared_preprocess_authority=(
-                    declaration.predeclared_preprocess_authority
-                ),
-            )
-            prepared = replace(
-                prepared,
-                previous=declaration.previous,
-                reuse_eligibility=declaration.reuse_eligibility,
-            )
-            self._assert_jit_declaration_matches(declaration, prepared)
-            prepared = replace(
-                prepared,
-                current_binding=self._bind_execution_provenance(prepared.current_binding),
-            )
-            summary, receipt_ids = self._execute_prepared(prepared)
-            summaries.append(summary)
-            paper_key = self._paper_key(prepared.item)
-            preprocess = summary.get("preprocess") if isinstance(summary, Mapping) else None
-            preprocess = preprocess if isinstance(preprocess, Mapping) else prepared.preprocess_metadata
-            source_items.append(
-                {
-                    "canonical_paper_key": paper_key,
-                    "source_paper_id": prepared.item.source_paper_id,
-                    "source_pdf": prepared.item.source_pdf,
-                    "disposition": "reused" if prepared.previous is not None else "provider_generated",
-                    "provider_receipt_ids": list(receipt_ids),
-                    "reuse_evidence_id": str(
-                        (summary.get("reuse_metadata") or {}).get("reuse_evidence_id") or ""
-                    )
-                    if isinstance(summary, Mapping)
-                    else "",
-                    "evidence_manifest_path": str(preprocess.get("evidence_manifest_path") or ""),
-                    "evidence_manifest_hash": str(preprocess.get("evidence_manifest_hash") or ""),
-                }
-            )
-            if prepared.previous is not None:
-                reused_count += 1
-            else:
-                generated_count += 1
+        with closing(self._prepare_jit_items(declarations, _verification_scope)) as prepared_items:
+            for prepared in prepared_items:
+                summary, receipt_ids = self._execute_prepared(
+                    prepared, _verification_scope=_verification_scope
+                )
+                summaries.append(summary)
+                paper_key = self._paper_key(prepared.item)
+                preprocess = summary.get("preprocess") if isinstance(summary, Mapping) else None
+                preprocess = preprocess if isinstance(preprocess, Mapping) else prepared.preprocess_metadata
+                source_items.append(
+                    {
+                        "canonical_paper_key": paper_key,
+                        "source_paper_id": prepared.item.source_paper_id,
+                        "source_pdf": prepared.item.source_pdf,
+                        "disposition": "reused" if prepared.previous is not None else "provider_generated",
+                        "provider_receipt_ids": list(receipt_ids),
+                        "reuse_evidence_id": str(
+                            (summary.get("reuse_metadata") or {}).get("reuse_evidence_id") or ""
+                        )
+                        if isinstance(summary, Mapping)
+                        else "",
+                        "evidence_manifest_path": str(preprocess.get("evidence_manifest_path") or ""),
+                        "evidence_manifest_hash": str(preprocess.get("evidence_manifest_hash") or ""),
+                    }
+                )
+                if prepared.previous is not None:
+                    reused_count += 1
+                else:
+                    generated_count += 1
+                del prepared
 
-            # Drop references to large prompt/content structures before the
-            # next paper is materialized.  The loop variable is rebound on the
-            # next iteration and declarations contain no heavy inputs.
-            del prepared
+        if imports is not None:
+            summaries.extend(entry.summary for entry in imports.imports)
+            source_items.extend(dict(item) for item in self._explicit_import_source_items)
+            by_key = {str(row["paper_info"]["canonical_paper_key"]): row for row in summaries}
+            sources_by_key = {str(row["canonical_paper_key"]): row for row in source_items}
+            expected_keys = [self._paper_key(item) for item in bundle.paper_work_items]
+            if (len(by_key) != len(summaries) or len(sources_by_key) != len(source_items)
+                    or set(by_key) != set(expected_keys) or set(sources_by_key) != set(expected_keys)):
+                raise RuntimeError("explicit typed imports and pending work do not exactly cover the source bundle")
+            summaries = [by_key[key] for key in expected_keys]
+            source_items = [sources_by_key[key] for key in expected_keys]
+            self.verify_explicit_imports_current()
 
         if len(summaries) != len(bundle.paper_work_items):
             raise RuntimeError("Stage 1 did not produce one result for every source work item")
@@ -396,6 +427,10 @@ class Stage1AnalysisService:
         # must not inherit a historical ledger path or manufacture a target
         # that was never published.
         for summary in summaries:
+            if imports is not None and str(summary["paper_info"]["canonical_paper_key"]) in {
+                entry.paper_key for entry in imports.imports
+            }:
+                continue
             provider = summary.get("provider") if isinstance(summary, Mapping) else None
             if isinstance(provider, Mapping):
                 summary["provider"] = {
@@ -421,7 +456,122 @@ class Stage1AnalysisService:
             reuse_evidence_ids=tuple(self.reuse_evidence_ids),
             expected_provider_transport_count=len(self.expected_calls),
             actual_provider_transport_count=actual_transport_count,
+            imported_count=len(imports.imports) if imports is not None else 0,
         )
+
+    def _start_explicit_imports(
+        self, bundle: SourceBundle, rows: Sequence[Mapping[str, Any]],
+        verification_scope: _TypedManifestVerificationScope,
+    ) -> None:
+        from services.explicit_stage1_typed_import import resolve_explicit_typed_imports
+
+        runtime_record = self.registry.get("runtime_job_spec")
+        if (runtime_record is None or runtime_record.job_id != self.job_id
+                or runtime_record.artifact_role != "runtime_spec"
+                or runtime_record.artifact_type != "runtime_job_spec"
+                or runtime_record.artifact_version != "v1" or runtime_record.status != "ready"):
+            raise RuntimeError("explicit typed import requires the registered current RuntimeJobSpec")
+        ArtifactRegistry._verify_ready_artifact(runtime_record)
+        raw = Path(runtime_record.path).read_bytes()
+        if hashlib.sha256(raw).hexdigest() != runtime_record.content_hash:
+            raise RuntimeError("explicit typed import RuntimeJobSpec bytes changed")
+        payload = json.loads(raw)
+        metadata = payload.get("metadata") if isinstance(payload, Mapping) else None
+        selected = payload.get("reuse_summary_files") if isinstance(payload, Mapping) else None
+        if (not isinstance(metadata, Mapping)
+                or metadata.get("stage1_summary_input_mode") != "explicit_typed_import"
+                or payload.get("job_id") != self.job_id
+                or payload.get("action") not in {"analyze", "run_all"}
+                or payload.get("reuse_stage1") is not True
+                or payload.get("summary_file") or payload.get("summary_sources")
+                or not isinstance(selected, list) or not selected
+                or any(not isinstance(path, str) or not path.strip() for path in selected)):
+            raise RuntimeError("current RuntimeJobSpec does not select explicit typed import inputs")
+        selected_paths = [str(Path(path).expanduser().resolve()) for path in selected]
+        row_paths = [str(Path(str((row.get("stage1_reuse") or {}).get("typed_manifest_path") or "")).expanduser().resolve())
+                     for row in rows if isinstance(row.get("stage1_reuse"), Mapping)]
+        if len(row_paths) != len(rows) or sorted(row_paths) != sorted(selected_paths):
+            raise RuntimeError("explicit typed import rows do not match the RuntimeJobSpec selected files")
+        self._explicit_import_rows = tuple(json.loads(json.dumps(row, ensure_ascii=False, allow_nan=False)) for row in rows)
+        from runtime.explicit_stage1_scope import authorized_explicit_stage1_registry_resolver
+
+        self._explicit_import_registry_resolver = authorized_explicit_stage1_registry_resolver(
+            list(self._explicit_import_rows), self.external_registry_resolver,
+        )
+        self._explicit_import_bundle = bundle
+        self._explicit_import_spec_signature = json.dumps(asdict(runtime_record), sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+        self._explicit_import_require_complete_visual_coverage = parse_strict_bool(
+            self.config.get("Stage1_Input", {}).get("require_complete_visual_coverage"),
+            field="Stage1_Input.require_complete_visual_coverage", default=True,
+        )
+        self._explicit_import_plan = resolve_explicit_typed_imports(
+            self._explicit_import_rows, bundle, f1_binding=metadata.get("f1_corpus_binding"),
+            external_registry_resolver=self._explicit_import_registry_resolver,
+            _verification_scope=verification_scope,
+            require_complete_visual_coverage=self._explicit_import_require_complete_visual_coverage,
+        )
+        runtime_dependency = ArtifactDependencyRefV2.from_record(runtime_record)
+        carriers: dict[str, ArtifactRecord] = {}
+        source_items = []
+        for entry in self._explicit_import_plan.imports:
+            source, manifest, closure, ledger, corrections = self._publish_typed_authority_carriers(
+                entry.authority, runtime_dependency,
+            )
+            records = [source, manifest, *([closure] if closure is not None else []),
+                       *([ledger] if ledger is not None else []), *corrections.values()]
+            carriers.update((record.artifact_id, record) for record in records)
+            source_items.append({**entry.source_item(), "authority_carriers": [
+                ArtifactDependencyRefV2.from_record(record).to_dict() for record in records
+            ]})
+        self._explicit_import_carriers = tuple(carriers.values())
+        self._explicit_import_source_items = tuple(source_items)
+
+    def verify_explicit_imports_current(self) -> None:
+        """Reopen the original proofs and participating current records before publication."""
+        if self._explicit_import_plan is None:
+            return
+        from services.explicit_stage1_typed_import import resolve_explicit_typed_imports
+
+        record = self.registry.get("runtime_job_spec")
+        if (record is None or json.dumps(asdict(record), sort_keys=True, separators=(",", ":"),
+                ensure_ascii=False, allow_nan=False) != self._explicit_import_spec_signature):
+            raise RuntimeError("explicit typed import RuntimeJobSpec record changed")
+        ArtifactRegistry._verify_ready_artifact(record)
+        metadata = json.loads(Path(record.path).read_text(encoding="utf-8"))["metadata"]
+        if parse_strict_bool(
+            self.config.get("Stage1_Input", {}).get("require_complete_visual_coverage"),
+            field="Stage1_Input.require_complete_visual_coverage", default=True,
+        ) is not self._explicit_import_require_complete_visual_coverage:
+            raise RuntimeError("explicit typed import consumer visual policy changed")
+        assert self._explicit_import_bundle is not None
+        with _TypedManifestVerificationScope() as fresh_scope:
+            current = resolve_explicit_typed_imports(
+                self._explicit_import_rows, self._explicit_import_bundle,
+                f1_binding=metadata.get("f1_corpus_binding"),
+                external_registry_resolver=self._explicit_import_registry_resolver,
+                _verification_scope=fresh_scope,
+                require_complete_visual_coverage=self._explicit_import_require_complete_visual_coverage,
+            )
+        if (current.authority_set_hash != self._explicit_import_plan.authority_set_hash
+                or current.pending_keys != self._explicit_import_plan.pending_keys):
+            raise RuntimeError("explicit typed import authority set changed")
+        for original in self._explicit_import_carriers:
+            current_record = self.registry.get(original.artifact_id)
+            if (current_record is None or json.dumps(asdict(current_record), sort_keys=True, separators=(",", ":"),
+                    ensure_ascii=False, allow_nan=False) != json.dumps(asdict(original), sort_keys=True, separators=(",", ":"),
+                    ensure_ascii=False, allow_nan=False)):
+                raise RuntimeError(f"explicit typed import carrier changed: {original.artifact_id}")
+        self.registry.verify_ready_artifact_closures(self._explicit_import_carriers,
+            external_registry_resolver=self.external_registry_resolver)
+
+    def _explicit_import_graph_fields(self) -> dict[str, Any]:
+        if self._explicit_import_plan is None:
+            return {}
+        return {
+            "imported_authority_set_hash": self._explicit_import_plan.authority_set_hash,
+            "imported_stage1_inputs": list(self._explicit_import_source_items),
+            "imported_require_complete_visual_coverage": self._explicit_import_require_complete_visual_coverage,
+        }
 
     def _freeze_source_scope(self, bundle: SourceBundle) -> ArtifactRecord:
         """Inspect every PDF locally before any parser/model side effect."""
@@ -478,15 +628,198 @@ class Stage1AnalysisService:
         self._source_scope_by_paper = {item["paper_key"]: item for item in papers}
         return record
 
-    def _verify_source_scope_item(self, item: PaperWorkItem) -> None:
+    def _local_predeclaration_route(self) -> bool:
+        section = self.config.get("Preprocess")
+        required = {"parser_mode", "primary_parser", "fallback_parser", "extractor_profile",
+                    "enable_local_rag", "local_rag_allow_model_download"}
+        if not isinstance(section, Mapping) or not required.issubset(section):
+            return False
+        try:
+            policy = resolve_preprocess_parser_policy(
+                section["parser_mode"], section["primary_parser"], section["fallback_parser"],
+                allow_local_parse_fallback=section.get("allow_local_parse_fallback"),
+            )
+            return (
+                policy.parser_mode in {"local", "hybrid"}
+                and policy.primary_parser == "local"
+                and policy.fallback_parser in {"local", "none"}
+                and str(section["extractor_profile"]).strip().casefold() in {"auto", "fitz"}
+                and not parse_strict_bool(section["enable_local_rag"], field="Preprocess.enable_local_rag")
+                and not parse_strict_bool(section["local_rag_allow_model_download"], field="Preprocess.local_rag_allow_model_download")
+            )
+        except ValueError:
+            return False
+
+    def _prepare_jit_items(
+        self, declarations: Sequence[_Stage1ItemDeclaration],
+        verification_scope: _TypedManifestVerificationScope | None,
+    ) -> Generator[_PreparedStage1Item, None, None]:
+        if not declarations:
+            return
+        root = getattr(self, "_source_scope_record", None)
+        context = (
+            Stage1SourceScopeVerification(
+                self.registry, root, is_local_route=self._local_predeclaration_route,
+                check_cancelled=self._check_cancelled,
+                external_registry_resolver=self.external_registry_resolver,
+            ) if root is not None else nullcontext(None)
+        )
+        with context as proof:
+            for declaration in declarations:
+                self._check_cancelled()
+                guard = proof.guard(root) if proof is not None and root is not None else nullcontext()
+                with guard:
+                    # Rebuild from the immutable, job-owned preprocess snapshot
+                    # and retain every original declaration/input assertion.
+                    prepared = self._prepare_item(
+                        declaration.item, None,
+                        predeclared_preprocess_authority=declaration.predeclared_preprocess_authority,
+                        _verification_scope=verification_scope, _jit_source_scope_verifier=proof,
+                    )
+                    prepared = replace(
+                        prepared, previous=declaration.previous,
+                        reuse_eligibility=declaration.reuse_eligibility,
+                    )
+                    self._assert_jit_declaration_matches(declaration, prepared)
+                    prepared = replace(
+                        prepared, current_binding=self._bind_execution_provenance(prepared.current_binding),
+                    )
+                # The source guard has successfully exited before the caller
+                # can admit or send a provider request.
+                yield prepared
+                del prepared
+
+    def _prepare_predeclared_items(
+        self, bundle: SourceBundle, existing: Mapping[str, dict[str, Any]], *,
+        _verification_scope: _TypedManifestVerificationScope | None,
+        pending_keys: set[str] | None = None,
+    ) -> Generator[_PreparedStage1Item, None, None]:
+        self._check_cancelled()
+        items = tuple(item for item in bundle.paper_work_items
+                      if pending_keys is None or self._paper_key(item) in pending_keys)
+        scope_record = getattr(self, "_source_scope_record", None)
+        if scope_record is None or not self._local_predeclaration_route():
+            for item in items:
+                yield self._prepare_item(item, existing.get(self._paper_key(item)),
+                                         _verification_scope=_verification_scope)
+            return
+        active_scope = _PREDECLARATION_SOURCE_SCOPE.get()
+        if active_scope is not None and active_scope[2][0]:
+            raise RuntimeError("local source predeclaration is already active")
+
+        def signature(record: ArtifactRecord) -> str:
+            return json.dumps(asdict(record), sort_keys=True, separators=(",", ":"),
+                              ensure_ascii=False, allow_nan=False)
+
+        _revision, records = self.registry.capture_record_snapshot()
+        initial = {record.artifact_id: record for record in records}
+        participating: dict[str, ArtifactRecord] = {}
+        pending = [scope_record.artifact_id]
+        while pending:
+            artifact_id = pending.pop()
+            if artifact_id in participating:
+                continue
+            record = initial.get(artifact_id)
+            if record is None:
+                raise RuntimeError(f"predeclaration source authority is missing: {artifact_id}")
+            participating[artifact_id] = record
+            for ref in record.depends_on:
+                if ref.dependency_kind != "local_job" or ref.job_id != self.job_id:
+                    # Keep unsupported/foreign authority on the original path.
+                    for item in items:
+                        yield self._prepare_item(item, existing.get(self._paper_key(item)),
+                                                 _verification_scope=_verification_scope)
+                    return
+                pending.append(ref.artifact_id)
+        signatures = {key: signature(record) for key, record in participating.items()}
+        if signatures[scope_record.artifact_id] != signature(scope_record):
+            raise RuntimeError(f"predeclaration source scope record changed: {scope_record.artifact_id}")
+
+        def check_records() -> None:
+            _current_revision, current_records = self.registry.capture_record_snapshot()
+            current = {record.artifact_id: record for record in current_records}
+            for key, value in signatures.items():
+                if key not in current or signature(current[key]) != value:
+                    raise RuntimeError(f"predeclaration participating source record changed: {key}")
+
+        self.registry.verify_ready_artifact_closure(scope_record)
+        scope_bytes = Path(scope_record.path).read_bytes()
+        if hashlib.sha256(scope_bytes).hexdigest() != scope_record.content_hash:
+            raise RuntimeError(f"predeclaration source scope bytes changed: {scope_record.artifact_id}")
+        papers = json.loads(scope_bytes)["papers"]
+        frozen_papers = MappingProxyType({
+            str(paper["paper_key"]): MappingProxyType(dict(paper)) for paper in papers
+        })
+        if len(frozen_papers) != len(papers):
+            raise RuntimeError("predeclaration source scope paper identity is ambiguous")
+        check_records()
+        token = (scope_record, signatures[scope_record.artifact_id], frozen_papers)
+        permit = [True]
+        context_token = _PREDECLARATION_SOURCE_SCOPE.set((self, token, permit))
+        try:
+            for item in items:
+                self._check_cancelled()
+                yield self._prepare_item(
+                    item, existing.get(self._paper_key(item)),
+                    _verification_scope=_verification_scope, _predeclared_source_scope=token,
+                )
+            self._check_cancelled()
+            self.registry.verify_ready_artifact_closure(scope_record)
+            for paper in papers:
+                self._check_cancelled()
+                path = Path(paper["source_pdf"]).expanduser().resolve()
+                if str(path) != paper["source_pdf"] or file_sha256(path) != paper["source_pdf_sha256"]:
+                    raise RuntimeError(f"predeclaration source scope PDF binding changed: {paper['paper_key']}")
+            for record in participating.values():
+                self._check_cancelled()
+                if file_sha256(record.path) != record.content_hash:
+                    raise RuntimeError(f"predeclaration participating source bytes changed: {record.artifact_id}")
+            check_records()
+        finally:
+            permit[0] = False
+            _PREDECLARATION_SOURCE_SCOPE.reset(context_token)
+
+    def _verify_source_scope_item(
+        self, item: PaperWorkItem, *,
+        _predeclared_source_scope: tuple[ArtifactRecord, str, Mapping[str, Mapping[str, Any]]] | None = None,
+        _jit_source_scope_verifier: Stage1SourceScopeVerification | None = None,
+    ) -> None:
+        if _jit_source_scope_verifier is not None and (
+            _predeclared_source_scope is not None
+            or not isinstance(_jit_source_scope_verifier, Stage1SourceScopeVerification)
+            or _jit_source_scope_verifier.registry is not self.registry
+        ):
+            raise RuntimeError("JIT source verifier has a foreign owner or mixed predeclaration scope")
+        if _predeclared_source_scope is not None:
+            active = _PREDECLARATION_SOURCE_SCOPE.get()
+            if (active is None or not active[2][0] or active[0] is not self
+                    or active[1] is not _predeclared_source_scope):
+                raise RuntimeError(f"predeclaration source scope token is not active for {self._paper_key(item)}")
         record = getattr(self, "_source_scope_record", None)
         if record is None:
+            if _jit_source_scope_verifier is not None:
+                raise RuntimeError("JIT source verifier requires a registered source scope")
             return  # Narrow direct component helpers do not run the full source preflight.
-        self.registry.verify_ready_artifact_closure(record)
-        scope = self._source_scope_by_paper.get(self._paper_key(item))
+        if _predeclared_source_scope is None:
+            if _jit_source_scope_verifier is None:
+                self.registry.verify_ready_artifact_closure(record)
+            else:
+                _jit_source_scope_verifier.verify(record)
+            scope = self._source_scope_by_paper.get(self._paper_key(item))
+        else:
+            if not self._local_predeclaration_route():
+                raise RuntimeError("local predeclaration parser route changed")
+            frozen_record, frozen_signature, frozen_papers = _predeclared_source_scope
+            self.registry.reload()
+            current = self.registry.get(frozen_record.artifact_id)
+            if (current is None or json.dumps(asdict(current), sort_keys=True, separators=(",", ":"),
+                    ensure_ascii=False, allow_nan=False) != frozen_signature
+                    or file_sha256(frozen_record.path) != frozen_record.content_hash):
+                raise RuntimeError(f"predeclaration current source scope authority changed: {frozen_record.artifact_id}")
+            scope = frozen_papers.get(self._paper_key(item))
         if (scope is None or str(Path(item.source_pdf).expanduser().resolve()) != scope["source_pdf"]
                 or file_sha256(item.source_pdf) != scope["source_pdf_sha256"]):
-            raise RuntimeError("Stage 1 source scope PDF binding changed before preprocessing")
+            raise RuntimeError(f"Stage 1 source scope PDF binding changed before preprocessing: {self._paper_key(item)}")
 
     def prepare_empty_provider_receipt_closure(self, bundle: SourceBundle) -> None:
         """Persist an explicit zero-call graph for summary-source Stage 1 runs."""
@@ -503,8 +836,15 @@ class Stage1AnalysisService:
         previous: dict[str, Any] | None,
         *,
         predeclared_preprocess_authority: _PredeclaredPreprocessAuthority | None = None,
+        _verification_scope: _TypedManifestVerificationScope | None = None,
+        _predeclared_source_scope: tuple[ArtifactRecord, str, Mapping[str, Mapping[str, Any]]] | None = None,
+        _jit_source_scope_verifier: Stage1SourceScopeVerification | None = None,
     ) -> _PreparedStage1Item:
-        self._verify_source_scope_item(item)
+        self._check_cancelled()
+        self._verify_source_scope_item(
+            item, _predeclared_source_scope=_predeclared_source_scope,
+            _jit_source_scope_verifier=_jit_source_scope_verifier,
+        )
         source_pdf = str(item.source_pdf or "").strip()
         if not source_pdf or not Path(source_pdf).is_file():
             raise RuntimeError(
@@ -580,6 +920,7 @@ class Stage1AnalysisService:
                 current_binding,
                 registry=self.registry,
                 external_registry_resolver=self.external_registry_resolver,
+                _verification_scope=_verification_scope,
             )
             if previous is not None
             else None
@@ -1982,6 +2323,7 @@ class Stage1AnalysisService:
             "attempt_id": self.attempt_id,
             "source_bundle_hash": source_bundle_hash,
             "runtime_spec_hash": runtime_spec_hash,
+            **self._explicit_import_graph_fields(),
             "call_shapes": [
                 {
                     "call_id": item["call_id"],
@@ -2032,6 +2374,7 @@ class Stage1AnalysisService:
         )
         self._append_mineru_provider_receipts()
         self.expected_call_graph_path = self.workspace.artifact_path("stage1/provider_expected_calls.json")
+        self._check_cancelled()
         self._publish_expected_call_graph()
         return tuple(declarations)
 
@@ -2432,13 +2775,17 @@ class Stage1AnalysisService:
                     "source_scope_artifact_hash": source_scope.content_hash}
                    if source_scope is not None else {}),
                 "expected_calls": [asdict(item) for item in self.expected_calls],
+                **self._explicit_import_graph_fields(),
             },
             artifact_role="provider_expected_call_graph",
             artifact_type="provider_expected_call_graph",
             artifact_version="v1",
             producer="services.stage1_analysis_service.Stage1AnalysisService",
             artifact_id="stage1:provider_expected_call_graph",
-            depends_on=[ArtifactDependencyRefV2.from_record(source_scope)] if source_scope is not None else [],
+            depends_on=[
+                *([ArtifactDependencyRefV2.from_record(source_scope)] if source_scope is not None else []),
+                *[ArtifactDependencyRefV2.from_record(record) for record in self._explicit_import_carriers],
+            ],
             metadata={
                 "closure_epoch_id": self.closure_epoch_id,
                 "expected_call_graph_hash": self.expected_call_graph_hash,
@@ -2469,6 +2816,7 @@ class Stage1AnalysisService:
             "attempt_id": self.attempt_id,
             "source_bundle_hash": self._expected_source_bundle_hash,
             "runtime_spec_hash": self._expected_runtime_spec_hash,
+            **self._explicit_import_graph_fields(),
             "call_shapes": [
                 {
                     "call_id": item.call_id,
@@ -2573,6 +2921,8 @@ class Stage1AnalysisService:
     def _execute_prepared(
         self,
         prepared: _PreparedStage1Item,
+        *,
+        _verification_scope: _TypedManifestVerificationScope | None = None,
     ) -> tuple[dict[str, Any], tuple[str, ...]]:
         item = prepared.item
         synthesis_budgets = stage1_output_budget_sequence(
@@ -2582,7 +2932,9 @@ class Stage1AnalysisService:
         )
         if prepared.previous is not None:
             summary = dict(prepared.previous)
-            reuse_record = self._persist_reuse_evidence(prepared)
+            reuse_record = self._persist_reuse_evidence(
+                prepared, _verification_scope=_verification_scope
+            )
             self.reuse_evidence_ids.append(reuse_record.artifact_id)
             reuse_payload = json.loads(Path(reuse_record.path).read_text(encoding="utf-8"))
             prior_reuse_metadata = summary.get("stage1_reuse")
@@ -2814,6 +3166,7 @@ class Stage1AnalysisService:
         if not primary_reader_only:
             logical_call_budget += 1 + semantic_retry_limit
         runtime = ProviderRuntime(
+            response_snapshot_sink=self.response_snapshot_sink,
             budget=ProviderBudgetV1(
                 max_calls=max(1, logical_call_budget),
                 max_retries_per_call=self.settings.runtime.node_retry_limit,
@@ -3632,6 +3985,7 @@ class Stage1AnalysisService:
                 prepared.stage1_input_settings,
             )
             runtime = ProviderRuntime(
+                response_snapshot_sink=self.response_snapshot_sink,
                 budget=ProviderBudgetV1(
                     max_calls=len(visual_budgets) * (semantic_retry_limit + 1),
                     max_retries_per_call=self.settings.runtime.node_retry_limit,
@@ -4591,7 +4945,112 @@ class Stage1AnalysisService:
             },
         )
 
-    def _persist_reuse_evidence(self, prepared: _PreparedStage1Item) -> ArtifactRecord:
+    def _publish_typed_authority_carriers(
+        self,
+        typed_authority: Stage1TypedManifestAuthorityV1,
+        runtime_dependency: ArtifactDependencyRefV2,
+    ) -> tuple[ArtifactRecord, ArtifactRecord, ArtifactRecord | None, ArtifactRecord | None, dict[str, ArtifactRecord]]:
+        """Publish original verified bytes without creating current Reader evidence."""
+        manifest = typed_authority.manifest
+        portable_ledger_record = None
+        portable_closure_record = None
+        owner_correction_records: dict[str, ArtifactRecord] = {}
+        portable_source_record = self._publish_portable_authority_record(
+            source_path=typed_authority.source_summary_path,
+            expected_hash=manifest.source_summary_artifact_hash,
+            portable_kind="summary_source",
+            source_authority_job_id=manifest.job_id,
+            original_artifact_id=manifest.source_summary_artifact_id,
+            dependencies=(runtime_dependency,),
+            typed_manifest_artifact_id=typed_authority.manifest_artifact_id,
+            typed_manifest_artifact_hash=typed_authority.manifest_file_hash,
+        )
+        if typed_authority.provider_ledger_path:
+            portable_ledger_record = self._publish_portable_authority_record(
+                source_path=typed_authority.provider_ledger_path,
+                expected_hash=manifest.provider_receipt_ledger_hash,
+                portable_kind="provider_ledger",
+                source_authority_job_id=manifest.job_id,
+                original_artifact_id=manifest.provider_receipt_ledger_id,
+                dependencies=(runtime_dependency,),
+                typed_manifest_artifact_id=typed_authority.manifest_artifact_id,
+                typed_manifest_artifact_hash=typed_authority.manifest_file_hash,
+            )
+        if typed_authority.provider_closure_path:
+            closure_dependencies = [runtime_dependency]
+            if portable_ledger_record is not None:
+                closure_dependencies.append(
+                    ArtifactDependencyRefV2.from_record(portable_ledger_record)
+                )
+            portable_closure_record = self._publish_portable_authority_record(
+                source_path=typed_authority.provider_closure_path,
+                expected_hash=manifest.provider_receipt_closure_hash,
+                portable_kind="provider_closure",
+                source_authority_job_id=manifest.job_id,
+                original_artifact_id=manifest.provider_receipt_closure_id,
+                dependencies=tuple(closure_dependencies),
+                typed_manifest_artifact_id=typed_authority.manifest_artifact_id,
+                typed_manifest_artifact_hash=typed_authority.manifest_file_hash,
+            )
+        manifest_dependencies = [
+            runtime_dependency,
+            ArtifactDependencyRefV2.from_record(portable_source_record),
+        ]
+        if isinstance(typed_authority, Stage1TypedManifestAuthorityV2):
+            authority_refs = typed_authority.manifest.owner_correction_authority
+            for label, ref_name, source_path in (
+                ("origin_source", "origin_source", typed_authority.owner_correction_origin_source_path),
+                ("prior_manifest", "origin_prior_manifest", typed_authority.owner_correction_prior_manifest_path),
+                ("derived_summary_set", "derived_summary_set", typed_authority.owner_correction_derived_summary_path),
+                ("adoption_receipt", "adoption_receipt", typed_authority.owner_correction_receipt_path),
+            ):
+                original_ref = authority_refs[ref_name]
+                if not isinstance(original_ref, Mapping):
+                    raise RuntimeError("owner correction authority reference is malformed")
+                proof_record = self._publish_portable_authority_record(
+                    source_path=source_path,
+                    expected_hash=str(original_ref["content_hash"]),
+                    portable_kind=f"owner_correction_{label}",
+                    source_authority_job_id=str(original_ref["job_id"]),
+                    original_artifact_id=str(original_ref["artifact_id"]),
+                    dependencies=(runtime_dependency, *(
+                        ArtifactDependencyRefV2.from_record(item)
+                        for item in owner_correction_records.values()
+                    )),
+                    typed_manifest_artifact_id=typed_authority.manifest_artifact_id,
+                    typed_manifest_artifact_hash=typed_authority.manifest_file_hash,
+                )
+                owner_correction_records[label] = proof_record
+                manifest_dependencies.append(ArtifactDependencyRefV2.from_record(proof_record))
+        for portable_record in (
+            portable_closure_record,
+            portable_ledger_record,
+        ):
+            if portable_record is not None:
+                manifest_dependencies.append(
+                    ArtifactDependencyRefV2.from_record(portable_record)
+                )
+        portable_manifest_record = self._publish_portable_authority_record(
+            source_path=typed_authority.manifest_path,
+            expected_hash=typed_authority.manifest_file_hash,
+            portable_kind="summary_manifest",
+            source_authority_job_id=manifest.job_id,
+            original_artifact_id=typed_authority.manifest_artifact_id,
+            dependencies=tuple(manifest_dependencies),
+            typed_manifest_artifact_id=typed_authority.manifest_artifact_id,
+            typed_manifest_artifact_hash=typed_authority.manifest_file_hash,
+        )
+        return (
+            portable_source_record, portable_manifest_record,
+            portable_closure_record, portable_ledger_record, owner_correction_records,
+        )
+
+    def _persist_reuse_evidence(
+        self,
+        prepared: _PreparedStage1Item,
+        *,
+        _verification_scope: _TypedManifestVerificationScope | None = None,
+    ) -> ArtifactRecord:
         """Persist typed evidence for a zero-transport exact summary reuse."""
 
         previous = dict(prepared.previous or {})
@@ -4614,6 +5073,7 @@ class Stage1AnalysisService:
             previous,
             prior_binding,
             external_registry_resolver=self.external_registry_resolver,
+            _verification_scope=_verification_scope,
         )
         typed_authority_requested = (
             isinstance(prior_reuse_metadata, Mapping)
@@ -4662,91 +5122,11 @@ class Stage1AnalysisService:
                 or manifest.source_summary_artifact_hash != source_authority_artifact_hash
             ):
                 raise RuntimeError("typed Stage 1 manifest authority identity changed")
-            portable_source_record = self._publish_portable_authority_record(
-                source_path=typed_authority.source_summary_path,
-                expected_hash=manifest.source_summary_artifact_hash,
-                portable_kind="summary_source",
-                source_authority_job_id=manifest.job_id,
-                original_artifact_id=manifest.source_summary_artifact_id,
-                dependencies=(runtime_dependency,),
-                typed_manifest_artifact_id=typed_authority.manifest_artifact_id,
-                typed_manifest_artifact_hash=typed_authority.manifest_file_hash,
-            )
-            if typed_authority.provider_ledger_path:
-                portable_ledger_record = self._publish_portable_authority_record(
-                    source_path=typed_authority.provider_ledger_path,
-                    expected_hash=manifest.provider_receipt_ledger_hash,
-                    portable_kind="provider_ledger",
-                    source_authority_job_id=manifest.job_id,
-                    original_artifact_id=manifest.provider_receipt_ledger_id,
-                    dependencies=(runtime_dependency,),
-                    typed_manifest_artifact_id=typed_authority.manifest_artifact_id,
-                    typed_manifest_artifact_hash=typed_authority.manifest_file_hash,
-                )
-            if typed_authority.provider_closure_path:
-                closure_dependencies = [runtime_dependency]
-                if portable_ledger_record is not None:
-                    closure_dependencies.append(
-                        ArtifactDependencyRefV2.from_record(portable_ledger_record)
-                    )
-                portable_closure_record = self._publish_portable_authority_record(
-                    source_path=typed_authority.provider_closure_path,
-                    expected_hash=manifest.provider_receipt_closure_hash,
-                    portable_kind="provider_closure",
-                    source_authority_job_id=manifest.job_id,
-                    original_artifact_id=manifest.provider_receipt_closure_id,
-                    dependencies=tuple(closure_dependencies),
-                    typed_manifest_artifact_id=typed_authority.manifest_artifact_id,
-                    typed_manifest_artifact_hash=typed_authority.manifest_file_hash,
-                )
-            manifest_dependencies = [
-                runtime_dependency,
-                ArtifactDependencyRefV2.from_record(portable_source_record),
-            ]
-            if isinstance(typed_authority, Stage1TypedManifestAuthorityV2):
-                authority_refs = typed_authority.manifest.owner_correction_authority
-                for label, ref_name, source_path in (
-                    ("origin_source", "origin_source", typed_authority.owner_correction_origin_source_path),
-                    ("prior_manifest", "origin_prior_manifest", typed_authority.owner_correction_prior_manifest_path),
-                    ("derived_summary_set", "derived_summary_set", typed_authority.owner_correction_derived_summary_path),
-                    ("adoption_receipt", "adoption_receipt", typed_authority.owner_correction_receipt_path),
-                ):
-                    original_ref = authority_refs[ref_name]
-                    if not isinstance(original_ref, Mapping):
-                        raise RuntimeError("owner correction authority reference is malformed")
-                    proof_record = self._publish_portable_authority_record(
-                        source_path=source_path,
-                        expected_hash=str(original_ref["content_hash"]),
-                        portable_kind=f"owner_correction_{label}",
-                        source_authority_job_id=str(original_ref["job_id"]),
-                        original_artifact_id=str(original_ref["artifact_id"]),
-                        dependencies=(runtime_dependency, *(
-                            ArtifactDependencyRefV2.from_record(item)
-                            for item in owner_correction_records.values()
-                        )),
-                        typed_manifest_artifact_id=typed_authority.manifest_artifact_id,
-                        typed_manifest_artifact_hash=typed_authority.manifest_file_hash,
-                    )
-                    owner_correction_records[label] = proof_record
-                    manifest_dependencies.append(ArtifactDependencyRefV2.from_record(proof_record))
-            for portable_record in (
-                portable_closure_record,
-                portable_ledger_record,
-            ):
-                if portable_record is not None:
-                    manifest_dependencies.append(
-                        ArtifactDependencyRefV2.from_record(portable_record)
-                    )
-            portable_manifest_record = self._publish_portable_authority_record(
-                source_path=typed_authority.manifest_path,
-                expected_hash=typed_authority.manifest_file_hash,
-                portable_kind="summary_manifest",
-                source_authority_job_id=manifest.job_id,
-                original_artifact_id=typed_authority.manifest_artifact_id,
-                dependencies=tuple(manifest_dependencies),
-                typed_manifest_artifact_id=typed_authority.manifest_artifact_id,
-                typed_manifest_artifact_hash=typed_authority.manifest_file_hash,
-            )
+            (
+                portable_source_record, portable_manifest_record,
+                portable_closure_record, portable_ledger_record,
+                owner_correction_records,
+            ) = self._publish_typed_authority_carriers(typed_authority, runtime_dependency)
             source_authority_record = portable_source_record
             source_authority_manifest = portable_manifest_record
             source_closure = portable_closure_record
@@ -5178,6 +5558,8 @@ class Stage1AnalysisService:
 
         from dataclasses import replace as dataclass_replace
 
+        self.verify_explicit_imports_current()
+
         receipts = tuple(
             receipt
             for receipt in self.receipt_ledger.list_receipts()
@@ -5318,6 +5700,7 @@ class Stage1AnalysisService:
             "reuse_evidence_count": len(reuse_records),
             "expected_provider_transport_count": len(self.expected_calls),
             "actual_provider_transport_count": len(receipts),
+            **self._explicit_import_graph_fields(),
             "mineru_receipt_artifact_ids": sorted(
                 record.artifact_id for record in self._mineru_receipt_records.values()
             ),
@@ -5334,6 +5717,7 @@ class Stage1AnalysisService:
                 record.artifact_id for record in self._mineru_receipt_records.values()
             ),
             *[record.artifact_id for record in reuse_records],
+            *[record.artifact_id for record in self._explicit_import_carriers],
         )
         if self.expected_calls:
             dependency_ids = (*dependency_ids, "stage1_provider_receipts")
@@ -5582,6 +5966,7 @@ class Stage1AnalysisService:
             provider_config=primary_config,
         )
         runtime = ProviderRuntime(
+            response_snapshot_sink=self.response_snapshot_sink,
             budget=ProviderBudgetV1(
                 max_calls=(
                     len(synthesis_budgets)

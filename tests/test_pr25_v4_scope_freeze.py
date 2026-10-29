@@ -18,7 +18,12 @@ from outline.v3_relations import build_global_relation_map
 from tests.test_outline_v3_semantic_execution import (
     _configured_test_provider,
     _executor,
+    _purposeful_relation_summaries,
 )
+
+
+def _source_contrast_executor(tmp_path):
+    return _executor(tmp_path, summaries=_purposeful_relation_summaries())
 
 
 def _relation_inputs(executor):
@@ -26,6 +31,9 @@ def _relation_inputs(executor):
     ledger = build_global_corpus_ledger(evidence)
     matrix = build_multi_view_matrix(evidence)
     candidates = build_global_relation_map(evidence, matrix, ledger)
+    relation_rows = [item.to_dict() for item in candidates.relations]
+    assert relation_rows
+    assert all(row.get("evidence_fields") and row.get("source_fields") for row in relation_rows)
     layers = build_paper_content_layers(
         executor.summaries, evidence, job_id=executor.job_id
     )
@@ -33,11 +41,11 @@ def _relation_inputs(executor):
         layers, candidates, candidate_count=executor.candidate_count,
         physical_call_limit=24,
     )
-    return evidence, [item.to_dict() for item in candidates.relations], plan
+    return evidence, relation_rows, plan
 
 
 def test_missing_frozen_relation_id_blocks_variant_before_transport(tmp_path) -> None:
-    executor = _executor(tmp_path)
+    executor = _source_contrast_executor(tmp_path)
     evidence, candidates, plan = _relation_inputs(executor)
     scope = executor._canonical_stability_relation_scope()
     assert scope["selected_relation_ids"]
@@ -53,7 +61,7 @@ def test_missing_frozen_relation_id_blocks_variant_before_transport(tmp_path) ->
 
 
 def test_changed_selected_bundle_blocks_variant_before_transport(tmp_path) -> None:
-    executor = _executor(tmp_path)
+    executor = _source_contrast_executor(tmp_path)
     evidence, candidates, plan = _relation_inputs(executor)
     scope = executor._canonical_stability_relation_scope()
     assert scope["selected_relation_ids"]
@@ -74,7 +82,7 @@ def test_changed_selected_bundle_blocks_variant_before_transport(tmp_path) -> No
 def test_changed_selected_relation_candidate_blocks_variant_before_transport(
     tmp_path,
 ) -> None:
-    executor = _executor(tmp_path)
+    executor = _source_contrast_executor(tmp_path)
     evidence, candidates, plan = _relation_inputs(executor)
     scope = executor._canonical_stability_relation_scope()
     selected_id = scope["selected_relation_ids"][0]
@@ -99,8 +107,9 @@ def test_changed_selected_relation_candidate_blocks_variant_before_transport(
 def test_changed_unselected_relation_candidate_does_not_expand_frozen_task(
     tmp_path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    executor = _executor(tmp_path)
+    executor = _source_contrast_executor(tmp_path)
     evidence, candidates, plan = _relation_inputs(executor)
+    assert len(candidates) > 1
     scope = executor._canonical_stability_relation_scope()
     selected_id = str(candidates[0]["relation_id"])
     selected = {selected_id}

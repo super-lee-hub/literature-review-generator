@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import configparser
 import ai_interface
 import json
 from pathlib import Path
@@ -38,9 +39,9 @@ def test_current_production_full_chain_uses_runner_validation_export_and_attesta
     pdf_dir = tmp_path / "papers"
     pdf_dir.mkdir()
     papers = [
-        ("paper-a", "Study A", "The treatment improved the outcome."),
-        ("paper-b", "Study B", "The treatment improved the outcome in a second context."),
-        ("paper-c", "Study C", "The treatment improved the outcome under a third condition."),
+        ("paper-a", "paper-a", "paper-a reports that the treatment improved the outcome."),
+        ("paper-b", "paper-b", "paper-b reports that the treatment improved the outcome in a second context."),
+        ("paper-c", "paper-c", "paper-c reports that the treatment improved the outcome under a third condition."),
     ]
     for key, title, finding in papers:
         _write_pdf(pdf_dir / f"{key}.pdf", title, finding)
@@ -88,6 +89,15 @@ def test_current_production_full_chain_uses_runner_validation_export_and_attesta
     request.addfinalizer(writer_thread.join)
     request.addfinalizer(writer_server.shutdown)
     config_path = _test_config(tmp_path)
+    # This fixture intentionally composes two effective sections: one bounded
+    # source comparison and one source-finding section. Keep the production
+    # default quality gate at three; scope the historical fixture expectation
+    # locally instead of manufacturing a third section or changing alternatives.
+    fixture_config = configparser.ConfigParser()
+    fixture_config.read(config_path, encoding="utf-8")
+    fixture_config["OutlineQualityGate"]["min_effective_sections"] = "2"
+    with config_path.open("w", encoding="utf-8") as handle:
+        fixture_config.write(handle)
     _configure_writer_loopback(config_path, writer_api_base)
 
     spec = RuntimeJobSpec(
@@ -114,11 +124,29 @@ def test_current_production_full_chain_uses_runner_validation_export_and_attesta
     assert scope_payload["limits"]["max_claims"] == len(scope_payload["claim_groups"])
     assert scope_payload["limits"]["max_support_rows"] == len(scope_payload["claim_slots"])
     assert scope_payload["source_inventory_binding"]["artifact_id"] == load_writer_source_inventory_v1(registry).artifact_id
-    for artifact in registry.list_records():
-        if artifact.artifact_id.startswith("outline-v3:candidate_") and artifact.artifact_id.endswith("_provider_generation"):
-            content = json.loads(Path(artifact.path).read_text(encoding="utf-8"))["payload"]
-            assert all(section.get("task_ids") for section in content["sections"])
-            assert all(row.get("claim_slot_id") for section in content["sections"] for row in section["claim_support"])
+    candidate_generation_records = [
+        artifact for artifact in registry.list_records()
+        if artifact.artifact_id.startswith("outline-v3:candidate_")
+        and artifact.artifact_id.endswith("_provider_generation")
+    ]
+    assert candidate_generation_records
+    slots_by_id = {slot["claim_slot_id"]: slot for slot in scope_payload["claim_slots"]}
+    for artifact in candidate_generation_records:
+        registry.verify_ready_artifact_closure(artifact)
+        content = json.loads(Path(artifact.path).read_text(encoding="utf-8"))["payload"]
+        assert content["sections"]
+        for section in content["sections"]:
+            assert section["task_ids"] and section["claim_support"], section
+            assert set(section["task_ids"]).issubset(scope_payload["task_ids"]), section
+            for row in section["claim_support"]:
+                slot = slots_by_id[row["claim_slot_id"]]
+                assert row["task_id"] in section["task_ids"], row
+                for field in ("task_id", "paper_key", "primary_claim_id", "study_id"):
+                    assert row[field] == slot[field], (field, row, slot)
+                # The sealed slots include all required source qualifiers.
+                for field in ("source_claim_ids", "evidence_ids", "source_field_ids"):
+                    assert set(row[field]) == set(slot[field]), (field, row, slot)
+                assert row["source_claim_ids"] and row["evidence_ids"], row
     assert "explicit adoption" in first.message, first
 
     control = ReviewControlPlane(repo_root=Path(__file__).resolve().parents[1])
@@ -166,7 +194,7 @@ def test_current_production_full_chain_uses_runner_validation_export_and_attesta
     assert attestation["status"] == "canonical_verified", attestation
     assert Path(attestation["report_path"]).is_file()
     assert attestation["artifact_id"].startswith("forensic_attestation:")
-    _assert_source_bound_fixture_trace(fixture_trace)
+    _assert_source_bound_fixture_trace(fixture_trace, require_candidate_source_bound=False)
     _assert_writer_http_receipts_match(
         writer_server,
         control.inspect(workspace=first.workspace_path),

@@ -1120,7 +1120,6 @@ def prepare_source_summary_correction_candidate(
         "source_authority_refs_before_only": copy.deepcopy(dict(proposal.source_authority_refs)),
         "source_entry_provenance_before_only": copy.deepcopy(dict(proposal.source_entry_provenance)),
         "original_proposal_payload_hash": proposal.original_payload_hash,
-        "normalized_proposal_hash": hash_json(proposal.to_dict()),
         "original_proposal_payload": copy.deepcopy(dict(proposal.original_payload)),
         "adapter_diagnostics": list(proposal.adapter_diagnostics),
         "requires_owner_approval_before_adoption": True,

@@ -16,19 +16,38 @@ import json
 import re
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
+from dataclasses import asdict, dataclass
+from dataclasses import field as dataclass_field
 from typing import Any
 
+from outline.candidate_output_scope import CandidateOutputScopeV1
+from outline.candidate_paper_level_study_mentions import (
+    paper_level_study_mention_occurrences_v1,
+)
 from outline.v3_models import compute_v3_hash
 from services.citation_ref_catalog import extract_ref_ids_from_token
 from services.sentence_segmenter import segment_sentences
 from services.writer_source_inventory import (
+    SOURCE_INVENTORY_ARTIFACT_ID,
     VerifiedWriterSourceInventoryV1,
 )
-
 
 WRITER_TASK_SCOPE_VERSION = "writer_task_scope/v1"
 WRITER_OUTPUT_TEXT_HARD_CAP_CHARS = 4096
 WRITER_REASON_CODE_MAX_CHARS = 64
+WRITER_SELECTED_SOURCE_CONTRACT = "source-closed-provider/v2"
+_SELECTED_SOURCE_BINDING_VERSION = "writer-selected-source-binding/v2"
+_SELECTED_BASIS_VERSION = "writer-selected-task-basis/v2"
+_BASIS_TASK_FIELDS = (
+    "writer_task_id", "task_kind", "planned_claim", "duplicate_index", "status",
+    "reason_codes", "support_rows", "source_evidence", "canonical_source_bundle",
+    "source_membership_status", "allowed_ref_ids", "output_units",
+)
+_CONTEXT_SOURCE_FIELDS = frozenset({
+    "paper_key", "source_summary_hash", "source_summary_hashes", "dossier_content_hash",
+    "evidence_view_hash", "dossier_status", "diagnostics", "allowed_ref_ids",
+})
 
 _CLAIM_IDS = ("source_claim_ids", "primary_claim_id", "required_source_claim_ids", "qualifier_source_claim_ids")
 _EVIDENCE_IDS = ("evidence_ids", "primary_evidence_ids", "required_evidence_ids", "qualifier_evidence_ids")
@@ -41,6 +60,25 @@ _STUDY_MENTION = re.compile(
     r"\b(?:study|experiment|trial)\s*[A-Za-z]?[1-9]\d*\b|研究\s*[A-Za-z]?[1-9]\d*|实验\s*[A-Za-z]?[1-9]\d*",
     re.IGNORECASE,
 )
+
+_VERIFIED_CANDIDATE_SCOPE_SEAL = object()
+
+
+@dataclass(frozen=True)
+class VerifiedCandidateOutputScopeV1:
+    """Candidate scope granted after Review service Registry verification."""
+
+    scope: CandidateOutputScopeV1
+    _seal: object = dataclass_field(default=None, repr=False, compare=False)
+
+    @property
+    def is_verified(self) -> bool:
+        return self._seal is _VERIFIED_CANDIDATE_SCOPE_SEAL
+
+
+def _verified_candidate_output_scope(scope: CandidateOutputScopeV1) -> VerifiedCandidateOutputScopeV1:
+    """Internal bridge for an exact current Registry lineage proof."""
+    return VerifiedCandidateOutputScopeV1(scope=scope, _seal=_VERIFIED_CANDIDATE_SCOPE_SEAL)
 _SOURCE_TEXT_FIELDS = {
     "claim", "source_value", "text", "summary", "finding", "condition", "boundary", "findings", "conclusions", "limitations",
     "research_gaps", "future_directions", "mechanisms", "sample_or_context", "method",
@@ -103,6 +141,73 @@ def _unit_text_limit(claim: str, rows: Sequence[Any], evidence: Sequence[Any]) -
     return limit, source_chars
 
 
+def _paper_level_study_mention_spans(
+    claim: str,
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    source_inventory: VerifiedWriterSourceInventoryV1 | None,
+    candidate_output_scope: VerifiedCandidateOutputScopeV1 | None,
+) -> set[tuple[int, int]]:
+    """Return only mentions proved by exact source claim, evidence, and scope slots."""
+
+    if (
+        not isinstance(source_inventory, VerifiedWriterSourceInventoryV1)
+        or type(source_inventory) is not VerifiedWriterSourceInventoryV1
+        or not source_inventory.is_verified
+        or type(candidate_output_scope) is not VerifiedCandidateOutputScopeV1
+        or not candidate_output_scope.is_verified
+        or not rows
+    ):
+        return set()
+
+    scope = candidate_output_scope.scope
+    if (
+        type(scope) is not CandidateOutputScopeV1
+        or scope.registry_job_id != source_inventory.registry_job_id
+        or scope.source_inventory_artifact_id != source_inventory.artifact_id
+        or scope.source_inventory_artifact_hash != source_inventory.artifact_hash
+        or scope.source_inventory_content_hash != source_inventory.content_hash
+    ):
+        return set()
+    slots_by_id = {slot.claim_slot_id: slot for slot in scope.claim_slots}
+    papers = source_inventory.paper_by_key()
+    proofs_by_support: list[set[tuple[int, int]]] = []
+    for row in rows:
+        slot = slots_by_id.get(_text(row.get("claim_slot_id")))
+        paper = papers.get(_text(row.get("paper_key")))
+        if slot is None or paper is None:
+            return set()
+        source_claim = next(
+            (
+                item for item in paper.claims
+                if item.claim_id == _text(row.get("primary_claim_id"))
+            ),
+            None,
+        )
+        if source_claim is None:
+            return set()
+        occurrences = paper_level_study_mention_occurrences_v1(
+            claim,
+            source_claim=asdict(source_claim),
+            support_row=row,
+            scope_slot=slot.to_dict(),
+        )
+        proofs_by_support.append({(item.start, item.end) for item in occurrences})
+    if not proofs_by_support:
+        return set()
+    return set.intersection(*proofs_by_support)
+
+
+def _has_unproved_study_mention(
+    claim: str,
+    proved_spans: set[tuple[int, int]],
+) -> bool:
+    return any(
+        match.span() not in proved_spans
+        for match in _STUDY_MENTION.finditer(claim)
+    )
+
+
 def _paper(raw: Any) -> str:
     if not isinstance(raw, Mapping):
         return ""
@@ -147,6 +252,7 @@ def _task_reasons(
     source_hashes: set[str],
     refs_by_paper: Mapping[str, Sequence[str]],
     ref_conflicts: set[str],
+    paper_level_study_mention_spans: set[tuple[int, int]] | None = None,
     validate_packet_source_hashes: bool = True,
 ) -> list[str]:
     reasons: set[str] = set()
@@ -172,7 +278,10 @@ def _task_reasons(
             reasons.add("support_row_missing_source_claim_identity")
         if not _ids([row], _EVIDENCE_IDS):
             reasons.add("support_row_missing_evidence_identity")
-        if (_text(row.get("study_id")) or _STUDY_MENTION.search(claim)) and not _ids([row], _FIELD_IDS):
+        if (
+            _text(row.get("study_id"))
+            or _has_unproved_study_mention(claim, paper_level_study_mention_spans or set())
+        ) and not _ids([row], _FIELD_IDS):
             reasons.add("scoped_claim_missing_source_field_identity")
         hashes = set(_ids([row], ("source_summary_hash", "source_summary_hashes")))
         if validate_packet_source_hashes and hashes and not hashes.issubset(source_hashes):
@@ -199,6 +308,8 @@ def _canonical_source_support(
     claim: str,
     rows: Sequence[Mapping[str, Any]],
     inventory: VerifiedWriterSourceInventoryV1,
+    *,
+    paper_level_study_mention_spans: set[tuple[int, int]] | None = None,
 ) -> tuple[list[str], list[dict[str, Any]]]:
     """Exact-join candidate support IDs to Registry-verified dossier rows."""
     reasons: set[str] = set()
@@ -223,7 +334,9 @@ def _canonical_source_support(
         if not paper or paper_key not in packet_papers:
             reasons.add("unknown_support_source")
             continue
-        if paper.dossier_status != "ready":
+        # Partial paper-level coverage is diagnostic; admission is decided by
+        # this assertion's exact claim/evidence/qualifier closure below.
+        if paper.dossier_status not in {"ready", "partial"}:
             reasons.add("source_dossier_not_ready")
         evidence_items = packet_evidence.get(paper_key, [])
         if len(evidence_items) != 1:
@@ -253,7 +366,10 @@ def _canonical_source_support(
             reasons.add("missing_source_claim_identity")
         if not explicit_evidence_ids:
             reasons.add("missing_evidence_identity")
-        if (row_study or _STUDY_MENTION.search(claim)) and not explicit_field_ids:
+        if (
+            row_study
+            or _has_unproved_study_mention(claim, paper_level_study_mention_spans or set())
+        ) and not explicit_field_ids:
             reasons.add("scoped_claim_missing_source_field_identity")
 
         claim_text_by_id: dict[str, str] = {}
@@ -410,6 +526,7 @@ def _canonical_source_support(
             "dossier_content_hash": paper.dossier_content_hash,
             "source_summary_hash": paper.source_summary_hash,
             "dossier_status": paper.dossier_status,
+            "dossier_diagnostics": list(paper.diagnostics),
             "study_id": row_study,
             "source_claims": canonical_claim_rows,
             "evidence": canonical_evidence,
@@ -430,6 +547,7 @@ def _make_task(
     refs_by_paper: Mapping[str, Sequence[str]],
     ref_conflicts: set[str],
     source_inventory: VerifiedWriterSourceInventoryV1 | None = None,
+    candidate_output_scope: VerifiedCandidateOutputScopeV1 | None = None,
     duplicate_index: int | None = None,
     kind: str = "planned_claim",
     forced_reasons: Sequence[str] = (),
@@ -441,6 +559,12 @@ def _make_task(
     evidence_papers = {_paper(row) for row in source_items if _paper(row)}
     source_hashes = {_text(value) for value in _items(packet.get("source_summary_hashes")) if _text(value)}
     reasons = set(forced_reasons)
+    paper_level_spans = _paper_level_study_mention_spans(
+        claim,
+        mappings,
+        source_inventory=source_inventory,
+        candidate_output_scope=candidate_output_scope,
+    )
     reasons.update(_task_reasons(
         claim,
         mappings,
@@ -449,6 +573,7 @@ def _make_task(
         source_hashes=source_hashes,
         refs_by_paper=refs_by_paper,
         ref_conflicts=ref_conflicts,
+        paper_level_study_mention_spans=paper_level_spans,
         validate_packet_source_hashes=source_inventory is None,
     ))
     canonical_source_reasons: list[str] = []
@@ -465,13 +590,126 @@ def _make_task(
                 claim,
                 mappings,
                 source_inventory,
+                paper_level_study_mention_spans=paper_level_spans,
             )
         else:
             canonical_source_reasons = ["unverified_source_inventory"]
         reasons.update(canonical_source_reasons)
-    source_claim_ids, evidence_ids, field_ids = _ids(mappings, _CLAIM_IDS), _ids(mappings, _EVIDENCE_IDS), _ids(mappings, _FIELD_IDS)
-    qualifier_claim_ids = _ids(mappings, _QUALIFIER_CLAIMS)
-    qualifier_evidence_ids, qualifier_field_ids = _ids(mappings, _QUALIFIER_EVIDENCE), _ids(mappings, _QUALIFIER_FIELDS)
+    source_claim_ids = _ids(mappings, _CLAIM_IDS)
+    evidence_ids = _ids(mappings, _EVIDENCE_IDS)
+    field_ids = _ids(mappings, _FIELD_IDS)
+    declared_qualifier_claim_ids = set(_ids(mappings, _QUALIFIER_CLAIMS))
+    declared_qualifier_evidence_ids = set(_ids(mappings, _QUALIFIER_EVIDENCE))
+    declared_qualifier_field_ids = set(_ids(mappings, _QUALIFIER_FIELDS))
+    derived_qualifier_claim_ids: set[str] = set()
+    derived_qualifier_evidence_ids: set[str] = set()
+    derived_qualifier_field_ids: set[str] = set()
+    if inventory_verified and not canonical_source_reasons and source_inventory is not None:
+        canonical_rows_by_paper: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+        for canonical_row in canonical_source_bundle:
+            canonical_paper_key = _text(canonical_row.get("paper_key"))
+            if canonical_paper_key:
+                canonical_rows_by_paper[canonical_paper_key].append(canonical_row)
+        for row in mappings:
+            paper_key = _text(row.get("paper_key"))
+            if not paper_key:
+                continue
+            paper_rows = canonical_rows_by_paper.get(paper_key, ())
+            if not paper_rows:
+                reasons.add("unknown_support_source")
+                continue
+            declared_source_claim_ids = set(_ids([row], ("source_claim_ids",)))
+            explicit_primary_claim_id = _text(row.get("primary_claim_id"))
+            if explicit_primary_claim_id:
+                primary_claim_ids = {explicit_primary_claim_id}
+            else:
+                # A legacy support row can omit its primary id. Resolve only
+                # dependency primaries that it explicitly lists as source
+                # claim IDs; never infer a primary by subtracting qualifiers.
+                primary_claim_ids = {
+                    _text(dependency.get("primary_claim_id"))
+                    for canonical_row in paper_rows
+                    for dependency in canonical_row.get("interpretation_dependencies") or ()
+                    if isinstance(dependency, Mapping)
+                    and _text(dependency.get("primary_claim_id")) in declared_source_claim_ids
+                }
+            row_study_id = _text(row.get("study_id"))
+            for primary_claim_id in primary_claim_ids:
+                primary_claim_rows = [
+                    source_claim
+                    for canonical_row in paper_rows
+                    for source_claim in canonical_row.get("source_claims") or ()
+                    if isinstance(source_claim, Mapping)
+                    and _text(source_claim.get("claim_id")) == primary_claim_id
+                ]
+                if not primary_claim_rows:
+                    reasons.add("unknown_source_claim_id")
+                    continue
+                if len({
+                    _text(source_claim.get("study_id"))
+                    for source_claim in primary_claim_rows
+                }) > 1:
+                    reasons.add("source_claim_wrong_study")
+                    continue
+                primary_study_id = _text(primary_claim_rows[0].get("study_id"))
+                if row_study_id and primary_study_id and row_study_id != primary_study_id:
+                    reasons.add("source_claim_wrong_study")
+                    continue
+                if not row_study_id and primary_study_id:
+                    reasons.add("source_claim_wrong_study")
+                    continue
+                for canonical_row in paper_rows:
+                    for dependency in canonical_row.get("interpretation_dependencies") or ():
+                        if not isinstance(dependency, Mapping):
+                            reasons.add("invalid_interpretation_dependency")
+                            continue
+                        if _text(dependency.get("primary_claim_id")) != primary_claim_id:
+                            continue
+                        dependency_scope = _text(dependency.get("scope"))
+                        dependency_owner = _text(dependency.get("owner_study_id"))
+                        dependency_study = _text(dependency.get("study_id"))
+                        if dependency_scope == "unresolved":
+                            reasons.add("unresolved_interpretation_dependency")
+                            continue
+                        if dependency_scope == "explicit_study":
+                            if (
+                                not row_study_id
+                                or dependency_study != row_study_id
+                                or dependency_owner != row_study_id
+                            ):
+                                reasons.add("interpretation_dependency_wrong_study")
+                                continue
+                        elif dependency_scope == "paper":
+                            # owner_study_id identifies the source unit that
+                            # contributed this verified dependency; it does
+                            # not narrow a paper-scoped qualifier. Only a
+                            # non-empty dependency study ID conflicts with a
+                            # paper-level dependency.
+                            if dependency_study:
+                                reasons.add("interpretation_dependency_wrong_study")
+                                continue
+                        else:
+                            reasons.add("unresolved_interpretation_dependency")
+                            continue
+                        derived_qualifier_claim_ids.update(
+                            _ids([dependency], ("required_source_claim_ids",))
+                        )
+                        derived_qualifier_evidence_ids.update(
+                            _ids([dependency], ("required_evidence_ids",))
+                        )
+                        derived_qualifier_field_ids.update(
+                            _ids([dependency], ("required_source_field_ids",))
+                        )
+
+    if not derived_qualifier_claim_ids.issubset(set(source_claim_ids)):
+        reasons.add("missing_interpretation_qualifier_claim")
+    if not derived_qualifier_evidence_ids.issubset(set(evidence_ids)):
+        reasons.add("missing_interpretation_qualifier_evidence")
+    if not derived_qualifier_field_ids.issubset(set(field_ids)):
+        reasons.add("missing_interpretation_qualifier_field")
+    qualifier_claim_ids = sorted(declared_qualifier_claim_ids | derived_qualifier_claim_ids)
+    qualifier_evidence_ids = sorted(declared_qualifier_evidence_ids | derived_qualifier_evidence_ids)
+    qualifier_field_ids = sorted(declared_qualifier_field_ids | derived_qualifier_field_ids)
     paper_keys = sorted({_text(row.get("paper_key")) for row in mappings if _text(row.get("paper_key"))})
     usable_papers = set(paper_keys) & packet_papers & evidence_papers
     allowed_refs = sorted({ref for paper in usable_papers for ref in refs_by_paper.get(paper, ()) if ref not in ref_conflicts})
@@ -562,15 +800,171 @@ def _max_response_bytes(scope: Mapping[str, Any]) -> int:
     return len(json.dumps(skeleton, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) + text_bytes
 
 
+def _selected_source_contract(scope: Mapping[str, Any], version: str | None) -> bool:
+    if not isinstance(scope, Mapping):
+        raise WriterTaskScopeError("Writer semantic scope must be an object")
+    if version is None:
+        if any(name in scope for name in ("provider_semantic_contract_version", "selected_source_binding",
+                                          "selected_catalog_entries", "selected_context_sources")):
+            raise WriterTaskScopeError("selected Writer scope requires its explicit semantic contract")
+        return False
+    if version != WRITER_SELECTED_SOURCE_CONTRACT or scope.get("provider_semantic_contract_version") != version:
+        raise WriterTaskScopeError("Writer semantic contract or scope marker is unsupported")
+    return True
+
+
+def _selected_source_binding(tasks: Sequence[Mapping[str, Any]], catalog_entries: Any,
+                             context_sources: Any) -> dict[str, Any]:
+    if not isinstance(catalog_entries, list):
+        raise WriterTaskScopeError("selected Writer catalog entries are absent")
+    if not isinstance(context_sources, list) or not context_sources:
+        raise WriterTaskScopeError("selected Writer context source pins are absent")
+    contexts = {}
+    for source in context_sources:
+        if (not isinstance(source, Mapping) or set(source) != _CONTEXT_SOURCE_FIELDS
+                or not isinstance(source.get("paper_key"), str) or not source["paper_key"]
+                or source["paper_key"] in contexts
+                or source.get("dossier_status") not in {"ready", "partial"}
+                or any(not isinstance(source.get(name), list) for name in ("source_summary_hashes", "diagnostics", "allowed_ref_ids"))
+                or source["source_summary_hash"] not in source["source_summary_hashes"]
+                or any(not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None
+                       for value in source["source_summary_hashes"])
+                or any(not isinstance(value, str) for value in source["diagnostics"])
+                or not source["allowed_ref_ids"]
+                or any(not isinstance(value, str) or not value for value in source["allowed_ref_ids"])
+                or len(set(source["allowed_ref_ids"])) != len(source["allowed_ref_ids"])
+                or any(not isinstance(source.get(name), str) or re.fullmatch(r"[0-9a-f]{64}", source[name]) is None
+                       for name in ("source_summary_hash", "dossier_content_hash", "evidence_view_hash"))):
+            raise WriterTaskScopeError("selected Writer context source identity is incomplete or duplicated")
+        contexts[source["paper_key"]] = source
+    papers = set(contexts)
+    refs = {ref for source in context_sources for ref in source["allowed_ref_ids"]}
+    sources = []
+    for task in tasks:
+        bundle = task.get("canonical_source_bundle")
+        if (task.get("status") != "ready" or task.get("source_membership_status") != "verified"
+                or not isinstance(bundle, list) or not bundle):
+            raise WriterTaskScopeError("selected Writer task has no verified complete source closure")
+        task_papers = set(task.get("paper_keys") or [])
+        bundle_papers = {row.get("paper_key") for row in bundle if isinstance(row, Mapping)}
+        if not task_papers or task_papers != bundle_papers or not task_papers.issubset(papers):
+            raise WriterTaskScopeError("selected Writer source paper membership differs")
+        expected_refs = {ref for paper in task_papers for ref in contexts[paper]["allowed_ref_ids"]}
+        if set(task.get("allowed_ref_ids") or []) != expected_refs:
+            raise WriterTaskScopeError("selected Writer task reference ownership differs")
+        for row in bundle:
+            if not isinstance(row, Mapping) or any(not isinstance(row.get(name), list) for name in (
+                "source_claims", "evidence", "source_fields", "interpretation_dependencies", "research_units",
+            )):
+                raise WriterTaskScopeError("selected Writer canonical source fields are incomplete")
+            pin = contexts[row["paper_key"]]
+            if any(row.get(name) != pin[name] for name in ("source_summary_hash", "dossier_content_hash", "dossier_status")):
+                raise WriterTaskScopeError("selected Writer source rows differ from their context authority pins")
+        sources.append({"writer_task_id": task["writer_task_id"], "canonical_source_bundle": bundle})
+    required_catalog = {"ref_id", "scope", "paper_id", "canonical_paper_key", "title", "authors",
+                        "year", "doi", "source_summary_hash", "status"}
+    observed_refs: list[str] = []
+    for row in catalog_entries:
+        if (not isinstance(row, Mapping) or not required_catalog.issubset(row)
+                or row.get("status") != "active" or row.get("canonical_paper_key") not in papers
+                or row.get("ref_id") not in refs
+                or row["ref_id"] not in contexts[row["canonical_paper_key"]]["allowed_ref_ids"]):
+            raise WriterTaskScopeError("selected Writer catalog contains foreign or incomplete source identity")
+        observed_refs.append(row["ref_id"])
+    if set(observed_refs) != refs or len(observed_refs) != len(refs):
+        raise WriterTaskScopeError("selected Writer catalog references are missing or duplicated")
+    return {
+        "schema_version": _SELECTED_SOURCE_BINDING_VERSION,
+        "paper_keys": sorted(papers),
+        "source_projection_hash": compute_v3_hash({"task_sources": sources, "context_sources": context_sources}),
+        "selected_catalog_hash": compute_v3_hash(catalog_entries),
+    }
+
+
+def _selected_task_basis(scope: Mapping[str, Any]) -> str:
+    rows = [{key: deepcopy(task[key]) for key in _BASIS_TASK_FIELDS} for task in scope["tasks"]]
+    if scope.get("schema_version") == "writer_task_scope/v2":
+        # The existing table binder promotes optional expansion units. Reopen
+        # the known base paragraph contract for its stored base-basis check;
+        # the independent table verifier checks every promoted unit/layout.
+        selected_units = set(scope["table_layout_binding"]["required_table_unit_ids"])
+        for task in rows:
+            for unit in task["output_units"]:
+                required = unit["unit_kind"] == "planned_claim" or unit["writer_output_unit_id"] in selected_units
+                if unit.get("required") is not required:
+                    raise WriterTaskScopeError("selected Writer table promotion differs from its exact layout")
+                unit["required"] = unit["unit_kind"] == "planned_claim"
+    return compute_v3_hash({
+        "version": _SELECTED_BASIS_VERSION,
+        "section_id": scope["section_id"], "packet_bundle": scope["source_bundle"],
+        "active_ref_mapping": scope["active_ref_mapping"],
+        "selected_source_binding": scope["selected_source_binding"], "tasks": rows,
+    })
+
+
+def verify_writer_selected_source_scope_v2(scope: Mapping[str, Any], *,
+                                          provider_semantic_contract_version: str | None = None) -> None:
+    """Check selected scope integrity; Registry/source admission stays external."""
+    if not _selected_source_contract(scope, provider_semantic_contract_version):
+        return
+    try:
+        if scope.get("schema_version") not in (WRITER_TASK_SCOPE_VERSION, "writer_task_scope/v2"):
+            raise WriterTaskScopeError("selected Writer scope schema is unsupported")
+        current_binding = scope.get("source_inventory_binding")
+        if (not isinstance(current_binding, Mapping) or current_binding.get("artifact_id") != SOURCE_INVENTORY_ARTIFACT_ID
+                or any(not isinstance(current_binding.get(name), str)
+                       or re.fullmatch(r"[0-9a-f]{64}", current_binding[name]) is None
+                       for name in ("artifact_hash", "content_hash"))):
+            raise WriterTaskScopeError("selected Writer scope lacks its complete current inventory authority binding")
+        tasks = scope["tasks"]
+        if not isinstance(tasks, list) or not tasks:
+            raise WriterTaskScopeError("selected Writer task rows are absent")
+        task_ids = [task["writer_task_id"] for task in tasks]
+        max_units = sum(len(task["output_units"]) for task in tasks)
+        min_units = sum(unit.get("required") is True for task in tasks for unit in task["output_units"])
+        if (len(set(task_ids)) != len(tasks) or scope.get("required_task_ids") != task_ids
+                or type(scope.get("task_count")) is not int or scope["task_count"] != len(tasks)
+                or type(scope.get("max_output_units")) is not int or type(scope.get("min_required_output_units")) is not int
+                or scope.get("max_output_units") != max_units or scope.get("min_required_output_units") != min_units):
+            raise WriterTaskScopeError("selected Writer task identities or finite output limits differ")
+        if scope.get("max_serialized_output_bytes_upper_bound") != _max_response_bytes(scope):
+            raise WriterTaskScopeError("selected Writer serialized output limit differs")
+        contexts = scope.get("selected_context_sources")
+        expected = _selected_source_binding(tasks, scope.get("selected_catalog_entries"), contexts)
+        assert isinstance(contexts, list)
+        if (expected["paper_keys"] != sorted(scope["source_bundle"]["paper_keys"])
+                or {row["paper_key"]: row["allowed_ref_ids"] for row in contexts} != scope["active_ref_mapping"]):
+            raise WriterTaskScopeError("selected Writer context pins do not cover its complete packet/ref set")
+        if scope.get("selected_source_binding") != expected:
+            raise WriterTaskScopeError("selected Writer source binding changed")
+        basis = _selected_task_basis(scope)
+        recorded = scope.get("writer_task_basis_hash")
+        if scope.get("schema_version") == "writer_task_scope/v2":
+            from services.writer_table_layout import _verified_bound_scope
+
+            _verified_bound_scope(scope)
+            recorded = scope.get("base_writer_task_basis_hash")
+        if recorded != basis:
+            raise WriterTaskScopeError("selected Writer task basis changed")
+    except (KeyError, TypeError, ValueError) as exc:
+        if isinstance(exc, WriterTaskScopeError):
+            raise
+        raise WriterTaskScopeError("selected Writer scope is incomplete or malformed") from exc
+
+
 def build_writer_task_scope_v1(
     packet: Mapping[str, Any],
     catalog: Mapping[str, Any],
     *,
     source_inventory: VerifiedWriterSourceInventoryV1 | None = None,
+    candidate_output_scope: VerifiedCandidateOutputScopeV1 | None = None,
+    provider_semantic_contract_version: str | None = None,
 ) -> dict[str, Any]:
     """Build source-bound tasks; raw packet IDs alone never authorize Writer admission."""
     if not isinstance(packet, Mapping) or not isinstance(catalog, Mapping):
         raise WriterTaskScopeError("Writer scope requires a packet and citation catalog")
+    if provider_semantic_contract_version not in (None, WRITER_SELECTED_SOURCE_CONTRACT):
+        raise WriterTaskScopeError("Writer semantic contract is unsupported")
     section_id = _text(packet.get("section_id"))
     if not section_id:
         raise WriterTaskScopeError("Writer scope requires section_id")
@@ -596,6 +990,7 @@ def build_writer_task_scope_v1(
             section_id, claim, by_claim.get(claim, []), packet=packet, bundle=bundle,
             refs_by_paper=refs_by_paper, ref_conflicts=ref_conflicts,
             source_inventory=source_inventory,
+            candidate_output_scope=candidate_output_scope,
             duplicate_index=duplicate,
             forced_reasons=("duplicate_planned_claim_identity",) if duplicate else (),
         ))
@@ -604,6 +999,7 @@ def build_writer_task_scope_v1(
             task = _make_task(
                 section_id, "", [], packet=packet, bundle=bundle, refs_by_paper=refs_by_paper,
                 ref_conflicts=ref_conflicts, source_inventory=source_inventory,
+                candidate_output_scope=candidate_output_scope,
                 duplicate_index=1, kind="malformed_planned_claim",
                 forced_reasons=("empty_or_null_planned_claim",),
             )
@@ -620,6 +1016,7 @@ def build_writer_task_scope_v1(
             section_id, _text(row.get("claim")), [row], packet=packet, bundle=bundle,
             refs_by_paper=refs_by_paper, ref_conflicts=ref_conflicts,
             source_inventory=source_inventory,
+            candidate_output_scope=candidate_output_scope,
             duplicate_index=orphan_occurrence[digest], kind="orphan_claim_support",
             forced_reasons=("support_without_planned_claim",),
         ))
@@ -627,6 +1024,7 @@ def build_writer_task_scope_v1(
         task = _make_task(
             section_id, "", [], packet=packet, bundle=bundle, refs_by_paper=refs_by_paper,
             ref_conflicts=ref_conflicts, source_inventory=source_inventory,
+            candidate_output_scope=candidate_output_scope,
             duplicate_index=index, kind="malformed_claim_support",
             forced_reasons=("malformed_claim_support",),
         )
@@ -709,6 +1107,29 @@ def build_writer_task_scope_v1(
             "oversize_policy": "reject_without_truncation",
         },
     }
+    if provider_semantic_contract_version is not None:
+        if not inventory_verified or not structural_ready:
+            raise WriterTaskScopeError("selected Writer scope requires complete verified source tasks")
+        allowed_refs = {ref for refs in ref_mapping.values() for ref in refs}
+        selected_catalog = [dict(row) for row in _items(catalog.get("entries"))
+                            if isinstance(row, Mapping) and row.get("status") == "active"
+                            and row.get("ref_id") in allowed_refs]
+        scope["provider_semantic_contract_version"] = provider_semantic_contract_version
+        scope["selected_catalog_entries"] = selected_catalog
+        assert verified_inventory is not None
+        papers_by_key = verified_inventory.paper_by_key()
+        if packet_papers - set(papers_by_key) or packet_papers - set(ref_mapping):
+            raise WriterTaskScopeError("selected Writer packet has an unknown or uncitable context source")
+        scope["selected_context_sources"] = [{
+            "paper_key": key, "source_summary_hash": papers_by_key[key].source_summary_hash,
+            "source_summary_hashes": list(papers_by_key[key].source_summary_hashes),
+            "dossier_content_hash": papers_by_key[key].dossier_content_hash,
+            "evidence_view_hash": papers_by_key[key].evidence_view_hash,
+            "dossier_status": papers_by_key[key].dossier_status,
+            "diagnostics": list(papers_by_key[key].diagnostics), "allowed_ref_ids": ref_mapping[key],
+        } for key in sorted(packet_papers)]
+        scope["selected_source_binding"] = _selected_source_binding(tasks, selected_catalog, scope["selected_context_sources"])
+        scope["writer_task_basis_hash"] = _selected_task_basis(scope)
     scope["max_serialized_output_bytes_upper_bound"] = _max_response_bytes(scope)
     return scope
 
@@ -743,10 +1164,12 @@ def build_writer_output_maximum_specimen_v1(scope: Mapping[str, Any]) -> dict[st
     return {"blocks": blocks, "task_dispositions": dispositions}
 
 
-def validate_writer_task_output_v1(scope: Mapping[str, Any], payload: Mapping[str, Any]) -> dict[str, Any]:
+def validate_writer_task_output_v1(scope: Mapping[str, Any], payload: Mapping[str, Any], *,
+                                  provider_semantic_contract_version: str | None = None) -> dict[str, Any]:
     """Reject missing/duplicate/foreign tasks, units, refs, sentences, or oversized text."""
     if not isinstance(scope, Mapping) or not isinstance(payload, Mapping):
         raise WriterTaskScopeError("Scope and Writer output must be objects")
+    verify_writer_selected_source_scope_v2(scope, provider_semantic_contract_version=provider_semantic_contract_version)
     if scope.get("schema_version") == "writer_task_scope/v2":
         from services.writer_table_layout import _verified_bound_scope
 

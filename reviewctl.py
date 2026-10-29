@@ -58,6 +58,38 @@ def _validator_host_ack_from_file(path: str) -> dict[str, Any] | None:
     return value
 
 
+def _manual_repair_proposal_from_file(path: str) -> dict[str, Any]:
+    """Load a reviewer-authored proposal as one strict, duplicate-free JSON object."""
+
+    try:
+        raw_json = Path(path).read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError) as exc:
+        raise ValueError("manual repair proposal file is unreadable") from exc
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"manual repair proposal repeats JSON field {key!r}")
+            value[key] = item
+        return value
+
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"manual repair proposal contains invalid JSON constant {value!r}")
+
+    try:
+        value = json.loads(
+            raw_json,
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"manual repair proposal JSON is invalid: {exc}") from exc
+    if not isinstance(value, dict):
+        raise TypeError("manual repair proposal must be a JSON object")
+    return value
+
+
 def _queue_snapshot(service: PersistentQueueService) -> dict[str, Any]:
     jobs = service.list_jobs()
     return {
@@ -147,8 +179,8 @@ def _queue_command(args: argparse.Namespace) -> dict[str, Any]:
             runtime = service.get_job_runtime(args.job)
             if runtime is None or runtime.state not in {QueueState.FAILED, QueueState.CANCELLED}:
                 raise ValueError(f"queue job is not retryable: {args.job}")
-            service.reset_job(args.job)
-            service.increment_retry_count(args.job)
+            if not service.prepare_retry(args.job):
+                raise ValueError(f"queue job could not be retried: {args.job}")
             retried = [args.job]
         else:
             retried = service.retry_failed_jobs()
@@ -285,6 +317,13 @@ def build_parser() -> argparse.ArgumentParser:
     plan = subparsers.add_parser("plan")
     plan.add_argument("--spec", required=True)
 
+    source_revision_plan = subparsers.add_parser(
+        "source-revision-plan", help="Save a source-bound derived-run plan without provider calls",
+    )
+    source_revision_plan.add_argument("--spec", required=True)
+    source_revision_plan.add_argument("--parent-workspace", required=True)
+    source_revision_plan.add_argument("--output", required=True)
+
     acceptance_run = subparsers.add_parser("acceptance-run")
     acceptance_run.add_argument("--acceptance-spec", required=True)
 
@@ -297,6 +336,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     chunk_plan.add_argument("--summary-file", "--summary-source", dest="summary_files", action="append", default=[])
     chunk_plan.add_argument("--job-id", default="chunk-plan")
+    chunk_plan.add_argument("--review-intent-file", default="", help="JSON ReviewIntent including exact required comparisons")
+    chunk_plan.add_argument("--provider-budget-file", default="", help="Strict V2 prospective run limits for this read-only plan")
+    chunk_plan.add_argument("--provider-semantic-contract-version", choices=("source-closed-provider/v2",), default=None)
     chunk_plan.add_argument("--candidate-count", type=int, default=None)
     chunk_plan.add_argument("--physical-call-limit", type=int, default=None)
     chunk_plan.add_argument("--output", default="")
@@ -341,6 +383,9 @@ def build_parser() -> argparse.ArgumentParser:
             subparser.add_argument("--dry-run", action="store_true")
         if command == "repair-apply":
             subparser.add_argument("--plan", required=True)
+            subparser.add_argument("--manual-proposal-file", default=None)
+            subparser.add_argument("--actor", default="")
+            subparser.add_argument("--reason", default="")
         if command == "repair-promote":
             subparser.add_argument("--transaction", required=True)
             subparser.add_argument("--actor", required=True)
@@ -355,6 +400,15 @@ def build_parser() -> argparse.ArgumentParser:
         if command in {"cancel", "pause"}:
             subparser.add_argument("--reason", default="user_requested")
         subparser.add_argument("--json", action="store_true", help="Emit JSON output (the default format)")
+
+    downstream = subparsers.add_parser("authorize-downstream")
+    downstream.add_argument("--job", default="")
+    downstream.add_argument("--workspace", default="")
+    downstream.add_argument("--budget-file", required=True)
+    downstream.add_argument("--actor", required=True)
+    downstream.add_argument("--reason", required=True)
+    downstream.add_argument("--authorization-reference", required=True)
+    downstream.add_argument("--json", action="store_true")
 
     export = subparsers.add_parser("export")
     export.add_argument("--batch", default="")
@@ -438,12 +492,38 @@ def _exit_code(command: str, payload: dict[str, Any]) -> int:
 def main(argv: list[str] | None = None) -> int:
     configure_utf8_stdio()
     args = build_parser().parse_args(argv)
-    # Initialize an owner-supplied acceptance controller at process start so
-    # max_wall_seconds covers preprocessing, stage setup, and all later routes,
-    # not merely the first ProviderRuntime construction.
-    from runtime.provider_runtime import provider_budget_controller_from_environment
-
     try:
+        manual_proposal: dict[str, Any] | None = None
+        manual_actor = ""
+        manual_reason = ""
+        if args.command == "repair-apply":
+            has_manual_file = args.manual_proposal_file is not None
+            has_manual_identity = bool(str(args.actor or "").strip()) or bool(
+                str(args.reason or "").strip()
+            )
+            if has_manual_file:
+                if not str(args.manual_proposal_file).strip():
+                    raise ValueError("--manual-proposal-file requires a non-empty path")
+                manual_actor = str(args.actor or "")
+                manual_reason = str(args.reason or "")
+                if not manual_actor.strip() or not manual_reason.strip():
+                    raise ValueError(
+                        "--manual-proposal-file requires both --actor and --reason"
+                    )
+                manual_proposal = _manual_repair_proposal_from_file(
+                    str(args.manual_proposal_file)
+                )
+            elif has_manual_identity:
+                raise ValueError(
+                    "--actor and --reason require --manual-proposal-file"
+                )
+
+        # Initialize an owner-supplied acceptance controller at process start so
+        # max_wall_seconds covers preprocessing, stage setup, and all later routes,
+        # not merely the first ProviderRuntime construction. Validate manual CLI
+        # input first so malformed proposals cause no controller or repair side effect.
+        from runtime.provider_runtime import provider_budget_controller_from_environment
+
         provider_budget_controller_from_environment()
         repo_root = args.repo_root or getattr(args, "doctor_repo_root", "")
         control = ReviewControlPlane(repo_root=repo_root or None)
@@ -476,9 +556,23 @@ def main(argv: list[str] | None = None) -> int:
             payload = _config_migrate_command(args)
         elif args.command == "plan":
             payload = control.plan(args.spec)
+        elif args.command == "source-revision-plan":
+            payload = control.source_revision_plan(
+                args.spec, parent_workspace=args.parent_workspace, output_path=args.output,
+            )
         elif args.command == "acceptance-run":
             payload = control.acceptance_run(args.acceptance_spec)
         elif args.command == "chunk-plan":
+            chunk_intent = None
+            chunk_budget = None
+            if args.review_intent_file:
+                chunk_intent = json.loads(Path(args.review_intent_file).read_text(encoding="utf-8"))
+                if not isinstance(chunk_intent, dict):
+                    raise ValueError("Review intent must be a JSON object")
+            if args.provider_budget_file:
+                chunk_budget = json.loads(Path(args.provider_budget_file).read_text(encoding="utf-8"))
+                if not isinstance(chunk_budget, dict):
+                    raise ValueError("Provider budget must be a JSON object")
             payload = control.chunk_plan(
                 args.summary_files,
                 job_id=args.job_id,
@@ -486,6 +580,9 @@ def main(argv: list[str] | None = None) -> int:
                 physical_call_limit=args.physical_call_limit,
                 output_path=args.output or None,
                 config_path=args.config or None,
+                review_intent=chunk_intent,
+                prospective_provider_budget=chunk_budget,
+                provider_semantic_contract_version=args.provider_semantic_contract_version,
             )
         elif args.command == "run":
             payload = control.run(
@@ -498,6 +595,15 @@ def main(argv: list[str] | None = None) -> int:
             payload = control.inspect(job_id=args.job or None, workspace=args.workspace or None)
         elif args.command == "next-action":
             payload = control.next_action(job_id=args.job or None, workspace=args.workspace or None)
+        elif args.command == "authorize-downstream":
+            payload = control.authorize_downstream(
+                job_id=args.job or None,
+                workspace=args.workspace or None,
+                budget=_queue_json_value("", file_path=args.budget_file),
+                actor=args.actor,
+                reason=args.reason,
+                authorization_reference=args.authorization_reference,
+            )
         elif args.command == "resume":
             payload = control.resume(
                 job_id=args.job or None,
@@ -549,6 +655,9 @@ def main(argv: list[str] | None = None) -> int:
                 job_id=args.job or None,
                 workspace=args.workspace or None,
                 plan_id=args.plan,
+                manual_proposal=manual_proposal,
+                actor=manual_actor,
+                reason=manual_reason,
             )
         elif args.command == "repair-promote":
             payload = control.repair_promote(

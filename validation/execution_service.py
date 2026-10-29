@@ -20,7 +20,9 @@ from runtime.provider_receipt_closure import (
 )
 from runtime.provider_runtime import (
     ProviderBudgetV1,
+    ProviderResponseSnapshotSink,
     ProviderRuntime,
+    ProviderRuntimeContractError,
     ProviderRuntimeLedger,
     compute_closure_epoch_id,
     _redact_mapping,
@@ -67,6 +69,9 @@ class ValidationExecutionService:
     validation_external_registry_resolver: Callable[[str], Any | None] | None = None
     publication_context: Any | None = None
     validation_source_binding_record: ArtifactRecord | None = None
+    response_snapshot_sink: ProviderResponseSnapshotSink | None = field(
+        default=None, kw_only=True, repr=False,
+    )
     _provider_receipt_ledger: ProviderRuntimeLedger | None = field(
         default=None,
         init=False,
@@ -356,6 +361,10 @@ class ValidationExecutionService:
         ).hexdigest()
         endpoint_type = str(config.get("endpoint_type") or "chat_completions")
         if self.provider_factory is not None:
+            snapshot_kwargs = (
+                {"response_snapshot_sink": self.response_snapshot_sink}
+                if self.response_snapshot_sink is not None else {}
+            )
             runtime = self.provider_factory(
                 budget=ProviderBudgetV1(max_calls=1, max_retries_per_call=retry_limit),
                 ledger=self.provider_receipt_ledger,
@@ -369,6 +378,7 @@ class ValidationExecutionService:
                 logical_attempt_identity=self.attempt_id,
                 endpoint_type=endpoint_type,
                 schema_hash=resolved_schema_hash,
+                **snapshot_kwargs,
             )
         else:
             runtime = ProviderRuntime(
@@ -387,9 +397,13 @@ class ValidationExecutionService:
                 prompt_id=self._validation_user_prompt_identity.prompt_id,
                 prompt_version=self._validation_user_prompt_identity.version,
                 prompt_sha256=self._validation_user_prompt_identity.sha256,
+                response_snapshot_sink=self.response_snapshot_sink,
             )
         if not isinstance(runtime, ProviderRuntime):
             raise TypeError("provider_factory must return ProviderRuntime")
+        if (self.response_snapshot_sink is not None
+                and runtime.response_snapshot_sink is not self.response_snapshot_sink):
+            raise ProviderRuntimeContractError("provider_factory did not preserve the response snapshot sink")
         runtime.prompt_id = self._validation_user_prompt_identity.prompt_id
         runtime.prompt_version = self._validation_user_prompt_identity.version
         runtime.prompt_sha256 = self._validation_user_prompt_identity.sha256
@@ -958,15 +972,17 @@ class ValidationExecutionService:
 
         from validation.current_validation import run_current_validation
 
-        paper_payloads: list[dict[str, Any]] = []
-        for record in paper_artifact_records or self.paper_artifact_records:
-            if record.status != "ready":
-                continue
-            payload = json.loads(Path(record.path).read_text(encoding="utf-8"))
-            if isinstance(payload, Mapping):
-                paper_payloads.append({**dict(payload), "_registry_artifact_id": record.artifact_id,
-                                       "_registry_artifact_hash": record.content_hash,
-                                       "_registry_path": record.path})
+        paper_payloads: list[dict[str, Any]] | None = None
+        if paper_artifact_records is not None:
+            paper_payloads = []
+            for record in paper_artifact_records:
+                if record.status != "ready":
+                    continue
+                payload = json.loads(Path(record.path).read_text(encoding="utf-8"))
+                if isinstance(payload, Mapping):
+                    paper_payloads.append({**dict(payload), "_registry_artifact_id": record.artifact_id,
+                                           "_registry_artifact_hash": record.content_hash,
+                                           "_registry_path": record.path})
         result: dict[str, Any] | None = None
         try:
             result = run_current_validation(
@@ -1094,22 +1110,52 @@ class ValidationExecutionService:
             *self.visual_artifact_records,
         ):
             add_dependency(record)
-        for expected in expected_calls:
-            expected_path = str(expected.artifact_path or "").strip()
-            if not expected_path:
-                continue
-            expected_resolved = Path(expected_path).resolve()
-            add_dependency(
-                next(
-                    (
-                        record
-                        for record in self.artifact_registry.list_records()
-                        if record.status == "ready"
-                        and Path(record.path).resolve() == expected_resolved
-                    ),
-                    None,
-                )
+        expected_paths = tuple(
+            path for expected in expected_calls
+            if (path := str(expected.artifact_path or "").strip())
+        )
+
+        def select_provider_outputs() -> tuple[
+            tuple[Path, ...], tuple[ArtifactRecord | None, ...],
+            dict[Path, tuple[str, str]],
+        ]:
+            resolved_paths = tuple(Path(path).resolve() for path in expected_paths)
+            wanted_paths = set(resolved_paths)
+            records_by_path: dict[Path, ArtifactRecord] = {}
+            if wanted_paths:
+                _revision, ordered_records = self.artifact_registry.capture_record_snapshot()
+                for record in ordered_records:
+                    if record.status != "ready":
+                        continue
+                    resolved_path = Path(record.path).resolve()
+                    if resolved_path in wanted_paths:
+                        records_by_path.setdefault(resolved_path, record)
+                        if len(records_by_path) == len(wanted_paths):
+                            break
+            signatures: dict[Path, tuple[str, str]] = {}
+            for resolved_path, record in records_by_path.items():
+                actual_hash = hashlib.sha256(Path(record.path).read_bytes()).hexdigest()
+                if actual_hash != record.content_hash:
+                    raise RuntimeError(
+                        f"validation provider output bytes changed during finalization: {record.artifact_id}"
+                    )
+                record_signature = hashlib.sha256(json.dumps(
+                    asdict(record), sort_keys=True, separators=(",", ":"),
+                    ensure_ascii=False, allow_nan=False,
+                ).encode("utf-8")).hexdigest()
+                signatures[resolved_path] = (record_signature, actual_hash)
+            return (
+                resolved_paths,
+                tuple(records_by_path.get(path) for path in resolved_paths),
+                signatures,
             )
+
+        initial_paths, _initial_records, initial_signatures = select_provider_outputs()
+        current_paths, output_records, current_signatures = select_provider_outputs()
+        if initial_paths != current_paths or initial_signatures != current_signatures:
+            raise RuntimeError("validation provider output selection changed during finalization")
+        for record in output_records:
+            add_dependency(record)
         for reuse_record in list(self._adjudication_reuse_records.values()):
             add_dependency(reuse_record)
         for reuse_record in list(self._verified_reuse_evidence_records.values()):

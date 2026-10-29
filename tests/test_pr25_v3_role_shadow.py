@@ -3,7 +3,7 @@ from __future__ import annotations
 import configparser
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from runtime.control_plane import (
     ReviewControlPlane,
@@ -135,15 +135,16 @@ def test_provider_free_capacity_comparison_labels_64_call_scenario_as_shadow_onl
 
 def test_chunk_plan_uses_distinct_outline_role_routes_without_transport(tmp_path: Path) -> None:
     summary_path = tmp_path / "summaries.json"
-    summary_path.write_text(
-        json.dumps(
-            [
-                _summary("paper-a", "Paper A", "Treatment improved the short-term outcome."),
-                _summary("paper-b", "Paper B", "Treatment improved the long-term outcome."),
-            ]
-        ),
-        encoding="utf-8",
-    )
+    summaries = [
+        _summary("paper-a", "Paper A", "Treatment improved the short-term outcome."),
+        _summary("paper-b", "Paper B", "Treatment improved the long-term outcome."),
+    ]
+    # This route/sharding fixture has no source evidence for an
+    # author-proposed research gap; omit the unbound claim so the test can
+    # independently require complete source-claim and evidence coverage.
+    for summary in summaries:
+        summary["core_analysis"]["research_gap"] = ""
+    summary_path.write_text(json.dumps(summaries), encoding="utf-8")
     config_path = tmp_path / "config.ini"
     _write_role_config(config_path)
 
@@ -228,18 +229,40 @@ def test_chunk_plan_uses_distinct_outline_role_routes_without_transport(tmp_path
         for row in result["semantic_request_plan"]
         if str(row.get("node_id") or "").startswith("topic_synthesis_provider:batch:")
     ]
-    runtime_fragment_count = sum(len(row.get("topic_fragments") or ()) for row in topic_rows)
-    planner_item_count = sum(len(row.get("cross_group_fragment_plans") or ()) for row in topic_rows)
-    # Two shared-construct fragments, an outlier, and each paper's context
-    # and method fragments remain distinct after the current semantic plan.
-    # Keeping each finding's typed boundary text can require one more
-    # physical batch without changing the seven logical fragments.
-    assert len(topic_rows) == 5
-    assert runtime_fragment_count == 7
+    runtime_fragments = [
+        (str(item.get("topic_id") or ""), str(item.get("fragment_id") or ""))
+        for row in topic_rows for item in row.get("topic_fragments") or ()
+        if isinstance(item, Mapping)
+    ]
+    planner_fragments = [
+        (str(item.get("topic_id") or ""), str(item.get("fragment_id") or ""))
+        for row in topic_rows for item in row.get("cross_group_fragment_plans") or ()
+        if isinstance(item, Mapping)
+    ]
+    runtime_fragment_count = len(runtime_fragments)
+    planner_item_count = len(planner_fragments)
+    assert topic_rows
+    assert len({str(row.get("node_id") or "") for row in topic_rows}) == len(topic_rows)
+    assert len(topic_rows) == result["semantic_topic_batch_count"]
+    assert runtime_fragments and all(topic_id and fragment_id for topic_id, fragment_id in runtime_fragments)
+    assert runtime_fragments == planner_fragments
+    assert len(set(runtime_fragments)) == runtime_fragment_count
+    for row in topic_rows:
+        row_fragments = [
+            item for item in row.get("topic_fragments") or () if isinstance(item, Mapping)
+        ]
+        row_plans = [
+            item for item in row.get("cross_group_fragment_plans") or () if isinstance(item, Mapping)
+        ]
+        assert {str(item.get("topic_id") or "") for item in row_fragments} == set(row.get("topic_ids") or ())
+        assert {str(item.get("fragment_id") or "") for item in row_fragments} == set(row.get("fragment_ids") or ())
+        assert {str(item.get("topic_id") or "") for item in row_plans} == set(row.get("topic_ids") or ())
+        assert {str(item.get("fragment_id") or "") for item in row_plans} == set(row.get("fragment_ids") or ())
     assert result["semantic_cross_group_runtime_fragment_count"] == runtime_fragment_count
     assert result["semantic_cross_group_planner_item_count"] == planner_item_count
     assert planner_item_count == runtime_fragment_count
     coverage = result["r1_request_workload_audit"]["topic_wire_coverage"]
+    assert coverage["topic_batch_count"] == len(topic_rows)
     assert coverage["status"] == "complete"
     assert coverage["all_planned_unit_sets_equal_materialized_unit_sets"] is True
     assert coverage["missing_source_claim_identity_count"] == 0
@@ -271,20 +294,18 @@ def test_three_paper_plan_does_not_reserve_unused_reducer_stage_capacity(
     tmp_path: Path,
 ) -> None:
     summary_path = tmp_path / "summaries.json"
-    summary_path.write_text(
-        json.dumps(
-            [
-                _summary(
-                    f"paper-{index}",
-                    f"Paper {index}",
-                    f"Treatment improved outcome in context {index}.",
-                )
-                for index in range(3)
-            ],
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
+    summaries = [
+        _summary(
+            f"paper-{index}",
+            f"Paper {index}",
+            f"Treatment improved outcome in context {index}.",
+        )
+        for index in range(3)
+    ]
+    # The fixture tests call-budget planning, not unsupported author-proposed gaps.
+    for summary in summaries:
+        summary["core_analysis"]["research_gap"] = ""
+    summary_path.write_text(json.dumps(summaries, ensure_ascii=False), encoding="utf-8")
     config_path = tmp_path / "config.ini"
     _write_role_config(config_path)
 
@@ -298,18 +319,26 @@ def test_three_paper_plan_does_not_reserve_unused_reducer_stage_capacity(
 
     assert result["provider_posts_emitted"] == 0
     assert result["semantic_physical_call_limit"] == 24
-    assert result["semantic_preflight_status"] == "rejected"
+    assert result["semantic_preflight_status"] == "awaiting_exact_future_request_materialization"
     preflight = result["semantic_route_preflight_summary"]
-    assert preflight["rejection_reason"] == "max_provider_calls_exceeded"
-    assert preflight["estimated_provider_calls"] == 30
-    assert preflight["estimated_provider_physical_attempts_upper_bound"] == 30
+    assert preflight["known_provider_calls_lower_bound"] <= result["semantic_physical_call_limit"]
+    assert preflight["estimated_provider_calls"] > result["semantic_physical_call_limit"]
+    assert preflight["semantic_output_dependent_request_count"] > 0
     assert preflight["semantic_conditional_reducer_call_reserve"] == 0
-    assert preflight["semantic_synthesis_calls_reserved"] == (
+    assert result["semantic_request_calls_reserved_upper_bound"] == result["semantic_request_plan_count"]
+    assert result["semantic_request_calls_reserved_upper_bound"] == (
         result["semantic_topic_batch_count"]
         + result["semantic_cross_materialized_request_count"]
         + result["semantic_global_request_count_upper_bound"]
     )
-    assert result["semantic_request_calls_reserved_upper_bound"] == 23
+    assert result["semantic_request_calls_reserved_upper_bound"] > result["semantic_physical_call_limit"]
+    assert result["semantic_request_budget_status"] == "BLOCKED_SEMANTIC_RESERVED_CALL_BOUND_EXCEEDS_LIMIT"
+    assert preflight["semantic_synthesis_calls_reserved"] == (
+        result["semantic_topic_batch_count"]
+        + result["semantic_cross_materialized_request_count"]
+        + result["semantic_global_request_count_upper_bound"]
+        + preflight["semantic_conditional_reducer_call_reserve"]
+    )
 
     config_path.write_text(
         config_path.read_text(encoding="utf-8").replace(
@@ -324,8 +353,11 @@ def test_three_paper_plan_does_not_reserve_unused_reducer_stage_capacity(
         physical_call_limit=30,
         config_path=config_path,
     )
-    assert admitted["semantic_preflight_status"] == "accepted"
-    assert admitted["semantic_route_preflight_summary"]["estimated_provider_calls"] == 30
+    assert admitted["semantic_preflight_status"] == "awaiting_exact_future_request_materialization"
+    assert admitted["semantic_request_budget_status"] == "SEMANTIC_RESERVED_CALL_BOUND_WITHIN_LIMIT"
+    assert admitted["semantic_request_calls_reserved_upper_bound"] <= 30
+    assert admitted["provider_posts_emitted"] == 0
+    assert admitted["semantic_route_preflight_summary"]["estimated_provider_calls"] > 30
     assert admitted["semantic_route_preflight_summary"]["semantic_conditional_reducer_call_reserve"] == 0
     assert admitted["r1_request_workload_audit"]["topic_wire_coverage"]["status"] == "complete"
     assert admitted["provider_posts_emitted"] == 0

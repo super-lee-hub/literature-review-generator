@@ -433,11 +433,24 @@ class OutlineNodeStore:
                 latest = dag
             return latest
 
-    def save(self, dag: OutlineNodeDAG) -> Tuple[OutlineNodeDAG, ArtifactRecord | None]:
+    def save(
+        self,
+        dag: OutlineNodeDAG,
+        *,
+        expected_current_dag: OutlineNodeDAG | None = None,
+    ) -> Tuple[OutlineNodeDAG, ArtifactRecord | None]:
         with self._lock:
             existing = self.load()
             if existing is not None and existing.job_id != dag.job_id:
                 raise ValueError("Outline v3 node DAG job_id does not match existing snapshots")
+            if expected_current_dag is not None and (
+                existing is None
+                or existing.job_id != expected_current_dag.job_id
+                or dag.job_id != expected_current_dag.job_id
+                or existing.snapshot_sequence != expected_current_dag.snapshot_sequence
+                or existing.content_hash != expected_current_dag.content_hash
+            ):
+                raise ValueError("Outline v3 node DAG changed since expected state was loaded")
             sequence = (existing.snapshot_sequence if existing is not None else 0) + 1
             current = replace(
                 dag,
@@ -507,6 +520,7 @@ class OutlineNodeStore:
         self,
         node_id: str,
         *,
+        expected_current_dag: OutlineNodeDAG | None = None,
         status: NodeStatus,
         input_hash: str = "",
         output_hash: str = "",
@@ -523,7 +537,7 @@ class OutlineNodeStore:
         diagnostics: Sequence[str] = (),
         execution_binding: Optional[Mapping[str, Any]] = None,
     ) -> OutlineNodeDAG:
-        dag = self.load()
+        dag = expected_current_dag if expected_current_dag is not None else self.load()
         if dag is None:
             raise ValueError("Outline v3 node DAG has not been initialized")
         current = dag.get(node_id)
@@ -553,7 +567,12 @@ class OutlineNodeStore:
             execution_binding=_stable_mapping(execution_binding) if execution_binding is not None else current.execution_binding,
         )
         nodes = [updated if node.node_id == node_id else node for node in dag.nodes]
-        updated_dag, _record = self.save(replace(dag, nodes=nodes))
+        if expected_current_dag is None:
+            updated_dag, _record = self.save(replace(dag, nodes=nodes))
+        else:
+            updated_dag, _record = self.save(
+                replace(dag, nodes=nodes), expected_current_dag=dag,
+            )
         return updated_dag
 
     def retry_node(self, node_id: str) -> Tuple[OutlineNodeDAG, ResumePlan]:

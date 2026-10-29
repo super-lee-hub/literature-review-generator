@@ -7,7 +7,6 @@ through the typed runtime job specification.
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any, Mapping
 
 from config_loader import load_config

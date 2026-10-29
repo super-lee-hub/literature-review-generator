@@ -20,6 +20,7 @@ from services.job_runner import (
     build_job_request_from_mapping,
 )
 from services.job_outcome import load_canonical_job_outcome
+from services.paper_identity import build_paper_key
 from services.queue_service import (
     PersistentQueueService,
     QueueJobSpec,
@@ -59,15 +60,15 @@ def _seed_direct_fixture(tmp_path: Path) -> tuple[Path, list[tuple[str, str, str
 
 def _seed_run_all_fixture(tmp_path: Path) -> tuple[Path, list[tuple[str, str, str]], Path]:
     papers = [
-        ("parity-a", "Parity Study A", "The treatment improved the outcome."),
-        ("parity-b", "Parity Study B", "The treatment improved the outcome in a second context."),
-        ("parity-c", "Parity Study C", "The treatment improved the outcome under a third condition."),
+        ("parity-a", "parity-a", "parity-a reports that the treatment improved the outcome."),
+        ("parity-b", "parity-b", "parity-b reports that the treatment improved the outcome in a second context."),
+        ("parity-c", "parity-c", "parity-c reports that the treatment improved the outcome under a third condition."),
     ]
     pdf_dir = tmp_path / "run-all-papers"
     pdf_dir.mkdir()
     for key, title, finding in papers:
         _write_pdf(pdf_dir / f"{key}.pdf", title, finding)
-    return pdf_dir, papers, _test_config(tmp_path)
+    return pdf_dir, papers, _test_config(tmp_path, min_effective_sections=2)
 
 
 def _patch_reader(monkeypatch: pytest.MonkeyPatch, papers: list[tuple[str, str, str]]) -> None:
@@ -86,8 +87,13 @@ def _patch_reader(monkeypatch: pytest.MonkeyPatch, papers: list[tuple[str, str, 
         del built_input, primary_config, backup_config, stage1_input_settings, runtime
         key = str(item.canonical_paper_key)
         title = str(item.paper_info.get("title") or "")
-        expected_title, finding = by_key.get(key, (title, "bounded evidence"))
-        summary = _reader_summary(key, expected_title, finding)
+        raw_key = Path(str(item.source_paper_id)).stem
+        assert raw_key in by_key, f"parity fixture received an unknown source path: {item.source_paper_id}"
+        expected_title, finding = by_key[raw_key]
+        # Direct intake can use the file stem when PDF metadata has no title.
+        assert title in {raw_key, expected_title}, (title, expected_title)
+        assert key == build_paper_key(item.paper_info), (key, item.paper_info)
+        summary = _reader_summary(key, title, finding)
         summary["paper_info"]["source_paper_id"] = item.source_paper_id
         return {"status": "success", "content": summary}
 

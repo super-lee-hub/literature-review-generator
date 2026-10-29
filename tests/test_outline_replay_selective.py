@@ -11,8 +11,6 @@ verified, never forged.
 
 import types
 
-import pytest
-
 from outline.v3_executor import OutlineV3Executor
 
 

@@ -38,14 +38,35 @@ def _payload(path: str | Path) -> dict[str, Any]:
 
 def _relation_fixture(tmp_path):
     executor = _executor(tmp_path, stability_mode="off")
-    summaries = [
-        _summary(
-            f"paper-{index}",
-            f"Study {index}",
-            "The treatment improves the outcome in a controlled setting.",
-        )
-        for index in range(5)
+    findings = [
+        "The intervention increased trust by four percentage points.",
+        "The intervention increased trust by two percentage points.",
+        "The intervention increased trust by one percentage point.",
+        "The intervention did not change trust.",
+        "The intervention decreased trust by three percentage points; the reported direction was negative.",
     ]
+    limitations = [
+        "The increase was observed only among first-time buyers.",
+        "The effect was conditional on first-time buyer status.",
+        "The increase was restricted to customers with prior brand familiarity.",
+        "The sample used controlled online shopping sessions.",
+        "The sample used repeated-purchase shopping sessions.",
+    ]
+    contexts = [
+        "First-time buyers during initial purchase.",
+        "First-time buyers in the initial-purchase sample.",
+        "Customers with prior brand familiarity.",
+        "Controlled online shopping sessions.",
+        "Repeated-purchase shopping sessions.",
+    ]
+    summaries = []
+    for index, finding in enumerate(findings):
+        summary = _summary(f"paper-{index}", f"Study {index}", finding)
+        summary["core_analysis"]["limitations"] = limitations[index]
+        summary["specialized_details"]["empirical"][
+            "sample_characteristics_or_context"
+        ] = contexts[index]
+        summaries.append(summary)
     evidence = build_outline_evidence_views(summaries, executor.job_id)
     ledger = build_global_corpus_ledger(evidence)
     matrix = build_multi_view_matrix(evidence)
@@ -59,6 +80,10 @@ def _relation_fixture(tmp_path):
     )
     candidates = [item.to_dict() for item in relation_map.relations]
     assert len(candidates) > 1
+    assert any(item["relation_type"] == "reported_magnitude_contrast" for item in candidates)
+    assert any("outcome_conflict" in item["diagnostics"] for item in candidates)
+    assert any("explicit_qualifier" in item["diagnostics"] for item in candidates)
+    assert all(len(item["paper_keys"]) == 2 for item in candidates)
     shard_plan = executor._build_relation_shard_plan(evidence.views, candidates)
     return executor, evidence, content_layers, semantic_plan, candidates, shard_plan
 

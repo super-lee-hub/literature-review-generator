@@ -29,6 +29,9 @@ from outline.v3_artifacts import (
     EvidenceCritique,
     FinalOutline,
     OutlineArtifact,
+    CandidateProviderResult,
+    CandidateOrganizationMapResult,
+    CandidateComparisonFragmentsResult,
     OutlineCandidate,
     OutlineStageHealth,
     ProviderReceiptClosureArtifact,
@@ -43,6 +46,43 @@ from outline.v3_critique import (
     derive_critique_disposition,
 )
 from outline.v3_revision import apply_selected_revision
+from outline.candidate_arbitration_packing import pack_arbitration_candidate_support
+from outline.candidate_arbitration_hierarchy import (
+    ArbitrationHierarchyError,
+    build_arbitration_final_ledger,
+    plan_arbitration_hierarchy,
+    project_arbitration_leaf_section_index,
+    validate_arbitration_leaf,
+)
+from outline.candidate_arbitration_ledger_packing import pack_arbitration_final_ledger
+from outline.candidate_arbitration_final_projection import project_arbitration_final_request
+from outline.topic_source_scope import (
+    build_topic_source_selection_v2,
+    topic_source_replay_scope_v1,
+    ownership_compatible_v2,
+    stable_topic_batch_identity_v2,
+)
+from runtime.source_revision import PROVIDER_SEMANTIC_CONTRACT_V2
+from outline.critique_coverage_wire import (
+    expand_critique_coverage_certificates,
+    pack_critique_coverage_certificates,
+)
+from outline.candidate_paper_level_study_mentions import paper_level_study_mention_occurrences_v1
+from outline.candidate_lineage_ancestry import load_verified_semantic_lineage_claims
+from outline.candidate_fragment_bank import (
+    build_candidate_fragment_bank_v1, build_candidate_organization_request_v1,
+    expand_candidate_organization_map_v1, resolve_candidate_fragment_claims,
+    validate_candidate_fragment_bank_v1, validate_candidate_organization_map_for_request_v1,
+)
+from outline.candidate_organization_partitions import (
+    account_candidate_organization_partition_maps_v1,
+    plan_candidate_organization_partitions_v1,
+)
+from outline.candidate_relation_fragments import (
+    build_candidate_comparison_fragments_request_v1,
+    estimate_candidate_comparison_output_tokens_v1,
+    validate_candidate_comparison_fragments_output_v1,
+)
 from outline.v3_evidence import (
     build_coverage_contract,
     build_global_corpus_ledger,
@@ -83,9 +123,14 @@ from outline.provider_router import (
     safe_config_identity,
     semantic_role,
 )
+from runtime.primary_repair_recovery import PrimaryRepairResponseJournal, PrimaryRepairScopeV1
 from runtime.provider_runtime import (
     AcceptanceExecutionContextV1,
+    ProviderAggregateBudgetV2,
     ProviderBudgetV1,
+    ProviderBudgetController,
+    ProviderResponseSnapshotSink,
+    ProviderCallReceiptV1,
     ProviderRuntime,
     ProviderRuntimeLedger,
     acceptance_execution_context_from_environment,
@@ -95,9 +140,11 @@ from runtime.provider_runtime import (
     hash_json,
     hash_text,
     provider_budget_controller_from_environment,
+    project_shared_retry_slots_v1,
 )
 from runtime.outline_v3_replay import ModelCallReplayKey, ModelCallReplayStore
 from services.artifact_registry import (
+    ArtifactClosureBatchError,
     ArtifactDependencyRefV2,
     ArtifactRecord,
     ArtifactRegistry,
@@ -117,6 +164,281 @@ SEMANTIC_SYNTHESIS_OUTPUT_LIMIT = 4_096
 SHARED_SYNTHESIS_CONTRACT_VERSION = "v1"
 MAX_SEMANTIC_REDUCTION_LEVELS = 4
 MAX_SEMANTIC_REDUCER_CALLS_PER_STAGE = 24
+
+
+def _resolve_outline_relation_shard_dependency_record(
+    registry: ArtifactRegistry,
+    expected: ExpectedProviderCall,
+) -> ArtifactRecord:
+    """Resolve a relation shard only from its exact READY local Registry identity."""
+
+    if expected.job_id != registry.job_id:
+        raise OutlineV3ExecutionError(
+            f"BLOCKED_CLOSURE: relation output call {expected.call_id} belongs to another job"
+        )
+    if not expected.artifact_path or not expected.registry_file_hash:
+        raise OutlineV3ExecutionError(
+            f"BLOCKED_CLOSURE: relation output identity is incomplete for {expected.call_id}"
+        )
+    try:
+        expected_path = os.path.normcase(os.path.realpath(expected.artifact_path))
+    except (OSError, TypeError, ValueError) as exc:
+        raise OutlineV3ExecutionError(
+            f"BLOCKED_CLOSURE: relation output path is invalid for {expected.call_id}"
+        ) from exc
+    matches = [
+        record
+        for record in registry.list_records()
+        if record.status == "ready"
+        and record.job_id == expected.job_id
+        and record.artifact_type == "relation_adjudication_result"
+        and record.artifact_version == "v3"
+        and record.content_hash == expected.registry_file_hash
+        and os.path.normcase(os.path.realpath(record.path)) == expected_path
+    ]
+    if len(matches) != 1:
+        raise OutlineV3ExecutionError(
+            f"BLOCKED_CLOSURE: expected exactly one READY local relation output for "
+            f"{expected.call_id}; found {len(matches)}"
+        )
+    record = matches[0]
+    try:
+        registry.verify_ready_artifact_closure(record)
+    except (OSError, RegistryError, ValueError, TypeError) as exc:
+        raise OutlineV3ExecutionError(
+            f"BLOCKED_CLOSURE: relation output is untrusted for {expected.call_id}: {exc}"
+        ) from exc
+    return record
+
+
+def _encode_semantic_dependency_templates_v1(
+    dependencies: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Encode repeated interpretation closures without losing per-claim provenance.
+
+    Only ``primary_claim_id`` and ``primary_evidence_ids`` are represented as
+    per-primary members. Every other field, including paper/study ownership,
+    scope, reason, and complete qualifier closure, remains in the exact shared
+    template. Ordinals preserve the original row order for local round trips.
+    """
+
+    primary_fields = {"primary_claim_id", "primary_evidence_ids"}
+    templates: dict[str, dict[str, Any]] = {}
+    for ordinal, raw in enumerate(dependencies):
+        if not isinstance(raw, Mapping):
+            raise ValueError("semantic dependency templates require mapping rows")
+        row = dict(raw)
+        shared_fields = {
+            key: value for key, value in row.items() if key not in primary_fields
+        }
+        template_key = hash_json(shared_fields)
+        group = templates.get(template_key)
+        if group is None:
+            group = {"shared_fields": shared_fields, "members": []}
+            templates[template_key] = group
+        elif group["shared_fields"] != shared_fields:
+            raise ValueError("semantic dependency template hash collision")
+        group["members"].append({
+            "ordinal": ordinal,
+            "primary_fields": {
+                key: row[key] for key in ("primary_claim_id", "primary_evidence_ids")
+                if key in row
+            },
+        })
+    return {
+        "schema_version": "outline-interpretation-dependency-templates/v1",
+        "templates": [
+            {
+                "template_hash": key,
+                "shared_fields": group["shared_fields"],
+                "members": group["members"],
+            }
+            for key, group in sorted(templates.items())
+        ],
+    }
+
+
+def _decode_semantic_dependency_templates_v1(
+    value: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Expand and validate the provider-facing interpretation closure codec."""
+
+    if value.get("schema_version") != "outline-interpretation-dependency-templates/v1":
+        raise ValueError("unsupported semantic dependency template schema")
+    templates = value.get("templates")
+    if not isinstance(templates, list):
+        raise ValueError("semantic dependency templates must be an array")
+    rows_by_ordinal: dict[int, dict[str, Any]] = {}
+    for template in templates:
+        if not isinstance(template, Mapping):
+            raise ValueError("semantic dependency template must be an object")
+        shared = template.get("shared_fields")
+        members = template.get("members")
+        if not isinstance(shared, Mapping) or not isinstance(members, list):
+            raise ValueError("semantic dependency template has an invalid shape")
+        if template.get("template_hash") != hash_json(dict(shared)):
+            raise ValueError(
+                "semantic dependency template hash does not match its fields"
+            )
+        if {"primary_claim_id", "primary_evidence_ids"}.intersection(shared):
+            raise ValueError("primary dependency fields must remain per-primary")
+        for member in members:
+            if not isinstance(member, Mapping):
+                raise ValueError(
+                    "semantic dependency template member must be an object"
+                )
+            ordinal = member.get("ordinal")
+            fields = member.get("primary_fields")
+            if type(ordinal) is not int or ordinal < 0 or ordinal in rows_by_ordinal:
+                raise ValueError("semantic dependency template member order is invalid")
+            if not isinstance(fields, Mapping) or set(fields) - {
+                "primary_claim_id", "primary_evidence_ids"
+            }:
+                raise ValueError(
+                    "semantic dependency template member fields are invalid"
+                )
+            rows_by_ordinal[ordinal] = {**dict(shared), **dict(fields)}
+    if set(rows_by_ordinal) != set(range(len(rows_by_ordinal))):
+        raise ValueError("semantic dependency template member order is incomplete")
+    return [rows_by_ordinal[index] for index in range(len(rows_by_ordinal))]
+
+
+def _source_derived_semantic_output_reserve_v1(
+    envelope: Mapping[str, Any],
+    profile: ProviderContextProfile,
+    minimum_tokens: int,
+) -> int:
+    """Reserve a bounded response from the exact carried semantic output rows."""
+
+    serialized_bytes = len(
+        json.dumps(envelope, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    )
+    source_tokens = max(
+        int(profile.estimate_tokens(envelope)),
+        math.ceil(serialized_bytes / 4),
+    )
+    floor_envelope = copy.deepcopy(dict(envelope))
+
+    def minimize_prose(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, child in list(value.items()):
+                if key in {"text", "reason", "rationale"} and isinstance(child, str):
+                    value[key] = "x" if child else ""
+                else:
+                    minimize_prose(child)
+        elif isinstance(value, list):
+            for child in value:
+                minimize_prose(child)
+
+    minimize_prose(floor_envelope)
+    floor_bytes = len(
+        json.dumps(
+            floor_envelope, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+    )
+    mandatory_floor = max(
+        int(profile.estimate_tokens(floor_envelope)),
+        math.ceil(floor_bytes / 4),
+    )
+    if mandatory_floor > int(profile.max_output_tokens):
+        raise OutlineV3ExecutionError(
+            "BLOCKED_BUDGET: source-closed semantic response schema floor requires "
+            f"{mandatory_floor} output tokens over configured route maximum "
+            f"{profile.max_output_tokens}"
+        )
+    requested = max(int(minimum_tokens), source_tokens)
+    # The complete envelope is a desired reserve, not a mandatory copy of
+    # all prior prose. A source-closed provider may condense it, with the exact
+    # expanded-input validator still deciding acceptance. The minimal field
+    # and support envelope above is the hard floor; no route cap is raised.
+    requested = min(requested, int(profile.max_output_tokens))
+    return min(int(profile.max_output_tokens), math.ceil(requested / 1024) * 1024)
+
+
+SEMANTIC_DEPENDENCY_TEMPLATE_CONTRACT_V1 = (
+    "outline-interpretation-dependency-templates/v1: each template contains "
+    "shared_fields and ordered members. Reconstruct one exact dependency row "
+    "per member by combining shared_fields with that member's primary_fields; "
+    "preserve member ordinal and all supplied IDs, ownership, scope, evidence, "
+    "field closure, reason, and hashes. Do not infer, union, or omit a row."
+)
+
+
+def _project_semantic_dependency_templates_request_v1(
+    candidate: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build the semantic wire view while retaining the full local audit input."""
+
+    projected = dict(candidate)
+    raw_items = candidate.get("topic_synthesis")
+    if not isinstance(raw_items, list):
+        return projected
+    compact_items: list[Any] = []
+    changed = False
+    for raw_item in raw_items:
+        if not isinstance(raw_item, Mapping):
+            compact_items.append(raw_item)
+            continue
+        item = dict(raw_item)
+        coverage_ref = item.get("coverage_ref")
+        result_ref = item.get("semantic_result_ref")
+        sealed_reducer = (
+            isinstance(coverage_ref, Mapping)
+            and coverage_ref.get("schema_version") == "outline-semantic-reducer-coverage-ref/v1"
+            and isinstance(item.get("reducer_id"), str)
+            and bool(item["reducer_id"].strip())
+            and coverage_ref.get("node_id") == item.get("reducer_id")
+            and isinstance(result_ref, Mapping)
+            and result_ref.get("schema_version") == "outline-semantic-reducer-result-ref/v1"
+        )
+        if sealed_reducer and "local_lineage_hash" in item:
+            # This digest describes local input/request lineage, not source
+            # content. The full local request retains it; the provider still
+            # receives both sealed references and the complete semantic body.
+            # Reference and source validation use the expanded local request.
+            item.pop("local_lineage_hash")
+            changed = True
+        group_papers = item.get("paper_ids")
+        paper_count = coverage_ref.get("paper_count") if isinstance(coverage_ref, Mapping) else None
+        if (
+            sealed_reducer
+            and "bridge_paper_ids" not in item
+            and isinstance(group_papers, list)
+            and bool(group_papers)
+            and all(
+                isinstance(value, str) and value and value == value.strip()
+                for value in group_papers
+            )
+            and type(paper_count) is int
+            and paper_count == len(group_papers) == len(set(group_papers))
+        ):
+            # The sealed manifest retains this complete cohort membership.
+            # Individual claim owners, support IDs and interpretation fields
+            # remain inline; output validation resolves the full local scope.
+            item.pop("paper_ids")
+            changed = True
+        context = item.get("interpretation_context")
+        if isinstance(context, Mapping):
+            projected_context = dict(context)
+            dependencies = projected_context.get("dependencies")
+            if isinstance(dependencies, list) and dependencies:
+                if any(not isinstance(row, Mapping) for row in dependencies):
+                    raise OutlineV3ExecutionError(
+                        "reducer interpretation dependency row is malformed"
+                    )
+                encoded = _encode_semantic_dependency_templates_v1(dependencies)
+                if len(encoded["templates"]) < len(dependencies):
+                    projected_context.pop("dependencies", None)
+                    projected_context["dependency_template_contract"] = (
+                        SEMANTIC_DEPENDENCY_TEMPLATE_CONTRACT_V1
+                    )
+                    projected_context["dependency_templates"] = encoded
+                    item["interpretation_context"] = projected_context
+                    changed = True
+        compact_items.append(item)
+    if changed:
+        projected["topic_synthesis"] = compact_items
+    return projected
 
 
 class OutlineV3ExecutionError(RuntimeError):
@@ -279,6 +601,8 @@ class OutlineV3Executor:
         max_source_prompt_tokens: int | None = None,
         semantic_output_max_tokens: int = SEMANTIC_SYNTHESIS_OUTPUT_LIMIT,
         semantic_transport_retries: int | None = None,
+        prospective_provider_budget: ProviderAggregateBudgetV2 | Mapping[str, Any] | None = None,
+        prospective_provider_budget_source: str | None = None,
         technical_shard_target_tokens: int = 0,
         pricing_source: str | None = None,
         pricing_provider: str | None = None,
@@ -288,6 +612,10 @@ class OutlineV3Executor:
         pricing_policy: str = "estimate_only_not_billing_v1",
         publication_context: Any | None = None,
         runtime_spec_binding: RuntimeSpecBindingV1 | None = None,
+        arbitration_work_policy_record: ArtifactRecord | None = None,
+        response_snapshot_sink: ProviderResponseSnapshotSink | None = None,
+        source_revision_replay_context: Any | None = None,
+        provider_semantic_contract_version: str | None = None,
         _skip_exact_replay_verification: bool = False,
     ) -> None:
         if not str(job_id).strip():
@@ -299,9 +627,21 @@ class OutlineV3Executor:
             raise ValueError("stability_mode must be one of: off, smoke, full")
         self.semantic_repair_enabled = bool(semantic_repair_enabled)
         self.runtime_spec_binding = runtime_spec_binding
+        self.arbitration_work_policy_record = arbitration_work_policy_record
+        self._arbitration_surface_body: dict[str, Any] | None = None
+        self._arbitration_terminal_dependencies: dict[str, ArtifactRecord] = {}
+        self.response_snapshot_sink = response_snapshot_sink
+        self.source_revision_replay_context = source_revision_replay_context
+        self._pending_source_revision_replays: dict[str, Any] = {}
+        self._source_revision_matches: dict[str, Any] = {}
+        if provider_semantic_contract_version not in (None, PROVIDER_SEMANTIC_CONTRACT_V2):
+            raise ValueError("unsupported provider semantic contract")
+        self.provider_semantic_contract_version = provider_semantic_contract_version
+        self._v2_topic_batch_identity_hashes: dict[str, str] = {}
         self._primary_candidate_repair_plan: OutlineCandidateRepairPlanV1 | None = None
         self._primary_candidate_repair_plan_record: ArtifactRecord | None = None
         self.opaque_alias_enabled = bool(opaque_alias_enabled)
+        self._alias_map: dict[str, Any] | None = None
         self.outline_pilot = dict(outline_pilot) if outline_pilot is not None else None
         if self.outline_pilot is not None and self.outline_pilot.get("schema_version") != "outline-topic-pilot/v1":
             raise ValueError("outline_pilot schema_version must be outline-topic-pilot/v1")
@@ -338,6 +678,19 @@ class OutlineV3Executor:
         self.semantic_output_max_tokens = semantic_output_max_tokens
         if semantic_transport_retries is not None and int(semantic_transport_retries) < 0:
             raise ValueError("semantic_transport_retries cannot be negative")
+        if prospective_provider_budget is None:
+            self.prospective_provider_budget = None
+        elif isinstance(prospective_provider_budget, ProviderAggregateBudgetV2):
+            self.prospective_provider_budget = prospective_provider_budget
+        elif isinstance(prospective_provider_budget, Mapping):
+            self.prospective_provider_budget = ProviderAggregateBudgetV2.from_mapping(
+                prospective_provider_budget
+            )
+        else:
+            raise ValueError("prospective_provider_budget must be strict V2 limits")
+        self.prospective_provider_budget_source = str(
+            prospective_provider_budget_source or "provided_strict_v2"
+        ).strip()
         if int(technical_shard_target_tokens) < 0:
             raise ValueError("technical_shard_target_tokens cannot be negative")
         self.job_id = str(job_id)
@@ -370,7 +723,10 @@ class OutlineV3Executor:
             or str(self.profile.endpoint_type or "").casefold() not in {"internal", "fixture"}
         )
         self._candidate_interpretation_tables: dict[str, Any] = {}
+        self._candidate_organization_partition_state: tuple[Any, str, ArtifactRecord] | None = None
         self._candidate_output_scope: Any | None = None
+        self._candidate_corpus_witness_group_ids: tuple[str, ...] = ()
+        self._candidate_corpus_witness_scope_hash = ""
         # Role-aware routing is opt-in so existing single-provider callers keep
         # working, but when it is supplied every node must resolve through it.
         self.router = provider_router
@@ -619,7 +975,12 @@ class OutlineV3Executor:
         self._expected_provider_calls: dict[str, ExpectedProviderCall] = {}
         self._dynamic_provider_bindings: dict[str, dict[str, Any]] = {}
         self._pending_replays: dict[str, tuple[ModelCallReplayKey, str, str]] = {}
+        self._final_fold_catalogs: dict[str, tuple[dict[str, Any], tuple[ArtifactRecord, ...]]] = {}
+        self._final_fold_results: dict[str, dict[str, Any]] = {}
+        self._semantic_identifier_plans: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+        self._semantic_identifier_outputs: dict[str, dict[str, Any]] = {}
         self._replay_evidence: list[dict[str, Any]] = []
+        self._logical_candidate_reuse_projections: dict[str, dict[str, Any]] = {}
         self._replay_receipt_sources: dict[str, ArtifactRecord] = {}
         self._replay_receipt_diagnostics: list[str] = []
         self._replay_receipt_index_cache: dict[str, Any] | None = None
@@ -814,6 +1175,9 @@ class OutlineV3Executor:
             "raw_response_refs": [],
             "artifact_refs": [],
         }
+        source_revision_scope = topic_source_replay_scope_v1(request)
+        if source_revision_scope is not None:
+            record["source_revision_scope"] = source_revision_scope
         self._request_payload_audit.append(record)
         return len(self._request_payload_audit) - 1
 
@@ -853,6 +1217,13 @@ class OutlineV3Executor:
             )
             if node_id in self.artifact_records
         ]
+        audit_id = f"outline-v3:request_payload_audit:{self.closure_epoch_id}"
+        audit_hash = hashlib.sha256(audit_lines).hexdigest()
+        existing_audit = self.registry.get(audit_id)
+        if existing_audit is not None and existing_audit.content_hash != audit_hash:
+            # Earlier recovered responses depend on this exact audit snapshot.
+            # A resumed epoch publishes a new snapshot without replacing it.
+            audit_id = f"{audit_id}:{audit_hash[:24]}"
         audit_record = publish_bytes_artifact(
             self.publication_context,
             self.registry,
@@ -862,7 +1233,7 @@ class OutlineV3Executor:
             artifact_type="outline_request_payload_audit",
             artifact_version="v1",
             producer="outline.v3_executor.OutlineV3Executor",
-            artifact_id=f"outline-v3:request_payload_audit:{self.closure_epoch_id}",
+            artifact_id=audit_id,
             depends_on=self._dependency_refs(dependency_ids),
             metadata={
                 "job_id": self.job_id,
@@ -1045,6 +1416,11 @@ class OutlineV3Executor:
         effective = str(transport_node_id or node_id)
         if effective.startswith("stability:"):
             effective = effective.rsplit(":", 1)[-1]
+        if transport_node_id is None and (
+            str(node_id).startswith("arbitration:")
+            or str(node_id).startswith("stability:") and ":arbitration:" in str(node_id)
+        ):
+            effective = "arbitration"
         return self._role_route(effective)
 
     @staticmethod
@@ -1454,6 +1830,16 @@ class OutlineV3Executor:
         *,
         fields: Sequence[str],
     ) -> dict[str, Any]:
+        return cls._complete_topic_evidence_unit_with_payloads(view, dossier, fields=fields)[0]
+
+    @classmethod
+    def _complete_topic_evidence_unit_with_payloads(
+        cls,
+        view: Any,
+        dossier: Any | None,
+        *,
+        fields: Sequence[str],
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         """Materialize one complete provider-visible evidence unit.
 
         This is intentionally separate from the routing projection used by
@@ -1465,12 +1851,13 @@ class OutlineV3Executor:
 
         payload = view.to_dict() if hasattr(view, "to_dict") else dict(view)
         if dossier is None or not hasattr(dossier, "to_dict"):
-            return cls._compact_topic_evidence_unit(
+            complete = cls._compact_topic_evidence_unit(
                 view,
                 dossier,
                 fields=fields,
                 include_field_refs=True,
             )
+            return complete, {}, payload
         dossier_payload = dict(dossier.to_dict())
         nested_claim_ids = {
             str(claim.get("claim_id") or "")
@@ -1483,6 +1870,9 @@ class OutlineV3Executor:
         source_field_ids_by_field = dossier_payload.get("evidence_ids_by_field") or {}
         source_text_by_id = dossier_payload.get("evidence_text_by_id") or {}
         projected_source_fields: dict[str, dict[str, Any]] = {}
+        field_names = tuple(str(name) for name in fields if str(name))
+        declared_roots_by_field: dict[str, set[str]] = {}
+        evidence_by_field_value: dict[str, dict[str, set[str]]] = {}
         for raw_entry in dossier_payload.get("source_field_ledger") or ():
             try:
                 entry = (
@@ -1500,42 +1890,50 @@ class OutlineV3Executor:
                 path_candidates.add(f"ai_summary.{source_path}")
             elif source_path.startswith("ai_summary."):
                 path_candidates.add(source_path[len("ai_summary.") :])
-            projected_fields = {
-                str(field_name)
-                for field_name in fields
-                if str(field_name)
-                and (
-                    entry.canonical_field == str(field_name)
-                    or any(
-                        candidate == str(root)
-                        or candidate.startswith(str(root) + ".")
-                        or candidate.startswith(str(root) + "[")
-                        for candidate in path_candidates
-                        for root in (
-                            declared_source_paths.get(str(field_name), ())
-                            if isinstance(declared_source_paths, Mapping)
-                            else ()
-                        )
-                    )
+            path_roots = {
+                root
+                for candidate in path_candidates
+                for root in (
+                    candidate,
+                    *(candidate[:index] for index, char in enumerate(candidate) if char in ".["),
                 )
             }
+            projected_fields: set[str] = set()
+            for field_name in field_names:
+                if entry.canonical_field == field_name:
+                    projected_fields.add(field_name)
+                    continue
+                if field_name not in declared_roots_by_field:
+                    roots = (declared_source_paths.get(field_name, ())
+                             if isinstance(declared_source_paths, Mapping) else ())
+                    declared_roots_by_field[field_name] = {str(root) for root in roots}
+                if path_roots.intersection(declared_roots_by_field[field_name]):
+                    projected_fields.add(field_name)
             if not projected_fields:
                 continue
+            for field_name in projected_fields:
+                if field_name in evidence_by_field_value:
+                    continue
+                by_value: dict[str, set[str]] = {}
+                for evidence_field, evidence_ids in source_field_ids_by_field.items():
+                    if evidence_field != field_name and not evidence_field.endswith(f":{field_name}"):
+                        continue
+                    for evidence_id in evidence_ids or ():
+                        value = str(source_text_by_id.get(str(evidence_id)) or "")
+                        by_value.setdefault(value, set()).add(str(evidence_id))
+                evidence_by_field_value[field_name] = by_value
             evidence_refs = sorted(
                 {
-                    str(evidence_id)
+                    evidence_id
                     for field_name in projected_fields
-                    for evidence_field, evidence_ids in source_field_ids_by_field.items()
-                    if evidence_field == field_name or evidence_field.endswith(f":{field_name}")
-                    for evidence_id in evidence_ids or ()
-                    if str(source_text_by_id.get(str(evidence_id)) or "") == entry.source_value
+                    for evidence_id in evidence_by_field_value[field_name].get(entry.source_value, ())
                 }
             )
             row = entry.to_dict()
             row["projected_fields"] = sorted(projected_fields)
             row["evidence_ids"] = evidence_refs
             projected_source_fields[entry.source_field_id] = row
-        return {
+        complete = {
             "paper_key": str(payload.get("paper_key") or payload.get("canonical_paper_key") or ""),
             "source_summary_hash": str(payload.get("source_summary_hash") or ""),
             "evidence_unit_id": str(getattr(dossier, "dossier_id", "") or ""),
@@ -1562,6 +1960,7 @@ class OutlineV3Executor:
             "dossier_diagnostics": list(dossier_payload.get("diagnostics") or []),
             "projection": "complete_dossier_study_claim_source_fields_unit_v2",
         }
+        return complete, dossier_payload, payload
 
     @classmethod
     def _complete_topic_evidence_units(
@@ -1589,10 +1988,10 @@ class OutlineV3Executor:
             raise OutlineV3ExecutionError(
                 "semantic topic request is missing its Registry-backed evidence dossier"
             )
-        complete = cls._complete_topic_evidence_unit(view, dossier, fields=fields)
+        complete, dossier_payload, view_payload = cls._complete_topic_evidence_unit_with_payloads(
+            view, dossier, fields=fields,
+        )
         complete_source_fields = list(complete.get("source_field_ledger") or [])
-        dossier_payload = dossier.to_dict()
-        view_payload = view.to_dict() if hasattr(view, "to_dict") else dict(view)
         text_by_id = {
             str(key): value
             for key, value in (dossier_payload.get("evidence_text_by_id") or {}).items()
@@ -2965,7 +3364,7 @@ class OutlineV3Executor:
                     "planned_evidence_ids": planned_evidence_ids,
                 }
             )
-        return {
+        request = {
             "semantic_contract_version": "semantic-evidence-graph-v2",
             "interpretation_contract_version": INTERPRETATION_CONTRACT_VERSION,
             "task": "substantive_topic_synthesis",
@@ -3016,6 +3415,43 @@ class OutlineV3Executor:
                 "overflow_policy": "Overflow: return a complete unresolved fragment with the exact reason 'Output limit.', no claims/conclusions/support IDs. Keep every fragment and complete JSON.",
             },
         }
+        if getattr(self, "provider_semantic_contract_version", None) == PROVIDER_SEMANTIC_CONTRACT_V2:
+            selection = build_topic_source_selection_v2(
+                request, evidence_model=evidence_model, content_layers_model=content_layers_model,
+            )
+            request["provider_semantic_contract_version"] = PROVIDER_SEMANTIC_CONTRACT_V2
+            projection = request["evidence_projection"]
+            projection.pop("content_layers_hash")
+            projection["selected_source_projection"] = {
+                "schema_version": selection["schema_version"],
+                "paper_keys": selection["paper_keys"], "content_hash": selection["content_hash"],
+            }
+            identity = stable_topic_batch_identity_v2(request)
+            request["hierarchy"]["batch_id"] = identity["batch_id"]
+            request["hierarchy"]["batch_identity_hash"] = identity["identity_hash"]
+        return request
+
+    def _topic_provider_node_id(self, topics_or_request: Any, batch_index: int) -> str:
+        if getattr(self, "provider_semantic_contract_version", None) != PROVIDER_SEMANTIC_CONTRACT_V2:
+            return f"topic_synthesis_provider:batch:{batch_index}"
+        identity = stable_topic_batch_identity_v2(topics_or_request)
+        node_id = identity["provider_node_id"]
+        previous = self._v2_topic_batch_identity_hashes.setdefault(node_id, identity["identity_hash"])
+        if previous != identity["identity_hash"]:
+            raise OutlineV3ExecutionError("source-closed topic batch identity collision")
+        return node_id
+
+    def _verify_topic_request_matches_plan(self, node_id: str, request: Mapping[str, Any]) -> None:
+        rows = [row for row in self.semantic_request_plan
+                if isinstance(row, Mapping) and row.get("node_id") == node_id]
+        hierarchy = request.get("hierarchy")
+        if (len(rows) != 1 or not isinstance(hierarchy, Mapping)
+                or not hierarchy.get("batch_id")
+                or rows[0].get("batch_id") != hierarchy["batch_id"]
+                or rows[0].get("request_hash") != hash_json(self._attach_prompt_authority(node_id, request))):
+            raise OutlineV3ExecutionError(
+                f"topic request {node_id} differs from its current materialized plan; replan sources before transport"
+            )
 
     @staticmethod
     def _minimum_complete_topic_response_bytes(request: Mapping[str, Any]) -> int:
@@ -3059,6 +3495,30 @@ class OutlineV3Executor:
         return len(json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
     def _plan_topic_provider_batches(
+        self,
+        topic_plan: Sequence[TopicSynthesis],
+        *,
+        topic_routes: Mapping[str, Any],
+        evidence_model: Any,
+        content_layers_model: Any,
+        profile: ProviderContextProfile,
+    ) -> tuple[list[TopicSynthesis], list[list[TopicSynthesis]], list[dict[str, Any]]]:
+        from outline.topic_materialization_snapshot import (
+            TopicMaterializationSourceChanged,
+            snapshot_topic_materialization,
+        )
+
+        try:
+            with snapshot_topic_materialization(evidence_model, content_layers_model) as snapshot:
+                return self._plan_topic_provider_batches_from_snapshot(
+                    topic_plan, topic_routes=topic_routes,
+                    evidence_model=snapshot.evidence_model,
+                    content_layers_model=snapshot.content_layers_model, profile=profile,
+                )
+        except TopicMaterializationSourceChanged as exc:
+            raise OutlineV3ExecutionError(f"topic planning source models changed: {exc}") from exc
+
+    def _plan_topic_provider_batches_from_snapshot(
         self,
         topic_plan: Sequence[TopicSynthesis],
         *,
@@ -3112,7 +3572,7 @@ class OutlineV3Executor:
                 batch_index=batch_index,
                 content_layers_hash=content_layers_hash,
             )
-            node_id = f"topic_synthesis_provider:batch:{batch_index}"
+            node_id = self._topic_provider_node_id(request, batch_index)
             budget = profile.estimate_request(self._attach_prompt_authority(node_id, request))
             tokens = int(budget.get("estimated_input_tokens") or profile.estimate_tokens(request))
             if tokens > input_limit:
@@ -3129,6 +3589,13 @@ class OutlineV3Executor:
             return request, budget
 
         for topic in expanded:
+            if (current
+                    and getattr(self, "provider_semantic_contract_version", None) == PROVIDER_SEMANTIC_CONTRACT_V2
+                    and not ownership_compatible_v2(current, [topic])):
+                batches.append(current)
+                assert current_measurement is not None
+                batch_measurements.append(current_measurement)
+                current, current_measurement = [], None
             batch_index = len(batches) + 1
             trial = [*current, topic]
             try:
@@ -3276,7 +3743,7 @@ class OutlineV3Executor:
             materialized_unit_ids = sorted(
                 str(item.get("evidence_unit_id") or "") for item in evidence_units
             )
-            topic_node_id = f"topic_synthesis_provider:batch:{batch_index}"
+            topic_node_id = self._topic_provider_node_id(request, batch_index)
             attached_request = self._attach_prompt_authority(topic_node_id, request)
             request_body_bytes = len(json.dumps(request, ensure_ascii=False, sort_keys=True).encode("utf-8"))
             attached_request_bytes = len(json.dumps(attached_request, ensure_ascii=False, sort_keys=True).encode("utf-8"))
@@ -3432,7 +3899,10 @@ class OutlineV3Executor:
         evidence_model = build_outline_evidence_views(summaries, self.job_id)
         ledger = build_global_corpus_ledger(evidence_model)
         matrix = build_multi_view_matrix(evidence_model)
-        relation_map = build_global_relation_map(evidence_model, matrix, ledger)
+        relation_map = build_global_relation_map(
+            evidence_model, matrix, ledger,
+            required_comparisons=build_review_intent(self.review_intent_input).required_comparisons,
+        )
         content_layers_model = build_paper_content_layers(
             summaries,
             evidence_model,
@@ -4567,7 +5037,10 @@ class OutlineV3Executor:
         evidence = build_outline_evidence_views(self.summaries, self.job_id)
         ledger = build_global_corpus_ledger(evidence)
         matrix = build_multi_view_matrix(evidence)
-        candidates = build_global_relation_map(evidence, matrix, ledger)
+        candidates = build_global_relation_map(
+            evidence, matrix, ledger,
+            required_comparisons=build_review_intent(self.review_intent_input).required_comparisons,
+        )
         layers = build_paper_content_layers(self.summaries, evidence, job_id=self.job_id)
         plan = build_semantic_chunk_plan(
             layers,
@@ -4857,7 +5330,10 @@ class OutlineV3Executor:
             evidence = merge_outline_evidence_shards(variant_shards)
         ledger = build_global_corpus_ledger(evidence)
         matrix = build_multi_view_matrix(evidence)
-        candidates = build_global_relation_map(evidence, matrix, ledger)
+        candidates = build_global_relation_map(
+            evidence, matrix, ledger,
+            required_comparisons=build_review_intent(self.review_intent_input).required_comparisons,
+        )
         relation_candidates = [item.to_dict() for item in candidates.relations]
         plan = self._build_relation_shard_plan(evidence.views, relation_candidates)
         content_layers = build_paper_content_layers(
@@ -5012,8 +5488,16 @@ class OutlineV3Executor:
         *,
         variant_name: str,
         candidate_id: str | None = None,
+        shared_semantic_context: Mapping[str, Any] | None = None,
     ) -> tuple[int, int]:
-        """Reserve every possible evidence shard before candidate transport."""
+        """Reserve candidate requests, using source-closed groups when available.
+
+        Before the shared synthesis and source-bound scope have been built, a
+        whole-paper shard is only a projection.  It can help estimate a finite
+        call reserve, but it cannot stand in for a future assertion group or
+        reject a request whose complete source closure is not materialized.
+        Every actual request still goes through the serializer-aware JIT cap.
+        """
 
         axes = build_organizing_axes(
             build_review_intent(self.review_intent_input), candidate_count=self.candidate_count,
@@ -5023,18 +5507,35 @@ class OutlineV3Executor:
                 self._candidate_hierarchical_preflight(
                     summaries, profile, variant_name=variant_name,
                     candidate_id=f"candidate_{index}",
+                    shared_semantic_context=shared_semantic_context,
                 )
                 for index in range(1, self.candidate_count + 1)
             ]
             return max(item[0] for item in projections), max(item[1] for item in projections)
         candidate_id = candidate_id or "candidate_1"
+
+        def record_projection(status: str, **details: Any) -> None:
+            state = getattr(self, "_candidate_preflight_projection_state", None)
+            if not isinstance(state, dict):
+                state = {}
+                self._candidate_preflight_projection_state = state
+            state[f"{variant_name}:{candidate_id}"] = {
+                "variant_name": variant_name,
+                "candidate_id": candidate_id,
+                "status": status,
+                **details,
+            }
+
         axis = axes[int(candidate_id.removeprefix("candidate_")) - 1]
         generation_node_id = f"{candidate_id}_provider_generation"
 
         evidence = build_outline_evidence_views(summaries, self.job_id)
         ledger = build_global_corpus_ledger(evidence)
         matrix = build_multi_view_matrix(evidence)
-        candidates = build_global_relation_map(evidence, matrix, ledger)
+        candidates = build_global_relation_map(
+            evidence, matrix, ledger,
+            required_comparisons=build_review_intent(self.review_intent_input).required_comparisons,
+        )
         content_layers = build_paper_content_layers(summaries, evidence, job_id=self.job_id)
         semantic_plan = build_semantic_chunk_plan(
             content_layers,
@@ -5075,6 +5576,20 @@ class OutlineV3Executor:
             "evidence_bound": True,
             "evidence_projection": "registry_complete_evidence_ref_v1",
         }
+        scope = self._candidate_output_scope
+        source_closed_scope_available = bool(
+            self.semantic_provider_synthesis_enabled
+            and scope is not None
+            and isinstance(shared_semantic_context, Mapping)
+        )
+        if source_closed_scope_available:
+            request["candidate_output_scope"] = self._candidate_output_scope_wire(paper_keys)
+            request["shared_semantic_context"] = dict(shared_semantic_context or {})
+            request["output_contract"] = {
+                "preferred_candidate_wire_version": "candidate-slot-output/v1",
+                "claim_prose_reserve_tokens": 256,
+                "section_prose_reserve_tokens": 64,
+            }
         node_prefix = (
             "stability:" + hash_json({"variant": variant_name, "candidate": candidate_id})[:16]
             if variant_name not in {"canonical", "baseline"} else ""
@@ -5089,7 +5604,114 @@ class OutlineV3Executor:
             int(budget.get("estimated_input_tokens") or profile.estimate_tokens(enriched)),
         )
         effective_cap = self._effective_input_cap(profile)
-        if estimate > self._relation_packing_target(profile) or not bool(budget.get("within_budget")):
+
+        from outline.candidate_request_packing import estimate_candidate_output
+
+        complete_output_estimate = (
+            estimate_candidate_output(scope, request, profile.estimate_tokens)
+            if source_closed_scope_available and scope is not None
+            else 0
+        )
+        needs_hierarchy = (
+            estimate > self._relation_packing_target(profile)
+            or not bool(budget.get("within_budget"))
+            or (
+                source_closed_scope_available
+                and complete_output_estimate > int(profile.max_output_tokens)
+            )
+        )
+        if not needs_hierarchy:
+            if self.semantic_provider_synthesis_enabled and scope is None:
+                record_projection(
+                    "unmaterialized_source_closed_candidate_request",
+                    projected_input_tokens=estimate,
+                    input_cap=effective_cap,
+                    projected_call_count=1,
+                    bound_status="request_shape_and_group_assignment_not_materialized",
+                )
+                return effective_cap, 1
+            if self.semantic_provider_synthesis_enabled and scope is not None and not source_closed_scope_available:
+                record_projection(
+                    "unmaterialized_shared_candidate_context",
+                    projected_input_tokens=estimate,
+                    input_cap=effective_cap,
+                    projected_call_count=1,
+                    bound_status="shared_semantic_context_not_materialized",
+                )
+                return effective_cap, 1
+            if source_closed_scope_available:
+                record_projection(
+                    "materialized_source_closed_candidate_request",
+                    projected_input_tokens=estimate,
+                    estimated_output_tokens=complete_output_estimate,
+                    input_cap=effective_cap,
+                    projected_call_count=1,
+                    bound_status="serializer_measured_scope_and_shared_context",
+                )
+            return estimate, 1
+
+        if self.semantic_provider_synthesis_enabled and scope is not None and not source_closed_scope_available:
+            # A persisted scope without the shared semantic input is not an
+            # executable group plan.  Do not fall back to per-paper shards,
+            # which can split a comparison or lose its required qualifiers.
+            record_projection(
+                "unmaterialized_shared_candidate_context",
+                projected_input_tokens=estimate,
+                input_cap=effective_cap,
+                projected_call_count=1,
+                bound_status="shared_semantic_context_not_materialized",
+            )
+            return effective_cap, 1
+
+        if self.semantic_provider_synthesis_enabled and scope is None:
+            try:
+                shard_requests = self._candidate_shard_requests(
+                    generation_node_id=generation_node_id,
+                    provider_request=request,
+                    evidence_views=evidence.views,
+                    relation_candidates=request["relations"],
+                    node_prefix=node_prefix,
+                )
+            except OutlineV3ExecutionError as exc:
+                # An indivisible whole-paper projection can be too large even
+                # though the future source-closed group request has not been
+                # built. Preserve the blocker as an estimate caveat, then let
+                # actual group materialization decide whether it fits.
+                record_projection(
+                    "unmaterialized_legacy_paper_shard_projection",
+                    projected_input_tokens=estimate,
+                    input_cap=effective_cap,
+                    projected_call_count=1,
+                    bound_status="legacy_paper_projection_failed; actual group plan remains unmaterialized",
+                    projection_diagnostic=str(exc)[:512],
+                )
+                return effective_cap, 1
+            if not shard_requests:
+                record_projection(
+                    "unmaterialized_source_closed_candidate_request",
+                    projected_input_tokens=estimate,
+                    input_cap=effective_cap,
+                    projected_call_count=1,
+                    bound_status="no_legacy_projection; actual group plan remains unmaterialized",
+                )
+                return effective_cap, 1
+            record_projection(
+                "unmaterialized_legacy_paper_shard_projection",
+                projected_input_tokens=estimate,
+                input_cap=effective_cap,
+                projected_call_count=len(shard_requests),
+                bound_status="legacy_paper_projection_is_not_a_candidate_group_assignment",
+            )
+            # Keep a finite prospective per-request input reserve, but do not
+            # validate the legacy projection as if it were a complete source
+            # closure.  The true group requests are measured before transport.
+            return effective_cap, len(shard_requests)
+
+        if not source_closed_scope_available:
+            # Deterministic internal fixtures and legacy callers have no
+            # model-authored scope to plan. Preserve their historical
+            # per-paper shard validation; this branch is not used to make a
+            # production semantic-synthesis admission decision.
             shard_requests = self._candidate_shard_requests(
                 generation_node_id=generation_node_id,
                 provider_request=request,
@@ -5099,7 +5721,9 @@ class OutlineV3Executor:
             )
             for node_id, _shard, _papers, _relations, lower_request in shard_requests:
                 enriched_shard = self._attach_prompt_authority(node_id, lower_request)
-                lower_estimate = int(profile.estimate_request(enriched_shard).get("estimated_input_tokens") or 0)
+                lower_estimate = int(
+                    profile.estimate_request(enriched_shard).get("estimated_input_tokens") or 0
+                )
                 if lower_estimate > effective_cap:
                     raise OutlineV3ExecutionError(
                         f"BLOCKED_BUDGET: {generation_node_id} shard {node_id} "
@@ -5110,14 +5734,77 @@ class OutlineV3Executor:
                     f"BLOCKED_BUDGET: {generation_node_id} has no bounded evidence shards"
                 )
             return effective_cap, len(shard_requests)
-        return estimate, 1
+
+        try:
+            shard_requests = self._candidate_shard_requests(
+                generation_node_id=generation_node_id,
+                provider_request=request,
+                evidence_views=evidence.views,
+                relation_candidates=request["relations"],
+                node_prefix=node_prefix,
+            )
+        except OutlineV3ExecutionError as exc:
+            if str(exc).startswith("RECOVERABLE_CAPACITY:"):
+                raise OutlineV3ExecutionError(
+                    f"BLOCKED_BUDGET: {generation_node_id} source-closed candidate group "
+                    f"cannot fit route input/output limits: {exc}"
+                ) from exc
+            raise
+        measured_inputs: list[int] = []
+        for node_id, _shard, _papers, _relations, lower_request in shard_requests:
+            enriched_shard = self._attach_prompt_authority(node_id, lower_request)
+            lower_estimate = int(
+                profile.estimate_request(enriched_shard).get("estimated_input_tokens") or 0
+            )
+            if lower_estimate > effective_cap:
+                raise OutlineV3ExecutionError(
+                    f"BLOCKED_BUDGET: {generation_node_id} complete source-closed group request "
+                    f"{node_id} estimates {lower_estimate} tokens, above effective input cap {effective_cap}"
+                )
+            measured_inputs.append(lower_estimate)
+        if not shard_requests:
+            raise OutlineV3ExecutionError(
+                f"BLOCKED_BUDGET: {generation_node_id} has no source-closed candidate groups"
+            )
+        record_projection(
+            "materialized_source_closed_group_plan",
+            projected_input_tokens=max(measured_inputs, default=0),
+            estimated_output_tokens=max(
+                (int(shard.get("estimated_output_tokens") or 0) for _node, shard, *_rest in shard_requests),
+                default=0,
+            ),
+            input_cap=effective_cap,
+            projected_call_count=len(shard_requests),
+            bound_status="serializer_measured_complete_assertion_groups",
+        )
+        return max(measured_inputs, default=effective_cap), len(shard_requests)
 
     def _build_provider_call_plans(self) -> tuple[OutlineProviderCallPlan, ...]:
         plans: list[OutlineProviderCallPlan] = []
         self._critique_preflight_shards: dict[tuple[str, str], int] = {}
+        self._candidate_preflight_projection_state: dict[str, dict[str, Any]] = {}
+        self._prospective_arbitration_requests: dict[str, dict[str, Any]] = {}
         for variant_name, variant_summaries, transport_expected in self._provider_call_plan_variants():
             variant_evidence = build_outline_evidence_views(variant_summaries, self.job_id)
             variant_layers = build_paper_content_layers(variant_summaries, variant_evidence, job_id=self.job_id)
+            candidate_projections: dict[tuple[str, str], tuple[int, int]] = {}
+
+            def planned_candidate_projection(profile: ProviderContextProfile, candidate_id: str | None = None) -> tuple[int, int]:
+                # Critics repeatedly ask for the same candidate_1 projection.
+                # Reuse only this plan operation's identical source/profile
+                # calculation; actual downstream requests retain fresh JIT checks.
+                logical_id = candidate_id or ("candidate_1" if self.candidate_count <= 5 else "all_candidates")
+                key = (logical_id, hash_json({
+                    "summaries": variant_summaries, "profile": asdict(profile),
+                    "review_intent": self.review_intent_input,
+                    "candidate_count": self.candidate_count, "max_provider_calls": self.max_provider_calls,
+                }))
+                if key not in candidate_projections:
+                    candidate_projections[key] = self._candidate_hierarchical_preflight(
+                        variant_summaries, profile, variant_name=variant_name, candidate_id=candidate_id,
+                    )
+                return candidate_projections[key]
+
             for node_id in self._provider_node_ids():
                 route = self._role_route(node_id)
                 profile = route.profile
@@ -5136,19 +5823,14 @@ class OutlineV3Executor:
                         # is no relation transport or receipt to reserve.
                         continue
                 elif node_id.endswith("_provider_generation"):
-                    hierarchical_relation_input, candidate_shard_multiplier = self._candidate_hierarchical_preflight(
-                        variant_summaries,
-                        profile,
-                        variant_name=variant_name,
-                        candidate_id=node_id.removesuffix("_provider_generation"),
+                    hierarchical_relation_input, candidate_shard_multiplier = planned_candidate_projection(
+                        profile, candidate_id=node_id.removesuffix("_provider_generation"),
                     )
                 elif (
                     node_id in {"structure_critique", "coverage_critique", "evidence_critique", "arbitration"}
                 ):
-                    _candidate_input, candidate_shard_multiplier = self._candidate_hierarchical_preflight(
-                        variant_summaries,
+                    _candidate_input, candidate_shard_multiplier = planned_candidate_projection(
                         self._role_route("candidate_1_provider_generation").profile,
-                        variant_name=variant_name,
                     )
                 common_estimation = {
                     "navigation_cards": [item.to_dict() for item in variant_layers.index_cards],
@@ -5175,6 +5857,92 @@ class OutlineV3Executor:
                         "node_id": node_id,
                         "hierarchical_relation_request": True,
                         "estimated_shard_input_tokens": hierarchical_relation_input,
+                    }
+                elif node_id == "arbitration" and self.semantic_provider_synthesis_enabled:
+                    # Arbitration sees the already-compiled candidate and
+                    # critique outputs.  It does not resend all Stage 1
+                    # navigation cards or summaries.  Materialize the real
+                    # compact arbitration envelope shape here, then add the
+                    # finite candidate/critique output reserves below.  The
+                    # exact source-support catalog depends on future
+                    # candidates and is still checked against the 32k cap
+                    # immediately before arbitration transport.
+                    candidate_ids = [
+                        f"candidate_{index}"
+                        for index in range(1, self.candidate_count + 1)
+                    ]
+                    authored_stub = "Source-supported assertion."
+                    arbitration_shell = {
+                        "candidate_ids": candidate_ids,
+                        "candidate_hashes": {item: "0" * 64 for item in candidate_ids},
+                        "candidate_contents": {
+                            item: {
+                                "candidate_id": item,
+                                "claims": [authored_stub],
+                                "sections": [{
+                                    "section_id": "section_1",
+                                    "title": "Source-supported synthesis",
+                                    "goal": "Organize the supported finding with its limits.",
+                                    "rationale": "Retain the verified source distinctions.",
+                                    "paper_keys": [],
+                                    "relation_ids": [],
+                                    "claims": [authored_stub],
+                                    "claim_support": [],
+                                }],
+                                "paper_assignments": [{
+                                    "section_id": "section_1", "paper_keys": [],
+                                }],
+                            }
+                            for item in candidate_ids
+                        },
+                        "critiques": {
+                            role: {
+                                "passed": True,
+                                "blocking_diagnostics": [],
+                                "issues": [],
+                                "recommendations": [],
+                                "score": 1.0,
+                            }
+                            for role in (
+                                "structure_critique",
+                                "coverage_critique",
+                                "evidence_critique",
+                            )
+                        },
+                        "critique_disposition": {"eligible_candidate_ids": candidate_ids},
+                        "coverage_metrics": {},
+                        "evidence_metrics": {},
+                        "structure_metrics": {},
+                        "blocking_diagnostics": [],
+                        "review_intent": build_review_intent(self.review_intent_input).to_dict(),
+                        "selection_rule": "coverage_then_evidence_then_structure",
+                        "section_coordination_contract": {
+                            "required_if_selected_candidate_sharded": candidate_ids,
+                            "candidate_section_hashes": {
+                                item: {"section_1": "0" * 64} for item in candidate_ids
+                            },
+                            "output_fields": (
+                                "Return exact section coordination only for a selected sharded candidate; "
+                                "preserve all authored claims, source support and distinctions."
+                            ),
+                        },
+                        "output_contract": {
+                            "output_fields": {
+                                "selected_candidate_id": "string copied from candidate_ids",
+                                "selection_reasons": "non-empty array of strings",
+                                "accepted_recommendations": "array",
+                                "rejected_recommendations": "array",
+                                "unresolved_risks": "array",
+                            },
+                            "must_include": ["selected_candidate_id", "selection_reasons"],
+                        },
+                    }
+                    representative_request = pack_arbitration_candidate_support(arbitration_shell)
+                    self._prospective_arbitration_requests[f"{variant_name}:{node_id}"] = {
+                        "status": "awaiting_candidate_and_critique_outputs",
+                        "candidate_count": self.candidate_count,
+                        "compact_support_packing": True,
+                        "exact_support_catalog_materialized": False,
                     }
                 elif node_id in {"structure_critique", "coverage_critique", "evidence_critique", "arbitration"}:
                     representative_request = {
@@ -5236,7 +6004,24 @@ class OutlineV3Executor:
                     * candidate_output_cap
                 )
                 critic_input_upper_bound = 0
-                if (
+                if node_id == "arbitration" and self.semantic_provider_synthesis_enabled:
+                    critique_output_upper_bound = sum(
+                        min(
+                            2_048,
+                            max(1, int(self._role_route(role).profile.max_output_tokens)),
+                        )
+                        for role in (
+                            "structure_critique",
+                            "coverage_critique",
+                            "evidence_critique",
+                        )
+                        if role in self._provider_node_ids()
+                    )
+                    critic_input_upper_bound = (
+                        candidate_output_upper_bound + critique_output_upper_bound
+                    )
+                    estimated_input = base_input_estimate + critic_input_upper_bound
+                elif (
                     node_id in {"structure_critique", "coverage_critique", "evidence_critique", "arbitration"}
                     and candidate_shard_multiplier > 1
                 ):
@@ -5312,7 +6097,9 @@ class OutlineV3Executor:
                     assumptions.append("candidate generation output is included in the upper bound")
                 if critic_input_upper_bound:
                     assumptions.append(
-                        "critic/arbitration input upper bound includes candidate outputs at configured max_output_tokens"
+                        "arbitration projection includes compact candidate and configured critique output reserves; exact future support catalog remains unmaterialized"
+                        if node_id == "arbitration" and self.semantic_provider_synthesis_enabled
+                        else "critic/arbitration input upper bound includes candidate outputs at configured max_output_tokens"
                     )
                 if stability_claim_review_reserve:
                     assumptions.append(
@@ -5322,6 +6109,19 @@ class OutlineV3Executor:
                         assumptions.append(
                             "arbitration input also includes three critic outputs at configured max_output_tokens"
                         )
+                candidate_projection = self._candidate_preflight_projection_state.get(
+                    f"{variant_name}:{node_id.removesuffix('_provider_generation')}"
+                    if node_id.endswith("_provider_generation")
+                    else f"{variant_name}:candidate_1"
+                )
+                if candidate_projection and str(candidate_projection.get("status") or "").startswith("unmaterialized"):
+                    assumptions.append(
+                        "candidate group assignment is unmaterialized; whole-paper shard counts are prospective only"
+                    )
+                if node_id == "arbitration" and self.semantic_provider_synthesis_enabled:
+                    assumptions.append(
+                        "arbitration uses compact candidate support; exact future candidate/source catalog is JIT serialized and input-cap checked"
+                    )
                 rate_input = self.input_cost_per_1k_tokens if self._pricing_is_explicit else None
                 rate_output = self.output_cost_per_1k_tokens if self._pricing_is_explicit else None
                 rate_reasoning = self.reasoning_cost_per_1k_tokens if self._pricing_is_explicit else None
@@ -5370,7 +6170,10 @@ class OutlineV3Executor:
                         cost_status="estimate" if self._pricing_is_explicit else "unknown",
                         assumptions=tuple(assumptions),
                         confidence="medium",
-                        upper_bound=True,
+                        upper_bound=not (
+                            node_id == "arbitration"
+                            and self.semantic_provider_synthesis_enabled
+                        ),
                         transport_expected=transport_expected,
                         configured_transport_retry_reserve=retry_reserve,
                         physical_attempt_upper_bound=(
@@ -5597,7 +6400,7 @@ class OutlineV3Executor:
         output_limit = self._semantic_output_token_limit(profile)
         content_layers_hash = str(getattr(content_layers_model, "content_hash", ""))
         for batch_index, batch in enumerate(topic_batches, start=1):
-            node_id = f"topic_synthesis_provider:batch:{batch_index}"
+            node_id = self._topic_provider_node_id(batch, batch_index)
             if node_id not in selected_ids:
                 continue
             request = self._build_topic_provider_request(
@@ -5919,6 +6722,33 @@ class OutlineV3Executor:
             self._dag,
         )
 
+    @staticmethod
+    def _bound_durable_retry_projection_controller() -> ProviderBudgetController | None:
+        """Read an already-bound durable controller without consulting the environment.
+
+        Provider-free plan construction must not instantiate or bind a budget
+        controller from inherited environment values. A live run may still
+        project against its controller when the execution context has already
+        bound one.
+        """
+
+        from runtime.provider_runtime import (
+            _ACTIVE_ACCEPTANCE_CONTROLLER,
+            _ACTIVE_RUN_PROVIDER_CONTROLLER,
+        )
+
+        controller = (
+            _ACTIVE_ACCEPTANCE_CONTROLLER.get()
+            or _ACTIVE_RUN_PROVIDER_CONTROLLER.get()
+        )
+        if (
+            not isinstance(controller, ProviderBudgetController)
+            or controller.state_path is None
+            or not controller.state_started
+        ):
+            return None
+        return controller
+
     def _preflight_stability_budget(self) -> None:
         core_calls = len(self._provider_node_ids())
         self.stability_preflight.update(
@@ -5950,7 +6780,10 @@ class OutlineV3Executor:
             evidence = build_outline_evidence_views(self.summaries, self.job_id)
             ledger = build_global_corpus_ledger(evidence)
             matrix = build_multi_view_matrix(evidence)
-            relation_map = build_global_relation_map(evidence, matrix, ledger)
+            relation_map = build_global_relation_map(
+                evidence, matrix, ledger,
+                required_comparisons=build_review_intent(self.review_intent_input).required_comparisons,
+            )
             content_layers = build_paper_content_layers(
                 self.summaries, evidence, job_id=self.job_id
             )
@@ -6022,6 +6855,7 @@ class OutlineV3Executor:
             else None
         )
         semantic_synthesis_calls = 0
+        semantic_topic_batches = 0
         semantic_physical_attempts_upper: int | None = (
             None if self.semantic_provider_synthesis_enabled else 0
         )
@@ -6034,6 +6868,9 @@ class OutlineV3Executor:
         semantic_input_tokens = 0
         semantic_output_tokens = 0
         semantic_reasoning_tokens = 0
+        semantic_fixed_wrapper_input_tokens = 0
+        semantic_required_stage_output_tokens = 0
+        semantic_required_stage_reasoning_tokens = 0
         cross_group_runtime_fragment_count: int | None = None
         cross_group_planner_item_count: int | None = None
         cross_group_fragment_bounds_status = "incomplete_upper_bound"
@@ -6132,7 +6969,7 @@ class OutlineV3Executor:
                 "shared_synthesis_contract_version": SHARED_SYNTHESIS_CONTRACT_VERSION,
                 "questions": list(self.semantic_cross_group_questions),
                 "topic_synthesis": semantic_context_plan,
-                "relation_candidates": self.semantic_relation_candidates,
+                "relation_candidates": [],
                 "output_contract": {
                     "comparisons": "array of evidence-bound comparisons",
                     "bridge_claims": "array of evidence-bound claims with topic_ids for every integrated topic they support",
@@ -6142,6 +6979,10 @@ class OutlineV3Executor:
                 },
             }
             cross_shell_request = {**cross_request, "topic_synthesis": []}
+            cross_relation_context_request = {
+                **cross_shell_request,
+                "relation_candidates": self.semantic_relation_candidates,
+            }
             cross_budget = semantic_route.profile.estimate_request(
                 self._attach_prompt_authority(
                     "cross_group_comparison_provider:preflight",
@@ -6151,6 +6992,19 @@ class OutlineV3Executor:
             cross_wrapper_tokens = int(
                 cross_budget.get("estimated_input_tokens")
                 or semantic_route.profile.estimate_tokens(cross_shell_request)
+            )
+            cross_relation_context_budget = semantic_route.profile.estimate_request(
+                self._attach_prompt_authority(
+                    "cross_group_comparison_provider:preflight",
+                    cross_relation_context_request,
+                )
+            )
+            cross_relation_context_tokens = max(
+                0,
+                int(
+                    cross_relation_context_budget.get("estimated_input_tokens")
+                    or semantic_route.profile.estimate_tokens(cross_relation_context_request)
+                ) - cross_wrapper_tokens,
             )
             cross_item_tokens = max(cross_group_item_output_bounds, default=semantic_output)
             global_request = {
@@ -6194,6 +7048,13 @@ class OutlineV3Executor:
                 global_budget.get("estimated_input_tokens")
                 or semantic_route.profile.estimate_tokens(global_shell_request)
             )
+            semantic_fixed_wrapper_input_tokens = (
+                cross_wrapper_tokens
+                + cross_relation_context_tokens
+                + global_wrapper_tokens
+            )
+            semantic_required_stage_output_tokens = 2 * semantic_output
+            semantic_required_stage_reasoning_tokens = 2 * semantic_reasoning
             input_limit = max(
                 1,
                 min(
@@ -6210,6 +7071,8 @@ class OutlineV3Executor:
                 item_count: int,
                 item_output_tokens: int,
                 wrapper_tokens: int,
+                first_level_context_tokens: int = 0,
+                final_wrapper_level: str = "final_relation_free_wrapper",
                 extra_output_tokens: int = 0,
             ) -> list[dict[str, Any]]:
                 rows: list[dict[str, Any]] = []
@@ -6218,12 +7081,37 @@ class OutlineV3Executor:
                 per_item_tokens = max(1, int(item_output_tokens))
                 overhead = max(0, int(wrapper_tokens)) + 512
                 level = 1
-                while overhead + count * per_item_tokens + extra_output_tokens > input_limit:
+                relation_group_packing_status = "not_applicable"
+                while (
+                    overhead + count * per_item_tokens + extra_output_tokens
+                    + (max(0, int(first_level_context_tokens)) if level == 1 else 0)
+                    > input_limit
+                ):
+                    first_level_context_reserve = (
+                        max(0, int(first_level_context_tokens)) if level == 1 else 0
+                    )
+                    if first_level_context_reserve:
+                        relation_group_packing_status = (
+                            "first_level_group_capacity_reserves_context_once"
+                        )
                     if level > MAX_SEMANTIC_REDUCTION_LEVELS:
                         raise OutlineV3ExecutionError(
                             f"BLOCKED_BUDGET: {node_id} reducer plan exceeds {MAX_SEMANTIC_REDUCTION_LEVELS} levels"
                         )
-                    available = input_limit - overhead - extra_output_tokens
+                    available = (
+                        input_limit - overhead - extra_output_tokens
+                        - first_level_context_reserve
+                    )
+                    if available < per_item_tokens and first_level_context_reserve:
+                        # Full relation context may be split across several
+                        # source-assigned groups only after reducer outputs
+                        # materialize. Keep the call-count projection
+                        # explicitly incomplete rather than rejecting the
+                        # run based on an unassigned all-relations wrapper.
+                        relation_group_packing_status = (
+                            "incomplete_until_relation_routing_materializes"
+                        )
+                        available = input_limit - overhead - extra_output_tokens
                     if available < per_item_tokens:
                         raise OutlineV3ExecutionError(
                             f"BLOCKED_BUDGET: one {node_id} semantic result plus its wrapper exceeds the effective input cap"
@@ -6234,18 +7122,29 @@ class OutlineV3Executor:
                         raise OutlineV3ExecutionError(
                             f"BLOCKED_BUDGET: {node_id} reducer upper bound does not shrink"
                         )
-                    if len(rows) + next_count > MAX_SEMANTIC_REDUCER_CALLS_PER_STAGE:
-                        raise OutlineV3ExecutionError(
-                            f"BLOCKED_BUDGET: {node_id} reducer plan exceeds {MAX_SEMANTIC_REDUCER_CALLS_PER_STAGE} calls"
-                        )
+                    # Enumerating a finite source-dependent graph grants no
+                    # transport authority. Keep every bounded level visible;
+                    # actual calls still pass the runtime guard and shared
+                    # aggregate reservation instead of truncating this plan.
                     for group_index in range(next_count):
                         group_size = min(per_call_items, count - group_index * per_call_items)
+                        # The cross-group reducer routes each relation to one
+                        # first-level group after the provider outputs exist.
+                        # The assignment is therefore not materialized here.
+                        # Reserve the complete relation context once at stage
+                        # level instead of repeating it on every hypothetical
+                        # group or inventing request identities.
+                        context_reserve = (
+                            max(0, int(first_level_context_tokens))
+                            if level == 1 and group_index == 0
+                            else 0
+                        )
                         rows.append(
                             {
                                 "node_id": f"{node_id}:reduce:{level}:{group_index + 1}",
-                                "estimated_input_tokens": min(
-                                    input_limit,
-                                    overhead + group_size * per_item_tokens + extra_output_tokens,
+                                "estimated_input_tokens": (
+                                    overhead + group_size * per_item_tokens
+                                    + extra_output_tokens + context_reserve
                                 ),
                                 "estimated_output_tokens": reducer_output_tokens,
                                 "estimated_reasoning_tokens": semantic_reasoning,
@@ -6257,16 +7156,36 @@ class OutlineV3Executor:
                                     "configured" if retry_reserve is not None else "unknown"
                                 ),
                                 "input_estimate_kind": "bounded_reducer_upper_bound",
+                                "request_payload_status": "output_dependent",
+                                "wrapper_level": (
+                                    "first_level_conservative_relation_context_reserve"
+                                    if context_reserve
+                                    else "first_level_relation_free_wrapper"
+                                    if level == 1
+                                    else "later_level_relations_cleared"
+                                ),
+                                "relation_context_reserve_tokens": context_reserve,
+                                "relation_group_packing_status": relation_group_packing_status,
                             }
                         )
                     count = next_count
                     per_item_tokens = reducer_output_tokens
                     extra_output_tokens = 0
+                    # Runtime consumes routed relations at the first reducer
+                    # level; subsequent reducer levels and the final fold use
+                    # the relation-cleared wrapper.
+                    first_level_context_tokens = 0
                     level += 1
+                final_context_reserve = (
+                    max(0, int(first_level_context_tokens)) if level == 1 else 0
+                )
                 rows.append(
                     {
                         "node_id": node_id,
-                        "estimated_input_tokens": overhead + count * per_item_tokens + extra_output_tokens,
+                        "estimated_input_tokens": (
+                            overhead + count * per_item_tokens + extra_output_tokens
+                            + final_context_reserve
+                        ),
                         "estimated_output_tokens": semantic_output,
                         "estimated_reasoning_tokens": semantic_reasoning,
                         "configured_transport_retry_reserve": retry_reserve,
@@ -6277,6 +7196,16 @@ class OutlineV3Executor:
                             "configured" if retry_reserve is not None else "unknown"
                         ),
                         "input_estimate_kind": "wrapper_plus_upstream_output_upper_bound",
+                        "request_payload_status": "output_dependent",
+                        "wrapper_level": (
+                            "first_level_conservative_relation_context_reserve"
+                            if level == 1 and final_context_reserve
+                            else "final_relations_cleared"
+                            if level > 1
+                            else final_wrapper_level
+                        ),
+                        "relation_context_reserve_tokens": final_context_reserve,
+                        "relation_group_packing_status": relation_group_packing_status,
                     }
                 )
                 return rows
@@ -6284,23 +7213,31 @@ class OutlineV3Executor:
             try:
                 cross_plan_rows = plan_bounded_stage(
                     "cross_group_comparison_provider",
-                    # Relation candidates are routed with their owning topic
-                    # group and consumed at the first reducer level. They are
-                    # fixed input context, not additional upstream result
-                    # items; the shell request above accounts for their full
-                    # serialized token cost.
+                    # Relation candidates are routed to one owning topic group
+                    # after provider outputs exist. Their serialized context
+                    # is reserved once on the first level, not repeated on
+                    # every projected group or carried into later levels.
                     item_count=max(1, cross_group_runtime_item_count),
                     item_output_tokens=cross_item_tokens,
                     wrapper_tokens=cross_wrapper_tokens,
+                    first_level_context_tokens=cross_relation_context_tokens,
                 )
                 global_plan_rows = plan_bounded_stage(
                     "global_synthesis_provider",
                     item_count=1,
                     item_output_tokens=semantic_output,
                     wrapper_tokens=global_wrapper_tokens,
+                    final_wrapper_level="final_relation_candidates_cleared",
                 )
                 cross_wrapper_bytes = len(json.dumps(
                     self._attach_prompt_authority("cross_group_comparison_provider:preflight", cross_shell_request),
+                    ensure_ascii=False, sort_keys=True,
+                ).encode("utf-8"))
+                cross_relation_context_wrapper_bytes = len(json.dumps(
+                    self._attach_prompt_authority(
+                        "cross_group_comparison_provider:preflight",
+                        cross_relation_context_request,
+                    ),
                     ensure_ascii=False, sort_keys=True,
                 ).encode("utf-8"))
                 global_wrapper_bytes = len(json.dumps(
@@ -6309,6 +7246,16 @@ class OutlineV3Executor:
                 ).encode("utf-8"))
                 for row in cross_plan_rows:
                     row["static_wrapper_canonical_bytes"] = cross_wrapper_bytes
+                    row["relation_context_wrapper_canonical_bytes"] = (
+                        cross_relation_context_wrapper_bytes
+                        if row.get("relation_context_reserve_tokens")
+                        else 0
+                    )
+                    row["relation_context_assignment_status"] = (
+                        "one_conservative_unassigned_stage_reserve"
+                        if row.get("relation_context_reserve_tokens")
+                        else "not_present_in_this_wrapper_level"
+                    )
                 for row in global_plan_rows:
                     row["static_wrapper_canonical_bytes"] = global_wrapper_bytes
             except OutlineV3ExecutionError as exc:
@@ -6323,6 +7270,22 @@ class OutlineV3Executor:
                 *global_plan_rows,
             ]
             self.semantic_request_plan = semantic_stage_plan
+            for stage_rows in (cross_plan_rows, global_plan_rows):
+                planned_reducer_count = len({
+                    str(row["node_id"]) for row in stage_rows
+                    if ":reduce:" in str(row["node_id"])
+                })
+                reducer_call_limit = planned_reducer_count or MAX_SEMANTIC_REDUCER_CALLS_PER_STAGE
+                for row in stage_rows:
+                    row["planned_reducer_count"] = planned_reducer_count
+                    row["runtime_reducer_call_limit"] = reducer_call_limit
+                    row["runtime_reducer_limit_basis"] = (
+                        "source_bounded_preflight_tree" if planned_reducer_count
+                        else "legacy_unmaterialized_fallback"
+                    )
+                    row["upper_bound_exceeds_runtime_reducer_guard"] = (
+                        planned_reducer_count > reducer_call_limit
+                    )
             self.topic_request_plan_identity_hash = self._compute_topic_provider_plan_identity_hash(
                 semantic_stage_plan
             )
@@ -6570,26 +7533,218 @@ class OutlineV3Executor:
                         + repair_output / 1000.0 * float(self.output_cost_per_1k_tokens or 0.0)
                         + repair_reasoning / 1000.0 * float(self.reasoning_cost_per_1k_tokens or 0.0)
                     )
-        nonsemantic_retry_unknown = retry_reserve_unknown_call_count > 0
+        attempt_bound_components = (
+            (len(transport_plans), estimated_physical_attempts_upper_bound),
+            (semantic_synthesis_calls, semantic_physical_attempts_upper),
+            (hierarchical_candidate_shard_calls, hierarchical_candidate_attempt_upper),
+            (hierarchical_relation_shard_calls, hierarchical_relation_attempt_upper),
+            (hierarchical_critique_shard_calls, critique_extra_attempt_upper),
+            (semantic_repair_calls_reserved, semantic_repair_attempt_upper),
+        )
+        configured_retry_slots_upper_bound = (
+            sum(
+                max(0, int(physical_attempts) - logical_calls)
+                for logical_calls, physical_attempts in attempt_bound_components
+                if physical_attempts is not None
+            )
+            if all(physical_attempts is not None for _, physical_attempts in attempt_bound_components)
+            else None
+        )
+        candidate_projection_rows = [
+            dict(row)
+            for _key, row in sorted(
+                getattr(self, "_candidate_preflight_projection_state", {}).items()
+            )
+            if isinstance(row, Mapping)
+        ]
+        unmaterialized_candidate_projection_rows = [
+            row for row in candidate_projection_rows
+            if str(row.get("status") or "").startswith("unmaterialized")
+        ]
+        arbitration_projection_rows = [
+            dict(row)
+            for _key, row in sorted(
+                getattr(self, "_prospective_arbitration_requests", {}).items()
+            )
+            if isinstance(row, Mapping)
+        ]
+        semantic_reducer_call_upper_bound = sum(
+            ":reduce:" in str(row.get("node_id") or "")
+            for row in self.semantic_request_plan
+            if isinstance(row, Mapping)
+        )
+        semantic_output_dependent_request_count = sum(
+            str(row.get("request_payload_status") or "") == "output_dependent"
+            for row in self.semantic_request_plan
+            if isinstance(row, Mapping)
+            and str(row.get("node_id") or "").startswith((
+                "cross_group_comparison_provider",
+                "global_synthesis_provider",
+            ))
+        )
+        semantic_reducer_relation_routing_unresolved = any(
+            row.get("relation_group_packing_status")
+            == "incomplete_until_relation_routing_materializes"
+            for row in self.semantic_request_plan
+            if isinstance(row, Mapping)
+        )
+        future_request_materialization_pending = bool(
+            unmaterialized_candidate_projection_rows
+            or arbitration_projection_rows
+            or semantic_reducer_call_upper_bound
+            or semantic_output_dependent_request_count
+        )
+        known_provider_calls_lower_bound = len(transport_plans)
+        if self.semantic_provider_synthesis_enabled:
+            # Topic batch count is materialized from complete evidence units;
+            # cross/global synthesis each require at least one call. Reducer
+            # calls above this floor depend on provider outputs and remain an
+            # upper projection until those outputs can be materialized.
+            known_provider_calls_lower_bound += semantic_topic_batches + 2
+        exact_topic_rows = [
+            row for row in self.semantic_request_plan
+            if isinstance(row, Mapping)
+            and str(row.get("node_id") or "").startswith("topic_synthesis_provider:batch:")
+            and bool(str(row.get("request_hash") or ""))
+        ]
+        exact_topic_input_tokens = sum(
+            max(0, int(row.get("estimated_input_tokens") or 0))
+            for row in exact_topic_rows
+        )
+        exact_topic_output_reserve_tokens = sum(
+            max(0, int(row.get("estimated_output_tokens") or 0))
+            for row in exact_topic_rows
+        )
+        exact_topic_reasoning_reserve_tokens = sum(
+            max(0, int(row.get("estimated_reasoning_tokens") or 0))
+            for row in exact_topic_rows
+        )
+        known_fixed_transport_input_tokens = 0
+        known_fixed_transport_output_reserve_tokens = 0
+        known_fixed_transport_reasoning_reserve_tokens = 0
+        unmaterialized_candidate_keys = {
+            (str(row.get("variant_name") or ""), str(row.get("candidate_id") or "candidate_1"))
+            for row in unmaterialized_candidate_projection_rows
+        }
+        for plan in transport_plans:
+            plan_variant = str(plan.variant_name or "")
+            if str(plan.node_id).endswith("_provider_generation"):
+                candidate_id = str(plan.node_id).removesuffix("_provider_generation")
+                dynamic_candidate_input = (plan_variant, candidate_id) in unmaterialized_candidate_keys
+            elif str(plan.node_id) in {
+                "structure_critique", "coverage_critique", "evidence_critique", "arbitration",
+            }:
+                dynamic_candidate_input = any(
+                    variant == plan_variant for variant, _candidate_id in unmaterialized_candidate_keys
+                ) or (
+                    str(plan.node_id) == "arbitration"
+                    and self.semantic_provider_synthesis_enabled
+                )
+            else:
+                dynamic_candidate_input = False
+            if plan.upper_bound and not dynamic_candidate_input:
+                known_fixed_transport_input_tokens += max(0, int(plan.estimated_input_tokens))
+            # Output and reasoning ceilings are fixed by the configured route
+            # for each already planned transport. They are reserved tokens,
+            # not claims about provider-reported usage.
+            known_fixed_transport_output_reserve_tokens += max(
+                0, int(plan.estimated_output_tokens)
+            )
+            known_fixed_transport_reasoning_reserve_tokens += max(
+                0, int(plan.estimated_reasoning_tokens)
+            )
+        known_estimated_input_tokens_lower_bound = (
+            exact_topic_input_tokens
+            + known_fixed_transport_input_tokens
+            + semantic_fixed_wrapper_input_tokens
+        )
+        known_estimated_output_tokens_lower_bound = (
+            exact_topic_output_reserve_tokens
+            + known_fixed_transport_output_reserve_tokens
+            + semantic_required_stage_output_tokens
+        )
+        known_estimated_reasoning_tokens_lower_bound = (
+            exact_topic_reasoning_reserve_tokens
+            + known_fixed_transport_reasoning_reserve_tokens
+            + semantic_required_stage_reasoning_tokens
+        )
+        known_estimated_total_tokens_lower_bound = (
+            known_estimated_input_tokens_lower_bound
+            + known_estimated_output_tokens_lower_bound
+            + known_estimated_reasoning_tokens_lower_bound
+        )
+        known_estimated_cost_lower_bound: float | None = None
+        if (
+            self._pricing_is_explicit
+            and not self._pricing_unknown_due_to_multiple_routes
+            and self.input_cost_per_1k_tokens is not None
+            and self.output_cost_per_1k_tokens is not None
+            and self.reasoning_cost_per_1k_tokens is not None
+        ):
+            known_estimated_cost_lower_bound = (
+                known_estimated_input_tokens_lower_bound
+                / 1000.0 * float(self.input_cost_per_1k_tokens)
+                + known_estimated_output_tokens_lower_bound
+                / 1000.0 * float(self.output_cost_per_1k_tokens)
+                + known_estimated_reasoning_tokens_lower_bound
+                / 1000.0 * float(self.reasoning_cost_per_1k_tokens)
+            )
+        estimated_cost_projected_before_materialization = estimated_cost
+        active_retry_controller = self._bound_durable_retry_projection_controller()
+        retry_projection_scope = "per_call_only"
+        retry_projection_budget_source = ""
+        retry_projection_bound_source = "per_call"
+        retry_projection_pool_remaining: int | None = None
+        if active_retry_controller is not None:
+            retry_projection = project_shared_retry_slots_v1(
+                estimated_provider_calls,
+                configured_retry_slots_upper_bound=configured_retry_slots_upper_bound,
+                aggregate_controller=active_retry_controller,
+            )
+            retry_projection_scope = "active_run"
+            retry_projection_budget_source = "bound_durable_controller"
+            retry_projection_bound_source = retry_projection.retry_bound_source
+            retry_projection_pool_remaining = (
+                retry_projection.aggregate_retry_pool_remaining
+            )
+        elif self.prospective_provider_budget is not None:
+            prospective_retry_pool = int(
+                self.prospective_provider_budget.max_retry_attempts_total
+            )
+            prospective_retry_slots = (
+                prospective_retry_pool
+                if configured_retry_slots_upper_bound is None
+                else min(
+                    configured_retry_slots_upper_bound,
+                    prospective_retry_pool,
+                )
+            )
+            retry_projection = project_shared_retry_slots_v1(
+                estimated_provider_calls,
+                configured_retry_slots_upper_bound=prospective_retry_slots,
+            )
+            retry_projection_scope = "prospective_run_resources"
+            retry_projection_budget_source = self.prospective_provider_budget_source
+            retry_projection_bound_source = "prospective_strict_v2_retry_pool"
+            retry_projection_pool_remaining = prospective_retry_pool
+        else:
+            retry_projection = project_shared_retry_slots_v1(
+                estimated_provider_calls,
+                configured_retry_slots_upper_bound=configured_retry_slots_upper_bound,
+            )
         if hierarchical_critique_shard_calls:
             # Their current dynamic input/retry estimates are not a complete
             # upper bound, so an apparent monetary ceiling would be misleading.
             estimated_cost = None
+        if future_request_materialization_pending:
+            # Candidate group assignment and arbitration support catalogs are
+            # not fully known at run start. Keep the finite resource projection
+            # visible, but do not label its partial sum a complete monetary
+            # estimate. The aggregate run envelope and per-request JIT checks
+            # remain authoritative for every actual call.
+            estimated_cost = None
         estimated_provider_physical_attempts_upper_bound = (
-            estimated_physical_attempts_upper_bound
-            + int(semantic_physical_attempts_upper)
-            + int(hierarchical_candidate_attempt_upper)
-            + int(hierarchical_relation_attempt_upper)
-            + int(critique_extra_attempt_upper)
-            + int(semantic_repair_attempt_upper)
-            if estimated_physical_attempts_upper_bound is not None
-            and semantic_physical_attempts_upper is not None
-            and not nonsemantic_retry_unknown
-            and hierarchical_candidate_attempt_upper is not None
-            and hierarchical_relation_attempt_upper is not None
-            and semantic_repair_attempt_upper is not None
-            and critique_extra_attempt_upper is not None
-            else None
+            retry_projection.physical_attempts_upper_bound
         )
         semantic_request_upper_bound_status = (
             "materialized_upper_bound"
@@ -6609,12 +7764,56 @@ class OutlineV3Executor:
             "provider_nodes_per_decision": core_calls,
             "variant_names": [name for name, _summaries, _order, _definition in variants],
             "estimated_provider_calls": estimated_provider_calls,
+            "known_provider_calls_lower_bound": known_provider_calls_lower_bound,
+            "provider_call_count_bound_status": (
+                "future_upper_bound_not_fully_materialized"
+                if future_request_materialization_pending
+                else "planned_upper_bound"
+            ),
             "estimated_provider_physical_attempts_upper_bound": estimated_provider_physical_attempts_upper_bound,
             "configured_retry_reserve_unknown_call_count": retry_reserve_unknown_call_count,
+            "configured_retry_slots_upper_bound": configured_retry_slots_upper_bound,
+            "aggregate_retry_pool_remaining": retry_projection_pool_remaining,
+            "retry_attempts_upper_bound": retry_projection.retry_attempts_upper_bound,
+            "retry_bound_source": retry_projection.retry_bound_source,
+            "retry_projection_scope": retry_projection_scope,
+            "retry_projection_budget_source": retry_projection_budget_source,
+            "retry_projection_bound_source": retry_projection_bound_source,
+            "aggregate_retry_pool_applied_to": "physical_attempts_only",
+            "token_retry_reserve_scope": "per_call_conservative_ceiling",
+            "cost_retry_reserve_scope": "per_call_conservative_ceiling",
             "physical_attempt_estimate_status": (
-                "upper_bound"
-                if estimated_provider_physical_attempts_upper_bound is not None
-                else "unknown_or_extra_shard_attempts_not_bound"
+                "incomplete_until_dynamic_request_materialization"
+                if future_request_materialization_pending
+                else (
+                    "upper_bound"
+                    if estimated_provider_physical_attempts_upper_bound is not None
+                    else "unknown_or_extra_shard_attempts_not_bound"
+                )
+            ),
+            "provider_call_plan_bound_status": (
+                "incomplete_until_dynamic_request_materialization"
+                if future_request_materialization_pending
+                else "materialized_upper_bound"
+            ),
+            "candidate_group_preflight_status": (
+                "unmaterialized_future_requests"
+                if unmaterialized_candidate_projection_rows
+                else "source_closed_group_plan_materialized"
+                if candidate_projection_rows
+                else "not_applicable"
+            ),
+            "candidate_group_preflight_projections": candidate_projection_rows,
+            "prospective_arbitration_request_status": (
+                "awaiting_exact_candidate_and_critique_outputs"
+                if arbitration_projection_rows
+                else "not_applicable"
+            ),
+            "prospective_arbitration_requests": arbitration_projection_rows,
+            "future_request_input_cap_policy": (
+                "serializer_measure_and_enforce_effective_cap_before_each_materialized_request"
+                if future_request_materialization_pending
+                else "all_planned_requests_measured"
             ),
             "hierarchical_candidate_shard_calls": hierarchical_candidate_shard_calls,
             "hierarchical_candidate_physical_attempts_upper_bound": hierarchical_candidate_attempt_upper,
@@ -6644,6 +7843,20 @@ class OutlineV3Executor:
             "semantic_cross_group_planner_item_count": cross_group_planner_item_count,
             "semantic_cross_group_fragment_bounds_status": cross_group_fragment_bounds_status,
             "semantic_request_upper_bound_status": semantic_request_upper_bound_status,
+            "semantic_reducer_call_upper_bound": semantic_reducer_call_upper_bound,
+            "semantic_reducer_call_bound_status": (
+                "incomplete_until_relation_routing_materializes"
+                if semantic_reducer_relation_routing_unresolved
+                else "output_dependent_upper_bound_pending_materialization"
+                if semantic_reducer_call_upper_bound
+                else "no_projected_reducer_calls"
+            ),
+            "semantic_output_dependent_request_count": semantic_output_dependent_request_count,
+            "semantic_output_dependent_request_status": (
+                "awaiting_upstream_provider_outputs"
+                if semantic_output_dependent_request_count
+                else "none"
+            ),
             "semantic_output_token_limit": semantic_output_token_limit,
             "semantic_input_plan_kind": (
                 "exact_topic_requests_plus_cross_global_output_upper_bounds"
@@ -6656,6 +7869,31 @@ class OutlineV3Executor:
             "estimated_cached_input_tokens": estimated_cached_input_tokens,
             "estimated_cache_write_tokens": estimated_cache_write_tokens,
             "estimated_total_tokens": estimated_total_tokens,
+            "known_estimated_input_tokens_lower_bound": known_estimated_input_tokens_lower_bound,
+            "known_estimated_output_tokens_lower_bound": known_estimated_output_tokens_lower_bound,
+            "known_estimated_reasoning_tokens_lower_bound": known_estimated_reasoning_tokens_lower_bound,
+            "known_estimated_total_tokens_lower_bound": known_estimated_total_tokens_lower_bound,
+            "known_token_reserve_floor_basis": {
+                "exact_hashed_topic_request_count": len(exact_topic_rows),
+                "fixed_transport_plan_count": len(transport_plans),
+                "fixed_transport_input_estimates_exclude_unmaterialized_candidate_critique_and_arbitration_inputs": True,
+                "mandatory_cross_global_wrapper_input_reserve_tokens": semantic_fixed_wrapper_input_tokens,
+                "mandatory_cross_global_output_reserve_tokens": semantic_required_stage_output_tokens,
+                "mandatory_cross_global_reasoning_reserve_tokens": semantic_required_stage_reasoning_tokens,
+                "interpretation": "configured request/output reserves used for admission planning, not provider-reported usage",
+            },
+            "known_estimated_cost_lower_bound": known_estimated_cost_lower_bound,
+            "known_estimated_cost_lower_bound_status": (
+                "estimated_from_explicit_rates"
+                if known_estimated_cost_lower_bound is not None
+                else "unknown_pricing_or_multi_route_rates"
+            ),
+            "estimated_cost_projected_before_materialization": estimated_cost_projected_before_materialization,
+            "estimated_cost_projected_before_materialization_status": (
+                "partial_future_request_projection"
+                if future_request_materialization_pending
+                else "complete_projected_estimate"
+            ),
             "estimated_cost": estimated_cost,
             "pricing_source": self.pricing_source,
             "pricing_policy": self.pricing_policy,
@@ -6693,14 +7931,34 @@ class OutlineV3Executor:
         if self.stability_mode != "off" and not self._provider_configured():
             self.stability_preflight["preflight_status"] = "rejected"
             self.stability_preflight["rejection_reason"] = "stability_provider_or_route_missing"
-        elif self.max_provider_calls is not None and estimated_provider_calls > self.max_provider_calls:
+        elif (
+            self.max_provider_calls is not None
+            and (
+                known_provider_calls_lower_bound > self.max_provider_calls
+                or (
+                    not future_request_materialization_pending
+                    and estimated_provider_calls > self.max_provider_calls
+                )
+            )
+        ):
             self.stability_preflight["preflight_status"] = "rejected"
             self.stability_preflight["rejection_reason"] = "max_provider_calls_exceeded"
-        elif self.max_provider_calls is not None and estimated_provider_physical_attempts_upper_bound is None:
+        elif (
+            self.max_provider_calls is not None
+            and retry_reserve_unknown_call_count > 0
+        ):
             self.stability_preflight["preflight_status"] = "rejected"
             self.stability_preflight["rejection_reason"] = "provider_physical_attempt_bound_unknown"
         elif (
             self.max_provider_calls is not None
+            and not future_request_materialization_pending
+            and estimated_provider_physical_attempts_upper_bound is None
+        ):
+            self.stability_preflight["preflight_status"] = "rejected"
+            self.stability_preflight["rejection_reason"] = "provider_physical_attempt_bound_unknown"
+        elif (
+            self.max_provider_calls is not None
+            and not future_request_materialization_pending
             and estimated_provider_physical_attempts_upper_bound is not None
             and estimated_provider_physical_attempts_upper_bound > self.max_provider_calls
         ):
@@ -6708,6 +7966,14 @@ class OutlineV3Executor:
             self.stability_preflight["rejection_reason"] = "max_provider_physical_attempts_exceeded"
         elif (
             self.max_estimated_cost is not None
+            and known_estimated_cost_lower_bound is not None
+            and known_estimated_cost_lower_bound > self.max_estimated_cost
+        ):
+            self.stability_preflight["preflight_status"] = "rejected"
+            self.stability_preflight["rejection_reason"] = "max_estimated_cost_exceeded"
+        elif (
+            self.max_estimated_cost is not None
+            and not future_request_materialization_pending
             and estimated_cost is not None
             and estimated_cost > self.max_estimated_cost
         ):
@@ -6715,7 +7981,13 @@ class OutlineV3Executor:
             self.stability_preflight["rejection_reason"] = "max_estimated_cost_exceeded"
         elif (
             self.max_estimated_total_tokens is not None
-            and estimated_total_tokens > self.max_estimated_total_tokens
+            and (
+                known_estimated_total_tokens_lower_bound > self.max_estimated_total_tokens
+                or (
+                    not future_request_materialization_pending
+                    and estimated_total_tokens > self.max_estimated_total_tokens
+                )
+            )
         ):
             self.stability_preflight["preflight_status"] = "rejected"
             self.stability_preflight["rejection_reason"] = "max_estimated_total_tokens_exceeded"
@@ -6723,6 +7995,7 @@ class OutlineV3Executor:
             item.estimated_input_tokens
             > self._effective_input_cap(self._role_route(item.node_id).profile)
             for item in transport_plans
+            if item.upper_bound
         ) or (
             semantic_repair_calls_reserved
             and semantic_repair_input
@@ -6740,6 +8013,13 @@ class OutlineV3Executor:
         ):
             self.stability_preflight["preflight_status"] = "rejected"
             self.stability_preflight["rejection_reason"] = "smoke_overhead_ratio_exceeded"
+        if (
+            self.stability_preflight["preflight_status"] == "accepted"
+            and future_request_materialization_pending
+        ):
+            self.stability_preflight["preflight_status"] = (
+                "awaiting_exact_future_request_materialization"
+            )
         if self.max_estimated_cost is not None and estimated_cost is None:
             self.stability_preflight["cost_ceiling_note"] = (
                 "monetary ceiling was not enforced because pricing or dynamic-call bounds are unknown"
@@ -6763,7 +8043,10 @@ class OutlineV3Executor:
         )
         self.artifact_paths["provider_call_plan"] = plan_record.path
         self.artifact_records["provider_call_plan"] = plan_record
-        if self.stability_preflight["preflight_status"] != "accepted":
+        if self.stability_preflight["preflight_status"] not in {
+            "accepted",
+            "awaiting_exact_future_request_materialization",
+        }:
             raise OutlineV3ExecutionError(
                 "outline stability preflight rejected: "
                 + str(self.stability_preflight.get("rejection_reason") or "unknown")
@@ -6834,6 +8117,10 @@ class OutlineV3Executor:
         return result
 
     def _artifact_type_for_node(self, node_id: str) -> str:
+        if node_id.startswith("candidate_comparison_fragments_provider:"):
+            return "candidate_comparison_fragments_result"
+        if node_id.startswith("candidate_organization_provider:"):
+            return "candidate_organization_map_result"
         if node_id == "relation_adjudication":
             return "relation_adjudication_result"
         if node_id == "global_relation_map":
@@ -6871,6 +8158,7 @@ class OutlineV3Executor:
         prompt_payload_hash: str = "",
         api_config: Mapping[str, Any] | None = None,
         route: OutlineRoleRoute | None = None,
+        provider_execution: bool = True,
     ) -> dict[str, Any]:
         """Build the complete current binding before attempting node reuse.
 
@@ -6887,8 +8175,13 @@ class OutlineV3Executor:
             "section_evidence_packets", "final_outline", "coverage_audit", "stability_audit",
             "provider_receipt_closure", "stage_health",
         }
-        provider_node = (
-            node_id in self._provider_node_ids()
+        provider_node = provider_execution and (
+            # Dynamic compiler IDs need not share a static DAG prefix. An
+            # explicit execution route is the provider authority for those
+            # calls, just as it is for their actual transport and receipt.
+            route is not None
+            or node_id in self._provider_node_ids()
+            or node_id.startswith("arbitration:")
             or node_id.startswith("stability:")
             or node_id.endswith("_semantic_repair")
             or node_id.startswith("relation_adjudication:")
@@ -6897,6 +8190,8 @@ class OutlineV3Executor:
                 "topic_synthesis_provider",
                 "cross_group_comparison_provider",
                 "global_synthesis_provider",
+                "candidate_comparison_fragments_provider:",
+                "candidate_organization_provider:",
             ))
             or (
                 self.semantic_provider_synthesis_enabled
@@ -6945,6 +8240,7 @@ class OutlineV3Executor:
                 })
         candidate_sensitive = (
             node_id in review_nodes
+            or node_id.startswith("arbitration:")
             or node_id.startswith("candidate_")
             or node_id.startswith((
                 "topic_synthesis_provider",
@@ -7530,6 +8826,25 @@ class OutlineV3Executor:
                 raise OutlineV3ExecutionError(
                     f"verified reuse evidence is not ready for {expected.call_id}"
                 )
+            if evidence.artifact_type == "source_revision_provider_reuse":
+                context = self.source_revision_replay_context
+                if context is None:
+                    raise OutlineV3ExecutionError("SourceRevision reuse lost its executing context")
+                proof = json.loads(Path(evidence.path).read_text(encoding="utf-8"))
+                match = self._source_revision_matches.get(expected.call_id)
+                if match is None:
+                    raise OutlineV3ExecutionError("SourceRevision closure lost its current request binding")
+                output_ref = proof.get("child_output_ref") or {}
+                output = self.registry.get(str(output_ref.get("artifact_id") or ""))
+                if output is None:
+                    raise OutlineV3ExecutionError("SourceRevision child output is missing")
+                context.verify_child_reuse_proof(
+                    evidence, child_expected_call=expected, child_output_record=output,
+                    current_scope=match.scope, route_identity=match.route_identity,
+                    external_registry_resolver=context.external_registry_resolver,
+                )
+                records.append(evidence)
+                continue
             try:
                 self.registry.verify_ready_artifact_closure(evidence)
                 payload = json.loads(Path(evidence.path).read_text(encoding="utf-8"))
@@ -7781,6 +9096,7 @@ class OutlineV3Executor:
         model: str = "deterministic",
         provider: str = "local",
         execution_binding: Mapping[str, Any] | None = None,
+        receipt_ids: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         path = self._node_path(node_id)
         artifact_id = (
@@ -7788,6 +9104,10 @@ class OutlineV3Executor:
             if node_id == "provider_receipt_closure"
             else f"outline-v3:{node_id}"
         )
+        derived_terminal = getattr(self, "_arbitration_terminal_dependencies", {}).get(node_id)
+        dependency_refs = self._dependency_refs(depends_on)
+        if derived_terminal is not None:
+            dependency_refs.append(ArtifactDependencyRefV2.from_record(derived_terminal))
         record = publish_json_artifact(
             self.publication_context,
             self.registry,
@@ -7798,7 +9118,7 @@ class OutlineV3Executor:
             artifact_version=artifact.artifact_version,
             producer="outline.v3_executor.OutlineV3Executor",
             artifact_id=artifact_id,
-            depends_on=self._dependency_refs(depends_on),
+            depends_on=dependency_refs,
             metadata={
                 "job_id": self.job_id,
                 "node_id": node_id,
@@ -7854,11 +9174,12 @@ class OutlineV3Executor:
             provider=provider,
             config_snapshot={"candidate_count": self.candidate_count},
             budget_snapshot={"input_budget": self.profile.input_budget},
-            receipt_ids=tuple(
+            receipt_ids=tuple(receipt_ids) if receipt_ids is not None else tuple(
                 [self._expected_provider_calls[f"outline:{node_id}"].call_id]
                 if f"outline:{node_id}" in self._expected_provider_calls else self.receipts
             ),
             execution_binding=binding,
+            expected_current_dag=self._dag,
         )
         expected = self._expected_provider_calls.get(self._provider_call_id(node_id))
         if expected is not None:
@@ -8230,6 +9551,7 @@ class OutlineV3Executor:
 
         artifact = self._artifact(OutlineArtifact, payload, dependency_hashes)
         artifact_id = f"outline-v3:stability:{hash_text(node_id)[:24]}"
+        derived_terminal = getattr(self, "_arbitration_terminal_dependencies", {}).get(node_id)
         record = publish_json_artifact(
             self.publication_context,
             self.registry,
@@ -8240,6 +9562,7 @@ class OutlineV3Executor:
             artifact_version="v1",
             producer="outline.v3_executor.OutlineV3Executor",
             artifact_id=artifact_id,
+            depends_on=[ArtifactDependencyRefV2.from_record(derived_terminal)] if derived_terminal else [],
             metadata={
                 "job_id": self.job_id,
                 "node_id": node_id,
@@ -8355,6 +9678,7 @@ class OutlineV3Executor:
         payload: Mapping[str, Any],
         *,
         dependency_hashes: Mapping[str, str],
+        source_validated: bool = True,
     ) -> None:
         """Persist one dynamic candidate-generation shard without a DAG node."""
 
@@ -8378,6 +9702,7 @@ class OutlineV3Executor:
                 "parent_node": "candidate_provider_generation",
                 "content_hash": artifact.content_hash,
                 "closure_epoch_id": self.closure_epoch_id,
+                "source_validation_status": "validated" if source_validated else "pending",
             },
         )
         self.artifact_paths[node_id] = record.path
@@ -8395,6 +9720,571 @@ class OutlineV3Executor:
                 registered_artifact_hash=artifact.content_hash,
                 node_output_hash=artifact.content_hash,
             )
+            if source_validated:
+                pending = self._pending_replays.pop(node_id, None)
+                if pending is not None and expected.normalized_output_hash:
+                    replay_key, normalized_hash, receipt_id = pending
+                    self._replay_store.append(
+                        replay_key, output_hash=normalized_hash, normalized_output_hash=normalized_hash,
+                        registered_artifact_hash=artifact.content_hash, node_output_hash=artifact.content_hash,
+                        output_artifact_ids=(artifact_id,), receipt_ids=(receipt_id,),
+                        audit_node_id=node_id, closure_epoch_id=self.closure_epoch_id,
+                    )
+                    self._expected_provider_calls[expected.call_id] = replace(
+                        self._expected_provider_calls[expected.call_id], replay_output_hash=normalized_hash,
+                    )
+
+    def _persist_dynamic_provider_result(
+        self,
+        node_id: str,
+        artifact: OutlineArtifact,
+        *,
+        artifact_id: str,
+        artifact_role: str,
+        path: str | Path,
+        depends_on: Sequence[str] = (),
+        recovery_sources: Sequence[ArtifactRecord] = (),
+        external_registry_resolver: Callable[[str], ArtifactRegistry | None] | None = None,
+    ) -> ArtifactRecord:
+        """Publish an actual response while preserving its receipt/replay identity."""
+
+        record = publish_json_artifact(
+            self.publication_context, self.registry, path, artifact.to_dict(),
+            artifact_role=artifact_role, artifact_type=artifact.artifact_type,
+            artifact_version=artifact.artifact_version,
+            producer="outline.v3_executor.OutlineV3Executor", artifact_id=artifact_id,
+            depends_on=[
+                *self._dependency_refs(depends_on),
+                *(ArtifactDependencyRefV2(
+                    dependency_kind="local_job", job_id=source.job_id,
+                    artifact_id=source.artifact_id, artifact_type=source.artifact_type,
+                    path=source.path, content_hash=source.content_hash,
+                ) for source in recovery_sources),
+            ],
+            metadata={"job_id": self.job_id, "node_id": node_id, "content_hash": artifact.content_hash},
+            external_registry_resolver=external_registry_resolver,
+        )
+        self.artifact_paths[node_id] = record.path
+        self.artifact_records[node_id] = record
+        if isinstance(artifact, CandidateProviderResult):
+            self._update_request_audit_artifact_ref(node_id, record)
+        expected = self._expected_provider_calls.get(self._provider_call_id(node_id))
+        if expected is not None:
+            self._expected_provider_calls[expected.call_id] = replace(
+                expected, artifact_payload_hash=hash_json(artifact.payload),
+                artifact_content_hash=artifact.content_hash, registry_file_hash=record.content_hash,
+                artifact_path=record.path, registered_artifact_hash=artifact.content_hash,
+                node_output_hash=artifact.content_hash,
+            )
+            pending = self._pending_replays.pop(node_id, None)
+            if pending is not None and expected.normalized_output_hash:
+                replay_key, normalized_hash, receipt_id = pending
+                self._replay_store.append(
+                    replay_key, output_hash=normalized_hash, normalized_output_hash=normalized_hash,
+                    registered_artifact_hash=artifact.content_hash, node_output_hash=artifact.content_hash,
+                    output_artifact_ids=(artifact_id,), receipt_ids=(receipt_id,),
+                    audit_node_id=node_id, closure_epoch_id=self.closure_epoch_id,
+                )
+                self._expected_provider_calls[expected.call_id] = replace(
+                    self._expected_provider_calls[expected.call_id], replay_output_hash=normalized_hash,
+                )
+        return record
+
+    def _persist_candidate_provider_result(
+        self, node_id: str, payload: Mapping[str, Any], request: Mapping[str, Any],
+        *, comparisons: bool, dependency_hashes: Mapping[str, str], depends_on: Sequence[str],
+    ) -> tuple[ArtifactRecord, tuple[str, ...]]:
+        """Retain a raw comparison/map response against its actual provider call."""
+
+        exact_request = self._attach_prompt_authority(node_id, request)
+        request_hash = hash_json(exact_request)
+        binding = self._dynamic_provider_bindings.get(node_id)
+        expected = self._expected_provider_calls.get(self._provider_call_id(node_id))
+        if (binding is None or expected is None
+                or binding.get("prompt_payload_hash") != request_hash
+                or expected.normalized_output_hash != hash_json(payload)):
+            raise OutlineV3ExecutionError("candidate provider result lacks its exact request/response authority")
+        pending = self._pending_replays.get(node_id)
+        if pending is not None:
+            receipt_ids = (str(pending[2]),)
+        else:
+            evidence = next((row for row in reversed(self._replay_evidence)
+                             if row.get("node_id") == node_id), {})
+            receipt_ids = tuple(str(value) for value in evidence.get("reused_receipt_ids") or ())
+        if not receipt_ids or len(set(receipt_ids)) != len(receipt_ids):
+            raise OutlineV3ExecutionError("candidate provider result has no exact physical receipt identity")
+        cls = CandidateComparisonFragmentsResult if comparisons else CandidateOrganizationMapResult
+        artifact = cls(
+            job_id=self.job_id,
+            dependency_hashes={**dict(dependency_hashes), "request_payload_hash": request_hash},
+            payload=json.loads(json.dumps(payload, ensure_ascii=False, allow_nan=False)),
+            provider_request=json.loads(json.dumps(exact_request, ensure_ascii=False, allow_nan=False)),
+        )
+        kind = "comparison-fragments" if comparisons else "organization-map"
+        record = self._persist_dynamic_provider_result(
+            node_id, artifact, artifact_id=f"outline-v3:{kind}:{hash_text(node_id)[:24]}",
+            artifact_role=f"outline_v3_candidate_{kind.replace('-', '_')}",
+            path=self._node_path(f"candidate_provider/{node_id}"), depends_on=depends_on,
+        )
+        return record, receipt_ids
+
+    def _snapshot_candidate_provider_receipts(
+        self, node_id: str, receipt_ids: Sequence[str], response: Mapping[str, Any],
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Copy actual immutable receipts; never make a partial canonical ledger."""
+
+        current = {row.receipt_id: row for row in self._receipt_ledger.list_receipts()}
+        historical = self._replay_receipt_index() if any(rid not in current for rid in receipt_ids) else {}
+        refs: list[dict[str, Any]] = []
+        keys: list[str] = []
+        binding = self._dynamic_provider_bindings.get(node_id) or {}
+        for receipt_id in receipt_ids:
+            receipt = current.get(receipt_id) or historical.get(receipt_id)
+            if (receipt is None or receipt.test_only or receipt.status != "success"
+                    or receipt.job_id != self.job_id or receipt.stage_name != "outline_v3"
+                    or receipt.call_id != self._provider_call_id(node_id)
+                    or receipt.attempt_id != self._provider_call_id(node_id)
+                    or receipt.node_id != self._semantic_receipt_node_id(node_id)
+                    or receipt.response_hash != hash_json(response)
+                    or receipt.input_hash != binding.get("prompt_payload_hash")
+                    or receipt.config_hash != binding.get("provider_config_hash")
+                    or receipt.schema_hash != binding.get("schema_hash")
+                    or receipt.provider != binding.get("provider_family")
+                    or receipt.model != binding.get("model_name")
+                    or receipt.endpoint_type != binding.get("endpoint_type")
+                    or receipt.endpoint != binding.get("api_base_host")
+                    or receipt.finish_reason == "length" or receipt.incomplete_reason):
+                raise OutlineV3ExecutionError("candidate fragment receipt has foreign or unverified response authority")
+            receipt_hash = self._receipt_record_hash(receipt)
+            payload = (json.dumps(receipt.to_dict(), ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n").encode("utf-8")
+            record = publish_bytes_artifact(
+                self.publication_context, self.registry,
+                self._path(f"outline_v3/candidate_receipts/{receipt_hash}.jsonl"), payload,
+                artifact_role="candidate_fragment_receipt_snapshot",
+                artifact_type="provider_receipt_ledger", artifact_version="v1",
+                producer="outline.v3_executor.OutlineV3Executor",
+                artifact_id=f"outline-v3:candidate-receipt:{receipt_hash[:24]}",
+                metadata={
+                    "stage_name": "outline_v3_candidate_receipt_snapshot",
+                    "closure_epoch_id": receipt.closure_epoch_id, "receipt_count": 1,
+                    "receipt_id": receipt.receipt_id, "receipt_record_hash": receipt_hash,
+                },
+            )
+            key = f"candidate_receipt:{receipt_id}"
+            self.artifact_records[key] = record
+            self.artifact_paths[key] = record.path
+            keys.append(key)
+            refs.append({
+                "receipt_id": receipt.receipt_id, "content_hash": receipt_hash,
+                "snapshot_artifact_id": record.artifact_id, "snapshot_content_hash": record.content_hash,
+                "registry_job_id": self.job_id, "call_id": receipt.call_id,
+                "closure_epoch_id": receipt.closure_epoch_id,
+            })
+        return refs, keys
+
+    def _prepare_candidate_fragment_bank(
+        self, scope: Any, inventory: Any, topic_routes: Sequence[Mapping[str, Any]],
+        bridge_claims: Sequence[Mapping[str, Any]],
+        *, lineage_claims: Sequence[Mapping[str, Any]] = (),
+    ) -> tuple[dict[str, Any], ArtifactRecord]:
+        """Understand selected comparisons once; reuse existing canonical facts."""
+
+        scope_key = "candidate_output_scope"
+        scope_record = self.artifact_records[scope_key]
+        self.registry.verify_ready_artifact_closure(scope_record)
+        canonical = resolve_candidate_fragment_claims(
+            scope, inventory, topic_routes, bridge_claims, lineage_claims=lineage_claims,
+        )
+        parent_hash = scope.content_hash
+        required = self._required_candidate_group_ids(scope)
+        route = self._node_route("candidate_1_provider_generation")
+        profile = route.profile
+        aliases = self._alias_map_for(scope.paper_keys, scope.selected_relation_ids) if self._alias_enabled else None
+        source_context = {"interpretation_source_tables": self._candidate_interpretation_tables}
+        plans: list[tuple[str, dict[str, Any], int]] = []
+
+        def build(ids: Sequence[str]) -> tuple[str, dict[str, Any], int, bool]:
+            request = build_candidate_comparison_fragments_request_v1(
+                scope, ids, source_context, required_group_ids=sorted(required),
+                parent_scope_hash=parent_hash, alias_map=aliases,
+            )
+            node = "candidate_comparison_fragments_provider:" + hash_json(sorted(ids))[:24]
+            output = estimate_candidate_comparison_output_tokens_v1(request, profile.estimate_tokens)
+            request["output_contract"]["max_output_tokens"] = output
+            exact = self._attach_prompt_authority(node, request)
+            estimate = profile.estimate_request_v1(exact, requested_output_tokens=min(output, profile.max_output_tokens))
+            fits = (estimate.estimated_input_tokens <= self._effective_input_cap(profile)
+                    and output <= profile.max_output_tokens and estimate.within_context_budget)
+            return node, request, output, fits
+
+        pending: list[str] = []
+        priority = {"contradicts": 0, "reported_magnitude_contrast": 1, "qualifies": 2}
+        seeds = sorted((group for group in scope.claim_groups if group.claim_seed), key=lambda group: (
+            0 if group.claim_group_id in required else 1,
+            priority.get(str(dict(group.task_contract).get("relation_type") or ""), 9),
+            hash_json(dict(group.task_contract)), group.claim_group_id,
+        ))
+        for group in seeds:
+            node, request, output, fits = build([*pending, group.claim_group_id])
+            if fits:
+                pending.append(group.claim_group_id)
+                continue
+            if pending:
+                old_node, old_request, old_output, old_fits = build(pending)
+                assert old_fits
+                plans.append((old_node, old_request, old_output))
+                pending = []
+            node, request, output, fits = build([group.claim_group_id])
+            if not fits:
+                if group.claim_group_id in required:
+                    raise OutlineV3ExecutionError(
+                        f"RECOVERABLE_CAPACITY: required comparison {group.claim_group_id} cannot fit intact; "
+                        f"input={profile.estimate_tokens(self._attach_prompt_authority(node, request))}/"
+                        f"{self._effective_input_cap(profile)}, output={output}/{profile.max_output_tokens}"
+                    )
+                self.diagnostics.append(f"optional comparison {group.claim_group_id} deferred: intact request capacity")
+                continue
+            pending = [group.claim_group_id]
+        if pending:
+            node, request, output, fits = build(pending)
+            assert fits
+            plans.append((node, request, output))
+        if self.max_provider_calls is not None and self._provider_call_count + len(plans) > self.max_provider_calls:
+            raise OutlineV3ExecutionError("outline budget cannot admit the materialized shared comparison plan")
+        source_keys = [key for key in (
+            scope_key, "outline_content_layers", "semantic_chunk_plan", "topic_synthesis",
+            "cross_group_comparison", "global_synthesis",
+        ) if key in self.artifact_records]
+        deps = {key: self.artifact_records[key].content_hash for key in source_keys}
+        rows: list[dict[str, Any]] = []
+        result_keys: list[str] = []
+        for node, request, output in plans:
+            self._check(node)
+            self.registry.verify_ready_artifact_closure(scope_record)
+            response = self._provider_call(
+                node, request, expect_json=True, input_artifact_hashes=tuple(deps.values()),
+                transport_node_id="candidate_1_provider_generation", output_tokens=output,
+            )
+            validate_candidate_comparison_fragments_output_v1(response, request)
+            record, receipt_ids = self._persist_candidate_provider_result(
+                node, response, request, comparisons=True, dependency_hashes=deps, depends_on=source_keys,
+            )
+            receipt_refs, receipt_keys = self._snapshot_candidate_provider_receipts(node, receipt_ids, response)
+            result_keys.extend([node, *receipt_keys])
+            for fragment in response["fragments"]:
+                group_id = request["claim_group_ids"][fragment["group_index"]]
+                if fragment["materialization_state"] == "materialized":
+                    rows.append({
+                        "claim_group_id": group_id, "text": fragment["text"],
+                        "artifact_refs": [{"artifact_id": record.artifact_id, "content_hash": record.content_hash}],
+                        "provider_receipt_refs": receipt_refs,
+                    })
+        all_keys = list(dict.fromkeys([*source_keys, *result_keys]))
+        refs = [{"artifact_id": self.artifact_records[key].artifact_id,
+                 "content_hash": self.artifact_records[key].content_hash,
+                 "registry_job_id": self.job_id} for key in all_keys]
+        bank = build_candidate_fragment_bank_v1(scope, canonical, rows, sorted(required), refs)
+        validate_candidate_fragment_bank_v1(bank, scope)
+        record = publish_json_artifact(
+            self.publication_context, self.registry,
+            self._path(f"outline_v3/candidate_fragment_bank_{bank['content_hash']}.json"), bank,
+            artifact_id="outline-v3:candidate_fragment_bank", artifact_type="outline_candidate_fragment_bank",
+            artifact_version="v1", artifact_role="outline_candidate_fragment_bank",
+            producer="outline.v3_executor.OutlineV3Executor", depends_on=self._dependency_refs(all_keys),
+            metadata={"scope_hash": parent_hash, "group_count": len(bank["groups"]),
+                      "shared_comparison_calls": len(plans), "source_validation_status": "validated"},
+        )
+        self.artifact_records["candidate_fragment_bank"] = record
+        self.artifact_paths["candidate_fragment_bank"] = record.path
+        return bank, record
+
+    @staticmethod
+    def _candidate_organization_metadata_catalog(axis: Any, required_groups: Sequence[Any] = ()) -> list[dict[str, str]]:
+        """Trusted structural phrases; the composer cannot author factual metadata."""
+        dimensions = list(dict.fromkeys(axis.preferred_dimensions)) or ["source evidence"]
+        catalog = [{
+            "title": f"{axis.label}: {dimension.replace('_', ' ')}",
+            "goal": f"Organize the included {dimension.replace('_', ' ')} evidence and its recorded boundaries.",
+            "rationale": str(axis.rationale or axis.organizing_logic),
+        } for dimension in dimensions]
+        catalog.extend({
+            "title": f"{axis.label}: {title}",
+            "goal": "Compare the selected source evidence and preserve its recorded conditions and disagreements.",
+            "rationale": str(axis.rationale or axis.organizing_logic),
+        } for title in (
+            "Core concepts", "Research designs", "Source findings", "Null findings",
+            "Contrasting findings", "Cross-source comparisons", "Conditions and boundaries",
+            "Evidence across contexts", "Measurement and interpretation", "Converging evidence",
+            "Unresolved questions", "Research implications",
+        ))
+        catalog.extend({
+            "title": f"{axis.label}: required source comparison {index}",
+            "goal": dict(group.task_contract)["comparison_question"],
+            "rationale": str(axis.rationale or axis.organizing_logic),
+        } for index, group in enumerate(required_groups, start=1) if group.claim_seed)
+        return catalog
+
+    def _plan_candidate_fragment_organization(
+        self, bank: Mapping[str, Any], bank_record: ArtifactRecord,
+        plans: Sequence[Any], axes_by_id: Mapping[str, Any], required_papers: Sequence[str],
+    ) -> None:
+        """Plan organization work once against every exact alternative request."""
+        scope = self._candidate_output_scope
+        if scope is None:
+            raise OutlineV3ExecutionError("organization planning lacks its verified source scope")
+        self.registry.verify_ready_artifact_closure(bank_record)
+        validate_candidate_fragment_bank_v1(bank, scope)
+        required = self._required_candidate_group_ids(scope)
+        required_groups = [group for group in scope.claim_groups if group.claim_group_id in required]
+        contexts = [(plan, axes_by_id[plan.axis_id], self._candidate_organization_metadata_catalog(
+            axes_by_id[plan.axis_id], required_groups,
+        ), self._node_route(plan.provider_generation_node_id).profile) for plan in plans]
+
+        def fits(node: str, request: Mapping[str, Any], profile: Any) -> bool:
+            exact = self._attach_prompt_authority(node, request)
+            estimate = profile.estimate_request_v1(exact, requested_output_tokens=profile.max_output_tokens)
+            return bool(estimate.estimated_input_tokens <= self._effective_input_cap(profile)
+                        and estimate.within_context_budget)
+
+        if all(fits(f"candidate_organization_provider:{plan.candidate_id}",
+                    build_candidate_organization_request_v1(
+                        bank, scope, axis=axis, plan=plan, required_group_ids=sorted(required),
+                        required_paper_keys=list(required_papers), metadata_catalog=catalog,
+                    ), profile) for plan, axis, catalog, profile in contexts):
+            self._candidate_organization_partition_state = None
+            return
+        witnesses: dict[str, str] = {}
+        for paper in sorted(required_papers):
+            choices = [entry for entry in bank["groups"] if entry["materialization_state"] == "materialized"
+                       and paper in entry["claim_group"]["paper_keys"]]
+            if not choices:
+                raise OutlineV3ExecutionError(f"required paper {paper} has no complete organization witness")
+            selected = min(choices, key=lambda entry: (
+                entry["claim_group"]["claim_group_id"] not in required,
+                (entry.get("canonical_claim") or {}).get("claim_type") != "empirical_finding",
+                len(entry["claim_group"]["paper_keys"]),
+                entry["claim_group"]["claim_hash"], entry["claim_group"]["claim_group_id"],
+            ))
+            witnesses[paper] = selected["claim_group"]["claim_group_id"]
+        mandatory = required | set(witnesses.values())
+        mandatory_seed_groups = [group for group in scope.claim_groups if group.claim_group_id in mandatory]
+        contexts = [(plan, axes_by_id[plan.axis_id], self._candidate_organization_metadata_catalog(
+            axes_by_id[plan.axis_id], mandatory_seed_groups,
+        ), profile) for plan, _axis, _catalog, profile in contexts]
+        full_scope_hash = scope.content_hash
+        basis = {"bank_hash": bank["content_hash"], "scope_hash": full_scope_hash,
+                 "required_group_ids": sorted(mandatory), "required_paper_witnesses": witnesses,
+                 "axis_plan_hashes": [hash_json([axis.to_dict(), plan.to_dict(), catalog])
+                                      for plan, axis, catalog, _profile in contexts]}
+        provisional_hash = hash_json(basis)
+
+        def descriptor(indices: Sequence[int], index: int, count: int, plan_hash: str) -> dict[str, Any]:
+            groups = [bank["groups"][i]["claim_group"]["claim_group_id"] for i in indices]
+            return {"schema_version": "candidate-organization-partition/v1", "partition_index": index,
+                    "partition_count": count, "full_bank_hash": bank["content_hash"],
+                    "full_bank_group_count": len(bank["groups"]), "full_scope_hash": full_scope_hash,
+                    "local_scope_hash": scope.for_groups(groups).content_hash,
+                    "partition_plan_hash": plan_hash, "local_to_global_group_indices": list(indices)}
+
+        def request_for(indices: Sequence[int], desc: Mapping[str, Any], plan: Any, axis: Any, catalog: Any) -> dict[str, Any]:
+            group_ids = {bank["groups"][i]["claim_group"]["claim_group_id"] for i in indices}
+            return build_candidate_organization_request_v1(
+                bank, scope, axis=axis, plan=plan, required_group_ids=sorted(group_ids & mandatory),
+                required_paper_keys=sorted(paper for paper, group in witnesses.items() if group in group_ids),
+                metadata_catalog=catalog, partition=desc,
+            )
+
+        def fits_indices(indices: tuple[int, ...]) -> bool:
+            # These maximum-width ordinal fields are planning estimates only;
+            # every final descriptor/request is measured again before any POST.
+            desc = descriptor(indices, len(bank["groups"]) - 1, len(bank["groups"]), provisional_hash)
+            return all(fits(f"candidate_organization_provider:{plan.candidate_id}:partition:planning",
+                            request_for(indices, desc, plan, axis, catalog), profile)
+                       for plan, axis, catalog, profile in contexts)
+
+        partition_plan = plan_candidate_organization_partitions_v1(
+            bank, scope, required_group_ids=sorted(mandatory), required_paper_keys=sorted(required_papers),
+            required_paper_witnesses=witnesses, fits_partition=fits_indices,
+        )
+        payload = {"schema_version": "candidate-organization-partition-plan/v1", **basis,
+                   "partitions": [{"partition_index": part.partition_index,
+                                   "global_group_indices": list(part.global_group_indices),
+                                   "local_scope_hash": part.scope_subset.content_hash,
+                                   "required_group_ids": list(part.required_group_ids),
+                                   "required_paper_witnesses": dict(part.required_paper_witnesses)}
+                                  for part in partition_plan.partitions]}
+        plan_hash = hash_json(payload)
+        for part in partition_plan.partitions:
+            desc = descriptor(part.global_group_indices, part.partition_index, len(partition_plan.partitions), plan_hash)
+            for plan, axis, catalog, profile in contexts:
+                node = f"candidate_organization_provider:{plan.candidate_id}:partition:{part.partition_index + 1}"
+                if not fits(node, request_for(part.global_group_indices, desc, plan, axis, catalog), profile):
+                    raise OutlineV3ExecutionError(f"RECOVERABLE_CAPACITY: final organization partition {node} exceeds its route")
+        physical_calls = len(partition_plan.partitions) * len(contexts)
+        if self.max_provider_calls is not None and self._provider_call_count + physical_calls > self.max_provider_calls:
+            raise OutlineV3ExecutionError("outline budget cannot admit the exact organization partition plan")
+        artifact = self._artifact(OutlineArtifact, {**payload, "plan_hash": plan_hash}, {
+            "candidate_fragment_bank": bank_record.content_hash,
+            "organizing_axes": self.artifact_records["organizing_axes"].content_hash,
+        })
+        record = publish_json_artifact(
+            self.publication_context, self.registry,
+            self._path(f"outline_v3/candidate_organization_plan_{plan_hash}.json"), artifact.to_dict(),
+            artifact_id=f"outline-v3:candidate-organization-plan:{plan_hash[:24]}",
+            artifact_type=artifact.artifact_type, artifact_version=artifact.artifact_version,
+            artifact_role="outline_v3_candidate_organization_partition_plan",
+            producer="outline.v3_executor.OutlineV3Executor",
+            depends_on=self._dependency_refs(("candidate_fragment_bank", "organizing_axes")),
+        )
+        self.artifact_records["candidate_organization_partition_plan"] = record
+        self.artifact_paths["candidate_organization_partition_plan"] = record.path
+        self._candidate_organization_partition_state = (partition_plan, plan_hash, record)
+
+    def _run_partitioned_candidate_organization(
+        self, *, candidate_id: str, generation_node_id: str, axis: Any, plan: Any,
+        bank: Mapping[str, Any], bank_record: ArtifactRecord, required_papers: Sequence[str],
+    ) -> tuple[dict[str, Any], dict[str, str], dict[str, Any]]:
+        from outline.candidate_fragment_bank import compile_candidate_organization_sections_v1
+
+        state, scope = self._candidate_organization_partition_state, self._candidate_output_scope
+        if state is None or scope is None:
+            raise OutlineV3ExecutionError("organization partition execution lost its exact plan/scope")
+        partition_plan, plan_hash, plan_record = state
+        self.registry.verify_ready_artifact_closure(plan_record)
+        required = set(partition_plan.required_group_ids)
+        catalog = self._candidate_organization_metadata_catalog(
+            axis, [group for group in scope.claim_groups if group.claim_group_id in required],
+        )
+        raw_maps, nodes = [], []
+        compiled_deps = {"candidate_fragment_bank": bank_record.content_hash,
+                         "candidate_organization_partition_plan": plan_record.content_hash}
+        base_deps = dict(compiled_deps)
+        expected_bindings: dict[str, str] | None = None
+        for part in partition_plan.partitions:
+            self._check(generation_node_id)
+            desc = {"schema_version": "candidate-organization-partition/v1", "partition_index": part.partition_index,
+                    "partition_count": len(partition_plan.partitions), "full_bank_hash": bank["content_hash"],
+                    "full_bank_group_count": len(bank["groups"]), "full_scope_hash": scope.content_hash,
+                    "local_scope_hash": part.scope_subset.content_hash, "partition_plan_hash": plan_hash,
+                    "local_to_global_group_indices": list(part.global_group_indices)}
+            request = build_candidate_organization_request_v1(
+                bank, scope, axis=axis, plan=plan, required_group_ids=list(part.required_group_ids),
+                required_paper_keys=[paper for paper, _group in part.required_paper_witnesses],
+                metadata_catalog=catalog, partition=desc,
+            )
+            bindings = {key: str(request[key]) for key in (
+                "candidate_id", "axis_hash", "plan_hash", "bank_hash", "metadata_catalog_hash",
+            )}
+            if expected_bindings is not None and expected_bindings != bindings:
+                raise OutlineV3ExecutionError("organization leaf changed the shared candidate/catalog identity")
+            expected_bindings = bindings
+            node = f"candidate_organization_provider:{candidate_id}:partition:{part.partition_index + 1}"
+            profile = self._node_route(generation_node_id).profile
+            deps = {**base_deps, "axis": request["axis_hash"], "plan": request["plan_hash"],
+                    "partition": hash_json(desc)}
+            raw = self._provider_call(node, request, expect_json=True, input_artifact_hashes=tuple(deps.values()),
+                                      transport_node_id=generation_node_id, output_tokens=profile.max_output_tokens)
+            validate_candidate_organization_map_for_request_v1(raw, request)
+            record, _receipt_ids = self._persist_candidate_provider_result(
+                node, raw, request, comparisons=False, dependency_hashes=deps,
+                depends_on=("candidate_fragment_bank", "candidate_organization_partition_plan", candidate_id, "organizing_axes"),
+            )
+            compiled_deps[node] = record.content_hash
+            raw_maps.append(raw)
+            nodes.append(node)
+        accounting = account_candidate_organization_partition_maps_v1(
+            bank, partition_plan, raw_maps, expected_bindings=expected_bindings or {},
+        )
+        content = compile_candidate_organization_sections_v1(
+            bank, scope, candidate_id=candidate_id, section_choices=accounting.sections, metadata_catalog=catalog,
+            required_group_ids=list(partition_plan.required_group_ids), required_paper_keys=list(required_papers),
+        )
+        content["organizing_logic"] = plan.organizing_logic
+        self._validate_candidate_payload(candidate_id, content, allowed_paper_keys=scope.paper_keys,
+                                         allowed_relation_ids=scope.selected_relation_ids)
+        assignment = {group: nodes[index] for group, index in partition_plan.group_assignment}
+        content["shard_plan"] = {
+            "execution_mode": "shared_fragment_organization_partitions", "shard_count": len(nodes),
+            "physical_node_ids": nodes, "group_assignment": assignment, "assignment_coverage_hash": hash_json(assignment),
+            "deferred_optional_groups": {bank["groups"][index]["claim_group"]["claim_group_id"]: reason
+                                         for index, reason in accounting.deferred_reason_codes},
+            "fragment_bank_artifact_id": bank_record.artifact_id, "fragment_bank_hash": bank["content_hash"],
+            "partition_plan_artifact_id": plan_record.artifact_id,
+        }
+        binding = self.build_current_node_binding(
+            generation_node_id, artifact_type="outline_candidate", artifact_version="v3",
+            dependency_hashes=compiled_deps, model="deterministic", provider="local", provider_execution=False,
+        )
+        return content, compiled_deps, binding
+
+    def _run_candidate_fragment_organization(
+        self, *, candidate_id: str, generation_node_id: str, axis: Any, plan: Any,
+        bank: Mapping[str, Any], bank_record: ArtifactRecord, required_papers: Sequence[str],
+    ) -> tuple[dict[str, Any], dict[str, str], dict[str, Any]]:
+        scope = self._candidate_output_scope
+        if scope is None:
+            raise OutlineV3ExecutionError("fragment organization lost its verified output scope")
+        if self._candidate_organization_partition_state is not None:
+            return self._run_partitioned_candidate_organization(
+                candidate_id=candidate_id, generation_node_id=generation_node_id, axis=axis, plan=plan,
+                bank=bank, bank_record=bank_record, required_papers=required_papers,
+            )
+        self.registry.verify_ready_artifact_closure(bank_record)
+        validate_candidate_fragment_bank_v1(bank, scope)
+        required = self._required_candidate_group_ids(scope)
+        catalog = self._candidate_organization_metadata_catalog(
+            axis, [group for group in scope.claim_groups if group.claim_group_id in required],
+        )
+        request = build_candidate_organization_request_v1(
+            bank, scope, axis=axis, plan=plan, required_group_ids=sorted(required),
+            required_paper_keys=list(required_papers), metadata_catalog=catalog,
+        )
+        node = f"candidate_organization_provider:{candidate_id}"
+        profile = self._node_route(generation_node_id).profile
+        exact = self._attach_prompt_authority(node, request)
+        estimate = profile.estimate_request_v1(exact, requested_output_tokens=profile.max_output_tokens)
+        if estimate.estimated_input_tokens > self._effective_input_cap(profile) or not estimate.within_context_budget:
+            raise OutlineV3ExecutionError(
+                f"RECOVERABLE_CAPACITY: {node} organization-only request needs "
+                f"{estimate.estimated_input_tokens}/{self._effective_input_cap(profile)} input tokens"
+            )
+        deps = {"candidate_fragment_bank": bank_record.content_hash,
+                "axis": request["axis_hash"], "plan": request["plan_hash"]}
+        raw = self._provider_call(
+            node, request, expect_json=True, input_artifact_hashes=tuple(deps.values()),
+            transport_node_id=generation_node_id, output_tokens=profile.max_output_tokens,
+        )
+        validate_candidate_organization_map_for_request_v1(raw, request)
+        record, _receipt_ids = self._persist_candidate_provider_result(
+            node, raw, request, comparisons=False, dependency_hashes=deps,
+            depends_on=("candidate_fragment_bank", candidate_id, "organizing_axes"),
+        )
+        content = expand_candidate_organization_map_v1(
+            raw, bank, scope, sorted(required), list(required_papers),
+            axis=axis, plan=plan, metadata_catalog=catalog,
+        )
+        self._validate_candidate_payload(
+            candidate_id, content, allowed_paper_keys=scope.paper_keys,
+            allowed_relation_ids=scope.selected_relation_ids,
+        )
+        assignment = {bank["groups"][index]["claim_group"]["claim_group_id"]: node
+                      for section in raw["sections"] for index in section["fragment_indices"]}
+        deferred = {bank["groups"][index]["claim_group"]["claim_group_id"]: row["reason_code"]
+                    for row in raw["deferred"] for index in row["fragment_indices"]}
+        content["shard_plan"] = {
+            "execution_mode": "shared_fragment_organization", "shard_count": 1,
+            "physical_node_ids": [node], "group_assignment": assignment,
+            "assignment_coverage_hash": hash_json(assignment), "deferred_optional_groups": deferred,
+            "fragment_bank_artifact_id": bank_record.artifact_id,
+            "fragment_bank_hash": bank["content_hash"], "organization_map_artifact_id": record.artifact_id,
+        }
+        compiled_deps = {"candidate_fragment_bank": bank_record.content_hash, node: record.content_hash}
+        binding = self.build_current_node_binding(
+            generation_node_id, artifact_type="outline_candidate", artifact_version="v3",
+            dependency_hashes=compiled_deps, model="deterministic", provider="local",
+            provider_execution=False,
+        )
+        return content, compiled_deps, binding
 
     def _persist_semantic_provider_output(
         self,
@@ -8402,6 +10292,9 @@ class OutlineV3Executor:
         payload: Mapping[str, Any],
         *,
         dependency_hashes: Mapping[str, str],
+        update_parent_node: bool = True,
+        recovery_sources: Sequence[ArtifactRecord] = (),
+        external_registry_resolver: Callable[[str], ArtifactRegistry | None] | None = None,
     ) -> ArtifactRecord:
         """Register one topic/cross/global provider response for closure.
 
@@ -8411,55 +10304,44 @@ class OutlineV3Executor:
         output identity and make resume incorrectly report a stale call.
         """
 
-        artifact = self._artifact(OutlineArtifact, dict(payload), dependency_hashes)
-        artifact_id = f"outline-v3:semantic-provider:{hash_text(node_id)[:24]}"
-        record = publish_json_artifact(
-            self.publication_context,
-            self.registry,
-            self._node_path(f"semantic_provider/{node_id}"),
-            artifact.to_dict(),
-            artifact_role="outline_v3_semantic_provider_output",
-            artifact_type="outline_artifact",
-            artifact_version="v3",
-            producer="outline.v3_executor.OutlineV3Executor",
-            artifact_id=artifact_id,
-            metadata={"job_id": self.job_id, "node_id": node_id, "content_hash": artifact.content_hash},
-        )
-        self.artifact_paths[node_id] = record.path
-        self.artifact_records[node_id] = record
+        expanded_alias = self._semantic_identifier_outputs.get(node_id)
+        retained = self._final_fold_results.get(node_id)
+        if retained is None and isinstance(payload.get("fragment_aggregation"), Mapping):
+            raise OutlineV3ExecutionError("final fold expanded output has no validated local binding")
+        if expanded_alias is not None:
+            self._restore_semantic_identifier_output(node_id, payload, expanded_alias)
+            record = self.artifact_records[node_id]
+        elif retained is not None:
+            self._restore_local_final_fold(node_id, {
+                "execution_mode": "source_closed_retention", "provider_output": payload,
+                "semantic_retention": {**retained, "provider_invoked": False},
+            })
+            if hash_json(payload) != retained["expanded_hash"]:
+                raise OutlineV3ExecutionError("final fold expanded output differs from its validated local result")
+            record = self.registry.get(retained["artifact_id"])
+            if record is None or record.content_hash != retained["registry_file_hash"]:
+                raise OutlineV3ExecutionError("final fold local result lost its Registry authority")
+            envelope = OutlineArtifact.from_dict(json.loads(Path(record.path).read_text(encoding="utf-8")))
+            if envelope.dependency_hashes.get("source_request_hash") != retained["source_request_hash"]:
+                raise OutlineV3ExecutionError("final fold source request binding changed")
+            self.registry.verify_ready_artifact_closure(record)
+        else:
+            artifact = self._artifact(OutlineArtifact, dict(payload), dependency_hashes)
+            artifact_id = f"outline-v3:semantic-provider:{hash_text(node_id)[:24]}"
+            record = self._persist_dynamic_provider_result(
+                node_id, artifact,
+                path=self._node_path(f"semantic_provider/{node_id}"),
+                artifact_role="outline_v3_semantic_provider_output",
+                artifact_id=artifact_id,
+                recovery_sources=recovery_sources,
+                external_registry_resolver=external_registry_resolver,
+            )
         expected = self._expected_provider_calls.get(self._provider_call_id(node_id))
         if expected is not None:
-            self._expected_provider_calls[expected.call_id] = replace(
-                expected,
-                artifact_payload_hash=hash_json(payload),
-                artifact_content_hash=artifact.content_hash,
-                registry_file_hash=record.content_hash,
-                artifact_path=record.path,
-                registered_artifact_hash=artifact.content_hash,
-                node_output_hash=artifact.content_hash,
-            )
-            pending = self._pending_replays.pop(node_id, None)
-            if pending is not None and expected.normalized_output_hash:
-                replay_key, normalized_hash, receipt_id = pending
-                self._replay_store.append(
-                    replay_key,
-                    output_hash=normalized_hash,
-                    normalized_output_hash=normalized_hash,
-                    registered_artifact_hash=artifact.content_hash,
-                    node_output_hash=artifact.content_hash,
-                    output_artifact_ids=(artifact_id,),
-                    receipt_ids=(receipt_id,),
-                    audit_node_id=node_id,
-                    closure_epoch_id=self.closure_epoch_id,
-                )
-                self._expected_provider_calls[expected.call_id] = replace(
-                    self._expected_provider_calls[expected.call_id],
-                    replay_output_hash=normalized_hash,
-                )
             base_node = self._semantic_receipt_node_id(node_id)
             base_record = self.artifact_records.get(base_node)
             binding = self._dynamic_provider_bindings.get(node_id)
-            if base_record is not None and binding is not None:
+            if update_parent_node and base_record is not None and binding is not None:
                 static_binding = self.build_current_node_binding(base_node)
                 base_output_hash = base_record.content_hash
                 try:
@@ -8495,6 +10377,7 @@ class OutlineV3Executor:
         manifest: Mapping[str, Any],
         *,
         dependency_hashes: Mapping[str, str],
+        source_records: Sequence[ArtifactRecord] = (),
     ) -> ArtifactRecord:
         """Bind a reducer call to its complete local member set before POST."""
 
@@ -8509,6 +10392,7 @@ class OutlineV3Executor:
             artifact_version="v3",
             producer="outline.v3_executor.OutlineV3Executor",
             artifact_id=f"outline-v3:semantic-input:{self.closure_epoch_id}:{hash_text(node_id)[:16]}",
+            depends_on=[ArtifactDependencyRefV2.from_record(record) for record in source_records],
             metadata={
                 "job_id": self.job_id,
                 "node_id": node_id,
@@ -8573,6 +10457,55 @@ class OutlineV3Executor:
             "candidate_content_hash": hash_json(dict(content)),
         }
 
+    @staticmethod
+    def _compact_critique_section_evidence(
+        candidate_id: str,
+        compact_candidate: Mapping[str, Any],
+        raw_sections: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Keep complete support identities while referencing claim text once."""
+        sections_by_id: dict[str, Mapping[str, Any]] = {}
+        for section in compact_candidate.get("sections") or ():
+            if not isinstance(section, Mapping):
+                raise OutlineV3ExecutionError("critique has an invalid candidate section")
+            section_id = str(section.get("section_id") or "")
+            if not section_id or section_id in sections_by_id:
+                raise OutlineV3ExecutionError("critique has duplicate or missing section identity")
+            sections_by_id[section_id] = section
+        projected: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for section in raw_sections:
+            section_id = str(section.get("section_id") or "")
+            if section_id not in sections_by_id or section_id in seen:
+                raise OutlineV3ExecutionError("critique evidence has a foreign section or duplicate identity")
+            seen.add(section_id)
+            claims = list(sections_by_id[section_id].get("claims") or ())
+            if list(section.get("claims") or ()) != claims:
+                raise OutlineV3ExecutionError("critique evidence claims differ from the candidate section")
+            supports: list[dict[str, Any]] = []
+            for support in section.get("claim_support") or ():
+                if not isinstance(support, Mapping):
+                    raise OutlineV3ExecutionError("critique support claim is invalid")
+                if str(support.get("section_id") or section_id) != section_id:
+                    raise OutlineV3ExecutionError("critique support references a foreign section")
+                indices = [index for index, claim in enumerate(claims) if claim == support.get("claim")]
+                if len(indices) != 1:
+                    raise OutlineV3ExecutionError("critique support claim has no unique section claim")
+                if "claim_index" in support and support["claim_index"] != indices[0]:
+                    raise OutlineV3ExecutionError("critique support claim index conflicts with its text")
+                supports.append({**{key: value for key, value in support.items() if key != "claim"},
+                                 "claim_index": indices[0]})
+            projected.append({
+                **{key: value for key, value in section.items() if key not in {"claims", "claim_support"}},
+                "candidate_id": candidate_id,
+                "claim_array_ref": {"candidate_id": candidate_id, "section_id": section_id,
+                                    "field": "candidate_contents.sections.claims"},
+                "claim_support": supports,
+            })
+        if seen != set(sections_by_id):
+            raise OutlineV3ExecutionError("critique evidence does not cover every selected section")
+        return projected
+
     def _persist_critique_shard_output(
         self,
         node_id: str,
@@ -8622,6 +10555,21 @@ class OutlineV3Executor:
                 registered_artifact_hash=artifact.content_hash,
                 node_output_hash=artifact.content_hash,
             )
+            pending = self._pending_replays.pop(node_id, None)
+            if pending is not None and expected.normalized_output_hash:
+                replay_key, normalized_hash, receipt_id = pending
+                self._replay_store.append(
+                    replay_key, output_hash=normalized_hash,
+                    normalized_output_hash=normalized_hash,
+                    registered_artifact_hash=artifact.content_hash,
+                    node_output_hash=artifact.content_hash,
+                    output_artifact_ids=(artifact_id,), receipt_ids=(receipt_id,),
+                    audit_node_id=node_id, closure_epoch_id=self.closure_epoch_id,
+                )
+                self._expected_provider_calls[expected.call_id] = replace(
+                    self._expected_provider_calls[expected.call_id],
+                    replay_output_hash=normalized_hash,
+                )
 
     @staticmethod
     def _split_critique_candidate(
@@ -8672,6 +10620,15 @@ class OutlineV3Executor:
         dependency_hashes: Mapping[str, str],
         node_prefix: str = "",
     ) -> dict[str, Any]:
+        from outline.critique_paper_role_projection import (
+            PAPER_ROLE_CLAIM_INDEX_CONTRACT_V1,
+            project_critique_paper_roles_v1,
+        )
+        from outline.critique_claim_support_packing import (
+            CritiqueComparisonClaimGroupV1,
+            pack_critique_claim_support_shards_v1,
+        )
+
         candidate_contents = request.get("candidate_contents")
         candidate_hashes = request.get("candidate_hashes")
         if not isinstance(candidate_contents, Mapping) or not candidate_contents:
@@ -8681,18 +10638,23 @@ class OutlineV3Executor:
         target = self._relation_packing_target(profile)
         effective_cap = self._effective_input_cap(profile)
         planned_calls: list[tuple[str, dict[str, Any], str, int, set[str]]] = []
+        evidence_review = self._critique_role_from_node_id(node_id) == "evidence_critique"
         for candidate_id in sorted(str(item) for item in candidate_contents):
             candidate_content = candidate_contents[candidate_id]
             compact = self._compact_candidate_for_critique(
                 candidate_id,
                 candidate_content if isinstance(candidate_content, Mapping) else {},
             )
-            candidate_shards = self._split_critique_candidate(
-                compact,
-                target_tokens=target,
-            )
-            for shard_index, compact_candidate in enumerate(candidate_shards, start=1):
+            def build_local_call(
+                compact_candidate: Mapping[str, Any],
+                shard_index: int,
+                *,
+                claim_support_shard: Mapping[str, Any] | None = None,
+            ) -> tuple[str, dict[str, Any], str, int, set[str]]:
                 local_request = dict(request)
+                # These maps are Registry-derived internal planner inputs, never provider-visible prose.
+                local_request.pop("_validated_critique_comparison_groups", None)
+                local_request.pop("_must_preserve_critique_sections", None)
                 shard_key = f"{candidate_id}:shard:{shard_index}"
                 local_request["hierarchy"] = {
                     "level": "critique_candidate_shard",
@@ -8701,37 +10663,132 @@ class OutlineV3Executor:
                     "candidate_id": candidate_id,
                     "section_ids": list(compact_candidate.get("shard_section_ids") or ()),
                 }
-                local_request["candidate_contents"] = {candidate_id: compact_candidate}
+                if claim_support_shard is None:
+                    local_candidate = {
+                        **compact_candidate,
+                        "sections": [
+                            project_critique_paper_roles_v1(candidate_id, section)
+                            for section in compact_candidate.get("sections") or ()
+                            if isinstance(section, Mapping)
+                        ],
+                    }
+                else:
+                    projected_section = claim_support_shard.get("candidate_section")
+                    if not isinstance(projected_section, Mapping):
+                        raise OutlineV3ExecutionError(
+                            "critique claim/support shard lacks its candidate section"
+                        )
+                    local_candidate = {
+                        **compact_candidate,
+                        "sections": [dict(projected_section)],
+                        "shard_section_ids": [str(projected_section.get("section_id") or "")],
+                    }
+                local_request["candidate_contents"] = {candidate_id: local_candidate}
+                if any(
+                    "paper_role_claim_array_ref" in section
+                    for section in local_candidate["sections"]
+                ):
+                    local_request["paper_role_claim_index_contract"] = (
+                        PAPER_ROLE_CLAIM_INDEX_CONTRACT_V1
+                    )
                 if isinstance(candidate_hashes, Mapping):
                     local_request["candidate_hashes"] = {candidate_id: candidate_hashes.get(candidate_id, "")}
                 candidate_papers = {
                     str(paper_key)
-                    for section in compact_candidate.get("sections") or ()
+                    for section in local_candidate.get("sections") or ()
                     if isinstance(section, Mapping)
                     for paper_key in section.get("paper_keys") or ()
                     if str(paper_key)
                 }
-                section_ids = {str(item.get("section_id") or "") for item in compact_candidate.get("sections") or () if isinstance(item, Mapping)}
+                section_ids = {str(item.get("section_id") or "") for item in local_candidate.get("sections") or () if isinstance(item, Mapping)}
                 if isinstance(local_request.get("candidate_claims"), Mapping):
                     local_request["candidate_claims"] = {
                         candidate_id: [str(item) for item in local_request["candidate_claims"].get(candidate_id) or () if str(item).strip()]
                     }
                 if isinstance(local_request.get("section_evidence"), Mapping):
-                    local_request["section_evidence"] = {
-                        candidate_id: [dict(section) for section in local_request["section_evidence"].get(candidate_id) or ()
-                                       if isinstance(section, Mapping) and str(section.get("section_id") or "") in section_ids]
-                    }
-                if isinstance(local_request.get("stability_claim_comparisons"), Mapping):
-                    candidate_pairs = [
-                        dict(pair)
-                        for pair in local_request["stability_claim_comparisons"].get(candidate_id) or ()
-                        if isinstance(pair, Mapping)
-                        and any(
-                            str(reference.get("section_id") or "") in section_ids
-                            for reference in pair.get("variant_claim_refs") or ()
-                            if isinstance(reference, Mapping)
+                    if claim_support_shard is not None:
+                        projected_evidence = claim_support_shard.get("section_evidence")
+                        coverage_index = claim_support_shard.get("atom_coverage_index")
+                        atom_contract = claim_support_shard.get("claim_support_atom_contract")
+                        if not isinstance(projected_evidence, Mapping) or not isinstance(coverage_index, Mapping):
+                            raise OutlineV3ExecutionError(
+                                "critique claim/support shard lacks its exact support projection"
+                            )
+                        local_request["section_evidence"] = {
+                            candidate_id: [dict(projected_evidence)]
+                        }
+                        local_request["atom_coverage_index"] = dict(coverage_index)
+                        local_request["claim_support_atom_contract"] = str(atom_contract or "")
+                        local_request.pop("candidate_claims", None)
+                        local_request["claim_text_contract"] = (
+                            "Resolve each claim_index against the claims array of the matching "
+                            "candidate_contents candidate_id and section_id. All support, qualifier "
+                            "and source identities remain attached to that exact claim."
                         )
-                    ]
+                    else:
+                        local_request["section_evidence"] = {
+                            candidate_id: [dict(section) for section in local_request["section_evidence"].get(candidate_id) or ()
+                                           if isinstance(section, Mapping) and str(section.get("section_id") or "") in section_ids]
+                        }
+                        if evidence_review:
+                            local_request["section_evidence"][candidate_id] = [
+                                project_critique_paper_roles_v1(candidate_id, section)
+                                for section in local_request["section_evidence"][candidate_id]
+                            ]
+                            local_request["section_evidence"][candidate_id] = self._compact_critique_section_evidence(
+                                candidate_id, local_candidate, local_request["section_evidence"][candidate_id],
+                            )
+                            local_request.pop("candidate_claims", None)
+                            local_request["claim_text_contract"] = (
+                                "Resolve each claim_index against the claims array of the matching "
+                                "candidate_contents candidate_id and section_id. All support, qualifier "
+                                "and source identities remain attached to that exact claim."
+                            )
+                if isinstance(local_request.get("stability_claim_comparisons"), Mapping):
+                    local_claim_indices_by_section: dict[str, set[int]] = {}
+                    if claim_support_shard is not None:
+                        coverage = claim_support_shard.get("atom_coverage_index")
+                        if not isinstance(coverage, Mapping):
+                            raise OutlineV3ExecutionError("claim/support atom lacks its coverage index")
+                        coverage_section_id = str(coverage.get("section_id") or "")
+                        if coverage_section_id not in section_ids:
+                            raise OutlineV3ExecutionError("claim/support atom coverage references a foreign section")
+                        local_claim_indices_by_section[coverage_section_id] = {
+                            int(value)
+                            for value in coverage.get("local_to_parent_claim_indices") or ()
+                            if type(value) is int
+                        }
+                    else:
+                        for local_section in local_candidate.get("sections") or ():
+                            if not isinstance(local_section, Mapping):
+                                continue
+                            local_section_id = str(local_section.get("section_id") or "")
+                            local_claims = local_section.get("claims") or ()
+                            if local_section_id and isinstance(local_claims, Sequence) and not isinstance(local_claims, (str, bytes)):
+                                local_claim_indices_by_section[local_section_id] = set(range(len(local_claims)))
+                    candidate_pairs: list[dict[str, Any]] = []
+                    raw_candidate_pairs = local_request["stability_claim_comparisons"].get(candidate_id) or ()
+                    if not isinstance(raw_candidate_pairs, Sequence) or isinstance(raw_candidate_pairs, (str, bytes)):
+                        raise OutlineV3ExecutionError("stability claim comparisons must be an array")
+                    for raw_pair in raw_candidate_pairs:
+                        if not isinstance(raw_pair, Mapping):
+                            raise OutlineV3ExecutionError("stability claim comparison is invalid")
+                        raw_refs = raw_pair.get("variant_claim_refs")
+                        if not isinstance(raw_refs, Sequence) or isinstance(raw_refs, (str, bytes)) or not raw_refs:
+                            raise OutlineV3ExecutionError("stability comparison claim references are invalid")
+                        complete_pair = True
+                        for raw_ref in raw_refs:
+                            if not isinstance(raw_ref, Mapping):
+                                raise OutlineV3ExecutionError("stability comparison claim reference is invalid")
+                            ref_section_id = raw_ref.get("section_id")
+                            ref_claim_index = raw_ref.get("claim_index")
+                            if not isinstance(ref_section_id, str) or not ref_section_id or type(ref_claim_index) is not int or ref_claim_index < 0:
+                                raise OutlineV3ExecutionError("stability comparison claim reference is invalid")
+                            if ref_claim_index not in local_claim_indices_by_section.get(ref_section_id, set()):
+                                complete_pair = False
+                                break
+                        if complete_pair:
+                            candidate_pairs.append(dict(raw_pair))
                     local_request["stability_claim_comparisons"] = {
                         candidate_id: candidate_pairs
                     }
@@ -8766,6 +10823,18 @@ class OutlineV3Executor:
                             if isinstance(relation, Mapping)
                             and (not candidate_papers or candidate_papers.intersection(str(value) for value in relation.get("paper_keys") or () if str(value)))
                         ]
+                if evidence_review:
+                    used_relation_ids = {
+                        str(value) for section in local_candidate.get("sections") or ()
+                        if isinstance(section, Mapping)
+                        for value in section.get("relation_ids") or () if str(value)
+                    }
+                    for relation_field in ("relations", "relation_evidence", "contradictions"):
+                        if isinstance(local_request.get(relation_field), list):
+                            local_request[relation_field] = [
+                                row for row in local_request[relation_field]
+                                if str(row.get("relation_id") or "") in used_relation_ids
+                            ]
                 for field_name in ("boundaries", "gaps"):
                     if isinstance(local_request.get(field_name), list):
                         local_request[field_name] = [
@@ -8776,7 +10845,161 @@ class OutlineV3Executor:
                 if node_prefix:
                     local_node_id = f"{node_prefix}:{local_node_id}"
                 local_request = self._attach_prompt_authority(local_node_id, local_request)
-                planned_calls.append((local_node_id, local_request, candidate_id, shard_index, section_ids))
+                local_request = self._attach_critique_output_contract(
+                    local_request, self._critique_role_from_node_id(node_id),
+                )
+                return local_node_id, local_request, candidate_id, shard_index, section_ids
+
+            sections: list[dict[str, Any]] = [
+                dict(section) for section in compact.get("sections") or ()
+                if isinstance(section, Mapping)
+            ]
+            if not sections:
+                planned_calls.append(build_local_call(compact, 1))
+                continue
+            current_sections: list[dict[str, Any]] = []
+            current_call: tuple[str, dict[str, Any], str, int, set[str]] | None = None
+            shard_index = 1
+            for section in sections:
+                trial_sections = [*current_sections, section]
+                trial_candidate = {
+                    **compact,
+                    "sections": trial_sections,
+                    "shard_section_ids": [str(row.get("section_id") or "") for row in trial_sections],
+                }
+                trial_call = build_local_call(trial_candidate, shard_index)
+                estimate = int(profile.estimate_request(trial_call[1]).get("estimated_input_tokens") or 0)
+                if current_call is not None and estimate > effective_cap:
+                    planned_calls.append(current_call)
+                    shard_index += 1
+                    trial_sections = [section]
+                    trial_candidate = {
+                        **compact,
+                        "sections": trial_sections,
+                        "shard_section_ids": [str(section.get("section_id") or "")],
+                    }
+                    trial_call = build_local_call(trial_candidate, shard_index)
+                    estimate = int(profile.estimate_request(trial_call[1]).get("estimated_input_tokens") or 0)
+                if evidence_review and estimate > effective_cap and len(trial_sections) == 1:
+                    section_id = str(trial_sections[0].get("section_id") or "")
+                    local_candidate = trial_call[1]["candidate_contents"][candidate_id]
+                    parent_section = local_candidate["sections"][0]
+                    parent_evidence = trial_call[1]["section_evidence"][candidate_id][0]
+                    comparison_map = request.get("_validated_critique_comparison_groups")
+                    raw_groups: Sequence[Any] = ()
+                    if isinstance(comparison_map, Mapping):
+                        candidate_groups = comparison_map.get(candidate_id)
+                        if isinstance(candidate_groups, Mapping):
+                            raw_groups = candidate_groups.get(section_id) or ()
+                    comparison_groups = []
+                    for raw_group in raw_groups:
+                        if not isinstance(raw_group, Mapping):
+                            raise OutlineV3ExecutionError("validated comparison claim group is invalid")
+                        comparison_groups.append(
+                            CritiqueComparisonClaimGroupV1(
+                                group_id=str(raw_group.get("group_id") or ""),
+                                claim_indices=tuple(raw_group.get("claim_indices") or ()),
+                                required_paper_keys=tuple(raw_group.get("required_paper_keys") or ()),
+                                relation_ids=tuple(raw_group.get("relation_ids") or ()),
+                            )
+                        )
+                    preserve_map = request.get("_must_preserve_critique_sections")
+                    preserve_ids = (
+                        preserve_map.get(candidate_id) or ()
+                        if isinstance(preserve_map, Mapping) else ()
+                    )
+                    stability_sections: set[str] = set()
+                    stability_map = request.get("stability_claim_comparisons")
+                    if isinstance(stability_map, Mapping):
+                        raw_pairs = stability_map.get(candidate_id) or ()
+                        if not isinstance(raw_pairs, Sequence) or isinstance(raw_pairs, (str, bytes)):
+                            raise OutlineV3ExecutionError("stability claim comparisons must be an array")
+                        for raw_pair in raw_pairs:
+                            if not isinstance(raw_pair, Mapping):
+                                raise OutlineV3ExecutionError("stability claim comparison is invalid")
+                            raw_refs = raw_pair.get("variant_claim_refs")
+                            if not isinstance(raw_refs, Sequence) or isinstance(raw_refs, (str, bytes)) or not raw_refs:
+                                raise OutlineV3ExecutionError("stability comparison claim references are invalid")
+                            for raw_ref in raw_refs:
+                                if not isinstance(raw_ref, Mapping):
+                                    raise OutlineV3ExecutionError("stability comparison claim reference is invalid")
+                                ref_section_id = raw_ref.get("section_id")
+                                ref_claim_index = raw_ref.get("claim_index")
+                                if not isinstance(ref_section_id, str) or not ref_section_id or type(ref_claim_index) is not int or ref_claim_index < 0:
+                                    raise OutlineV3ExecutionError("stability comparison claim reference is invalid")
+                                stability_sections.add(ref_section_id)
+                    parent_relation_ids = {
+                        str(value) for value in parent_section.get("relation_ids") or () if str(value)
+                    }
+                    mapped_relation_ids = {
+                        str(value)
+                        for raw_group in comparison_groups
+                        for value in raw_group.relation_ids
+                        if str(value)
+                    }
+                    has_unmapped_relation = bool(parent_relation_ids - mapped_relation_ids)
+                    must_preserve_parent = (
+                        section_id in preserve_ids
+                        or section_id in stability_sections
+                        or has_unmapped_relation
+                    )
+                    if has_unmapped_relation:
+                        comparison_groups = []
+                    parent_candidate_hash = str(
+                        (candidate_hashes.get(candidate_id) if isinstance(candidate_hashes, Mapping) else "")
+                        or ""
+                    )
+                    first_atom_shard = shard_index
+
+                    def measure_claim_support_projection(projection: Mapping[str, Any]) -> int:
+                        coverage = projection.get("atom_coverage_index")
+                        if not isinstance(coverage, Mapping):
+                            raise OutlineV3ExecutionError("claim/support atom lacks its coverage index")
+                        relative_index = max(0, int(coverage.get("shard_index") or 1) - 1)
+                        atom_shard_index = first_atom_shard + relative_index
+                        atom_candidate = {
+                            **compact,
+                            "sections": [dict(projection["candidate_section"])],
+                            "shard_section_ids": [section_id],
+                        }
+                        _atom_node, atom_request, *_rest = build_local_call(
+                            atom_candidate,
+                            atom_shard_index,
+                            claim_support_shard=projection,
+                        )
+                        return int(profile.estimate_request(atom_request).get("estimated_input_tokens") or 0)
+
+                    packed_atoms = pack_critique_claim_support_shards_v1(
+                        candidate_id,
+                        parent_candidate_hash,
+                        parent_section,
+                        parent_evidence,
+                        input_cap_tokens=effective_cap,
+                        measure_request=measure_claim_support_projection,
+                        comparison_groups=tuple(comparison_groups),
+                        must_preserve_parent_section=must_preserve_parent,
+                    )
+                    for atom_offset, atom_projection in enumerate(packed_atoms):
+                        atom_candidate = {
+                            **compact,
+                            "sections": [dict(atom_projection["candidate_section"])],
+                            "shard_section_ids": [section_id],
+                        }
+                        planned_calls.append(
+                            build_local_call(
+                                atom_candidate,
+                                shard_index + atom_offset,
+                                claim_support_shard=atom_projection,
+                            )
+                        )
+                    shard_index += len(packed_atoms)
+                    current_sections = []
+                    current_call = None
+                    continue
+                current_sections = trial_sections
+                current_call = trial_call
+            if current_call is not None:
+                planned_calls.append(current_call)
         if (
             self.max_provider_calls is not None
             and self._provider_call_count + len(planned_calls) > self.max_provider_calls
@@ -8799,12 +11022,35 @@ class OutlineV3Executor:
                 output_tokens=min(int(profile.max_output_tokens), 2048),
             )
             result = dict(content)
+            # Coverage is local execution provenance, never provider-supplied authority.
+            result.pop("claim_support_coverage", None)
+            if "issues" in result and not isinstance(result["issues"], list):
+                raise OutlineV3ExecutionError("critique shard issues must be an array")
             result["candidate_id"] = candidate_id
             result["shard_index"] = shard_index
             result["reviewed_section_ids"] = sorted(section_ids)
             candidate_hashes = request.get("candidate_hashes")
             if isinstance(candidate_hashes, Mapping):
                 result["parent_candidate_hash"] = str(candidate_hashes.get(candidate_id) or "")
+            atom_coverage = local_request.get("atom_coverage_index")
+            if isinstance(atom_coverage, Mapping):
+                parent_section_id = str(atom_coverage.get("section_id") or "")
+                parent_content = candidate_contents.get(candidate_id)
+                parent_sections = [
+                    section for section in (parent_content.get("sections") or ())
+                    if isinstance(section, Mapping)
+                    and str(section.get("section_id") or "") == parent_section_id
+                ] if isinstance(parent_content, Mapping) else []
+                if len(parent_sections) != 1 or section_ids != {parent_section_id}:
+                    raise OutlineV3ExecutionError("critique claim/support coverage has no unique source section")
+                coverage_body = {
+                    "schema_version": "outline_critique_claim_support_coverage/v1",
+                    "parent_source_section_hash": hash_json(dict(parent_sections[0])),
+                    "atom_coverage_index": copy.deepcopy(dict(atom_coverage)),
+                }
+                result["claim_support_coverage"] = {
+                    **coverage_body, "content_hash": hash_json(coverage_body),
+                }
             shard_results.append(result)
         blocking = [
             str(item)
@@ -8822,6 +11068,11 @@ class OutlineV3Executor:
             "node_id": node_id,
             "passed": all(bool(result.get("passed", True)) for result in shard_results),
             "blocking_diagnostics": blocking,
+            "issues": [
+                copy.deepcopy(issue)
+                for result in shard_results
+                for issue in result.get("issues") or ()
+            ],
             "recommendations": recommendations,
             "score": min(float(result.get("score", 1.0) or 0.0) for result in shard_results),
             "coverage_metrics": {},
@@ -8840,6 +11091,674 @@ class OutlineV3Executor:
         }
         return merged
 
+    def _prepare_arbitration_hierarchy(
+        self,
+        request: Mapping[str, Any],
+        *,
+        node_id: str = "arbitration",
+    ) -> dict[str, Any] | None:
+        """Plan full-section evaluations, subdividing only over-cap aligned claim/support closures."""
+        profile = self._node_route(node_id, "arbitration").profile
+        full_request = self._attach_prompt_authority(node_id, request)
+        full_request = self._attach_arbitration_output_contract(full_request)
+        if int(self._arbitration_request_estimate(node_id, full_request, profile)["estimated_input_tokens"]) <= self._effective_input_cap(profile):
+            return None
+        from outline.candidate_arbitration_packing import expand_arbitration_candidate_support
+
+        source = expand_arbitration_candidate_support(request)
+
+        def build_leaf(payload: Mapping[str, Any]) -> dict[str, Any]:
+            body = copy.deepcopy(dict(payload))
+            sections = body.pop("candidate_sections_by_id")
+            headers = body.pop("candidate_headers")
+            body["candidate_contents"] = {
+                candidate_id: {**dict(headers[candidate_id]), "sections": sections[candidate_id]}
+                for candidate_id in body["candidate_ids"]
+            }
+            body["review_intent"] = copy.deepcopy(source.get("review_intent") or {})
+            body["selection_rule"] = source.get("selection_rule")
+            assessment_contract = (
+                "One row per candidate_id, including absent alternatives: candidate_id, candidate_hash, "
+                "presence (present/absent), reviewed_section_ids and section_hashes matching "
+                "candidate_section_bindings, coverage_assessment, evidence_assessment, "
+                "structure_assessment, advantages, limitations, evidence_refs, critic_issue_ids. "
+                "Use substantive source-bound reasons, not scores alone. Present rows cite assigned "
+                "support/critic evidence IDs. Absent rows state no section was assigned and have empty "
+                "evidence/advantage/limitation/issue arrays. Address every assigned typed critic issue."
+            )
+            if body.get("claim_support_part_bindings"):
+                assessment_contract += (
+                    " Part leaves: echo exact part_id, part_hash, and parent section_id/section_hash "
+                    "in claim_support_part_receipts; omit slots and support rows."
+                )
+            body["output_contract"] = {
+                "output_fields": {
+                    "leaf_id": "Echo hierarchy.leaf_id exactly.",
+                    "unit_ids": "Echo the exact ordered hierarchy.unit_ids.",
+                    "candidate_assessments": assessment_contract,
+                },
+                "must_include": ["leaf_id", "unit_ids", "candidate_assessments"],
+            }
+            body = project_arbitration_leaf_section_index(body)
+            body = pack_arbitration_candidate_support(body)
+            leaf_id = str(body["hierarchy"]["leaf_id"])
+            return self._attach_prompt_authority(f"{node_id}:leaf:{leaf_id}", body)
+
+        def measure(payload: Mapping[str, Any]) -> dict[str, Any]:
+            estimate = self._arbitration_request_estimate(
+                str((payload.get("_prompt_authority") or {}).get("node_id") or node_id), payload, profile,
+            )
+            candidate_rows = []
+            part_bindings = payload.get("claim_support_part_bindings")
+            for candidate_id in payload["candidate_ids"]:
+                row = {
+                    "candidate_id": candidate_id,
+                    "candidate_hash": payload["candidate_hashes"][candidate_id],
+                    "presence": "present" if payload["candidate_section_bindings"][candidate_id] else "absent",
+                    "reviewed_section_ids": [item["section_id"] for item in payload["candidate_section_bindings"][candidate_id]],
+                    "section_hashes": {item["section_id"]: item["section_hash"] for item in payload["candidate_section_bindings"][candidate_id]},
+                    "coverage_assessment": "", "evidence_assessment": "", "structure_assessment": "",
+                    "advantages": [], "limitations": [],
+                    "evidence_refs": ["source-evidence-reference"],
+                    "critic_issue_ids": [item["issue_id"] for item in payload["candidate_critique_issues"][candidate_id]],
+                }
+                if isinstance(part_bindings, Mapping):
+                    row["claim_support_part_receipts"] = [
+                        {
+                            "part_id": part["part_id"],
+                            "part_hash": part["part_hash"],
+                            "parent_section_bindings": [
+                                {"section_id": binding["section_id"], "section_hash": binding["section_hash"]}
+                                for binding in part["parent_bindings_by_candidate"][candidate_id]
+                            ],
+                        }
+                        for part in part_bindings.get("parts") or []
+                    ]
+                candidate_rows.append(row)
+            response_shape = {
+                "leaf_id": payload["hierarchy"]["leaf_id"],
+                "unit_ids": payload["hierarchy"]["unit_ids"],
+                "candidate_assessments": candidate_rows,
+            }
+            output_limit = max(
+                2_048, profile.estimate_tokens(response_shape) + 256 * len(payload["candidate_ids"]),
+            )
+            estimate["requested_output_tokens"] = output_limit
+            estimate["within_budget"] = bool(
+                estimate["within_budget"]
+                and output_limit <= int(profile.max_output_tokens)
+                and int(estimate["estimated_input_tokens"]) + output_limit
+                + int(profile.reasoning_reserve) + int(profile.safety_margin)
+                <= int(profile.verified_context_limit)
+            )
+            return estimate
+
+        source_section_count = sum(len(value.get("sections") or ()) for value in source["candidate_contents"].values())
+        remaining_calls = (
+            int(self.max_provider_calls) - self._provider_call_count
+            if self.max_provider_calls is not None else source_section_count + 1
+        )
+        try:
+            plan = plan_arbitration_hierarchy(
+                source["candidate_ids"], source["candidate_hashes"], source["candidate_contents"],
+                source["critique_disposition"],
+                critique_hashes={key: hash_json(value) for key, value in source["critiques"].items()},
+                provenance_hashes={"request": hash_json(source), "intent": hash_json(source.get("review_intent") or {})},
+                request_builder=build_leaf, estimate_input_tokens=measure,
+                input_cap=self._effective_input_cap(profile), max_calls=remaining_calls,
+                output_cap=int(profile.max_output_tokens),
+            )
+        except ArbitrationHierarchyError as exc:
+            raise OutlineV3ExecutionError(f"BLOCKED_BUDGET: arbitration hierarchy: {exc}") from exc
+        return {"plan": plan, "source_request": source, "node_id": node_id}
+
+    def _run_arbitration_hierarchy(
+        self,
+        prepared: Mapping[str, Any],
+        dependency_hashes: Mapping[str, str],
+    ) -> dict[str, Any]:
+        plan = prepared["plan"]
+        node_id = str(prepared["node_id"])
+        plan_record = self._persist_semantic_provider_output(
+            f"{node_id}:evaluation-plan:{str(plan['plan_hash'])[:24]}",
+            {key: copy.deepcopy(value) for key, value in plan.items() if key != "max_calls"},
+            dependency_hashes=dependency_hashes,
+        )
+        results: dict[str, dict[str, Any]] = {}
+        for leaf in plan["leaves"]:
+            leaf_id = str(leaf["leaf_id"])
+            physical_id = f"{node_id}:leaf:{leaf_id}"
+            response = self._provider_call(
+                physical_id, leaf["request"], expect_json=True,
+                input_artifact_hashes=(*dependency_hashes.values(), plan["plan_hash"], leaf["request_hash"]),
+                transport_node_id="arbitration", output_tokens=int(leaf.get("requested_output_tokens") or prepared.get("output_limit") or 2_048),
+            )
+            try:
+                validate_arbitration_leaf(plan, leaf_id, response)
+                # Ledger assembly validates the physical response again. Keep
+                # its exact part echoes until that final coverage check.
+                results[leaf_id] = response
+            except ArbitrationHierarchyError as exc:
+                raise OutlineV3ExecutionError(f"arbitration leaf coverage invalid: {exc}") from exc
+        try:
+            ledger = build_arbitration_final_ledger(plan, results)
+        except ArbitrationHierarchyError as exc:
+            raise OutlineV3ExecutionError(f"arbitration ledger is incomplete: {exc}") from exc
+        source = prepared["source_request"]
+        ledger_record = self._persist_semantic_provider_output(
+            f"{node_id}:evaluation-ledger:{str(ledger['ledger_hash'])[:24]}",
+            ledger, dependency_hashes={**dict(dependency_hashes), "evaluation_plan": plan["plan_hash"]},
+        )
+        final_request = {
+            key: copy.deepcopy(value) for key, value in source.items()
+            if key != "candidate_contents"
+        }
+        final_request["candidate_contents"] = {
+            candidate_id: {
+                "candidate_id": candidate_id,
+                "organizing_logic": str(source["candidate_contents"][candidate_id].get("organizing_logic") or ""),
+                "section_index_ref": {"ledger_field": "candidate_section_index", "candidate_id": candidate_id},
+            }
+            for candidate_id in plan["candidate_ids"]
+        }
+        final_request["arbitration_evaluation_ledger"] = pack_arbitration_final_ledger(ledger)
+        final_request["hierarchy"] = {
+            "level": "all_candidate_final_arbitration", "plan_hash": plan["plan_hash"],
+            "ledger_hash": ledger["ledger_hash"],
+            "coverage": ledger["coverage"],
+            "plan_artifact": {"artifact_id": plan_record.artifact_id, "content_hash": plan_record.content_hash},
+            "ledger_artifact": {"artifact_id": ledger_record.artifact_id, "content_hash": ledger_record.content_hash},
+        }
+        final_request["evaluation_contract"] = (
+            "All full candidate sections and source closures were evaluated by the hash-bound leaf calls. "
+            "Select among every candidate using the complete semantic assessment ledger and critic dispositions. "
+            "Resolve each candidate section's exact title, goal, task/source identities and hash from "
+            "the ledger candidate_section_index using candidate_id and section_id. "
+            "Do not infer support from scores or omit a candidate. Preserve the full section coordination contract."
+        )
+        if ledger.get("claim_support_partition"):
+            final_request["evaluation_contract"] += (
+                " The claim_support_partition uses wire/v1: resolve string_catalog references and decode each "
+                "positional table by its *_columns contract. Parent slots bind full claim/support hashes and "
+                "exact authored occurrence/support-row indexes; unit_assignments bind disjoint slot positions. "
+                "Use leaf_coverage rows for exhaustive leaf coverage and derive compact part receipts from "
+                "leaf_result_receipt_rows.unit_ids plus unit_assignments. Preserve typed_issue_coverage exactly. "
+                "Treat leaf assessments as part-scoped and choose one global winner across all five alternatives."
+            )
+        final_node_id = f"{node_id}:final:{str(plan['plan_hash'])[:24]}"
+        final_request = self._attach_prompt_authority(final_node_id, final_request)
+        final_request = self._attach_arbitration_output_contract(final_request)
+        final_request = project_arbitration_final_request(final_request)
+        profile = self._node_route(node_id, "arbitration").profile
+
+        def final_input(body: Mapping[str, Any]) -> int:
+            return int(self._arbitration_request_estimate(final_node_id, body, profile, force_formal=True)["estimated_input_tokens"])
+
+        if final_input(final_request) > self._effective_input_cap(profile):
+            packed_critique_request = pack_critique_coverage_certificates(final_request)
+            if hash_json(expand_critique_coverage_certificates(packed_critique_request)) != hash_json(final_request):
+                raise OutlineV3ExecutionError("arbitration critique coverage wire did not preserve the exact request")
+            final_request = packed_critique_request
+        if final_input(final_request) > self._effective_input_cap(profile):
+            packed_feedback_request = pack_critique_coverage_certificates(final_request, compact_feedback=True)
+            canonical_feedback_request = expand_critique_coverage_certificates(packed_feedback_request)
+            canonical_request = expand_critique_coverage_certificates(final_request)
+            if hash_json(canonical_feedback_request) != hash_json(canonical_request):
+                raise OutlineV3ExecutionError("arbitration feedback wire did not preserve the exact request")
+            if final_input(packed_feedback_request) < final_input(final_request):
+                final_request = packed_feedback_request
+        if final_input(final_request) > self._effective_input_cap(profile):
+            if getattr(self, "arbitration_work_policy_record", None) is None:
+                raise OutlineV3ExecutionError("BLOCKED_BUDGET: complete arbitration evaluation ledger exceeds input cap")
+            # A previously completed exact request can still be replayed. A
+            # fresh miss is stopped by the formal-wire guard before admission.
+            calls_before = self._provider_call_count
+            receipts_before = len(self._receipt_ledger.list_receipts())
+            try:
+                decision = self._provider_call(
+                    final_node_id, final_request, expect_json=True,
+                    input_artifact_hashes=(*dependency_hashes.values(), plan["plan_hash"], ledger["ledger_hash"]),
+                    transport_node_id="arbitration", output_tokens=min(int(profile.max_output_tokens), 2_048),
+                )
+            except OutlineV3ExecutionError as exc:
+                capacity = str(exc).startswith("BLOCKED_BUDGET:") and (
+                    "serialized input estimate" in str(exc) or "complete formal arbitration request" in str(exc)
+                )
+                if (not capacity or self._provider_call_count != calls_before
+                        or len(self._receipt_ledger.list_receipts()) != receipts_before):
+                    raise
+                self._expected_provider_calls.pop(self._provider_call_id(final_node_id), None)
+                return self._run_arbitration_overflow(
+                    prepared, ledger, plan_record, ledger_record, final_request, dependency_hashes,
+                )
+            decision["hierarchical_evaluation"] = {"plan_hash": plan["plan_hash"],
+                                                  "ledger_hash": ledger["ledger_hash"], "coverage": ledger["coverage"]}
+            return decision
+        decision = self._provider_call(
+            final_node_id, final_request, expect_json=True,
+            input_artifact_hashes=(*dependency_hashes.values(), plan["plan_hash"], ledger["ledger_hash"]),
+            transport_node_id="arbitration", output_tokens=min(int(profile.max_output_tokens), 2_048),
+        )
+        decision["hierarchical_evaluation"] = {
+            "plan_hash": plan["plan_hash"], "ledger_hash": ledger["ledger_hash"],
+            "coverage": ledger["coverage"],
+        }
+        return decision
+
+    def _run_arbitration_overflow(
+        self, prepared: Mapping[str, Any], ledger: Mapping[str, Any],
+        plan_record: ArtifactRecord, ledger_record: ArtifactRecord,
+        final_request: Mapping[str, Any], dependency_hashes: Mapping[str, str],
+    ) -> dict[str, Any]:
+        from outline.arbitration_overflow_execution import execute_arbitration_overflow_pipeline
+        from outline.candidate_arbitration_aggregation import ArbitrationSerializationCaps, _selection_response_shape
+        from outline.candidate_arbitration_navigation import EXTRACT_KIND, REDUCE_KIND, NAV_KIND, DETAIL_KIND
+        from runtime.arbitration_work_policy import ALLOWED_KINDS, record_ref, verify_arbitration_surface
+        from runtime.provider_response_snapshot import ProviderResponseSnapshotStore
+        from runtime.runner import AgentRuntimeRunner
+        from services.writer_source_inventory import load_writer_source_inventory_v1
+
+        policy_record = self.arbitration_work_policy_record
+        if policy_record is None or self._candidate_output_scope is None:
+            raise OutlineV3ExecutionError("overflow arbitration requires its original run policy and canonical source scope")
+        policy = verify_arbitration_surface(self.registry, policy_record)
+        if policy["configured_candidate_count"] != self.candidate_count:
+            raise OutlineV3ExecutionError("overflow configured candidate scope changed after run admission")
+        resolver = AgentRuntimeRunner._external_registry_resolver(self.workspace)
+        inventory = load_writer_source_inventory_v1(self.registry, external_registry_resolver=resolver)
+        source = prepared["source_request"]
+        node_id = str(prepared["node_id"])
+        route = self._node_route(node_id, "arbitration")
+        profile = route.profile
+        cap = self._effective_input_cap(profile)
+        roots = {row.artifact_id: row for row in (policy_record, plan_record, ledger_record)}
+        for artifact_id in (inventory.artifact_id, "outline-v3:candidate_output_scope"):
+            record = self.registry.get(artifact_id)
+            if record is None or record.status != "ready":
+                raise OutlineV3ExecutionError("overflow source authority is not READY")
+            roots[artifact_id] = record
+        self.registry.verify_ready_artifact_closures(roots.values(), external_registry_resolver=resolver)
+        source_guard: dict[tuple[str, str], tuple[ArtifactRegistry, ArtifactRecord]] = {}
+        pending = list(roots.values())
+        while pending:
+            guarded = pending.pop()
+            key = (guarded.job_id, guarded.artifact_id)
+            if key in source_guard:
+                continue
+            owner = self.registry if guarded.job_id == self.job_id else resolver(guarded.job_id)
+            if owner is None:
+                raise OutlineV3ExecutionError("overflow source owner cannot be resolved")
+            source_guard[key] = (owner, guarded)
+            for dependency in guarded.depends_on:
+                target_owner = self.registry if dependency.job_id == self.job_id else resolver(dependency.job_id)
+                target = target_owner.get(dependency.artifact_id) if target_owner is not None else None
+                if target is None or target.content_hash != dependency.content_hash:
+                    raise OutlineV3ExecutionError("overflow source graph changed during admission")
+                pending.append(target)
+
+        def check_source_guard() -> None:
+            for owner in {id(owner): owner for owner, _ in source_guard.values()}.values():
+                owner.reload()
+            for owner, guarded in source_guard.values():
+                if owner.get(guarded.artifact_id) != guarded or file_sha256(guarded.path) != guarded.content_hash:
+                    raise OutlineV3ExecutionError("overflow source bytes or owner record changed before reuse/POST")
+
+        def physical(logical: str) -> str:
+            return f"{node_id}:derived:{logical}" if node_id.startswith("stability:") else logical
+
+        def attach(logical: str, body: Mapping[str, Any]) -> dict[str, Any]:
+            return self._attach_arbitration_output_contract(self._attach_prompt_authority(physical(logical), body))
+
+        def estimate(body: Mapping[str, Any]) -> dict[str, Any]:
+            actual = str((body.get("_prompt_authority") or {}).get("node_id") or node_id)
+            return self._arbitration_request_estimate(actual, body, profile, force_formal=True)
+
+        route_identity = {"provider": route.provider_name, "model": route.model,
+                          "endpoint_type": route.endpoint_type, "route_fingerprint": route.safe_config_fingerprint(),
+                          "prompt_sha256": self._outline_prompt_identity.sha256}
+        caps = ArbitrationSerializationCaps(
+            effective_input_cap=cap, verified_context_limit=int(profile.verified_context_limit),
+            route_max_output=int(profile.max_output_tokens), reasoning_reserve=int(profile.reasoning_reserve),
+            safety_margin=int(profile.safety_margin), route_identity=route_identity,
+            assessment_text_tokens=min(128, max(1, int(profile.max_output_tokens) // (4 * self.candidate_count))),
+            group_summary_text_tokens=min(128, max(1, int(profile.max_output_tokens) // (4 * self.candidate_count))),
+            selection_text_tokens=min(256, max(1, int(profile.max_output_tokens) // 8)), max_detail_required_ids=0,
+            assessment_wire_enabled=True,
+        )
+        # Source-bounded detail IDs must also fit their actual output schema.
+        source_ceiling = self.candidate_count * max(1, self._candidate_output_scope.max_support_rows)
+        low, high = 0, source_ceiling
+        while low < high:
+            trial = (low + high + 1) // 2
+            shape = _selection_response_shape(source, trial, caps)
+            if profile.estimate_tokens(shape) <= int(profile.max_output_tokens):
+                low = trial
+            else:
+                high = trial - 1
+        caps = replace(caps, max_detail_required_ids=low)
+        context = {"verified_context_limit": int(profile.verified_context_limit),
+                   "max_output_tokens": int(profile.max_output_tokens),
+                   "reasoning_reserve": int(profile.reasoning_reserve), "safety_margin": int(profile.safety_margin),
+                   "route_identity": route_identity, "effective_input_cap": cap}
+        nav_kinds = (EXTRACT_KIND, REDUCE_KIND, NAV_KIND, DETAIL_KIND)
+        retained_store = ProviderResponseSnapshotStore(self.workspace, self.registry, self.publication_context)
+        payload_records: dict[str, ArtifactRecord] = {}
+        raw_requests: dict[str, tuple[str, Mapping[str, Any]]] = {}
+        raw_refs: dict[str, str] = {}
+        admissions: dict[str, Mapping[str, Any]] = {}
+        admitted_work_rows: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        fixed_dependencies = {**dict(dependency_hashes), **{key: row.content_hash for key, row in roots.items()}}
+
+        def ref_record(ref: Mapping[str, Any]) -> ArtifactRecord:
+            record = self.registry.get(str(ref["artifact_id"]))
+            if record is None or record.status != "ready" or record.content_hash != ref["content_hash"]:
+                raise OutlineV3ExecutionError("overflow READY dependency changed")
+            self.registry._verify_ready_artifact(record)
+            return record
+
+        def persist(*, kind: str, artifact_id: str, payload: Mapping[str, Any], dependencies: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+            check_source_guard()
+            deps = [ref_record(ref) for ref in dependencies]
+            accepted = kind == "provider_validated_result" or kind in {
+                "selector_detail_results", "selected_candidate_navigation_proposal",
+                "selected_candidate_merge_detail_slice_results", "selected_candidate_merge_detail_reduction_node",
+                "selected_candidate_merge_group_adjudications",
+            }
+            artifact = self._artifact(OutlineArtifact, dict(payload), {row.artifact_id: row.content_hash for row in deps})
+            record = publish_json_artifact(
+                self.publication_context, self.registry,
+                self._path(f"outline_v3/arbitration_overflow/{hash_text(artifact_id)}.json"), artifact.to_dict(),
+                artifact_id=artifact_id, artifact_role=kind, artifact_type=artifact.artifact_type,
+                artifact_version=artifact.artifact_version, producer="outline.v3_executor.OutlineV3Executor",
+                depends_on=[ArtifactDependencyRefV2.from_record(row) for row in deps],
+                external_registry_resolver=resolver,
+                metadata={
+                    "job_id": self.job_id, "arbitration_kind": kind, "source_payload_hash": hash_json(payload),
+                    **({"work_plan_hash": payload["work_plan_ref"]["content_hash"], "work_kind": payload["kind"]}
+                       if kind == "arbitration_ready_kind" else {}),
+                },
+            )
+            check_source_guard()
+            self.artifact_records[artifact_id] = record
+            payload_records[hash_json(payload)] = record
+            if kind == "provider_raw_response":
+                raw_refs[record.artifact_id] = str(payload["request_id"])
+            if accepted:
+                # A reusable physical output must depend on the durable typed
+                # validation result. A crash before this point leaves only the
+                # original retained response, which is revalidated on recovery.
+                check_source_guard()
+                for dep in deps:
+                    logical = raw_refs.get(dep.artifact_id)
+                    if logical is None or logical not in raw_requests:
+                        continue
+                    actual, raw = raw_requests[logical]
+                    self._persist_semantic_provider_output(
+                        actual, raw, dependency_hashes=fixed_dependencies, update_parent_node=False,
+                        recovery_sources=(*roots.values(), record), external_registry_resolver=resolver,
+                    )
+                    raw_requests.pop(logical)
+                    index = next((i for i in range(len(self._request_payload_audit) - 1, -1, -1)
+                                  if self._request_payload_audit[i].get("node_id") == actual), -1)
+                    self._finish_request_payload_audit(index, semantic_validation_status="accepted")
+            return record_ref(record)
+
+        branch = {"schema_version": "arbitration-ready-branch/v1", "selected_path": "legacy_packed_final_overflow",
+                  "source_request_hash": hash_json(source), "legacy_plan_hash": prepared["plan"]["plan_hash"],
+                  "legacy_ledger_hash": ledger["ledger_hash"], "packed_final_request": dict(final_request),
+                  "measurement": estimate(final_request), "effective_input_cap": cap,
+                  "surface_ref": record_ref(policy_record), "route_identity": route_identity}
+        if int(branch["measurement"]["estimated_input_tokens"]) <= cap:
+            raise OutlineV3ExecutionError("overflow branch is not reachable from the actual packed final request")
+        branch_ref = persist(kind="arbitration_ready_branch", artifact_id=f"{node_id}:branch:{hash_json(branch)[:24]}",
+                             payload=branch, dependencies=[record_ref(row) for row in roots.values()])
+        roots[branch_ref["artifact_id"]] = ref_record(branch_ref)
+        fixed_dependencies[branch_ref["artifact_id"]] = branch_ref["content_hash"]
+
+        def admit_work(*, work_plan: Mapping[str, Any], kind: str, max_count: int,
+                       request_records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+            from runtime.arbitration_dispatch import (
+                build_arbitration_dispatch_row, admit_arbitration_work_rows, validate_arbitration_admission,
+            )
+
+            check_source_guard()
+            if kind not in ALLOWED_KINDS or type(max_count) is not int or max_count < len(request_records):
+                raise OutlineV3ExecutionError("unrecognized or over-count arbitration kind")
+            counts = work_plan.get("counts") or {}
+            count_fields = {
+                "arbitration_leaf_assessment_v2": "new_assessment_leaf_count",
+                "arbitration_reduce_new": "new_reducer_count",
+                "arbitration_selector_detail_review": "Qselector_detail",
+                "arbitration_decision_final": "Qfinal_selector",
+                EXTRACT_KIND: "Jnav", REDUCE_KIND: "Anav", NAV_KIND: "Qglobal",
+                "arbitration_detail_finalize/v2": "Qdetail_final",
+            }
+            if kind == DETAIL_KIND:
+                source_limit = int(counts.get("Qdetail_slice", -1)) + int(counts.get("Qdetail_reduce", -1))
+            elif kind == "arbitration_decision":
+                source_limit = 1
+            else:
+                source_limit = counts.get(count_fields[kind])
+            if type(source_limit) is not int or max_count != source_limit:
+                raise OutlineV3ExecutionError("arbitration kind count differs from its READY source plan")
+            work_record = payload_records.get(hash_json(work_plan))
+            if work_record is None:
+                raise OutlineV3ExecutionError("arbitration kind has no exact READY source work plan")
+            self.registry.verify_ready_artifact_closures(
+                [work_record, *roots.values()], external_registry_resolver=resolver,
+            )
+            scope = (work_record.content_hash, kind)
+            if scope not in admitted_work_rows:
+                restored: list[dict[str, Any]] = []
+                previous = [record for record in self.registry.list_records()
+                            if record.status == "ready" and record.artifact_role == "arbitration_ready_kind"
+                            and record.metadata.get("work_plan_hash") == scope[0]
+                            and record.metadata.get("work_kind") == kind]
+                for record in sorted(previous, key=lambda item: (item.created_at, item.artifact_id)):
+                    self.registry.verify_ready_artifact_closure(record, external_registry_resolver=resolver)
+                    previous_body = OutlineArtifact.from_dict(json.loads(Path(record.path).read_text(encoding="utf-8"))).payload
+                    if (previous_body.get("schema_version") != "arbitration-ready-kind/v1"
+                            or previous_body.get("kind") != kind or previous_body.get("max_count") != max_count
+                            or previous_body.get("work_plan_ref") != record_ref(work_record)
+                            or previous_body.get("branch_ref") != branch_ref
+                            or previous_body.get("original_provider_budget") != policy["original_provider_budget"]
+                            or hash_json(previous_body) != record.metadata.get("source_payload_hash")):
+                        raise OutlineV3ExecutionError("restored arbitration work authority differs from its original scope")
+                    validate_arbitration_admission(previous_body)
+                    restored = admit_arbitration_work_rows(
+                        restored, previous_body["cumulative_requests"], max_count=max_count,
+                    )
+                admitted_work_rows[scope] = restored
+            prior_rows = admitted_work_rows.get(scope, [])
+            prior_by_id = {row["request_id"]: row for row in prior_rows}
+            ids, rows = [], []
+            for request_record in request_records:
+                logical = str(request_record.get("request_id") or request_record.get("node_id") or "")
+                request = request_record.get("request", request_record.get("prompt_request"))
+                output = request_record.get("requested_output_tokens")
+                if (not logical or logical in ids or not isinstance(request, Mapping)
+                        or compute_v3_hash(request) != request_record.get("request_hash")
+                        or type(output) is not int or not 0 < output <= int(profile.max_output_tokens)):
+                    raise OutlineV3ExecutionError("arbitration kind request identity or output reserve is invalid")
+                measured = estimate(request)
+                if int(measured["estimated_input_tokens"]) > cap or not measured["within_budget"]:
+                    raise OutlineV3ExecutionError("arbitration kind complete serialized input exceeds its route")
+                ids.append(logical)
+                body = request_record.get("body") or {}
+                level = request_record.get("level", body.get("level", request.get("level", 0)))
+                ordinal = prior_by_id[logical]["ordinal"] if logical in prior_by_id else sum(
+                    row["level"] == level for row in prior_rows
+                ) + sum(
+                    row["level"] == level and row["request_id"] not in prior_by_id for row in rows
+                )
+                rows.append(build_arbitration_dispatch_row(
+                    request_record, kind=kind, measured=measured, ordinal=ordinal, level=level,
+                ))
+            try:
+                cumulative_rows = admit_arbitration_work_rows(prior_rows, rows, max_count=max_count)
+            except ValueError as exc:
+                raise OutlineV3ExecutionError(str(exc)) from exc
+            body = {"schema_version": "arbitration-ready-kind/v1", "kind": kind, "count": len(rows),
+                    "max_count": max_count, "request_ids": ids, "requests": rows,
+                    "cumulative_count": len(cumulative_rows), "cumulative_requests": cumulative_rows,
+                    "work_plan_ref": record_ref(work_record), "branch_ref": branch_ref,
+                    "conditional_path_id": branch_ref["artifact_id"],
+                    "alternative_group_id": f"arbitration:{branch['source_request_hash']}",
+                    "original_provider_budget": policy["original_provider_budget"],
+                    "physical_reservation_owner": "ProviderRuntime.admit", "is_provider_reservation": False}
+            record = persist(kind="arbitration_ready_kind", artifact_id=f"{node_id}:kind:{hash_json(body)[:24]}",
+                             payload=body, dependencies=[*map(record_ref, roots.values()), record_ref(work_record)])
+            admissions[record["artifact_id"]] = body
+            admitted_work_rows[scope] = cumulative_rows
+            return {**record, "kind": kind, "count": len(rows), "max_count": max_count, "request_ids": ids}
+
+        def send(*, request_record: Mapping[str, Any], root_dependencies: Sequence[Mapping[str, Any]],
+                 admission: Mapping[str, Any]) -> dict[str, Any]:
+            from runtime.arbitration_dispatch import (
+                retained_output_reserve_per_attempt,
+                validate_arbitration_dispatch,
+                verify_arbitration_hash_domains,
+            )
+
+            check_source_guard()
+            admission_record = ref_record(admission)
+            declared = admissions.get(str(admission["artifact_id"]))
+            registered = OutlineArtifact.from_dict(
+                json.loads(Path(admission_record.path).read_text(encoding="utf-8")),
+            ).payload
+            if (declared != registered or hash_json(registered) != admission_record.metadata.get("source_payload_hash")
+                    or admission_record.artifact_role != "arbitration_ready_kind"):
+                raise OutlineV3ExecutionError("arbitration dispatch authority differs from its Registry readback")
+            logical = str(request_record["request_id"])
+            if declared is None or logical not in declared["request_ids"]:
+                raise OutlineV3ExecutionError("arbitration dispatch has no matching source-bound kind authority")
+            expected_row = declared["requests"][declared["request_ids"].index(logical)]
+            try:
+                validate_arbitration_dispatch(declared, request_record, measured=estimate(request_record["request"]))
+            except ValueError as exc:
+                raise OutlineV3ExecutionError(str(exc)) from exc
+            for dep in root_dependencies:
+                ref_record(dep)
+            check_source_guard()
+            actual = physical(logical)
+            request = dict(request_record["request"])
+
+            def recover(expected: ExpectedProviderCall):
+                calls = [row for row in self._receipt_ledger.list_receipts()
+                         if row.job_id == self.job_id and row.call_id == expected.call_id]
+                if not calls:
+                    return None
+                receipt = max(calls, key=lambda row: (str(row.finished_at), row.sequence, row.attempts))
+                if receipt.status != "success" or receipt.input_hash != expected.input_hash:
+                    return None
+                return retained_store.read_registered_content(receipt), receipt
+
+            def fresh_guard(_node: str, body: Mapping[str, Any], measured: Mapping[str, Any]) -> None:
+                try:
+                    validate_arbitration_dispatch(declared, request_record, measured=measured)
+                except ValueError as exc:
+                    raise OutlineV3ExecutionError(str(exc)) from exc
+                if compute_v3_hash(body) != expected_row["request_hash"] or estimate(body)["wire_request_hash"] != measured.get("wire_request_hash"):
+                    raise OutlineV3ExecutionError("arbitration physical serializer differs from its exact READY work")
+                for row in roots.values():
+                    self.registry._verify_ready_artifact(row)
+                components = [0, 0, 0]
+                for receipt in self._receipt_ledger.list_receipts():
+                    if receipt.job_id != self.job_id or receipt.stage_name != "outline_v3" or receipt.attempts <= 0:
+                        continue
+                    prior = receipt.metadata.get("estimation") or {}
+                    attempts = max(1, receipt.attempts)
+                    components[0] += max(int(prior.get("estimated_input_tokens") or 0) * attempts, int(receipt.input_tokens or 0))
+                    components[1] += max(retained_output_reserve_per_attempt(prior) * attempts, int(receipt.output_tokens or 0))
+                    components[2] += int(prior.get("reasoning_reserve") or 0) * attempts
+                attempts = int(measured.get("effective_attempts") or 1)
+                components[0] += int(measured["estimated_input_tokens"]) * attempts
+                components[1] += int(request_record["requested_output_tokens"]) * attempts
+                components[2] += int(profile.reasoning_reserve) * attempts
+                if self.max_estimated_total_tokens is not None and sum(components) > self.max_estimated_total_tokens:
+                    raise OutlineV3ExecutionError("BLOCKED_BUDGET: original Outline total-token ceiling is exhausted")
+                if self.max_estimated_cost is not None:
+                    rates = (self.input_cost_per_1k_tokens, self.output_cost_per_1k_tokens, self.reasoning_cost_per_1k_tokens)
+                    if any(rate is None for rate in rates):
+                        raise OutlineV3ExecutionError("BLOCKED_BUDGET: exact arbitration work has no configured price bound")
+                    cost = sum(count * float(rate or 0) / 1000.0 for count, rate in zip(components, rates))
+                    if cost > self.max_estimated_cost:
+                        raise OutlineV3ExecutionError("BLOCKED_BUDGET: original Outline estimated-cost ceiling is exhausted")
+                check_source_guard()
+
+            self._check(actual)
+            result = self._provider_call(
+                actual, request, transport_node_id="arbitration",
+                output_tokens=int(request_record["requested_output_tokens"]),
+                input_artifact_hashes=tuple(fixed_dependencies.values()),
+                before_provider_admission=fresh_guard, retained_response_lookup=recover,
+                response_snapshot_sink_override=retained_store,
+            )
+            audit = next(row for row in reversed(self._request_payload_audit) if row["node_id"] == actual)
+            ids = audit.get("receipt_ids") or []
+            # The planner uses the v3 content digest; provider audit/receipt
+            # identity uses the provider-runtime JSON hash domain. Bind both
+            # to these exact bytes rather than comparing unlike digests.
+            try:
+                verify_arbitration_hash_domains(
+                    request, planner_request_hash=expected_row["request_hash"],
+                    provider_input_hash=audit["payload_hash"],
+                )
+            except ValueError as exc:
+                raise OutlineV3ExecutionError(str(exc)) from exc
+            if len(ids) != 1:
+                raise OutlineV3ExecutionError("arbitration send has no exact original receipt/readback")
+            raw_requests[logical] = (actual, result)
+            return {"request_id": logical, "transport_node_id": "arbitration", "actual_request": request,
+                    "request_hash": expected_row["request_hash"], "provider_input_hash": audit["payload_hash"],
+                    "raw_response": result, "receipt_id": ids[0],
+                    "response_hash": hash_json(result), "replay_status": str(audit.get("status") or "complete")}
+
+        def atoms(value: Any) -> int:
+            if isinstance(value, Mapping):
+                return 1 + sum(1 + atoms(item) for item in value.values())
+            if isinstance(value, list):
+                return 1 + sum(atoms(item) for item in value)
+            return max(1, len(str(value).encode("utf-8")))
+
+        candidates = list(source["candidate_contents"].values())
+        fnav_max = max(atoms([{key: row.get(key) for key in ("title", "goal", "rationale", "task_ids")}
+                             for row in candidate.get("sections", [])]) for candidate in candidates)
+        emax = 2 * max(atoms(candidate.get("sections", [])) for candidate in candidates) + atoms(source["review_intent"])
+        execution = execute_arbitration_overflow_pipeline(
+            prepared_hierarchy=prepared, legacy_ledger=ledger, candidate_scope=self._candidate_output_scope,
+            source_inventory=inventory, review_intent=source["review_intent"],
+            critique_disposition=source["critique_disposition"], arbitration_caps=caps,
+            navigation_context_reserve={kind: dict(context) for kind in nav_kinds},
+            navigation_input_caps={kind: cap for kind in nav_kinds}, fnav_max=fnav_max, emax=emax,
+            root_dependencies=[record_ref(row) for row in roots.values()],
+            arbitration_request_builder=lambda _kind, body: attach(str(body["node_id"]), body),
+            arbitration_input_estimator=estimate, arbitration_output_estimator=profile.estimate_tokens,
+            navigation_prompt_authority=lambda _kind, identity, body: attach(identity, body)["_prompt_authority"],
+            navigation_route_estimator=lambda _kind, body: estimate(body),
+            navigation_output_estimator=lambda _kind, body: profile.estimate_tokens(body),
+            admit_work=admit_work, send=send, persist=persist,
+            apply_section_coordination=self._apply_section_coordination,
+        )
+        selection = execution["selection_result"]
+        terminal_body = {"schema_version": "arbitration-overflow-terminal/v1",
+                         "selected_candidate_id": execution["selected_candidate_id"],
+                         "selection_result": dict(selection), "coordination": execution.get("coordination"),
+                         "counts": execution["counts"], "branch_ref": branch_ref}
+        terminal = persist(
+            kind="arbitration_overflow_terminal", artifact_id=f"{node_id}:overflow-terminal:{hash_json(terminal_body)[:24]}",
+            payload=terminal_body, dependencies=execution["ready_artifacts"],
+        )
+        self._arbitration_terminal_dependencies[node_id] = ref_record(terminal)
+        return {"selected_candidate_id": execution["selected_candidate_id"],
+                "selection_reasons": [str(selection.get("rationale") or "Source-bound all-candidate selection")],
+                "accepted_recommendations": [], "rejected_recommendations": [], "unresolved_risks": [],
+                "section_coordination": execution.get("coordination"),
+                "hierarchical_evaluation": {"plan_hash": prepared["plan"]["plan_hash"],
+                                            "ledger_hash": ledger["ledger_hash"], "coverage": ledger["coverage"]},
+                "overflow_execution": {"counts": execution["counts"], "branch_ref": branch_ref,
+                                       "terminal_ref": terminal}}
+
     def _candidate_shard_requests(
         self,
         *,
@@ -8850,6 +11769,12 @@ class OutlineV3Executor:
         node_prefix: str = "",
     ) -> list[tuple[str, dict[str, Any], list[str], list[str], dict[str, Any]]]:
         """Build the same complete candidate shards for checks and transport."""
+
+        if self._candidate_output_scope is not None and provider_request.get("shared_semantic_context"):
+            return self._candidate_group_requests(
+                generation_node_id=generation_node_id, provider_request=provider_request,
+                node_prefix=node_prefix,
+            )
 
         shard_plan = self._build_relation_shard_plan(
             evidence_views,
@@ -8901,6 +11826,30 @@ class OutlineV3Executor:
                     if isinstance(item, Mapping)
                 ],
             })
+            # Candidate organization already consumed the source-bearing shared
+            # synthesis. Do not replace its verified compact references with
+            # full evidence views merely because physical sharding was needed.
+            # The shared semantic context retains the actual claims, qualifier
+            # texts and dependencies; the full views stay in the local Registry.
+            parent_refs = provider_request.get("evidence") or ()
+            if parent_refs and all(
+                isinstance(item, Mapping)
+                and item.get("projection") == "registry_complete_evidence_ref_v1"
+                for item in parent_refs
+            ) and isinstance(request.get("shared_semantic_context"), Mapping):
+                if self._alias_enabled and self._alias_map is not None:
+                    from outline.evidence_alias import canonicalize_structural
+
+                    parent_refs = canonicalize_structural(
+                        {"evidence": list(parent_refs)}, self._alias_map,
+                    )["evidence"]
+                compact_refs = [
+                    dict(item) for item in parent_refs
+                    if str(item.get("paper_key") or "") in shard_key_set
+                ]
+                if {str(item.get("paper_key") or "") for item in compact_refs} != shard_key_set:
+                    raise OutlineV3ExecutionError("candidate shard lost a verified evidence reference")
+                request["evidence"] = compact_refs
             if self._alias_enabled and self._alias_map is not None:
                 from outline.evidence_alias import alias_structural
 
@@ -8911,20 +11860,276 @@ class OutlineV3Executor:
             requests.append((node_id, shard, paper_keys, shard_relation_ids, request))
         return requests
 
-    def _candidate_output_scope_wire(self, paper_keys: Sequence[str]) -> dict[str, Any]:
+    def _candidate_group_requests(
+        self, *, generation_node_id: str, provider_request: Mapping[str, Any],
+        node_prefix: str = "",
+    ) -> list[tuple[str, dict[str, Any], list[str], list[str], dict[str, Any]]]:
+        from outline.candidate_request_packing import (
+            CandidatePackingError, estimate_candidate_output, pack_candidate_groups,
+            project_semantic_context, select_required_candidate_groups,
+        )
+
+        scope = self._candidate_output_scope
+        if scope is None:
+            raise OutlineV3ExecutionError("candidate group packing requires a verified output scope")
+        profile = self._node_route(generation_node_id).profile
+        parent = dict(provider_request)
+        if self._alias_enabled and self._alias_map is not None:
+            from outline.evidence_alias import canonicalize_structural
+
+            parent = canonicalize_structural(parent, self._alias_map)
+        context = parent["shared_semantic_context"]
+        context_hash = hash_json(context)
+        parent_scope_hash = scope.content_hash
+        semantic_chunk_plan_hash = hash_json(parent.get("semantic_chunk_plan") or {})
+        self._candidate_corpus_witness_group_ids = ()
+        self._candidate_corpus_witness_scope_hash = parent_scope_hash
+        required_ids = self._required_candidate_group_ids(scope)
+        wire_required_ids = required_ids
+        coverage = parent.get("required_corpus_coverage")
+        if coverage is not None and not isinstance(coverage, Mapping):
+            raise OutlineV3ExecutionError("candidate required corpus coverage must be an object")
+        coverage_papers = coverage.get("paper_keys") if coverage is not None else list(scope.paper_keys)
+        if not isinstance(coverage_papers, (list, tuple)) or any(
+            not isinstance(paper, str) or not paper.strip() for paper in coverage_papers
+        ):
+            raise OutlineV3ExecutionError("candidate required corpus paper keys must be an array of source identities")
+        required_papers = list(coverage_papers)
+        source_values = {
+            str(row.get("source_field_id") or ""): str(row.get("source_value", ""))
+            for row in (context.get("interpretation_source_tables") or {}).get("source_fields") or ()
+            if isinstance(row, Mapping)
+        }
+
+        def build(group_ids: Sequence[str]) -> dict[str, Any]:
+            key = tuple(sorted(group_ids))
+            local = scope.for_groups(key)
+            papers = set(local.paper_keys)
+            relations = {value for group in local.claim_groups for value in group.relation_ids}
+            request = {
+                **parent,
+                "paper_keys": list(local.paper_keys), "relation_ids": sorted(relations),
+                "relations": [dict(row) for row in parent.get("relations") or ()
+                              if isinstance(row, Mapping) and row.get("relation_id") in relations],
+                "evidence": [dict(row) for row in parent.get("evidence") or ()
+                             if isinstance(row, Mapping) and row.get("paper_key") in papers],
+                "candidate_output_scope": self._candidate_output_scope_wire_from_scope(
+                    local, parent_content_hash=parent_scope_hash,
+                    required_group_ids=wire_required_ids,
+                ),
+                "required_corpus_coverage": {
+                    "paper_keys": sorted(papers.intersection(required_papers)),
+                    **({"contract_hash": coverage.get("contract_hash")} if coverage is not None else {}),
+                },
+                "shared_semantic_context": project_semantic_context(context, local, context_hash=context_hash),
+                "semantic_chunk_plan": {"projection": "shared_ready_plan_ref",
+                                        "content_hash": semantic_chunk_plan_hash},
+                "content_layer_refs": {**dict(parent.get("content_layer_refs") or {}),
+                                       "dossier_ids": [f"dossier:{paper}" for paper in local.paper_keys]},
+                "hierarchy": {"level": "candidate_local_shard", "claim_group_ids": list(key),
+                              "paper_keys": list(local.paper_keys), "assignment_policy": "complete_assertion_closure",
+                              "shard_id": "candidate_group_" + hash_json(list(key))[:16]},
+            }
+            if {str(row.get("paper_key") or "") for row in request["evidence"]} != papers:
+                raise CandidatePackingError("candidate group lost an included-paper evidence reference")
+            if self._alias_enabled and self._alias_map is not None:
+                from outline.evidence_alias import alias_structural
+
+                request = alias_structural(request, self._alias_map)
+            return request
+
+        def measure(request: Mapping[str, Any], local: Any) -> dict[str, Any]:
+            # Output estimation reads only the candidate identity and output
+            # contract. Both are unchanged by structural paper/relation aliases.
+            output = estimate_candidate_output(local, parent, profile.estimate_tokens)
+            shard_id = str((request.get("hierarchy") or {})["shard_id"])
+            node_id = f"{generation_node_id}:local:{shard_id}"
+            if node_prefix:
+                node_id = f"{node_prefix}:{node_id}"
+            exact = self._attach_prompt_authority(node_id, request)
+            estimate = profile.estimate_request_v1(exact, requested_output_tokens=min(output, profile.max_output_tokens))
+            return {"input_tokens": estimate.estimated_input_tokens, "output_tokens": output,
+                    "within_context": estimate.within_context_budget,
+                    "serializer_hash": estimate.request_hash, "output_estimate_kind": "complete_scope_json_estimate"}
+
+        required_slots = [slot for slot in scope.claim_slots if slot.claim_group_id in required_ids]
+        superseded = set()
+        for group in scope.claim_groups:
+            if group.claim_seed or group.claim_group_id in required_ids:
+                continue
+            slots = [slot for slot in scope.claim_slots if slot.claim_group_id == group.claim_group_id]
+            if slots and all(any(
+                slot.paper_key == required.paper_key and slot.primary_claim_id == required.primary_claim_id
+                and slot.study_id == required.study_id
+                and set(slot.source_claim_ids).issubset(required.source_claim_ids)
+                and set(slot.evidence_ids).issubset(required.evidence_ids)
+                and set(slot.source_field_ids).issubset(required.source_field_ids)
+                for required in required_slots
+            ) for slot in slots):
+                superseded.add(group.claim_group_id)
+        core_ids = ({group.claim_group_id for group in scope.claim_groups if not group.claim_seed}
+                    - superseded) | required_ids
+        try:
+            selected_ids, paper_witnesses = select_required_candidate_groups(
+                scope, core_group_ids=sorted(core_ids),
+                required_comparison_group_ids=sorted(required_ids), required_paper_keys=required_papers,
+                source_field_values=source_values,
+                measure_group=lambda group_id: measure(build([group_id]), scope.for_groups([group_id])),
+                input_cap=self._effective_input_cap(profile), output_cap=profile.max_output_tokens,
+            )
+        except CandidatePackingError as exc:
+            raise OutlineV3ExecutionError(f"RECOVERABLE_CANDIDATE_COVERAGE: {exc}") from exc
+        core_ids = set(selected_ids)
+        # Required paper inclusion is a task obligation even when its only
+        # witness is a relation group. Demand one complete witness per paper,
+        # while leaving additional available claims and comparisons optional.
+        self._candidate_corpus_witness_group_ids = tuple(sorted({
+            row["claim_group_id"] for row in paper_witnesses
+        }))
+        wire_required_ids = required_ids | set(self._candidate_corpus_witness_group_ids)
+        core_scope = scope.for_groups(sorted(core_ids))
+        try:
+            bins = pack_candidate_groups(core_scope, build, measure,
+                                         input_cap=self._effective_input_cap(profile), output_cap=profile.max_output_tokens)
+        except CandidatePackingError as exc:
+            raise OutlineV3ExecutionError(f"RECOVERABLE_CAPACITY: {exc}") from exc
+        # Available relation exploration does not multiply organization calls.
+        # Attach a complete optional task only when it fits an already needed
+        # request. Otherwise record its deferral explicitly before transport.
+        deferred = {group_id: "standalone_source_support_is_already_closed_inside_the_required_comparison"
+                    for group_id in superseded}
+        priority = {"contradicts": 0, "reported_magnitude_contrast": 1,
+                    "explains_discrepancy": 2, "qualifies": 3, "bridge_between_topics": 4}
+        optional_groups = sorted(
+            (group for group in scope.claim_groups if group.claim_group_id not in core_ids | superseded),
+            key=lambda group: (
+                priority.get(str(dict(group.task_contract).get("relation_type") or ""), 9),
+                hash_json(sorted(source_values.get(field_id, "")
+                                 for slot in scope.claim_slots if slot.claim_group_id == group.claim_group_id
+                                 for field_id in slot.source_field_ids)),
+                group.claim_group_id,
+            ),
+        )
+        for group in optional_groups:
+            if group.claim_group_id in core_ids:
+                continue
+            for index, (group_ids, _metrics) in enumerate(bins):
+                proposed = [*group_ids, group.claim_group_id]
+                local = scope.for_groups(proposed)
+                metrics = measure(build(proposed), local)
+                if (int(metrics["input_tokens"]) <= self._effective_input_cap(profile)
+                        and int(metrics["output_tokens"]) <= profile.max_output_tokens
+                        and metrics["within_context"]):
+                    bins[index] = (proposed, metrics)
+                    break
+            else:
+                deferred[group.claim_group_id] = "optional_exploration_would_require_an_additional_organization_request"
+        assignments = {}
+        planned = []
+        for group_ids, metrics in bins:
+            request = copy.deepcopy(build(group_ids))
+            shard_id = "candidate_group_" + hash_json(sorted(group_ids))[:16]
+            node_id = f"{generation_node_id}:local:{shard_id}"
+            if node_prefix:
+                node_id = f"{node_prefix}:{node_id}"
+            local = scope.for_groups(group_ids)
+            for group_id in group_ids:
+                assignments[group_id] = node_id
+            request["hierarchy"]["shard_id"] = shard_id
+            shard = {"shard_id": shard_id, "paper_keys": list(local.paper_keys),
+                     "claim_group_ids": group_ids, "capacity": metrics,
+                     "estimated_output_tokens": metrics["output_tokens"]}
+            relation_ids = sorted({value for group in local.claim_groups for value in group.relation_ids})
+            planned.append((node_id, shard, list(local.paper_keys), relation_ids, request))
+        for _node, shard, _papers, _relations, _request in planned:
+            shard["group_assignment"] = {group_id: assignments[group_id]
+                                         for group_id in shard["claim_group_ids"]}
+            shard["assignment_coverage_hash"] = hash_json(assignments)
+            shard["assigned_group_count_total"] = len(assignments)
+            shard["deferred_optional_groups"] = deferred
+            shard["required_corpus_witnesses"] = list(paper_witnesses)
+        return planned
+
+    def _required_candidate_group_ids(self, scope: Any) -> set[str]:
+        required = build_review_intent(self.review_intent_input).required_comparisons
+        selected: set[str] = set()
+        for item in required:
+            papers = set(item["paper_keys"])
+            witnesses = [group for group in scope.claim_groups if group.claim_seed
+                         and set(group.paper_keys) == papers
+                         and dict(group.task_contract).get("comparison_question") == item["question"]
+                         and (not item["relation_type"] or dict(group.task_contract).get("relation_type") == item["relation_type"])]
+            if not witnesses:
+                raise OutlineV3ExecutionError(
+                    f"required comparison has no complete selected source task: papers={sorted(papers)}, "
+                    f"question={item['question']}"
+                )
+            selected.update(group.claim_group_id for group in witnesses)
+        if (self._candidate_corpus_witness_group_ids
+                and self._candidate_corpus_witness_scope_hash == scope.content_hash):
+            selected.update(self._candidate_corpus_witness_group_ids)
+        return selected
+
+    def _expand_candidate_wire_payload(
+        self, payload: Mapping[str, Any], paper_keys: Sequence[str],
+        group_ids: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        if "candidate_wire_version" not in payload:
+            return dict(payload)
+        from outline.candidate_request_packing import CandidatePackingError, expand_candidate_slot_output
+        from outline.candidate_output_scope import CandidateOutputScopeError
+
+        parent = self._candidate_output_scope
+        if parent is None:
+            raise OutlineV3ExecutionError("compact candidate output has no verified source scope")
+        try:
+            scope = (parent.for_groups(group_ids, allowed_paper_keys=paper_keys)
+                     if group_ids is not None else parent.for_papers(paper_keys))
+            return expand_candidate_slot_output(payload, scope)
+        except (CandidatePackingError, CandidateOutputScopeError) as exc:
+            raise OutlineV3ExecutionError(f"compact candidate source contract: {exc}") from exc
+
+    def _candidate_output_scope_wire(
+        self, paper_keys: Sequence[str], claim_group_ids: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
         """Expose the complete slot closure once, leaving audit lineage in Registry."""
 
         parent_scope = self._candidate_output_scope
         if parent_scope is None:
             raise OutlineV3ExecutionError("candidate output scope is missing before wire materialization")
-        scope = parent_scope.for_papers(paper_keys)
+        scope = (parent_scope.for_groups(claim_group_ids, allowed_paper_keys=paper_keys)
+                 if claim_group_ids is not None else parent_scope.for_papers(paper_keys))
+        return self._candidate_output_scope_wire_from_scope(
+            scope, parent_content_hash=parent_scope.content_hash,
+            required_group_ids=self._required_candidate_group_ids(parent_scope),
+        )
+
+    @staticmethod
+    def _candidate_output_scope_wire_from_scope(
+        scope: Any, *, parent_content_hash: str, required_group_ids: Iterable[str],
+    ) -> dict[str, Any]:
+        """Render an already source-closed projection using operation-local authority."""
+
         payload = scope.to_dict()
         group_indices = {group.claim_group_id: index for index, group in enumerate(scope.claim_groups)}
         return {
             "schema_version": "outline-candidate-output-scope-wire/v1",
-            "content_hash": scope.content_hash,
-            "parent_content_hash": parent_scope.content_hash,
+            "content_hash": payload["content_hash"],
+            "parent_content_hash": parent_content_hash,
             "task_ids": list(scope.task_ids), "limits": payload["limits"],
+            "claim_group_ids": list(group_indices),
+            "required_claim_group_indices": [group_indices[group_id]
+                                             for group_id in sorted(required_group_ids)
+                                             if group_id in group_indices],
+            "organization_tasks": [
+                {"claim_group_index": group_indices[group.claim_group_id],
+                 "claim_group_id": group.claim_group_id, "task_id": group.task_id,
+                 "synthesis_claim_id": group.synthesis_claim_id,
+                 "claim_kind": group.claim_kind, "claim_seed": group.claim_seed,
+                 "paper_keys": list(group.paper_keys), "support_slot_ids": list(group.support_slot_ids),
+                 "task_contract": dict(group.task_contract)}
+                for group in scope.claim_groups if group.claim_seed
+            ],
             "claim_slots": [
                 {"claim_group_index": group_indices[slot.claim_group_id], **{
                     key: value for key, value in slot.to_dict().items() if key in {
@@ -8977,14 +12182,45 @@ class OutlineV3Executor:
                 if str(source_hashes[source_id]) != _hash_payload(original[source_id]):
                     raise OutlineV3ExecutionError("section coordination merge source hash changed")
             source_sections = [original[source_id] for source_id in source_ids]
-            title = str(source_sections[0].get("title") or "").strip()
-            goal = str(source_sections[0].get("goal") or "").strip()
+            title = str(raw_group.get("title") or "").strip()
+            goal = str(raw_group.get("goal") or "").strip()
+            canonical_intent = raw_group.get("canonical_intent")
+            source_intents: dict[str, dict[str, str]] = {}
             if (
                 not title or not goal
-                or any(str(item.get("title") or "").strip() != title or str(item.get("goal") or "").strip() != goal for item in source_sections)
-                or str(raw_group.get("title") or "").strip() != title
-                or str(raw_group.get("goal") or "").strip() != goal
                 or not str(raw_group.get("integration_reason") or "").strip()
+            ):
+                raise OutlineV3ExecutionError("section coordination merge has conflicting section intent")
+            if canonical_intent is not None:
+                # Different wording is legal only under an explicit coordinator
+                # decision bound to every source intent. Claims and provenance
+                # are still merged losslessly and checked independently below.
+                if (
+                    not isinstance(canonical_intent, Mapping)
+                    or str(canonical_intent.get("title") or "").strip() != title
+                    or str(canonical_intent.get("goal") or "").strip() != goal
+                ):
+                    raise OutlineV3ExecutionError("section coordination canonical intent changed")
+                raw_intents = canonical_intent.get("source_intents")
+                if not isinstance(raw_intents, Mapping) or set(raw_intents) != set(source_ids):
+                    raise OutlineV3ExecutionError("section coordination intent has incomplete source accounting")
+                for source_id in source_ids:
+                    binding = raw_intents[source_id]
+                    if (
+                        not isinstance(binding, Mapping)
+                        or str(binding.get("title") or "") != str(original[source_id].get("title") or "")
+                        or str(binding.get("goal") or "") != str(original[source_id].get("goal") or "")
+                        or not str(binding.get("contribution") or "").strip()
+                    ):
+                        raise OutlineV3ExecutionError("section coordination source intent changed or lacks contribution")
+                    source_intents[source_id] = {
+                        "title": str(binding["title"]), "goal": str(binding["goal"]),
+                        "contribution": str(binding["contribution"]),
+                    }
+            elif any(
+                str(item.get("title") or "").strip() != title
+                or str(item.get("goal") or "").strip() != goal
+                for item in source_sections
             ):
                 raise OutlineV3ExecutionError("section coordination merge has conflicting section intent")
             paper_keys: list[str] = []
@@ -9027,6 +12263,8 @@ class OutlineV3Executor:
             result = dict(source_sections[0])
             result.update({
                 "section_id": new_id,
+                "title": title,
+                "goal": goal,
                 "paper_keys": list(dict.fromkeys(paper_keys)),
                 "relation_ids": list(dict.fromkeys(relation_ids)),
                 "claims": list(dict.fromkeys(claims)),
@@ -9042,6 +12280,7 @@ class OutlineV3Executor:
                 ]),
                 "coordination_source_rationales": source_rationales,
                 "coordination_source_section_ids": source_ids,
+                **({"coordination_source_intents": source_intents} if source_intents else {}),
             })
             merged[new_id] = result
             consumed.update(source_ids)
@@ -9051,6 +12290,9 @@ class OutlineV3Executor:
                 "source_section_hashes": {key: str(source_hashes[key]) for key in source_ids},
                 "merged_section_hash": _hash_payload(result),
                 "integration_reason": str(raw_group["integration_reason"]),
+                **({"canonical_intent": {
+                    "title": title, "goal": goal, "source_intents": source_intents,
+                }} if source_intents else {}),
             })
         final_by_id = {
             **{key: value for key, value in original.items() if key not in consumed},
@@ -9099,6 +12341,38 @@ class OutlineV3Executor:
             relation_candidates=relation_candidates,
             node_prefix=node_prefix,
         )
+        physical_node_ids = [node_id for node_id, *_rest in shard_requests]
+        physical_call_ids = [self._provider_call_id(node_id) for node_id in physical_node_ids]
+        logical_group_assignment: dict[str, str] = {}
+        deferred_group_ids: set[str] = set()
+        for node_id, shard, _papers, _relations, _request in shard_requests:
+            for group_id, assigned_node in (shard.get("group_assignment") or {}).items():
+                key = str(group_id or "")
+                value = str(assigned_node or "")
+                if not key or value != node_id or key in logical_group_assignment:
+                    raise OutlineV3ExecutionError(
+                        f"{generation_node_id} has an invalid or duplicate logical group assignment"
+                    )
+                logical_group_assignment[key] = value
+            deferred_group_ids.update(
+                str(group_id) for group_id in (shard.get("deferred_optional_groups") or {}) if str(group_id)
+            )
+        if logical_group_assignment and set(logical_group_assignment.values()) != set(physical_node_ids):
+            raise OutlineV3ExecutionError(
+                f"{generation_node_id} logical group assignment does not cover every physical shard"
+            )
+        assignment_coverage_hash = hash_json(logical_group_assignment) if logical_group_assignment else ""
+        force_shard_provider = False
+        if logical_group_assignment and not node_prefix:
+            prior_candidate = self.registry.get(f"outline-v3:{generation_node_id}")
+            if prior_candidate is not None:
+                try:
+                    if prior_candidate.status != "ready":
+                        raise RegistryError("prior merged candidate is not ready")
+                    self.registry.verify_ready_artifact_closure(prior_candidate)
+                except (OSError, RegistryError, TypeError, ValueError):
+                    force_shard_provider = True
+        replay_evidence_start = len(self._replay_evidence)
         profile = self._node_route(generation_node_id).profile
         effective_cap = self._effective_input_cap(profile)
         if (
@@ -9142,16 +12416,16 @@ class OutlineV3Executor:
                 expect_json=True,
                 input_artifact_hashes=tuple(shard_deps.values()),
                 transport_node_id=generation_node_id,
-                output_tokens=min(
-                    int(self._node_route(generation_node_id).profile.max_output_tokens),
-                    1024,
-                ),
+                output_tokens=min(int(self._node_route(generation_node_id).profile.max_output_tokens),
+                                  max(1024, int(shard.get("estimated_output_tokens") or 1024))),
+                force_provider=force_shard_provider,
             )
             content = (
                 canonicalize_structural(dict(raw), alias_map)
                 if alias_map is not None
                 else dict(raw)
             )
+            content = self._expand_candidate_wire_payload(content, paper_keys, shard.get("claim_group_ids"))
             if content.get("candidate_id") != candidate_id:
                 raise OutlineV3ExecutionError("candidate shard output omitted or changed candidate_id")
             self._validate_candidate_payload(
@@ -9160,6 +12434,7 @@ class OutlineV3Executor:
                 allowed_paper_keys=paper_keys,
                 allowed_relation_ids=shard_relation_ids,
                 alias_map=alias_map,
+                allowed_claim_group_ids=shard.get("claim_group_ids"),
             )
             self._persist_candidate_shard_output(
                 node_id,
@@ -9258,6 +12533,36 @@ class OutlineV3Executor:
                     section_by_identity[original_section_id] = section_payload
                 sections.append(section_payload)
             claims.extend(str(item) for item in content.get("claims") or () if str(item).strip())
+        if not node_prefix and logical_group_assignment:
+            child_replays = [
+                item for item in self._replay_evidence[replay_evidence_start:]
+                if str(item.get("node_id") or "") in set(physical_node_ids)
+            ]
+            if len(child_replays) != len(physical_node_ids):
+                raise OutlineV3ExecutionError(
+                    f"{generation_node_id} logical replay projection omitted a physical shard"
+                )
+            reused_artifact_ids = list(dict.fromkeys(
+                str(value) for item in child_replays for value in item.get("reused_artifact_ids") or () if str(value)
+            ))
+            reused_receipt_ids = list(dict.fromkeys(
+                str(value) for item in child_replays for value in item.get("reused_receipt_ids") or () if str(value)
+            ))
+            provider_invoked = any(bool(item.get("provider_invoked")) for item in child_replays)
+            self._replay_evidence.append({
+                "node_id": generation_node_id,
+                "semantic_node_id": generation_node_id,
+                "closure_epoch_id": self.closure_epoch_id,
+                "lookup_status": "miss" if provider_invoked else "hit",
+                "provider_invoked": provider_invoked,
+                "reused_artifact_ids": reused_artifact_ids,
+                "reused_receipt_ids": reused_receipt_ids,
+                "reused_artifact_id": reused_artifact_ids[0] if len(reused_artifact_ids) == 1 else "",
+                "reused_receipt_id": reused_receipt_ids[0] if len(reused_receipt_ids) == 1 else "",
+                "logical_child_call_ids": physical_call_ids,
+                "logical_group_assignment": dict(logical_group_assignment),
+                "assignment_coverage_hash": assignment_coverage_hash,
+            })
         if not sections:
             raise OutlineV3ExecutionError(f"{generation_node_id} produced no shard sections")
         planned_view_hashes = list(dict.fromkeys(
@@ -9276,8 +12581,34 @@ class OutlineV3Executor:
                 "paper_keys": list(allowed_paper_keys),
                 "relation_ids": list(allowed_relation_ids),
                 "source_view_hashes": planned_view_hashes,
+                "group_assignment": {
+                    group_id: assigned_node
+                    for _node, shard, _papers, _relations, _request in shard_requests
+                    for group_id, assigned_node in (shard.get("group_assignment") or {}).items()
+                },
+                "deferred_optional_groups": {
+                    group_id: reason
+                    for _node, shard, _papers, _relations, _request in shard_requests
+                    for group_id, reason in (shard.get("deferred_optional_groups") or {}).items()
+                },
+                "assignment_coverage_hash": assignment_coverage_hash,
             },
         }
+        if not node_prefix and logical_group_assignment:
+            self._logical_candidate_reuse_projections[generation_node_id] = {
+                "schema_version": "logical-candidate-reuse-projection/v1",
+                "call_id": self._provider_call_id(generation_node_id),
+                "node_id": generation_node_id,
+                "child_call_ids": physical_call_ids,
+                "group_assignment": dict(logical_group_assignment),
+                "deferred_group_ids": sorted(deferred_group_ids),
+                "assignment_coverage_hash": assignment_coverage_hash,
+                "merged_node_id": generation_node_id,
+                "merged_artifact_id": f"outline-v3:{generation_node_id}",
+                "merged_artifact_hash": "",
+                "verified_reuse_evidence_artifact_ids": {},
+                "status": "pending",
+            }
         self._validate_candidate_payload(
             candidate_id,
             merged,
@@ -9286,6 +12617,69 @@ class OutlineV3Executor:
             alias_map=alias_map,
         )
         return merged
+
+    def _finalize_logical_candidate_reuse_projection(self, generation_node_id: str) -> None:
+        """Close a logical generation view over its real local shard calls."""
+
+        projection = self._logical_candidate_reuse_projections.get(generation_node_id)
+        if projection is None:
+            return
+        record = self.registry.get(str(projection.get("merged_artifact_id") or ""))
+        if record is None or record.status != "ready":
+            projection["status"] = "unverified_merged_artifact"
+            return
+        try:
+            self.registry.verify_ready_artifact_closure(record)
+            envelope = json.loads(Path(record.path).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError, RegistryError, TypeError, ValueError):
+            projection["status"] = "unverified_merged_artifact"
+            return
+        payload = envelope.get("payload") if isinstance(envelope, Mapping) else None
+        shard_plan = payload.get("shard_plan") if isinstance(payload, Mapping) else None
+        observed_assignment = shard_plan.get("group_assignment") if isinstance(shard_plan, Mapping) else None
+        observed_deferred = shard_plan.get("deferred_optional_groups") if isinstance(shard_plan, Mapping) else None
+        group_assignment = dict(projection.get("group_assignment") or {})
+        deferred = set(str(value) for value in projection.get("deferred_group_ids") or () if str(value))
+        expected_groups = (
+            {str(group.claim_group_id) for group in self._candidate_output_scope.claim_groups}
+            if self._candidate_output_scope is not None else set()
+        )
+        if (
+            not isinstance(observed_assignment, Mapping)
+            or dict(observed_assignment) != group_assignment
+            or not isinstance(observed_deferred, Mapping)
+            or set(str(key) for key in observed_deferred) != deferred
+            or set(group_assignment).intersection(deferred)
+            or set(group_assignment) | deferred != expected_groups
+            or hash_json(group_assignment) != str(projection.get("assignment_coverage_hash") or "")
+            or str(envelope.get("content_hash") or "") != str(record.metadata.get("content_hash") or "")
+        ):
+            projection["status"] = "unverified_group_assignment"
+            return
+        projection["merged_artifact_hash"] = record.content_hash
+        child_call_ids = [str(value) for value in projection.get("child_call_ids") or () if str(value)]
+        child_expected = [self._expected_provider_calls.get(call_id) for call_id in child_call_ids]
+        if len(child_expected) != len(child_call_ids) or any(item is None for item in child_expected):
+            projection["status"] = "unverified_child_call_graph"
+            return
+        if not all(bool(item and item.verified_reuse) for item in child_expected):
+            projection["status"] = "not_reused"
+            projection["verified_reuse_evidence_artifact_ids"] = {}
+            return
+        evidence_records = self._verify_verified_reuse_evidence(
+            [item for item in child_expected if item is not None]
+        )
+        evidence_by_id = {record.artifact_id: record for record in evidence_records}
+        evidence_ids = {
+            call_id: str(item.reuse_evidence_artifact_id or "")
+            for call_id, item in zip(child_call_ids, child_expected)
+            if item is not None
+        }
+        if set(evidence_by_id) != set(evidence_ids.values()) or any(not value for value in evidence_ids.values()):
+            projection["status"] = "unverified_reuse_evidence"
+            return
+        projection["verified_reuse_evidence_artifact_ids"] = evidence_ids
+        projection["status"] = "verified"
 
     def _semantic_output_token_limit(self, profile: ProviderContextProfile) -> int:
         """Bound semantic conclusions for both preflight and transport.
@@ -9345,6 +12739,7 @@ class OutlineV3Executor:
             request,
             expect_json=True,
             input_artifact_hashes=tuple(dependency_hashes.values()),
+            semantic_dependency_hashes=dependency_hashes,
             transport_node_id="candidate_1_provider_generation",
             output_tokens=(
                 int(output_tokens)
@@ -9370,6 +12765,815 @@ class OutlineV3Executor:
         self._finish_request_payload_audit(
             audit_index, semantic_validation_status="accepted"
         )
+        if node_id.startswith("topic_synthesis_provider:batch:"):
+            pending = self._pending_replays.get(node_id)
+            if pending is not None:
+                if pending[1] != hash_json(result):
+                    raise OutlineV3ExecutionError("topic result differs from its pending provider response")
+                # A later batch may fail before the parent topic node exists.
+                # Retain this validated physical result and its replay now.
+                self._persist_semantic_provider_output(
+                    node_id, result, dependency_hashes=dependency_hashes,
+                    update_parent_node=False,
+                )
+            match = self._pending_source_revision_replays.pop(node_id, None)
+            if match is not None:
+                record = self._persist_semantic_provider_output(
+                    node_id, result, dependency_hashes=dependency_hashes,
+                    update_parent_node=False,
+                )
+                context = self.source_revision_replay_context
+                if context is None:
+                    raise OutlineV3ExecutionError("SourceRevision response lost its executing context")
+                call_id = self._provider_call_id(node_id)
+                expected = self._expected_provider_calls[call_id]
+                proof = context.publish_child_reuse_proof(
+                    match=match, child_output_record=record,
+                    child_plan_record=context.plan_record, child_expected_call=expected,
+                    publication_context=self.publication_context,
+                    path=self._path(f"outline_v3/source_revision_reuse/{hash_text(call_id)}.json"),
+                )
+                self._expected_provider_calls[call_id] = replace(
+                    expected, verified_reuse=True,
+                    reuse_evidence_artifact_id=proof.artifact_id,
+                    reuse_evidence_artifact_hash=proof.content_hash,
+                    reuse_evidence_record_hash=self._artifact_record_hash(proof),
+                )
+                self.artifact_records[proof.artifact_id] = proof
+                self._source_revision_matches[call_id] = match
+        return result
+
+    def _prepare_final_fold_catalog(
+        self, node_id: str, items: Sequence[Mapping[str, Any]],
+        base_items: Sequence[Mapping[str, Any]],
+        intermediate_items: Mapping[str, Mapping[str, Any]],
+        questions: Sequence[Any],
+    ) -> dict[str, Any]:
+        from outline.semantic_final_fold_response import (
+            build_final_fold_catalog, topic_fragment_inputs,
+        )
+
+        scope = self.artifact_records.get("topic_synthesis")
+        if scope is None or scope.job_id != self.job_id or scope.status != "ready":
+            raise OutlineV3ExecutionError("final fold has no Registry-owned original topic scope")
+        self.registry.verify_ready_artifact_closure(scope)
+        source = OutlineArtifact.from_dict(json.loads(Path(scope.path).read_text(encoding="utf-8")))
+        expected_items = topic_fragment_inputs(source.payload.get("topics") or [])
+        if sorted(hash_json(value) for value in expected_items) != sorted(hash_json(value) for value in base_items):
+            raise OutlineV3ExecutionError("final fold base fragment inventory differs from the original topic artifact")
+        records = {scope.artifact_id: scope}
+        plan_record = self.artifact_records.get("semantic_chunk_plan")
+        if plan_record is None:
+            raise OutlineV3ExecutionError("final fold has no Registry-owned semantic plan")
+        self.registry.verify_ready_artifact_closure(plan_record)
+        plan = OutlineArtifact.from_dict(json.loads(Path(plan_record.path).read_text(encoding="utf-8")))
+        if hash_json(list(questions)) != hash_json(plan.payload.get("cross_group_questions") or []):
+            raise OutlineV3ExecutionError("final fold changed the original cross-group questions")
+        records[plan_record.artifact_id] = plan_record
+        manifests: dict[str, Any] = {}
+        results: dict[str, Any] = {}
+        for item in [*items, *intermediate_items.values()]:
+            manifest = self._load_semantic_reducer_coverage_ref(item)
+            result = self._load_semantic_reducer_result_ref(item)
+            if manifest is None or result is None:
+                raise OutlineV3ExecutionError("final fold source has no sealed coverage/result authority")
+            coverage_ref = item["coverage_ref"]
+            result_ref = item["semantic_result_ref"]
+            manifests[str(coverage_ref["artifact_id"])] = manifest
+            results[str(result_ref["artifact_id"])] = result
+            for reference in (coverage_ref, result_ref):
+                record = self.registry.get(str(reference["artifact_id"]))
+                if record is None or record.content_hash != str(reference["registry_file_hash"]):
+                    raise OutlineV3ExecutionError("final fold source Registry reference changed")
+                records[record.artifact_id] = record
+        try:
+            catalog = build_final_fold_catalog(
+                items, node_id=node_id, source_results=results,
+                codec_version="v2-fragment-aggregation",
+                ownership_proof={
+                    "base_items": list(base_items), "input_manifests": manifests,
+                    "intermediate_items": dict(intermediate_items),
+                    "source_scope_ref": {"artifact_id": scope.artifact_id, "registry_file_hash": scope.content_hash},
+                    "plan_scope_ref": {"artifact_id": plan_record.artifact_id, "registry_file_hash": plan_record.content_hash},
+                    "questions": list(questions),
+                    "required_comparisons": list(self.review_intent_input.get("required_comparisons") or []),
+                },
+            )
+        except (TypeError, ValueError, KeyError) as exc:
+            raise OutlineV3ExecutionError(f"invalid source-bound final fold catalog: {exc}") from exc
+        self._final_fold_catalogs[str(catalog["catalog_hash"])] = (
+            catalog, tuple(records[key] for key in sorted(records)),
+        )
+        return catalog
+
+    def _global_retention_authority(
+        self, request: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any], tuple[ArtifactRecord, ...]]:
+        """Load the immutable, already validated cross frontier for GLOBAL only."""
+        parent = self._payloads.get("cross_group_comparison") or {}
+        cross = parent.get("provider_output")
+        state = self._final_fold_results.get("cross_group_comparison_provider")
+        if not isinstance(cross, Mapping) or not isinstance(state, Mapping):
+            raise OutlineV3ExecutionError("GLOBAL frontier has no retained cross authority")
+        # Metadata candidates only become authority after the complete union.
+        aggregate = self._retained_cross_record_candidate(cross)
+        if (aggregate.metadata.get("node_id") != "cross_group_comparison_provider"
+                or aggregate.metadata.get("execution_kind") != "validated_leaf_aggregation"):
+            raise OutlineV3ExecutionError("GLOBAL frontier aggregate execution metadata changed")
+        source = self.registry.get(str(state.get("request_artifact_id") or ""))
+        if (source is None or source.content_hash != state.get("request_registry_file_hash")
+                or source.job_id != self.job_id or source.status != "ready"
+                or source.artifact_role != "outline_v3_semantic_local_aggregate_request"
+                or source.artifact_type != "outline_artifact" or source.artifact_version != "v3"
+                or source.producer != "outline.v3_executor.OutlineV3Executor"
+                or source.metadata.get("node_id") != "cross_group_comparison_provider"
+                or source.metadata.get("closure_epoch_id") != self.closure_epoch_id
+                or source.metadata.get("provider_invoked") is not False
+                or source.metadata.get("execution_kind") != "validated_leaf_aggregation"
+                or ArtifactDependencyRefV2.from_record(source) not in aggregate.depends_on):
+            raise OutlineV3ExecutionError("GLOBAL frontier lost its exact source request")
+        sidecar = cross.get("fragment_aggregation") or {}
+        obligations = list(self.review_intent_input.get("required_comparisons") or [])
+        if hash_json(sidecar.get("required_comparison_obligations") or []) != hash_json(obligations):
+            raise OutlineV3ExecutionError("GLOBAL frontier required comparison authority changed")
+        question_sources: list[ArtifactRecord] = []
+        for key, expected_node in (("plan_scope_ref", "semantic_chunk_plan"), ("source_scope_ref", "topic_synthesis")):
+            reference = sidecar.get(key) or {}
+            question_source = self.registry.get(str(reference.get("artifact_id") or ""))
+            if (question_source is None or question_source.content_hash != reference.get("registry_file_hash")
+                    or question_source.job_id != self.job_id or question_source.status != "ready"
+                    or question_source.metadata.get("node_id") != expected_node):
+                raise OutlineV3ExecutionError("GLOBAL frontier question source authority changed")
+            question_sources.append(question_source)
+        roots = (aggregate, source, *question_sources)
+        try:
+            verified_roots = tuple(self.registry.verify_ready_artifact_closures(roots))
+        except ArtifactClosureBatchError as exc:
+            raise exc.original_error from None
+        if verified_roots != roots:
+            raise OutlineV3ExecutionError("GLOBAL frontier authority records changed before parsing")
+        raw_source = Path(source.path).read_bytes()
+        if hashlib.sha256(raw_source).hexdigest() != source.content_hash:
+            raise OutlineV3ExecutionError("GLOBAL frontier source request bytes changed")
+        envelope = OutlineArtifact.from_dict(json.loads(raw_source.decode("utf-8")))
+        original = envelope.payload
+        marker = {
+            "schema_version": "outline-global-retained-frontier/v1",
+            "aggregate": ArtifactDependencyRefV2.from_record(aggregate).to_dict(),
+            "request": ArtifactDependencyRefV2.from_record(source).to_dict(),
+            "source_request_hash": str(state["source_request_hash"]),
+        }
+        if (envelope.job_id != self.job_id or envelope.content_hash != source.metadata.get("content_hash")
+                or hash_json(original) != state["source_request_hash"]
+                or not isinstance(original.get("topic_synthesis"), list) or not original["topic_synthesis"]):
+            raise OutlineV3ExecutionError("GLOBAL frontier source request changed")
+        topic_questions = None
+        for question_source in question_sources:
+            raw_question = Path(question_source.path).read_bytes()
+            if hashlib.sha256(raw_question).hexdigest() != question_source.content_hash:
+                raise OutlineV3ExecutionError("GLOBAL frontier question source bytes changed")
+            question_payload = OutlineArtifact.from_dict(json.loads(raw_question.decode("utf-8"))).payload
+            if topic_questions is None and question_payload.get("topics"):
+                topic_questions = [{"topic_id": row.get("topic_id"), "question": row.get("question")}
+                                   for row in question_payload["topics"]]
+        if "global_retention_source" in request:
+            if (hash_json(request["global_retention_source"]) != hash_json(marker)
+                    or request.get("cross_group_comparison")
+                    or hash_json(request.get("questions") or []) != hash_json(original.get("questions") or [])
+                    or hash_json(request.get("topic_questions") or []) != hash_json(topic_questions or [])
+                    or hash_json(request.get("required_comparison_obligations") or []) != hash_json(obligations)):
+                raise OutlineV3ExecutionError("GLOBAL frontier source/question/obligation binding changed")
+        return marker, dict(original), roots
+
+    def _global_retention_member_scope(
+        self, node_id: str, request: Mapping[str, Any],
+    ) -> tuple[tuple[ArtifactRecord, ...], list[str]]:
+        """Prove exact member ownership without admitting the full parent ledger."""
+        revision, record_map = self.registry.capture_record_snapshot()
+        snapshot_hash = hash_json({record.artifact_id: asdict(record) for record in record_map})
+        marker, original, authority = self._global_retention_authority(request)
+        frontier = {hash_json(item): item for item in original["topic_synthesis"]}
+        if len(frontier) != len(original["topic_synthesis"]):
+            raise OutlineV3ExecutionError("GLOBAL frontier has duplicate source members")
+        snapshot_records = {record.artifact_id: record for record in record_map}
+        discovered = {record.artifact_id: record for record in authority}
+        discovering: set[str] = set()
+        discovered_members: set[str] = set()
+
+        def verify_discovery_record(record: ArtifactRecord) -> None:
+            expected = snapshot_records.get(record.artifact_id)
+            if expected is None or self._artifact_record_hash(expected) != self._artifact_record_hash(record):
+                raise OutlineV3ExecutionError("GLOBAL discovery Registry record changed")
+            # Discovery reads sealed coverage only. No source ownership or
+            # result-restoration authority exists until the complete union
+            # below has passed its recursive checks.
+            self.registry._verify_ready_artifact(record)
+
+        def discover(value: Any) -> None:
+            if not isinstance(value, Mapping):
+                raise OutlineV3ExecutionError("GLOBAL frontier member is malformed")
+            digest = hash_json(value)
+            if digest in discovering:
+                raise OutlineV3ExecutionError("GLOBAL frontier lineage contains a cycle")
+            if digest in discovered_members:
+                return
+            discovering.add(digest)
+            manifest = self._load_semantic_reducer_coverage_ref(
+                value, verify_closure=verify_discovery_record,
+            )
+            if manifest is None:
+                raise OutlineV3ExecutionError("GLOBAL frontier member has no sealed source authority")
+            for ref_field in ("coverage_ref", "semantic_result_ref"):
+                reference = value.get(ref_field)
+                if not isinstance(reference, Mapping):
+                    raise OutlineV3ExecutionError("GLOBAL frontier member has no sealed source authority")
+                record = self.registry.get(str(reference.get("artifact_id") or ""))
+                expected = snapshot_records.get(record.artifact_id) if record is not None else None
+                if (record is None or expected is None
+                        or record.content_hash != reference.get("registry_file_hash")
+                        or self._artifact_record_hash(record) != self._artifact_record_hash(expected)):
+                    raise OutlineV3ExecutionError("GLOBAL discovery Registry member changed")
+                discovered[record.artifact_id] = record
+            if digest not in frontier:
+                sources = manifest.get("global_source_items")
+                if (not str(value.get("reducer_id") or "").startswith("global_synthesis_provider:reduce:")
+                        or hash_json(manifest.get("global_retention_source")) != hash_json(marker)
+                        or not isinstance(sources, list) or not sources
+                        or manifest.get("source_input_hash") != hash_json(sources)
+                        or hash_json(manifest.get("source_item_hashes")) != hash_json([hash_json(item) for item in sources])):
+                    raise OutlineV3ExecutionError("GLOBAL reducer lost its exact source partition")
+                for source in sources:
+                    discover(source)
+            discovering.remove(digest)
+            discovered_members.add(digest)
+
+        for value in request.get("topic_synthesis") or []:
+            discover(value)
+        roots = tuple(discovered.values())
+        expected_hashes = {record.artifact_id: self._artifact_record_hash(record) for record in roots}
+
+        def verify_union() -> None:
+            current = self.registry.verify_ready_artifact_closures(roots)
+            if ([self._artifact_record_hash(record) for record in current]
+                    != [expected_hashes[record.artifact_id] for record in roots]):
+                raise OutlineV3ExecutionError("GLOBAL frontier Registry records changed during verification")
+
+        verify_union()
+        verification_active = True
+
+        def verify_closure(record: ArtifactRecord) -> None:
+            if (not verification_active
+                    or expected_hashes.get(record.artifact_id) != self._artifact_record_hash(record)):
+                raise OutlineV3ExecutionError("GLOBAL reference is outside the verified member scope")
+
+        try:
+            checked, reasons = self._global_retention_member_scope_checked(
+                node_id, request, frontier=frontier, marker=marker,
+                authority=authority, verify_closure=verify_closure,
+            )
+            if {record.artifact_id for record in checked} != set(discovered):
+                raise OutlineV3ExecutionError("GLOBAL discovered and interpreted member sets differ")
+            for record in checked:
+                verify_closure(record)
+            verify_union()
+            current_revision, current_map = self.registry.capture_record_snapshot()
+            if (current_revision != revision
+                    or hash_json({record.artifact_id: asdict(record) for record in current_map}) != snapshot_hash):
+                raise OutlineV3ExecutionError("GLOBAL frontier Registry snapshot changed during source parsing")
+            return checked, reasons
+        finally:
+            verification_active = False
+
+    def _global_retention_member_scope_checked(
+        self, node_id: str, request: Mapping[str, Any], *,
+        frontier: Mapping[str, Any], marker: Mapping[str, Any],
+        authority: tuple[ArtifactRecord, ...],
+        verify_closure: Callable[[ArtifactRecord], None],
+    ) -> tuple[tuple[ArtifactRecord, ...], list[str]]:
+        """Interpret only the complete, operation-verified member lineage."""
+        records = {record.artifact_id: record for record in authority}
+        active: set[str] = set()
+        global_assertion_definitions: dict[str, str] = {}
+
+        def member(value: Any) -> set[str]:
+            if not isinstance(value, Mapping):
+                raise OutlineV3ExecutionError("GLOBAL frontier member is malformed")
+            digest = hash_json(value)
+            if digest in active:
+                raise OutlineV3ExecutionError("GLOBAL frontier lineage contains a cycle")
+            active.add(digest)
+            manifest = self._load_semantic_reducer_coverage_ref(value, verify_closure=verify_closure)
+            result = self._load_semantic_reducer_result_ref(value, verify_closure=verify_closure)
+            if manifest is None or result is None:
+                raise OutlineV3ExecutionError("GLOBAL frontier member has no sealed source authority")
+            own_records = []
+            for ref_field in ("coverage_ref", "semantic_result_ref"):
+                record = self.registry.get(str(value[ref_field]["artifact_id"]))
+                if record is None or record.content_hash != value[ref_field]["registry_file_hash"]:
+                    raise OutlineV3ExecutionError("GLOBAL frontier Registry member changed")
+                records[record.artifact_id] = record
+                own_records.append(record)
+            if digest in frontier:
+                leaves = {digest}
+            else:
+                sources = manifest.get("global_source_items")
+                if (not str(value.get("reducer_id") or "").startswith("global_synthesis_provider:reduce:")
+                        or hash_json(manifest.get("global_retention_source")) != hash_json(marker)
+                        or not isinstance(sources, list) or not sources
+                        or manifest.get("source_input_hash") != hash_json(sources)
+                        or hash_json(manifest.get("source_item_hashes")) != hash_json([hash_json(item) for item in sources])):
+                    raise OutlineV3ExecutionError("GLOBAL reducer lost its exact source partition")
+                # A new GLOBAL result cannot redefine another child's ID.
+                # Original cross-frontier bridge representations remain exact
+                # historical inputs; this check governs only new GLOBAL rows.
+                for claim in result.get("synthesis_claims") or []:
+                    if not isinstance(claim, Mapping) or not isinstance(claim.get("claim_id"), str) or not claim["claim_id"]:
+                        raise OutlineV3ExecutionError("GLOBAL reducer has a malformed synthesis claim identity")
+                    claim_id, definition = claim["claim_id"], hash_json(dict(claim))
+                    previous = global_assertion_definitions.setdefault(claim_id, definition)
+                    if previous != definition:
+                        raise OutlineV3ExecutionError("GLOBAL reducer claim identity has conflicting canonical definitions")
+                leaves: set[str] = set()
+                for source_item in sources:
+                    child_leaves = member(source_item)
+                    if leaves.intersection(child_leaves):
+                        raise OutlineV3ExecutionError("GLOBAL reducer repeats a frontier member")
+                    leaves.update(child_leaves)
+                    for ref_field in ("coverage_ref", "semantic_result_ref"):
+                        dependency = records[str(source_item[ref_field]["artifact_id"])]
+                        if ArtifactDependencyRefV2.from_record(dependency) not in own_records[0].depends_on:
+                            raise OutlineV3ExecutionError("GLOBAL input manifest lost a typed member dependency")
+                for dependency in authority:
+                    if ArtifactDependencyRefV2.from_record(dependency) not in own_records[0].depends_on:
+                        raise OutlineV3ExecutionError("GLOBAL input manifest lost retained source authority")
+                if ArtifactDependencyRefV2.from_record(own_records[0]) not in own_records[1].depends_on:
+                    # Aliased canonical output depends on the physical result;
+                    # its map also retains the exact child input manifest.
+                    if own_records[1].artifact_role != "outline_v3_semantic_identifier_expanded_output":
+                        raise OutlineV3ExecutionError("GLOBAL result lost its exact input manifest")
+            active.remove(digest)
+            return leaves
+
+        leaves: set[str] = set()
+        for item in request.get("topic_synthesis") or []:
+            item_leaves = member(item)
+            if leaves.intersection(item_leaves):
+                raise OutlineV3ExecutionError("GLOBAL request repeats a frontier member")
+            leaves.update(item_leaves)
+        if not leaves or (":reduce:" not in node_id and leaves != set(frontier)):
+            raise OutlineV3ExecutionError("GLOBAL final fold lost a source frontier member")
+        reasons: set[str] = set()
+        deferred_only = True
+        for digest in leaves:
+            item = frontier[digest]
+            semantic = item.get("semantic_result") or {}
+            groups = item.get("topic_disposition_groups") or []
+            # `text` is the current comparison statement field. Questions or
+            # organization rows may carry source/task pointers without making
+            # an assertion; a supported statement of any effect direction may
+            # never use the no-assertion fallback.
+            comparison_assertion = any(
+                isinstance(row, Mapping) and isinstance(row.get("text"), str) and row["text"].strip()
+                and any(row.get(key) for key in (
+                    "evidence_id", "evidence_ids", "supporting_evidence_ids", "source_claim_id", "source_claim_ids",
+                ))
+                for row in semantic.get("comparisons") or []
+            )
+            if (semantic.get("bridge_claims") or semantic.get("synthesis_claims")
+                    or semantic.get("claims") or comparison_assertion or not groups):
+                deferred_only = False
+            for row in groups:
+                if (not isinstance(row, Mapping)
+                        or row.get("status") not in {"deferred", "unresolved", "insufficient_evidence", "not_comparable"}
+                        or row.get("synthesis_claim_ids_by_topic") or not str(row.get("reason") or "").strip()):
+                    deferred_only = False
+                else:
+                    reasons.add(str(row["reason"]))
+            reasons.update(str(value) for value in semantic.get("unresolved_questions") or [] if str(value))
+        checked = tuple(records.values())
+        return checked, sorted(reasons) if deferred_only else []
+
+    def _semantic_identifier_source_records(
+        self, node_id: str, request: Mapping[str, Any],
+    ) -> tuple[ArtifactRecord, ...]:
+        if "global_retention_source" not in request:
+            cross = request.get("cross_group_comparison")
+            if not isinstance(cross, Mapping):
+                raise OutlineV3ExecutionError("semantic identifier plan has no source aggregate")
+            return (self._verified_retained_cross_record(cross),)
+        records, _reasons = self._global_retention_member_scope(node_id, request)
+        if ":reduce:" not in node_id:
+            return records
+        key = f"{node_id}:input_manifest"
+        manifest = self.artifact_records.get(key) or self.registry.get(
+            f"outline-v3:semantic-input:{self.closure_epoch_id}:{hash_text(node_id)[:16]}"
+        )
+        if (manifest is None or manifest.metadata.get("node_id") != node_id
+                or manifest.artifact_id != f"outline-v3:semantic-input:{self.closure_epoch_id}:{hash_text(node_id)[:16]}"
+                or manifest.job_id != self.job_id or manifest.status != "ready"
+                or manifest.artifact_type != "outline_artifact" or manifest.artifact_version != "v3"
+                or manifest.producer != "outline.v3_executor.OutlineV3Executor"
+                or manifest.artifact_role != "outline_v3_semantic_reducer_input_manifest"):
+            raise OutlineV3ExecutionError("semantic identifier child lost its input manifest")
+        self.registry.verify_ready_artifact_closure(manifest)
+        envelope = OutlineArtifact.from_dict(json.loads(Path(manifest.path).read_text(encoding="utf-8")))
+        body = envelope.payload
+        if (envelope.content_hash != manifest.metadata.get("content_hash")
+                or body.get("source_input_hash") != hash_json(request.get("topic_synthesis"))
+                or hash_json(body.get("global_source_items")) != hash_json(request.get("topic_synthesis"))
+                or hash_json(body.get("global_retention_source")) != hash_json(request["global_retention_source"])
+                or any(ArtifactDependencyRefV2.from_record(source) not in manifest.depends_on for source in records)):
+            raise OutlineV3ExecutionError("semantic identifier child input scope changed")
+        return (*records, manifest)
+
+    def _publish_semantic_identifier_plan(
+        self, node_id: str, expanded_request: Mapping[str, Any], wire_request: Mapping[str, Any],
+    ) -> ArtifactRecord:
+        from outline.semantic_identifier_aliases import WIRE_KEY, expand_identifier_alias_request
+        from outline.semantic_request_wire import expand_semantic_request_wire
+
+        aliased = expand_semantic_request_wire(wire_request)
+        catalog_hash = str((aliased.get(WIRE_KEY) or {}).get("catalog_hash") or "")
+        prepared = self._semantic_identifier_plans.get(catalog_hash)
+        if prepared is None:
+            raise OutlineV3ExecutionError("semantic identifier aliases have no locally verified plan")
+        catalog, canonical_request = prepared
+        if hash_json(expand_identifier_alias_request(aliased, catalog)) != hash_json(canonical_request):
+            raise OutlineV3ExecutionError("semantic identifier wire request changed")
+        sources = self._semantic_identifier_source_records(node_id, expanded_request)
+        artifact = self._artifact(OutlineArtifact, {
+            "catalog": catalog, "canonical_wire_request": canonical_request,
+            "aliased_wire_request": aliased, "expanded_request": dict(expanded_request),
+        }, {"source_request_hash": hash_json(expanded_request), "catalog_hash": catalog_hash})
+        record = publish_json_artifact(
+            self.publication_context, self.registry,
+            self._node_path(f"semantic_identifier_map/{hash_json([catalog_hash, self.closure_epoch_id])[:32]}"),
+            artifact.to_dict(), artifact_role="outline_v3_semantic_identifier_alias_map",
+            artifact_type="outline_artifact", artifact_version="v3",
+            producer="outline.v3_executor.OutlineV3Executor",
+            artifact_id=f"outline-v3:semantic-identifier-map:{catalog_hash}:{self.closure_epoch_id}",
+            depends_on=[ArtifactDependencyRefV2.from_record(source) for source in sources],
+            metadata={"job_id": self.job_id, "node_id": node_id, "closure_epoch_id": self.closure_epoch_id,
+                      "content_hash": artifact.content_hash, "execution_kind": "verified_identifier_expansion"},
+        )
+        key = f"{node_id}:identifier_map"
+        self.artifact_records[key], self.artifact_paths[key] = record, record.path
+        return record
+
+    def _persist_semantic_identifier_output(
+        self, node_id: str, raw: Mapping[str, Any], expanded: Mapping[str, Any],
+        request: Mapping[str, Any], map_record: ArtifactRecord, dependencies: Mapping[str, str],
+    ) -> None:
+        raw_record = self._persist_dynamic_provider_result(
+            node_id, self._artifact(OutlineArtifact, raw, dependencies),
+            artifact_id=f"outline-v3:semantic-provider:{hash_text(node_id)[:24]}",
+            artifact_role="outline_v3_semantic_provider_output",
+            path=self._node_path(f"semantic_provider/{node_id}"), recovery_sources=(map_record,),
+        )
+        artifact = self._artifact(OutlineArtifact, expanded, {
+            **dict(dependencies), "physical_response_hash": hash_json(raw),
+            "source_request_hash": hash_json(request), "identifier_map_file_hash": map_record.content_hash,
+        })
+        record = publish_json_artifact(
+            self.publication_context, self.registry,
+            self._node_path(f"semantic_identifier_output/{hash_json([node_id, artifact.content_hash])[:32]}"),
+            artifact.to_dict(), artifact_role="outline_v3_semantic_identifier_expanded_output",
+            artifact_type="outline_artifact", artifact_version="v3",
+            producer="outline.v3_executor.OutlineV3Executor",
+            artifact_id=f"outline-v3:semantic-identifier-output:{artifact.content_hash}",
+            depends_on=[ArtifactDependencyRefV2.from_record(value) for value in (raw_record, map_record)],
+            metadata={"job_id": self.job_id, "node_id": node_id, "closure_epoch_id": self.closure_epoch_id,
+                      "content_hash": artifact.content_hash, "execution_kind": "verified_identifier_expansion"},
+        )
+        state = {
+            "physical_artifact_id": raw_record.artifact_id, "physical_registry_file_hash": raw_record.content_hash,
+            "expanded_artifact_id": record.artifact_id, "expanded_registry_file_hash": record.content_hash,
+            "map_artifact_id": map_record.artifact_id, "map_registry_file_hash": map_record.content_hash,
+            "physical_response_hash": hash_json(raw), "expanded_response_hash": hash_json(expanded),
+            "source_request_hash": hash_json(request), "closure_epoch_id": self.closure_epoch_id,
+            "execution_kind": "verified_identifier_expansion",
+        }
+        self._restore_semantic_identifier_output(node_id, expanded, state)
+
+    def _restore_semantic_identifier_output(
+        self, node_id: str, expanded: Mapping[str, Any], state: Mapping[str, Any],
+    ) -> None:
+        from outline.semantic_identifier_aliases import decode_identifier_alias_output, expand_identifier_alias_request
+
+        self.registry.reload()
+        if (state.get("closure_epoch_id") != self.closure_epoch_id
+                or state.get("execution_kind") != "verified_identifier_expansion"):
+            raise OutlineV3ExecutionError("semantic identifier expansion has no current execution authority")
+        records: dict[str, ArtifactRecord] = {}
+        envelopes: dict[str, OutlineArtifact] = {}
+        for key, role in (("physical", "outline_v3_semantic_provider_output"),
+                          ("expanded", "outline_v3_semantic_identifier_expanded_output"),
+                          ("map", "outline_v3_semantic_identifier_alias_map")):
+            record = self.registry.get(str(state.get(f"{key}_artifact_id") or ""))
+            if (record is None or record.job_id != self.job_id or record.status != "ready"
+                    or record.artifact_type != "outline_artifact" or record.artifact_version != "v3"
+                    or record.artifact_role != role or record.producer != "outline.v3_executor.OutlineV3Executor"
+                    or record.metadata.get("node_id") != node_id
+                    or record.content_hash != state.get(f"{key}_registry_file_hash")):
+                raise OutlineV3ExecutionError("semantic identifier expansion lost Registry authority")
+            if key != "physical" and (
+                record.metadata.get("closure_epoch_id") != self.closure_epoch_id
+                or record.metadata.get("execution_kind") != "verified_identifier_expansion"
+            ):
+                raise OutlineV3ExecutionError("semantic identifier expansion execution metadata changed")
+            records[key] = record
+        roots = tuple(records.values())
+        try:
+            verified_roots = tuple(self.registry.verify_ready_artifact_closures(roots))
+        except ArtifactClosureBatchError as exc:
+            raise exc.original_error from None
+        if verified_roots != roots:
+            raise OutlineV3ExecutionError("semantic identifier Registry records changed before parsing")
+        for key, record in records.items():
+            raw_bytes = Path(record.path).read_bytes()
+            if hashlib.sha256(raw_bytes).hexdigest() != record.content_hash:
+                raise OutlineV3ExecutionError("semantic identifier expansion raw bytes changed")
+            envelope = OutlineArtifact.from_dict(json.loads(raw_bytes.decode("utf-8")))
+            if envelope.job_id != self.job_id or envelope.content_hash != record.metadata.get("content_hash"):
+                raise OutlineV3ExecutionError("semantic identifier expansion envelope changed")
+            envelopes[key] = envelope
+        for owner, dependency in (("physical", "map"), ("expanded", "physical"), ("expanded", "map")):
+            if ArtifactDependencyRefV2.from_record(records[dependency]) not in records[owner].depends_on:
+                raise OutlineV3ExecutionError("semantic identifier expansion lost a typed dependency")
+        authority = envelopes["map"].payload
+        catalog = authority.get("catalog") or {}
+        canonical = expand_identifier_alias_request(authority.get("aliased_wire_request") or {}, catalog)
+        full_request = authority.get("expanded_request") or {}
+        from outline.semantic_global_view import project_global_retention_request
+
+        sources = self._semantic_identifier_source_records(node_id, full_request)
+        if any(ArtifactDependencyRefV2.from_record(source) not in records["map"].depends_on for source in sources):
+            raise OutlineV3ExecutionError("semantic identifier map lost its exact source dependencies")
+        canonical_source = (
+            full_request if "global_retention_source" in full_request else
+            project_global_retention_request(full_request, source_reference=ArtifactDependencyRefV2.from_record(sources[0]).to_dict())
+        )
+        expected_canonical = self._attach_prompt_authority(node_id, _project_semantic_dependency_templates_request_v1(
+            canonical_source,
+        ))
+        raw = envelopes["physical"].payload
+        decoded = decode_identifier_alias_output(raw, catalog)
+        if (hash_json(canonical) != hash_json(authority.get("canonical_wire_request"))
+                or hash_json(canonical) != hash_json(expected_canonical)
+                or hash_json(full_request) != state.get("source_request_hash")
+                or hash_json(raw) != state.get("physical_response_hash")
+                or hash_json(decoded) != state.get("expanded_response_hash")
+                or hash_json(expanded) != hash_json(decoded)
+                or hash_json(envelopes["expanded"].payload) != hash_json(decoded)
+                or envelopes["expanded"].dependency_hashes.get("physical_response_hash") != hash_json(raw)
+                or envelopes["expanded"].dependency_hashes.get("identifier_map_file_hash") != records["map"].content_hash):
+            raise OutlineV3ExecutionError("semantic identifier physical/expanded response binding changed")
+        self._validate_semantic_provider_output(node_id, full_request, decoded)
+        checked = (*records.values(), *sources)
+        if tuple(self.registry.verify_ready_artifact_closures(checked)) != checked:
+            raise OutlineV3ExecutionError("semantic identifier Registry records changed during verification")
+        self._semantic_identifier_outputs[node_id] = dict(state)
+        for key, record in ((node_id, records["physical"]), (f"{node_id}:identifier_expanded", records["expanded"]),
+                            (f"{node_id}:identifier_map", records["map"])):
+            self.artifact_records[key], self.artifact_paths[key] = record, record.path
+
+    def _retained_cross_record_candidate(self, cross: Mapping[str, Any]) -> ArtifactRecord:
+        """Collect state-bound metadata; callers still need a closure proof."""
+        state = self._final_fold_results.get("cross_group_comparison_provider")
+        record = self.registry.get(str((state or {}).get("artifact_id") or ""))
+        if (state is None or record is None or record.content_hash != state["registry_file_hash"]
+                or hash_json(cross) != state["expanded_hash"]
+                or record.job_id != self.job_id or record.status != "ready"
+                or record.artifact_role != "outline_v3_semantic_local_aggregate"
+                or record.producer != "outline.v3_executor.OutlineV3Executor"
+                or record.metadata.get("closure_epoch_id") != self.closure_epoch_id
+                or record.metadata.get("provider_invoked") is not False):
+            raise OutlineV3ExecutionError("global scientific view lost its retained cross-result authority")
+        return record
+
+    def _verified_retained_cross_record(self, cross: Mapping[str, Any]) -> ArtifactRecord:
+        record = self._retained_cross_record_candidate(cross)
+        if self.registry.verify_ready_artifact_closure(record) != record:
+            raise OutlineV3ExecutionError("retained cross-result Registry record changed")
+        return record
+
+    def _assert_no_final_fold_provider(self, node_id: str) -> None:
+        call_id = self._provider_call_id(node_id)
+        if node_id in self._pending_replays or any(
+            receipt.call_id == call_id and receipt.job_id == self.job_id
+            and receipt.stage_name == "outline_v3"
+            and receipt.closure_epoch_id == self.closure_epoch_id
+            for receipt in self._receipt_ledger.list_receipts()
+        ):
+            raise OutlineV3ExecutionError("local final fold cannot hide an existing provider response; reconcile it first")
+
+    def _restore_local_final_fold(self, node_id: str, parent: Mapping[str, Any]) -> None:
+        """Revalidate local aggregation authority before cached-parent reuse."""
+        from outline.semantic_final_fold_response import compact_final_fold_response, expand_final_fold_response
+
+        self.registry.reload()
+        state = parent.get("semantic_retention")
+        if (parent.get("execution_mode") != "source_closed_retention"
+                or not isinstance(state, Mapping) or state.get("provider_invoked") is not False
+                or state.get("execution_kind") != "validated_leaf_aggregation"
+                or state.get("new_cross_leaf_inference") is not False
+                or state.get("closure_epoch_id") != self.closure_epoch_id):
+            raise OutlineV3ExecutionError("cached local final fold has no current execution authority")
+        self._assert_no_final_fold_provider(node_id)
+        records: dict[str, ArtifactRecord] = {}
+        envelopes: dict[str, OutlineArtifact] = {}
+        for key, id_key, hash_key, role in (
+            ("aggregate", "artifact_id", "registry_file_hash", "outline_v3_semantic_local_aggregate"),
+            ("catalog", "catalog_artifact_id", "catalog_registry_file_hash", "outline_v3_semantic_final_fold_catalog"),
+            ("request", "request_artifact_id", "request_registry_file_hash", "outline_v3_semantic_local_aggregate_request"),
+        ):
+            record = self.registry.get(str(state.get(id_key) or ""))
+            if (record is None or record.job_id != self.job_id or record.status != "ready"
+                    or record.artifact_type != "outline_artifact" or record.artifact_version != "v3"
+                    or record.artifact_role != role
+                    or record.producer != "outline.v3_executor.OutlineV3Executor"
+                    or record.metadata.get("node_id") != node_id
+                    or record.content_hash != state.get(hash_key)):
+                raise OutlineV3ExecutionError(f"cached local final fold {key} lost Registry authority")
+            if key != "catalog" and (
+                record.metadata.get("provider_invoked") is not False
+                or record.metadata.get("closure_epoch_id") != self.closure_epoch_id
+                or record.metadata.get("execution_kind") != "validated_leaf_aggregation"
+            ):
+                raise OutlineV3ExecutionError("local final fold execution metadata changed")
+            records[key] = record
+        roots = tuple(records.values())
+        try:
+            verified_roots = tuple(self.registry.verify_ready_artifact_closures(roots))
+        except ArtifactClosureBatchError as exc:
+            raise exc.original_error from None
+        if verified_roots != roots:
+            raise OutlineV3ExecutionError("local final fold Registry records changed before parsing")
+        for key, record in records.items():
+            raw_bytes = Path(record.path).read_bytes()
+            if hashlib.sha256(raw_bytes).hexdigest() != record.content_hash:
+                raise OutlineV3ExecutionError("local final fold raw bytes changed")
+            envelope = OutlineArtifact.from_dict(json.loads(raw_bytes.decode("utf-8")))
+            if envelope.job_id != self.job_id or envelope.content_hash != record.metadata.get("content_hash"):
+                raise OutlineV3ExecutionError("local final fold envelope identity changed")
+            envelopes[key] = envelope
+
+        def require_dependency(owner: ArtifactRecord, target: ArtifactRecord) -> None:
+            if ArtifactDependencyRefV2.from_record(target) not in owner.depends_on:
+                raise OutlineV3ExecutionError("local final fold lost a typed source dependency")
+
+        require_dependency(records["aggregate"], records["catalog"])
+        require_dependency(records["aggregate"], records["request"])
+        require_dependency(records["request"], records["catalog"])
+        catalog = envelopes["catalog"].payload
+        request, result = envelopes["request"].payload, envelopes["aggregate"].payload
+        if (catalog.get("catalog_hash") != state.get("catalog_hash")
+                or hash_json(request) != state.get("source_request_hash")
+                or hash_json(result) != state.get("expanded_hash")
+                or hash_json(parent.get("provider_output")) != hash_json(result)
+                or envelopes["aggregate"].dependency_hashes.get("source_request_hash") != hash_json(request)
+                or envelopes["aggregate"].dependency_hashes.get("catalog_hash") != catalog.get("catalog_hash")
+                or envelopes["aggregate"].dependency_hashes.get("compiler_version") != hash_text("validated-leaf-retention/v1")
+                or (request.get("final_fold_retention_contract") or {}).get("catalog_hash") != catalog.get("catalog_hash")):
+            raise OutlineV3ExecutionError("cached local final fold request/result binding changed")
+        sidecar = catalog.get("fragment_aggregation") or {}
+        source_records: dict[str, ArtifactRecord] = {}
+        for reference in catalog.get("source_refs") or []:
+            for prefix, role in (("coverage", "outline_v3_semantic_reducer_input_manifest"),
+                                 ("result", "outline_v3_semantic_provider_output")):
+                record = self.registry.get(str(reference.get(f"{prefix}_artifact_id") or ""))
+                if (record is None or record.job_id != self.job_id or record.status != "ready"
+                        or record.artifact_type != "outline_artifact" or record.artifact_version != "v3"
+                        or record.artifact_role != role
+                        or record.producer != "outline.v3_executor.OutlineV3Executor"
+                        or record.metadata.get("node_id") != reference.get("reducer_id")
+                        or record.content_hash != reference.get(f"{prefix}_registry_file_hash")):
+                    raise OutlineV3ExecutionError("local final fold sealed source authority changed")
+                require_dependency(records["catalog"], record)
+                source_records[record.artifact_id] = record
+        for name in ("source_scope_ref", "plan_scope_ref"):
+            reference = sidecar.get(name) or {}
+            record = self.registry.get(str(reference.get("artifact_id") or ""))
+            if record is None or record.job_id != self.job_id or record.content_hash != reference.get("registry_file_hash"):
+                raise OutlineV3ExecutionError("local final fold original scope authority changed")
+            require_dependency(records["catalog"], record)
+            source_records[record.artifact_id] = record
+        if (hash_json(request.get("questions") or []) != hash_json(sidecar.get("original_questions") or [])
+                or hash_json(sidecar.get("required_comparison_obligations") or []) != hash_json(
+                    list(self.review_intent_input.get("required_comparisons") or []))):
+            raise OutlineV3ExecutionError("local final fold question/comparison obligations changed")
+        try:
+            rebuilt = expand_final_fold_response(compact_final_fold_response(catalog), catalog)
+            if hash_json(rebuilt) != hash_json(result):
+                raise ValueError("aggregate differs from its source catalog")
+            self._validate_semantic_provider_output(node_id, request, result)
+        except (TypeError, ValueError, KeyError) as exc:
+            raise OutlineV3ExecutionError(f"invalid cached local final fold: {exc}") from exc
+        checked = (*records.values(), *source_records.values())
+        if tuple(self.registry.verify_ready_artifact_closures(checked)) != checked:
+            raise OutlineV3ExecutionError("local final fold Registry records changed during verification")
+        self._assert_no_final_fold_provider(node_id)
+        self._expected_provider_calls.pop(self._provider_call_id(node_id), None)
+        self._final_fold_results[node_id] = dict(state)
+        for key, record in ((node_id, records["aggregate"]),
+                            (f"{node_id}:retention_catalog", records["catalog"]),
+                            (f"{node_id}:retention_request", records["request"])):
+            self.artifact_records[key], self.artifact_paths[key] = record, record.path
+
+    def _compile_final_fold_retention(
+        self, node_id: str, expanded_request: Mapping[str, Any],
+        dependency_hashes: Mapping[str, str],
+    ) -> dict[str, Any]:
+        from outline.semantic_final_fold_response import compact_final_fold_response, expand_final_fold_response
+
+        self._semantic_request_contract(node_id, expanded_request)
+        contract = expanded_request.get("final_fold_retention_contract") or {}
+        catalog_hash = str(contract.get("catalog_hash") or "")
+        prepared = self._final_fold_catalogs.get(catalog_hash)
+        if prepared is None:
+            raise OutlineV3ExecutionError("final fold has no locally verified catalog")
+        catalog, sources = prepared
+        if hash_json(expanded_request.get("questions") or []) != hash_json(catalog["fragment_aggregation"]["original_questions"]):
+            raise OutlineV3ExecutionError("local final fold no longer carries its original questions")
+        self.registry.verify_ready_artifact_closures(sources)
+        artifact = self._artifact(OutlineArtifact, catalog, {"catalog_hash": catalog_hash})
+        catalog_id = f"outline-v3:semantic-final-fold-catalog:{catalog_hash}"
+        catalog_record = self.registry.get(catalog_id)
+        if catalog_record is None:
+            catalog_record = publish_json_artifact(
+                self.publication_context, self.registry,
+                self._node_path(f"semantic_final_fold_catalog/{catalog_hash}"),
+                artifact.to_dict(), artifact_role="outline_v3_semantic_final_fold_catalog",
+                artifact_type="outline_artifact", artifact_version="v3",
+                producer="outline.v3_executor.OutlineV3Executor", artifact_id=catalog_id,
+                depends_on=[ArtifactDependencyRefV2(
+                    dependency_kind="local_job", job_id=record.job_id,
+                    artifact_id=record.artifact_id, artifact_type=record.artifact_type,
+                    path=record.path, content_hash=record.content_hash,
+                ) for record in sources],
+                metadata={"job_id": self.job_id, "node_id": node_id, "catalog_hash": catalog_hash, "content_hash": artifact.content_hash},
+            )
+        else:
+            self.registry.verify_ready_artifact_closure(catalog_record)
+            stored = OutlineArtifact.from_dict(json.loads(Path(catalog_record.path).read_text(encoding="utf-8")))
+            if stored.content_hash != artifact.content_hash:
+                raise OutlineV3ExecutionError("final fold catalog identity refers to different source data")
+        catalog_key = f"{node_id}:retention_catalog"
+        self.artifact_records[catalog_key] = catalog_record
+        self.artifact_paths[catalog_key] = catalog_record.path
+        self._assert_no_final_fold_provider(node_id)
+        # This operation only retains verified leaf results and fragment states.
+        # No model is asked to echo known indices or make new scientific claims.
+        self._expected_provider_calls.pop(self._provider_call_id(node_id), None)
+        try:
+            result = expand_final_fold_response(compact_final_fold_response(catalog), catalog)
+            self._validate_semantic_provider_output(node_id, expanded_request, result)
+        except (TypeError, ValueError, KeyError) as exc:
+            raise OutlineV3ExecutionError(f"invalid compact semantic final fold: {exc}") from exc
+        source_request_hash, expanded_hash = hash_json(expanded_request), hash_json(result)
+        request_artifact = self._artifact(OutlineArtifact, expanded_request, {"catalog_hash": catalog_hash})
+        execution_metadata = {"job_id": self.job_id, "node_id": node_id,
+                              "closure_epoch_id": self.closure_epoch_id,
+                              "provider_invoked": False, "execution_kind": "validated_leaf_aggregation"}
+        request_record = publish_json_artifact(
+            self.publication_context, self.registry,
+            self._node_path(f"semantic_final_fold_request/{hash_json([source_request_hash, self.closure_epoch_id])[:32]}"),
+            request_artifact.to_dict(), artifact_role="outline_v3_semantic_local_aggregate_request",
+            artifact_type="outline_artifact", artifact_version="v3",
+            producer="outline.v3_executor.OutlineV3Executor",
+            artifact_id=f"outline-v3:semantic-final-fold-request:{source_request_hash}:{self.closure_epoch_id}",
+            depends_on=self._dependency_refs((catalog_key,)),
+            metadata={**execution_metadata, "content_hash": request_artifact.content_hash},
+        )
+        request_key = f"{node_id}:retention_request"
+        self.artifact_records[request_key], self.artifact_paths[request_key] = request_record, request_record.path
+        aggregate = self._artifact(OutlineArtifact, result, {
+            **dict(dependency_hashes), "catalog_hash": catalog_hash,
+            "source_request_hash": source_request_hash,
+            "compiler_version": hash_text("validated-leaf-retention/v1"),
+        })
+        record = publish_json_artifact(
+            self.publication_context, self.registry,
+            self._node_path(f"semantic_final_fold/{hash_json([catalog_hash, source_request_hash, self.closure_epoch_id])[:32]}"), aggregate.to_dict(),
+            artifact_role="outline_v3_semantic_local_aggregate", artifact_type="outline_artifact", artifact_version="v3",
+            producer="outline.v3_executor.OutlineV3Executor",
+            artifact_id=f"outline-v3:semantic-final-fold:{catalog_hash}:{source_request_hash}:{self.closure_epoch_id}",
+            depends_on=self._dependency_refs((catalog_key, request_key)),
+            metadata={**execution_metadata, "content_hash": aggregate.content_hash},
+        )
+        self.artifact_records[node_id], self.artifact_paths[node_id] = record, record.path
+        self._final_fold_results[node_id] = {
+            "artifact_id": record.artifact_id, "registry_file_hash": record.content_hash,
+            "expanded_hash": expanded_hash,
+            "source_request_hash": source_request_hash, "catalog_hash": catalog_hash,
+            "catalog_artifact_id": catalog_record.artifact_id,
+            "catalog_registry_file_hash": catalog_record.content_hash,
+            "request_artifact_id": request_record.artifact_id,
+            "request_registry_file_hash": request_record.content_hash,
+            "closure_epoch_id": self.closure_epoch_id,
+            "execution_kind": "validated_leaf_aggregation", "new_cross_leaf_inference": False,
+            "required_comparison_state_at_aggregation": "pending_dedicated_candidate_fragments_and_validation",
+        }
         return result
 
     def _run_bounded_semantic_provider_call(
@@ -9397,22 +13601,197 @@ class OutlineV3Executor:
         )
         is_cross = logical_stage == "cross_group_comparison"
 
+        def provider_projection(
+            candidate: Mapping[str, Any], candidate_node_id: str,
+        ) -> dict[str, Any]:
+            """Reference sealed cohorts; retain inline scientific support and text."""
+            cross = candidate.get("cross_group_comparison")
+            retained_global = (not is_cross and (
+                "global_retention_source" in candidate or
+                (isinstance(cross, Mapping) and isinstance(cross.get("fragment_aggregation"), Mapping))
+            ))
+            if retained_global and "global_retention_source" not in candidate and isinstance(cross, Mapping):
+                from outline.semantic_global_view import project_global_retention_request
+
+                record = self._verified_retained_cross_record(cross)
+                candidate = project_global_retention_request(
+                    candidate, source_reference=ArtifactDependencyRefV2.from_record(record).to_dict(),
+                )
+            projected = _project_semantic_dependency_templates_request_v1(candidate)
+            if retained_global:
+                from outline.semantic_request_wire import pack_semantic_request_wire
+
+                attached = self._attach_prompt_authority(candidate_node_id, projected)
+                packed = pack_semantic_request_wire(
+                    attached, source_keys=("topic_synthesis", "cross_group_comparison"),
+                )
+                retain_final_authority = "global_retention_source" in candidate and ":reduce:" not in candidate_node_id
+                if retain_final_authority or profile.estimate_tokens(packed) > input_limit:
+                    from outline.semantic_identifier_aliases import build_identifier_alias_plan
+
+                    catalog, aliased = build_identifier_alias_plan(attached)
+                    self._semantic_identifier_plans[str(catalog["catalog_hash"])] = (catalog, attached)
+                    packed = pack_semantic_request_wire(
+                        aliased, source_keys=("topic_synthesis", "cross_group_comparison"),
+                    )
+                # The final map retains every canonical child as a typed
+                # source for later parent publication. Children already bind
+                # their exact input manifest and need aliases only for size.
+                return packed if retain_final_authority or profile.estimate_tokens(packed) < profile.estimate_tokens(attached) else projected
+            # Keep physical child grouping/request identities stable for exact
+            # replay. This representation repair targets the final fold of
+            # already source-closed results, before another reduction level.
+            hierarchy = candidate.get("hierarchy")
+            if not isinstance(hierarchy, Mapping) or hierarchy.get("level") != "bounded_semantic_final_fold":
+                return projected
+            items = candidate.get("topic_synthesis")
+            if not isinstance(items, list) or not items or not all(
+                isinstance(item, Mapping)
+                and isinstance(item.get("coverage_ref"), Mapping)
+                and item["coverage_ref"].get("schema_version") == "outline-semantic-reducer-coverage-ref/v1"
+                and isinstance(item.get("semantic_result_ref"), Mapping)
+                and item["semantic_result_ref"].get("schema_version") == "outline-semantic-reducer-result-ref/v1"
+                for item in items
+            ):
+                raise OutlineV3ExecutionError("semantic final fold requires sealed coverage and result references")
+            projected = self._project_sealed_semantic_topic_memberships(projected)
+            original_tokens = profile.estimate_tokens(
+                self._attach_prompt_authority(candidate_node_id, projected)
+            )
+            if original_tokens <= input_limit:
+                return projected
+            from outline.semantic_request_wire import pack_semantic_request_wire
+
+            # Bind the codec hash to the complete transmitted request. The
+            # provider boundary reattaches this same authority idempotently.
+            packed = pack_semantic_request_wire(
+                self._attach_prompt_authority(candidate_node_id, projected)
+            )
+            packed_tokens = profile.estimate_tokens(
+                self._attach_prompt_authority(candidate_node_id, packed)
+            )
+            return packed if packed_tokens < original_tokens else projected
+
         def estimate(candidate: Mapping[str, Any], candidate_node_id: str) -> int:
-            attached = self._attach_prompt_authority(candidate_node_id, candidate)
+            attached = self._attach_prompt_authority(
+                candidate_node_id, provider_projection(candidate, candidate_node_id)
+            )
             budget = profile.estimate_request(attached)
             return int(budget.get("estimated_input_tokens") or profile.estimate_tokens(attached))
 
+        def run_semantic_call(
+            candidate_node_id: str,
+            expanded_request: Mapping[str, Any],
+            dependencies: Mapping[str, str],
+            *,
+            output_tokens: int | None = None,
+        ) -> dict[str, Any]:
+            """Send a compact request while validating against expanded local sources."""
+
+            if expanded_request.get("final_fold_retention_contract") is not None:
+                return self._compile_final_fold_retention(
+                    candidate_node_id, expanded_request, dependencies,
+                )
+            wire_request = provider_projection(expanded_request, candidate_node_id)
+            from outline.semantic_identifier_aliases import WIRE_KEY as IDENTIFIER_ALIAS_KEY
+
+            map_record = (
+                self._publish_semantic_identifier_plan(candidate_node_id, expanded_request, wire_request)
+                if IDENTIFIER_ALIAS_KEY in wire_request else None
+            )
+            if wire_request == dict(expanded_request):
+                return self._run_semantic_provider_call(
+                    candidate_node_id,
+                    expanded_request,
+                    dependencies,
+                    output_tokens=output_tokens,
+                )
+            self._semantic_request_contract(candidate_node_id, expanded_request)
+            result = self._provider_call(
+                candidate_node_id,
+                wire_request,
+                expect_json=True,
+                input_artifact_hashes=(*dependencies.values(), *((map_record.content_hash,) if map_record is not None else ())),
+                transport_node_id="candidate_1_provider_generation",
+                output_tokens=(
+                    int(output_tokens)
+                    if output_tokens is not None
+                    else self._semantic_output_token_limit(
+                        self._node_route("candidate_1_provider_generation").profile
+                    )
+                ),
+            )
+            audit_index = next((
+                index for index in range(len(self._request_payload_audit) - 1, -1, -1)
+                if self._request_payload_audit[index].get("node_id") == candidate_node_id
+            ), -1)
+            try:
+                raw_result = result
+                if map_record is not None:
+                    from outline.semantic_identifier_aliases import decode_identifier_alias_output
+
+                    catalog = self._semantic_identifier_plans[str(wire_request[IDENTIFIER_ALIAS_KEY]["catalog_hash"])][0]
+                    result = decode_identifier_alias_output(raw_result, catalog)
+                self._validate_semantic_provider_output(
+                    candidate_node_id, expanded_request, result
+                )
+            except (OutlineV3ExecutionError, ValueError, TypeError) as exc:
+                self._finish_request_payload_audit(
+                    audit_index,
+                    semantic_validation_status="rejected",
+                    semantic_validation_error=str(exc),
+                )
+                raise
+            self._finish_request_payload_audit(
+                audit_index, semantic_validation_status="accepted"
+            )
+            if map_record is not None:
+                self._persist_semantic_identifier_output(
+                    candidate_node_id, raw_result, result, expanded_request, map_record, dependencies,
+                )
+            return result
+
         base_request = dict(request)
+        intermediate_items: dict[str, Mapping[str, Any]] = {}
         local_input_manifests: dict[str, dict[str, Any]] = {}
         local_input_manifest_hashes: dict[str, str] = {}
         topic_items = base_request.get("topic_synthesis")
         if not isinstance(topic_items, list) or not topic_items:
             initial_tokens = estimate(base_request, node_id)
-            if initial_tokens > input_limit:
+            if initial_tokens <= input_limit:
+                return run_semantic_call(node_id, base_request, dependency_hashes)
+            cross = base_request.get("cross_group_comparison")
+            if (is_cross or not isinstance(cross, Mapping)
+                    or not isinstance(cross.get("fragment_aggregation"), Mapping)):
                 raise OutlineV3ExecutionError(
                     f"BLOCKED_BUDGET: {logical_stage} has no reducible topic units and requires {initial_tokens} tokens over cap {input_limit}"
                 )
-            return self._run_semantic_provider_call(node_id, base_request, dependency_hashes)
+            state = self._final_fold_results.get("cross_group_comparison_provider") or {}
+            self._restore_local_final_fold("cross_group_comparison_provider", {
+                "execution_mode": "source_closed_retention", "provider_output": cross,
+                "semantic_retention": {**state, "provider_invoked": False},
+            })
+            marker, original, _records = self._global_retention_authority(base_request)
+            topic_items = copy.deepcopy(original["topic_synthesis"])
+            base_request.update({
+                "topic_synthesis": topic_items, "cross_group_comparison": {},
+                "global_retention_source": marker,
+                "hierarchy": {"level": "bounded_semantic_final_fold", "stage": logical_stage, "reduction_level": 1},
+            })
+        if "global_retention_source" in base_request:
+            # Validate the whole supplied partition before any subgroup can
+            # consume budget; duplicates may otherwise land in separate calls.
+            self._global_retention_member_scope(node_id, base_request)
+            # These are sealed cross-reducer members, not original inline
+            # topic fragments. Preserve their exact maps and original IDs in
+            # every new GLOBAL child manifest, including disjoint topic slices.
+            for item in topic_items:
+                manifest = self._load_semantic_reducer_coverage_ref(item)
+                if manifest is None:
+                    raise OutlineV3ExecutionError("GLOBAL frontier lost its member coverage manifest")
+                source_id = str(item["reducer_id"])
+                local_input_manifests[source_id] = manifest
+                local_input_manifest_hashes[source_id] = str(item["coverage_ref"]["registry_file_hash"])
 
         def topic_ids(items: Sequence[Any]) -> set[str]:
             result: set[str] = set()
@@ -9505,6 +13884,7 @@ class OutlineV3Executor:
                         str(value)
                         for value in (
                             *list(raw.get("paper_ids") or ()),
+                            *list(raw.get("bridge_paper_ids") or ()),
                             *list(raw.get("paper_keys") or ()),
                             *([raw.get("paper_key")] if raw.get("paper_key") else []),
                         )
@@ -9519,7 +13899,16 @@ class OutlineV3Executor:
                             values = [values]
                         identities.update(str(value) for value in values if str(value))
                     for identity in identities:
-                        if identity not in members_by_id or not members_by_id[identity]:
+                        # Source topic/fragment rows can contribute disjoint
+                        # slices of the same identity. Union their declared
+                        # membership; a claim's paper_key(s) or a reducer's
+                        # plural IDs cannot widen an already known map.
+                        source_slice = (
+                            identity == str(raw.get(singular_field) or "")
+                            and isinstance(raw.get("paper_ids"), list)
+                            and not raw.get("claim_id")
+                        )
+                        if source_slice or identity not in members_by_id or not members_by_id[identity]:
                             members_by_id.setdefault(identity, set()).update(direct_members)
                     for child in raw.values():
                         add_mapping(child)
@@ -9527,6 +13916,23 @@ class OutlineV3Executor:
                     for child in raw:
                         add_mapping(child)
 
+            map_field = {
+                "topic": "topic_members_by_id",
+                "fragment": "fragment_members_by_id",
+                "relation": "relation_members_by_id",
+            }[identity_kind]
+            for item in items:
+                if not isinstance(item, Mapping):
+                    continue
+                source_manifest = local_input_manifests.get(str(item.get("reducer_id") or ""))
+                source_members = source_manifest.get(map_field) if isinstance(source_manifest, Mapping) else None
+                if isinstance(source_members, Mapping):
+                    for identity, members in source_members.items():
+                        identity_key = str(identity or "")
+                        if identity_key:
+                            members_by_id.setdefault(identity_key, set()).update(
+                                str(value) for value in members or () if str(value)
+                            )
             add_mapping(items)
             add_mapping(additional)
             return {key: sorted(values) for key, values in sorted(members_by_id.items())}
@@ -9567,6 +13973,177 @@ class OutlineV3Executor:
                 "dependencies": [dependencies[key] for key in sorted(dependencies)],
             }
 
+        def carried_interpretation_context(
+            context: Mapping[str, Any], output: Mapping[str, Any],
+        ) -> dict[str, list[dict[str, Any]]]:
+            """Carry only source text and dependencies used by this reducer result."""
+
+            fields_by_id = {
+                str(row.get("source_field_id") or ""): dict(row)
+                for row in context.get("fields") or ()
+                if isinstance(row, Mapping) and str(row.get("source_field_id") or "")
+            }
+            dependencies = [
+                dict(row) for row in context.get("dependencies") or ()
+                if isinstance(row, Mapping)
+            ]
+            needed_claim_ids: set[str] = set()
+            needed_field_ids: set[str] = set()
+
+            def collect_refs(value: Any) -> None:
+                if isinstance(value, Mapping):
+                    for key in ("source_claim_id", "source_claim_ids"):
+                        raw = value.get(key)
+                        values = [raw] if isinstance(raw, str) else raw or ()
+                        needed_claim_ids.update(str(item) for item in values if str(item))
+                    raw_fields = value.get("source_field_ids")
+                    values = [raw_fields] if isinstance(raw_fields, str) else raw_fields or ()
+                    needed_field_ids.update(str(item) for item in values if str(item))
+                    for child in value.values():
+                        collect_refs(child)
+                elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+                    for child in value:
+                        collect_refs(child)
+
+            collect_refs(output)
+            selected_dependencies: dict[str, dict[str, Any]] = {}
+            changed = True
+            while changed:
+                changed = False
+                for dependency in dependencies:
+                    dependency_claim_ids = {
+                        str(dependency.get("primary_claim_id") or ""),
+                        *(str(item) for item in dependency.get("required_source_claim_ids") or () if str(item)),
+                    }
+                    dependency_claim_ids.discard("")
+                    dependency_field_ids = {
+                        str(item) for item in dependency.get("required_source_field_ids") or () if str(item)
+                    }
+                    if not (
+                        dependency_claim_ids.intersection(needed_claim_ids)
+                        or dependency_field_ids.intersection(needed_field_ids)
+                    ):
+                        continue
+                    dependency_hash = hash_json(dependency)
+                    if dependency_hash not in selected_dependencies:
+                        selected_dependencies[dependency_hash] = dependency
+                        changed = True
+                    before = (len(needed_claim_ids), len(needed_field_ids))
+                    needed_claim_ids.update(dependency_claim_ids)
+                    needed_field_ids.update(dependency_field_ids)
+                    changed = changed or before != (len(needed_claim_ids), len(needed_field_ids))
+
+            missing_fields = sorted(needed_field_ids - set(fields_by_id))
+            if missing_fields:
+                raise OutlineV3ExecutionError(
+                    "reducer result references interpretation fields absent from its verified input closure"
+                )
+            return {
+                "fields": [fields_by_id[key] for key in sorted(needed_field_ids)],
+                "dependencies": [selected_dependencies[key] for key in sorted(selected_dependencies)],
+            }
+
+        def compact_topic_disposition_groups(dispositions: Any) -> list[dict[str, Any]]:
+            """Group exact coverage dispositions without repeating shared status/reason text."""
+
+            grouped: dict[tuple[str, str], dict[str, Any]] = {}
+            for row in dispositions or ():
+                if not isinstance(row, Mapping):
+                    continue
+                topic_id = str(row.get("topic_id") or "")
+                if not topic_id:
+                    continue
+                status = str(row.get("status") or "")
+                reason = str(row.get("reason") or "")
+                group = grouped.setdefault((status, reason), {
+                    "status": status,
+                    "reason": reason,
+                    "topic_ids": [],
+                    "synthesis_claim_ids_by_topic": {},
+                })
+                group["topic_ids"].append(topic_id)
+                claim_ids = sorted({
+                    str(value) for value in row.get("synthesis_claim_ids") or () if str(value)
+                })
+                if claim_ids:
+                    group["synthesis_claim_ids_by_topic"][topic_id] = claim_ids
+            return [
+                {
+                    **group,
+                    "topic_ids": sorted(group["topic_ids"]),
+                    **({"synthesis_claim_ids_by_topic": dict(sorted(group["synthesis_claim_ids_by_topic"].items()))}
+                       if group["synthesis_claim_ids_by_topic"] else {}),
+                }
+                for _key, group in sorted(grouped.items())
+            ]
+
+        def source_derived_output_reserve(items: Sequence[Any]) -> int:
+            """Reserve a bounded final-fold completion from its exact source rows."""
+
+            envelope: dict[str, list[Any]] = {
+                "comparisons": [],
+                "bridge_claims": [],
+                "topic_dispositions": [],
+                "unresolved_questions": [],
+            }
+            for item in items:
+                if not isinstance(item, Mapping):
+                    continue
+                semantic = item.get("semantic_result")
+                if isinstance(semantic, Mapping):
+                    for key in ("comparisons", "bridge_claims", "unresolved_questions"):
+                        rows = semantic.get(key)
+                        if isinstance(rows, list):
+                            envelope[key].extend(rows)
+                for group in item.get("topic_disposition_groups") or ():
+                    if not isinstance(group, Mapping):
+                        continue
+                    by_topic = group.get("synthesis_claim_ids_by_topic")
+                    by_topic = by_topic if isinstance(by_topic, Mapping) else {}
+                    for raw_topic_id in group.get("topic_ids") or ():
+                        topic_id = str(raw_topic_id or "")
+                        if not topic_id:
+                            continue
+                        disposition: dict[str, Any] = {
+                            "topic_id": topic_id,
+                            "status": str(group.get("status") or ""),
+                        }
+                        if str(group.get("reason") or ""):
+                            disposition["reason"] = str(group.get("reason") or "")
+                        claim_ids = by_topic.get(topic_id)
+                        if isinstance(claim_ids, list) and claim_ids:
+                            disposition["synthesis_claim_ids"] = list(claim_ids)
+                        envelope["topic_dispositions"].append(disposition)
+            return _source_derived_semantic_output_reserve_v1(
+                envelope,
+                profile,
+                self._semantic_output_token_limit(profile),
+            )
+
+        def semantic_result_body(value: Any) -> dict[str, Any] | None:
+            if not isinstance(value, Mapping):
+                return None
+            return {
+                str(key): item for key, item in value.items()
+                if key not in {
+                    "processed_topic_ids", "processed_fragment_ids",
+                    "processed_result_ids", "processed_relation_ids",
+                    "topic_dispositions",
+                }
+            }
+
+        def reducer_coverage_signature(manifest: Mapping[str, Any]) -> str:
+            return hash_json({
+                key: manifest.get(key)
+                for key in (
+                    "topic_ids", "fragment_ids", "result_ids", "relation_ids",
+                    "paper_ids", "topic_members_by_id", "fragment_members_by_id",
+                    "relation_members_by_id", "source_field_ids",
+                )
+            })
+
+        default_reducer_output_tokens = max(1, min(output_limit, input_limit // 4))
+
         def reducer_request(
             items: Sequence[Any],
             *,
@@ -9598,6 +14175,19 @@ class OutlineV3Executor:
                     "integrate only the supplied topic fragments; preserve conclusions, conditions, conflicts, unresolved items, and evidence support; do not invent missing evidence"
                 ),
             }
+            if is_cross and items and all(
+                isinstance(item, Mapping)
+                and isinstance(item.get("semantic_result"), Mapping)
+                and isinstance(item.get("coverage_ref"), Mapping)
+                and item["coverage_ref"].get("schema_version") == "outline-semantic-reducer-coverage-ref/v1"
+                and isinstance(item.get("semantic_result_ref"), Mapping)
+                and item["semantic_result_ref"].get("schema_version") == "outline-semantic-reducer-result-ref/v1"
+                for item in items
+            ):
+                # Like the final fold, a materialized source-closed aggregate
+                # has a measurable response envelope. Bind its derived reserve
+                # into the request; the route and whole-run ceilings still apply.
+                child["output_contract"]["max_output_tokens"] = source_derived_output_reserve(items)
             if child.get("shared_synthesis_contract_version") == SHARED_SYNTHESIS_CONTRACT_VERSION:
                 child["output_contract"]["coverage_ledger"] = (
                     "do not echo processed ID arrays; runtime computes and persists the exact input membership"
@@ -9610,6 +14200,101 @@ class OutlineV3Executor:
                 })
             return child
 
+        def reducer_capacity(
+            items: Sequence[Any], *, level: int, index: int,
+            relations: Sequence[Mapping[str, Any]] = (),
+            cross_context: Mapping[str, Any] | None = None,
+        ) -> tuple[int, str]:
+            try:
+                child = reducer_request(
+                    items, level=level, index=index,
+                    relations=relations, cross_context=cross_context,
+                )
+            except OutlineV3ExecutionError as exc:
+                if not str(exc).startswith(
+                    "BLOCKED_BUDGET: source-closed semantic response schema floor"
+                ):
+                    raise
+                return 0, str(exc)
+            tokens = estimate(child, f"{node_id}:reduce:{level}:{index}")
+            if tokens > input_limit:
+                return tokens, f"input {tokens} over cap {input_limit}"
+            output_tokens = int(
+                child["output_contract"].get("max_output_tokens", default_reducer_output_tokens)
+            )
+            total = tokens + output_tokens + int(profile.reasoning_reserve) + int(profile.safety_margin)
+            if total > int(profile.verified_context_limit):
+                return tokens, f"total context {total} over verified route limit {profile.verified_context_limit}"
+            return tokens, ""
+
+        def final_request_for_items(
+            items: Sequence[Any], reduction_level: int,
+        ) -> tuple[dict[str, Any], int, bool]:
+            final_request = dict(base_request)
+            final_request["topic_synthesis"] = list(items)
+            if reduction_level > 1:
+                if base_request.get("shared_synthesis_contract_version") == SHARED_SYNTHESIS_CONTRACT_VERSION:
+                    final_request["hierarchy"] = {
+                        "level": "bounded_semantic_final_fold",
+                        "stage": logical_stage,
+                        "reduction_level": reduction_level,
+                    }
+                if "relation_candidates" in final_request:
+                    final_request["relation_candidates"] = []
+                if not is_cross and "cross_group_comparison" in final_request:
+                    final_request["cross_group_comparison"] = {}
+            final_output_tokens = self._semantic_output_token_limit(profile)
+            source_closed_final_fold = (
+                is_cross and reduction_level > 1
+                and any(
+                    isinstance(item, Mapping)
+                    and isinstance(item.get("semantic_result"), Mapping)
+                    for item in items
+                )
+            )
+            if source_closed_final_fold:
+                try:
+                    final_output_tokens = source_derived_output_reserve(items)
+                except OutlineV3ExecutionError as exc:
+                    if not str(exc).startswith("BLOCKED_BUDGET: source-closed semantic response schema floor"):
+                        raise
+                    from outline.semantic_final_fold_response import compact_final_fold_response
+
+                    catalog = self._prepare_final_fold_catalog(
+                        node_id, items, topic_items, intermediate_items,
+                        list(base_request.get("questions") or []),
+                    )
+                    compact = compact_final_fold_response(catalog)
+                    final_output_tokens = 0
+                    final_request["final_fold_retention_contract"] = {
+                        "schema_version": "outline-semantic-final-fold-retention/v2",
+                        "catalog_hash": catalog["catalog_hash"],
+                        "identity": catalog["identity"],
+                        "category_counts": {key: len(value) for key, value in catalog["categories"].items()},
+                        "response_shape": compact,
+                        "rule": (
+                            "The local compiler retains every verified source row and every original fragment disposition. "
+                            "No provider POST, new scientific claim, or resolved cross-leaf question is authorized by this contract."
+                        ),
+                    }
+                final_request["output_contract"] = {
+                    **dict(final_request.get("output_contract") or {}),
+                    "max_output_tokens": final_output_tokens,
+                    "final_fold_policy": (
+                        "Keep every supplied source-closed bridge claim and exact topic "
+                        "disposition. Do not repeat the same claim as extra prose. Preserve "
+                        "all source, evidence, qualifier, topic, and paper IDs; if a new "
+                        "comparison cannot be stated within this output allowance, mark it unresolved."
+                    ),
+                }
+                if "final_fold_retention_contract" in final_request:
+                    final_request["output_contract"] = {
+                        "max_output_tokens": final_output_tokens,
+                        "execution_kind": "validated_leaf_aggregation",
+                        "provider_post_permitted": False,
+                    }
+            return final_request, final_output_tokens, source_closed_final_fold
+
         current_items: list[Any] = list(topic_items)
         current_relations = [
             dict(item)
@@ -9621,28 +14306,29 @@ class OutlineV3Executor:
             if not is_cross
             else {}
         )
-        # A stage-local guard prevents an output-dependent reducer from
-        # iterating indefinitely. It never grants aggregate provider budget.
-        max_reducer_calls = MAX_SEMANTIC_REDUCER_CALLS_PER_STAGE
+        # Use the finite source/output-bound tree already projected for this
+        # stage. The legacy limit is only a fallback without a materialized
+        # tree; neither limit grants aggregate provider budget or more depth.
+        planned_reducer_nodes = {
+            str(row.get("node_id") or "") for row in self.semantic_request_plan
+            if isinstance(row, Mapping)
+            and str(row.get("node_id") or "").startswith(f"{node_id}:reduce:")
+        }
+        max_reducer_calls = len(planned_reducer_nodes) or MAX_SEMANTIC_REDUCER_CALLS_PER_STAGE
         reducer_calls_started = 0
         level = 1
         while True:
-            final_request = dict(base_request)
-            final_request["topic_synthesis"] = current_items
-            if level > 1:
-                if base_request.get("shared_synthesis_contract_version") == SHARED_SYNTHESIS_CONTRACT_VERSION:
-                    final_request["hierarchy"] = {
-                        "level": "bounded_semantic_final_fold",
-                        "stage": logical_stage,
-                        "reduction_level": level,
-                    }
-                # Relation inputs and prior cross-group output have already
-                # been consumed by the reducers; the final fold receives their
-                # evidence-linked reduction results through topic_synthesis.
-                if "relation_candidates" in final_request:
-                    final_request["relation_candidates"] = []
-                if not is_cross and "cross_group_comparison" in final_request:
-                    final_request["cross_group_comparison"] = {}
+            if level > 1 and "global_retention_source" in base_request:
+                # Check the whole new frontier before either FINAL or another
+                # reduction level can spend a call on conflicting child IDs.
+                self._global_retention_member_scope(node_id, {
+                    **base_request, "topic_synthesis": current_items,
+                })
+            final_request, final_output_tokens, source_closed_final_fold = (
+                final_request_for_items(current_items, level)
+            )
+            if "final_fold_retention_contract" in final_request:
+                return run_semantic_call(node_id, final_request, dependency_hashes, output_tokens=0)
             final_tokens = estimate(final_request, node_id)
             if final_tokens <= input_limit:
                 if is_cross and hash_json(final_request.get("questions")) != hash_json(
@@ -9651,7 +14337,25 @@ class OutlineV3Executor:
                     raise OutlineV3ExecutionError(
                         "cross-group reducer lost its original comparison questions"
                     )
-                return self._run_semantic_provider_call(node_id, final_request, dependency_hashes)
+                if source_closed_final_fold:
+                    total_reserved = (
+                        final_tokens
+                        + final_output_tokens
+                        + int(profile.reasoning_reserve)
+                        + int(profile.safety_margin)
+                    )
+                    if total_reserved > int(profile.verified_context_limit):
+                        raise OutlineV3ExecutionError(
+                            "BLOCKED_BUDGET: source-closed semantic final fold requires "
+                            f"{total_reserved} total context tokens over verified route limit "
+                            f"{profile.verified_context_limit}"
+                        )
+                return run_semantic_call(
+                    node_id,
+                    final_request,
+                    dependency_hashes,
+                    output_tokens=final_output_tokens,
+                )
             if level > MAX_SEMANTIC_REDUCTION_LEVELS:
                 raise OutlineV3ExecutionError(
                     f"BLOCKED_BUDGET: {logical_stage} exceeded {MAX_SEMANTIC_REDUCTION_LEVELS} bounded reduction levels"
@@ -9661,10 +14365,8 @@ class OutlineV3Executor:
             # the same route prompt/schema used by the real provider call.
             packing_items: list[Any] = []
             for item in current_items:
-                single = reducer_request([item], level=level, index=1)
-                if isinstance(item, Mapping) and estimate(
-                    single, f"{node_id}:reduce:{level}:1"
-                ) > input_limit:
+                _single_tokens, single_issue = reducer_capacity([item], level=level, index=1)
+                if isinstance(item, Mapping) and single_issue:
                     from outline.semantic_reducer_projection import split_nested_topic_for_reduction_v1
 
                     try:
@@ -9680,27 +14382,22 @@ class OutlineV3Executor:
             current_group: list[Any] = []
             for item in current_items:
                 trial = [*current_group, item]
-                probe = reducer_request(
-                    trial,
-                    level=level,
-                    index=len(groups) + 1,
+                _probe_tokens, probe_issue = reducer_capacity(
+                    trial, level=level, index=len(groups) + 1,
                 )
-                probe_node_id = f"{node_id}:reduce:{level}:{len(groups) + 1}"
-                if current_group and estimate(probe, probe_node_id) > input_limit:
+                if current_group and probe_issue:
                     groups.append(current_group)
                     current_group = [item]
-                    single_probe = reducer_request(
-                        current_group,
-                        level=level,
-                        index=len(groups) + 1,
+                    _single_tokens, single_issue = reducer_capacity(
+                        current_group, level=level, index=len(groups) + 1,
                     )
-                    if estimate(single_probe, f"{node_id}:reduce:{level}:{len(groups) + 1}") > input_limit:
+                    if single_issue:
                         raise OutlineV3ExecutionError(
-                            f"BLOCKED_BUDGET: one {logical_stage} topic result is indivisible over the effective input cap"
+                            f"BLOCKED_BUDGET: one {logical_stage} topic result is indivisible: {single_issue}"
                         )
-                elif not current_group and estimate(probe, probe_node_id) > input_limit:
+                elif not current_group and probe_issue:
                     raise OutlineV3ExecutionError(
-                        f"BLOCKED_BUDGET: one {logical_stage} topic result is indivisible over the effective input cap"
+                        f"BLOCKED_BUDGET: one {logical_stage} topic result is indivisible: {probe_issue}"
                     )
                 else:
                     current_group = trial
@@ -9733,26 +14430,25 @@ class OutlineV3Executor:
                         )
                         relations_by_group[target_index].append(relation)
                 oversized_index = None
-                oversized_tokens = 0
+                oversized_reason = ""
                 for index, group in enumerate(groups):
-                    child = reducer_request(
+                    _tokens, capacity_issue = reducer_capacity(
                         group,
                         level=level,
                         index=index + 1,
                         relations=relations_by_group[index],
                         cross_context=(current_cross if not is_cross and index == 0 else None),
                     )
-                    tokens = estimate(child, f"{node_id}:reduce:{level}:{index + 1}")
-                    if tokens > input_limit:
+                    if capacity_issue:
                         oversized_index = index
-                        oversized_tokens = tokens
+                        oversized_reason = capacity_issue
                         break
                 if oversized_index is None:
                     break
                 oversized_group = groups[oversized_index]
                 if len(oversized_group) == 1:
                     raise OutlineV3ExecutionError(
-                        f"BLOCKED_BUDGET: one complete {logical_stage} fragment plus its assigned relations/context needs {oversized_tokens} tokens over cap {input_limit}"
+                        f"BLOCKED_BUDGET: one complete {logical_stage} fragment plus its assigned relations/context cannot fit: {oversized_reason}"
                     )
                 midpoint = len(oversized_group) // 2
                 groups[oversized_index:oversized_index + 1] = [
@@ -9772,7 +14468,7 @@ class OutlineV3Executor:
                 )
 
             reduced_items: list[dict[str, Any]] = []
-            reducer_output_tokens = max(1, min(output_limit, input_limit // 4))
+            unchanged_singleton_ids: list[str] = []
             for group_index, group in enumerate(groups, start=1):
                 cross_context: Mapping[str, Any] | None = None
                 if not is_cross and group_index == 1 and current_cross:
@@ -9784,6 +14480,9 @@ class OutlineV3Executor:
                     relations=relations_by_group[group_index - 1],
                     cross_context=cross_context,
                 )
+                reducer_output_tokens = int(child_request["output_contract"].get(
+                    "max_output_tokens", default_reducer_output_tokens,
+                ))
                 child_node_id = f"{node_id}:reduce:{level}:{group_index}"
                 child_tokens = estimate(child_request, child_node_id)
                 if child_tokens > input_limit:
@@ -9812,6 +14511,11 @@ class OutlineV3Executor:
                         if str(relation.get("relation_id") or "")
                     } | set(lineage_member_ids(group, "relation_ids"))),
                     "paper_ids": sorted(paper_ids(group)),
+                    "topic_members_by_id": membership_map(group, "topic"),
+                    "fragment_members_by_id": membership_map(group, "fragment"),
+                    "relation_members_by_id": membership_map(
+                        group, "relation", additional=relations_by_group[group_index - 1],
+                    ),
                     "source_field_ids": sorted({
                         str(field.get("source_field_id") or "")
                         for field in verified_interpretation.get("fields") or ()
@@ -9824,8 +14528,15 @@ class OutlineV3Executor:
                     }),
                     "source_item_hashes": [hash_json(item) for item in group],
                     "source_input_hash": hash_json(group),
-                    "provider_request_hash": hash_json(child_request),
+                    "provider_request_hash": hash_json(provider_projection(child_request, child_node_id)),
                 }
+                global_sources: tuple[ArtifactRecord, ...] = ()
+                if "global_retention_source" in child_request:
+                    global_sources, _reasons = self._global_retention_member_scope(child_node_id, child_request)
+                    input_manifest.update({
+                        "global_retention_source": copy.deepcopy(child_request["global_retention_source"]),
+                        "global_source_items": copy.deepcopy(group),
+                    })
                 input_record = self._persist_semantic_reducer_input_manifest(
                     child_node_id,
                     input_manifest,
@@ -9833,6 +14544,7 @@ class OutlineV3Executor:
                         **dict(dependency_hashes),
                         "reduction_input": reduction_input_hash,
                     },
+                    source_records=global_sources,
                 )
                 local_input_manifests[child_node_id] = input_manifest
                 local_input_manifest_hashes[child_node_id] = input_record.content_hash
@@ -9841,42 +14553,102 @@ class OutlineV3Executor:
                     "reduction_input": reduction_input_hash,
                     "input_manifest": input_record.content_hash,
                 }
-                result = self._run_semantic_provider_call(
+                result = run_semantic_call(
                     child_node_id,
                     child_request,
                     call_dependencies,
                     output_tokens=reducer_output_tokens,
                 )
-                self._persist_semantic_provider_output(
+                semantic_output_record = self._persist_semantic_provider_output(
                     child_node_id,
                     result,
                     dependency_hashes=call_dependencies,
+                    recovery_sources=(input_record,) if global_sources else (),
                 )
+                if global_sources and child_node_id in self._semantic_identifier_outputs:
+                    semantic_output_record = self.artifact_records[f"{child_node_id}:identifier_expanded"]
                 if base_request.get("shared_synthesis_contract_version") == SHARED_SYNTHESIS_CONTRACT_VERSION:
+                    disposition_groups = (
+                        compact_topic_disposition_groups(result.get("topic_dispositions"))
+                        if is_cross else []
+                    )
                     semantic_body = {
                         key: value for key, value in result.items()
                         if key not in {
                             "processed_topic_ids", "processed_fragment_ids",
                             "processed_result_ids", "processed_relation_ids",
+                            *(('topic_dispositions',) if is_cross else ()),
                         }
+                    }
+                    carried_context = carried_interpretation_context(
+                        verified_interpretation, semantic_body,
+                    )
+                    unchanged_singleton = False
+                    if len(group) == 1 and isinstance(group[0], Mapping):
+                        prior_item = group[0]
+                        prior_id = str(prior_item.get("reducer_id") or "")
+                        prior_manifest = local_input_manifests.get(prior_id)
+                        prior_body = semantic_result_body(prior_item.get("semantic_result"))
+                        prior_context = prior_item.get("interpretation_context")
+                        prior_dispositions = prior_item.get("topic_disposition_groups")
+                        unchanged_singleton = bool(
+                            prior_id
+                            and isinstance(prior_manifest, Mapping)
+                            and prior_body is not None
+                            and hash_json(prior_body) == hash_json(semantic_body)
+                            and hash_json(prior_dispositions or []) == hash_json(disposition_groups)
+                            and hash_json(prior_context or {}) == hash_json(carried_context)
+                            and not relations_by_group[group_index - 1]
+                            and int(prior_manifest.get("relation_count") or 0) == 0
+                            and int(input_manifest.get("relation_count") or 0) == 0
+                            and reducer_coverage_signature(prior_manifest)
+                            == reducer_coverage_signature(input_manifest)
+                        )
+                    if unchanged_singleton:
+                        unchanged_singleton_ids.append(child_node_id)
+                    membership_maps = {
+                        key: input_manifest[key]
+                        for key in ("topic_members_by_id", "fragment_members_by_id", "relation_members_by_id")
+                    }
+                    coverage_ref = {
+                        "schema_version": "outline-semantic-reducer-coverage-ref/v1",
+                        "artifact_id": input_record.artifact_id,
+                        "registry_file_hash": input_record.content_hash,
+                        "artifact_content_hash": str(input_record.metadata.get("content_hash") or ""),
+                        "node_id": child_node_id,
+                        "manifest_hash": hash_json(input_manifest),
+                        "membership_hash": hash_json(membership_maps),
+                        "topic_count": len(input_manifest["topic_ids"]),
+                        "fragment_count": len(input_manifest["fragment_ids"]),
+                        "result_count": len(input_manifest["result_ids"]),
+                        "relation_count": len(input_manifest["relation_ids"]),
+                        "paper_count": len(input_manifest["paper_ids"]),
+                    }
+                    semantic_result_ref = {
+                        "schema_version": "outline-semantic-reducer-result-ref/v1",
+                        "artifact_id": semantic_output_record.artifact_id,
+                        "registry_file_hash": semantic_output_record.content_hash,
+                        "artifact_content_hash": str(semantic_output_record.metadata.get("content_hash") or ""),
+                        "provider_result_hash": hash_json(result),
+                        **({"response_kind": "verified_identifier_expansion"} if global_sources
+                           and semantic_output_record.artifact_role == "outline_v3_semantic_identifier_expanded_output" else {}),
                     }
                     reduced_items.append({
                         "reducer_id": child_node_id,
                         "topic_ids": group_ids,
-                        "topic_members_by_id": membership_map(group, "topic"),
-                        "fragment_members_by_id": membership_map(group, "fragment"),
-                        "relation_members_by_id": membership_map(
-                            group, "relation", additional=relations_by_group[group_index - 1],
-                        ),
                         "paper_ids": sorted(paper_ids(group)),
+                        "coverage_ref": coverage_ref,
+                        **({"topic_disposition_groups": disposition_groups} if disposition_groups else {}),
                         "semantic_result": semantic_body,
-                        "local_lineage": {
+                        "semantic_result_ref": semantic_result_ref,
+                        **({
+                            "interpretation_context": carried_context,
+                        } if carried_context["fields"] or carried_context["dependencies"] else {}),
+                        "local_lineage_hash": hash_json({
                             "source_input_hash": hash_json(group),
                             "source_request_hash": hash_json(child_request),
                             "interpretation_context_hash": hash_json(verified_interpretation),
-                            "fragment_identity_set_hash": hash_json(input_manifest["fragment_ids"]),
-                            "result_identity_set_hash": hash_json(input_manifest["result_ids"]),
-                        },
+                        }),
                         "reduction_level": level,
                     })
                 else:
@@ -9912,17 +14684,28 @@ class OutlineV3Executor:
                         ],
                         "reduction_level": level,
                     })
-            reduced_final_request = dict(base_request)
-            reduced_final_request["topic_synthesis"] = reduced_items
-            if is_cross:
-                reduced_final_request["relation_candidates"] = []
-            else:
-                reduced_final_request["cross_group_comparison"] = {}
-                if "relation_candidates" in reduced_final_request:
-                    reduced_final_request["relation_candidates"] = []
+            # Contraction and no-progress checks use the same complete final
+            # contract that the next iteration would actually send.
+            intermediate_items.update({hash_json(item): item for item in reduced_items})
+            reduced_final_request, _output_tokens, _source_closed = final_request_for_items(
+                reduced_items, level + 1,
+            )
+            reduced_final_tokens = estimate(reduced_final_request, node_id)
+            if (
+                groups
+                and len(unchanged_singleton_ids) == len(groups)
+                and all(len(group) == 1 for group in groups)
+                and reduced_final_tokens > input_limit
+            ):
+                raise OutlineV3ExecutionError(
+                    f"BLOCKED_BUDGET: {logical_stage} singleton reducers repeated the exact "
+                    "source-supported result, qualifier closure, and sealed coverage while "
+                    f"the final request still requires {reduced_final_tokens} tokens over "
+                    f"cap {input_limit}; no further provider call was sent"
+                )
             if (
                 len(reduced_items) >= len(current_items)
-                and estimate(reduced_final_request, node_id) >= final_tokens
+                and reduced_final_tokens >= final_tokens
             ):
                 raise OutlineV3ExecutionError(
                     f"BLOCKED_BUDGET: {logical_stage} reducer did not reduce the bounded input"
@@ -9933,10 +14716,259 @@ class OutlineV3Executor:
             reducer_calls_started += len(groups)
             level += 1
 
+    def _project_sealed_semantic_topic_memberships(
+        self, request: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Expose Registry-backed membership for inline sources to a stateless provider."""
+
+        def source_owners(value: Any) -> set[str]:
+            owners: set[str] = set()
+            if isinstance(value, Mapping):
+                for key, child in value.items():
+                    if key in {"paper_key", "paper_keys", "paper_ids"}:
+                        values = child if isinstance(child, list) else [child]
+                        owners.update(str(item) for item in values if item is not None and str(item))
+                    else:
+                        owners.update(source_owners(child))
+            elif isinstance(value, list):
+                for child in value:
+                    owners.update(source_owners(child))
+            return owners
+
+        projected = dict(request)
+        items = request.get("topic_synthesis")
+        if not isinstance(items, list):
+            return projected
+        projected_items: list[Any] = []
+        for item in items:
+            if not isinstance(item, Mapping):
+                projected_items.append(item)
+                continue
+            manifest = self._load_semantic_reducer_coverage_ref(item)
+            if manifest is None:
+                projected_items.append(dict(item))
+                continue
+            if self._load_semantic_reducer_result_ref(item) is None:
+                raise OutlineV3ExecutionError("sealed semantic membership has no verified result")
+            owners = source_owners(item.get("semantic_result"))
+            owners.update(source_owners(item.get("interpretation_context")))
+            if not owners.issubset(set(manifest.get("paper_ids") or ())):
+                raise OutlineV3ExecutionError("sealed semantic source owner is outside its coverage manifest")
+            members = manifest.get("topic_members_by_id") or {}
+            topic_ids = manifest.get("topic_ids") or ()
+            paper_ids = set(manifest.get("paper_ids") or ())
+            if (
+                not isinstance(members, Mapping)
+                or set(members) != set(topic_ids)
+                or any(
+                    not isinstance(values, list) or not set(values).issubset(paper_ids)
+                    for values in members.values()
+                )
+            ):
+                raise OutlineV3ExecutionError("sealed semantic topic membership is inconsistent with its coverage cohort")
+            projected_items.append({
+                **item,
+                "topic_members_by_id": {
+                    str(topic_id): sorted(owners.intersection(members.get(topic_id) or ()))
+                    for topic_id in topic_ids
+                },
+            })
+        projected["topic_synthesis"] = projected_items
+        return projected
+
+    def _load_semantic_reducer_coverage_ref(
+        self, value: Mapping[str, Any],
+        *, verify_closure: Callable[[ArtifactRecord], None] | None = None,
+    ) -> dict[str, Any] | None:
+        """Resolve and verify a reducer's compact Registry-backed coverage reference."""
+
+        reference = value.get("coverage_ref")
+        if not isinstance(reference, Mapping):
+            return None
+        if reference.get("schema_version") != "outline-semantic-reducer-coverage-ref/v1":
+            raise OutlineV3ExecutionError("semantic reducer coverage reference has an unknown schema")
+        artifact_id = str(reference.get("artifact_id") or "")
+        record = self.registry.get(artifact_id) if artifact_id else None
+        node_id = str(reference.get("node_id") or "")
+        if (
+            record is None
+            or record.status != "ready"
+            or record.job_id != self.job_id
+            or record.artifact_role != "outline_v3_semantic_reducer_input_manifest"
+            or record.artifact_type != "outline_artifact"
+            or record.artifact_version != "v3"
+            or record.producer != "outline.v3_executor.OutlineV3Executor"
+            or str(record.metadata.get("node_id") or "") != node_id
+            or node_id != str(value.get("reducer_id") or "")
+            or record.content_hash != str(reference.get("registry_file_hash") or "")
+            or str(record.metadata.get("content_hash") or "")
+            != str(reference.get("artifact_content_hash") or "")
+        ):
+            raise OutlineV3ExecutionError("semantic reducer coverage reference has no matching Registry authority")
+        try:
+            if verify_closure is None:
+                self.registry.verify_ready_artifact_closure(record)
+            else:
+                verify_closure(record)
+            envelope = json.loads(Path(record.path).read_text(encoding="utf-8"))
+            artifact = OutlineArtifact.from_dict(envelope)
+        except (OSError, UnicodeError, json.JSONDecodeError, RegistryError, TypeError, ValueError) as exc:
+            raise OutlineV3ExecutionError("semantic reducer coverage manifest is not Registry-verifiable") from exc
+        manifest = dict(artifact.payload)
+        maps = {
+            key: manifest.get(key) or {}
+            for key in ("topic_members_by_id", "fragment_members_by_id", "relation_members_by_id")
+        }
+        if (
+            artifact.content_hash != str(reference.get("artifact_content_hash") or "")
+            or str(manifest.get("node_id") or "") != node_id
+            or hash_json(manifest) != str(reference.get("manifest_hash") or "")
+            or hash_json(maps) != str(reference.get("membership_hash") or "")
+            or len(manifest.get("topic_ids") or ()) != reference.get("topic_count")
+            or len(manifest.get("fragment_ids") or ()) != reference.get("fragment_count")
+            or len(manifest.get("result_ids") or ()) != reference.get("result_count")
+            or len(manifest.get("relation_ids") or ()) != reference.get("relation_count")
+            or len(manifest.get("paper_ids") or ()) != reference.get("paper_count")
+        ):
+            raise OutlineV3ExecutionError("semantic reducer coverage manifest differs from its sealed reference")
+        return manifest
+
+    def _load_semantic_reducer_result_ref(
+        self, value: Mapping[str, Any],
+        *, verify_closure: Callable[[ArtifactRecord], None] | None = None,
+    ) -> dict[str, Any] | None:
+        """Verify the Registry result behind a compact reducer wire projection."""
+
+        reference = value.get("semantic_result_ref")
+        if not isinstance(reference, Mapping):
+            return None
+        if reference.get("schema_version") != "outline-semantic-reducer-result-ref/v1":
+            raise OutlineV3ExecutionError("semantic reducer result reference has an unknown schema")
+        artifact_id = str(reference.get("artifact_id") or "")
+        node_id = str(value.get("reducer_id") or "")
+        record = self.registry.get(artifact_id) if artifact_id else None
+        expanded_identifier = reference.get("response_kind") == "verified_identifier_expansion"
+        if (
+            record is None
+            or record.status != "ready"
+            or record.job_id != self.job_id
+            or record.artifact_role != (
+                "outline_v3_semantic_identifier_expanded_output" if expanded_identifier
+                else "outline_v3_semantic_provider_output"
+            )
+            or record.artifact_type != "outline_artifact"
+            or record.artifact_version != "v3"
+            or record.producer != "outline.v3_executor.OutlineV3Executor"
+            or str(record.metadata.get("node_id") or "") != node_id
+            or record.content_hash != str(reference.get("registry_file_hash") or "")
+            or str(record.metadata.get("content_hash") or "")
+            != str(reference.get("artifact_content_hash") or "")
+        ):
+            raise OutlineV3ExecutionError("semantic reducer result reference has no matching Registry authority")
+        try:
+            if verify_closure is None:
+                self.registry.verify_ready_artifact_closure(record)
+            else:
+                verify_closure(record)
+            envelope = json.loads(Path(record.path).read_text(encoding="utf-8"))
+            artifact = OutlineArtifact.from_dict(envelope)
+        except (OSError, UnicodeError, json.JSONDecodeError, RegistryError, TypeError, ValueError) as exc:
+            raise OutlineV3ExecutionError("semantic reducer result is not Registry-verifiable") from exc
+        provider_result = dict(artifact.payload)
+        if (
+            artifact.content_hash != str(reference.get("artifact_content_hash") or "")
+            or hash_json(provider_result) != str(reference.get("provider_result_hash") or "")
+        ):
+            raise OutlineV3ExecutionError("semantic reducer provider-result hash differs from its Registry payload")
+        if expanded_identifier:
+            dependencies: dict[str, ArtifactRecord] = {}
+            for dependency in record.depends_on:
+                target = self.registry.get(dependency.artifact_id)
+                if target is None or ArtifactDependencyRefV2.from_record(target) != dependency:
+                    raise OutlineV3ExecutionError("semantic reducer expansion lost an exact dependency")
+                dependencies[target.artifact_role] = target
+            physical = dependencies.get("outline_v3_semantic_provider_output")
+            mapping = dependencies.get("outline_v3_semantic_identifier_alias_map")
+            if physical is None or mapping is None or len(record.depends_on) != 2:
+                raise OutlineV3ExecutionError("semantic reducer expansion has no physical/map authority")
+            raw = OutlineArtifact.from_dict(json.loads(Path(physical.path).read_text(encoding="utf-8"))).payload
+            map_payload = OutlineArtifact.from_dict(json.loads(Path(mapping.path).read_text(encoding="utf-8"))).payload
+            self._restore_semantic_identifier_output(node_id, provider_result, {
+                "physical_artifact_id": physical.artifact_id, "physical_registry_file_hash": physical.content_hash,
+                "expanded_artifact_id": record.artifact_id, "expanded_registry_file_hash": record.content_hash,
+                "map_artifact_id": mapping.artifact_id, "map_registry_file_hash": mapping.content_hash,
+                "physical_response_hash": hash_json(raw), "expanded_response_hash": hash_json(provider_result),
+                "source_request_hash": hash_json(map_payload.get("expanded_request")),
+                "closure_epoch_id": self.closure_epoch_id, "execution_kind": "verified_identifier_expansion",
+            })
+
+        compact_groups = value.get("topic_disposition_groups")
+        expected_groups: list[dict[str, Any]] | None = None
+        if isinstance(compact_groups, list):
+            grouped: dict[tuple[str, str], dict[str, Any]] = {}
+            for row in provider_result.get("topic_dispositions") or ():
+                if not isinstance(row, Mapping):
+                    continue
+                topic_id = str(row.get("topic_id") or "")
+                if not topic_id:
+                    continue
+                status = str(row.get("status") or "")
+                reason = str(row.get("reason") or "")
+                group = grouped.setdefault((status, reason), {
+                    "status": status,
+                    "reason": reason,
+                    "topic_ids": [],
+                    "synthesis_claim_ids_by_topic": {},
+                })
+                group["topic_ids"].append(topic_id)
+                claim_ids = sorted({
+                    str(item) for item in row.get("synthesis_claim_ids") or () if str(item)
+                })
+                if claim_ids:
+                    group["synthesis_claim_ids_by_topic"][topic_id] = claim_ids
+            expected_groups = [
+                {
+                    **group,
+                    "topic_ids": sorted(group["topic_ids"]),
+                }
+                for _key, group in sorted(grouped.items())
+            ]
+            if hash_json(expected_groups) != hash_json(compact_groups):
+                raise OutlineV3ExecutionError(
+                    "semantic reducer compact disposition groups differ from their Registry result"
+                )
+
+        processed_fields = {
+            "processed_topic_ids", "processed_fragment_ids",
+            "processed_result_ids", "processed_relation_ids",
+        }
+        expected_semantic_body = {
+            key: item for key, item in provider_result.items()
+            if key not in processed_fields
+            and not (expected_groups is not None and key == "topic_dispositions")
+        }
+        compact_semantic_body = value.get("semantic_result")
+        if (
+            not isinstance(compact_semantic_body, Mapping)
+            or hash_json(dict(compact_semantic_body)) != hash_json(expected_semantic_body)
+        ):
+            raise OutlineV3ExecutionError(
+                "semantic reducer compact semantic result differs from its Registry result"
+            )
+        return provider_result
+
     def _semantic_request_contract(
-        self, node_id: str, request: Mapping[str, Any]
+        self, node_id: str, request: Mapping[str, Any],
+        *, global_scope_result: dict[str, Any] | None = None,
     ) -> tuple[str, bool, Mapping[str, Any] | None]:
-        """Check semantic request identity and local cross lineage before transport."""
+        """Check request authority; optionally return this call's verified scope.
+
+        The collector is output only. It never supplies authority and is
+        populated only after the complete member proof has succeeded.
+        """
+
+        if global_scope_result is not None:
+            global_scope_result.clear()
 
         stage = (
             "cross_group_comparison"
@@ -10023,6 +15055,16 @@ class OutlineV3Executor:
             raise OutlineV3ExecutionError(
                 f"{node_id} has no validated cross result or bounded reducer input"
             )
+        if "global_retention_source" in request:
+            scope_records, deferred_reasons = self._global_retention_member_scope(node_id, request)
+            if global_scope_result is not None:
+                global_scope_result.update(
+                    completed=True, records=scope_records,
+                    deferred_reasons=list(deferred_reasons),
+                )
+            # The parent ledger proves lineage. Only exact sealed members
+            # grant semantic IDs and ownership to this child/final call.
+            return stage, False, None
         return stage, False, ledger
 
     def _validate_semantic_provider_output(
@@ -10031,14 +15073,113 @@ class OutlineV3Executor:
         request: Mapping[str, Any],
         result: Mapping[str, Any],
     ) -> None:
+        """Share reducer closure work only within this fenced validation."""
+
+        if not isinstance(result, Mapping) or not result:
+            raise OutlineV3ExecutionError(f"{node_id} returned an empty semantic result")
+        reference_ids: set[str] = set()
+        cross = request.get("cross_group_comparison")
+
+        def collect(value: Any) -> None:
+            if isinstance(value, Mapping):
+                for key in ("coverage_ref", "semantic_result_ref"):
+                    reference = value.get(key)
+                    if isinstance(reference, Mapping) and reference.get("artifact_id"):
+                        reference_ids.add(str(reference["artifact_id"]))
+                for key, child in value.items():
+                    # Match add_prior_synthesis: claim bodies, relation rows,
+                    # and the already verified aggregate's provenance are not
+                    # stand-alone reducer inputs.
+                    if key in {"claims", "bridge_claims", "synthesis_claims"}:
+                        continue
+                    if key == "relation_candidates" and isinstance(child, list):
+                        continue
+                    if key == "fragment_aggregation" and value is cross:
+                        continue
+                    collect(child)
+            elif isinstance(value, list):
+                for child in value:
+                    collect(child)
+
+        collect(request.get("topic_synthesis"))
+        collect(cross)
+        if not reference_ids:
+            self._validate_semantic_provider_output_checked(node_id, request, result)
+            return
+
+        def capture_snapshot() -> tuple[int, list[ArtifactRecord], str]:
+            try:
+                revision, records = self.registry.capture_record_snapshot()
+                snapshot_hash = hash_json({record.artifact_id: asdict(record) for record in records})
+            except (OSError, UnicodeError, json.JSONDecodeError, RegistryError, TypeError, ValueError) as exc:
+                raise OutlineV3ExecutionError("semantic reducer Registry snapshot is not verifiable") from exc
+            return revision, records, snapshot_hash
+
+        revision, records, snapshot_hash = capture_snapshot()
+        records_by_id = {record.artifact_id: record for record in records}
+        if not reference_ids.issubset(records_by_id):
+            raise OutlineV3ExecutionError("semantic reducer reference has no matching Registry authority")
+        roots = tuple(records_by_id[artifact_id] for artifact_id in sorted(reference_ids))
+        expected_hashes = {record.artifact_id: self._artifact_record_hash(record) for record in roots}
+
+        def check_records(current: Sequence[ArtifactRecord]) -> None:
+            if ([self._artifact_record_hash(record) for record in current]
+                    != [expected_hashes[record.artifact_id] for record in roots]):
+                raise OutlineV3ExecutionError("semantic reducer authority changed during validation")
+
+        def verify_closure(record: ArtifactRecord) -> None:
+            if expected_hashes.get(record.artifact_id) != self._artifact_record_hash(record):
+                raise OutlineV3ExecutionError("semantic reducer reference is outside the verified validation scope")
+
+        def verify_roots() -> None:
+            try:
+                current = self.registry.verify_ready_artifact_closures(roots)
+            except (OSError, UnicodeError, json.JSONDecodeError, RegistryError, TypeError, ValueError) as exc:
+                raise OutlineV3ExecutionError("semantic reducer references are not Registry-verifiable") from exc
+            check_records(current)
+
+        verify_roots()
+        self._validate_semantic_provider_output_checked(
+            node_id, request, result, verify_closure=verify_closure,
+        )
+        # A successful semantic result cannot outlive a source byte or record
+        # change during parsing. No proof is retained for another operation.
+        verify_roots()
+        current_revision, _current_records, current_hash = capture_snapshot()
+        if current_revision != revision or current_hash != snapshot_hash:
+            raise OutlineV3ExecutionError("semantic reducer Registry snapshot changed during validation")
+
+    def _validate_semantic_provider_output_checked(
+        self,
+        node_id: str,
+        request: Mapping[str, Any],
+        result: Mapping[str, Any],
+        *, verify_closure: Callable[[ArtifactRecord], None] | None = None,
+    ) -> None:
         """Validate schema, stage coverage, and ownership-linked evidence IDs."""
 
         if not isinstance(result, Mapping) or not result:
             raise OutlineV3ExecutionError(f"{node_id} returned an empty semantic result")
 
+        cross = request.get("cross_group_comparison")
+        if isinstance(cross, Mapping) and isinstance(cross.get("fragment_aggregation"), Mapping):
+            self._verified_retained_cross_record(cross)
+
+        global_scope_result: dict[str, Any] = {}
         _, _, local_cross_ledger = self._semantic_request_contract(
-            node_id, request
+            node_id, request, global_scope_result=global_scope_result,
         )
+        global_scope_records: tuple[ArtifactRecord, ...] = ()
+        global_deferred_reasons: list[str] = []
+        if "global_retention_source" in request:
+            if global_scope_result.get("completed") is True:
+                global_scope_records = global_scope_result["records"]
+                global_deferred_reasons = list(global_scope_result["deferred_reasons"])
+            else:
+                # Legacy early-return contracts still need their real proof.
+                global_scope_records, global_deferred_reasons = self._global_retention_member_scope(node_id, request)
+        global_scope_revision, global_scope_map = self.registry.capture_record_snapshot() if global_scope_records else (0, [])
+        global_scope_map_hash = hash_json({record.artifact_id: asdict(record) for record in global_scope_map})
 
         allowed_papers: set[str] = set()
         allowed_studies: set[str] = set()
@@ -10248,16 +15389,34 @@ class OutlineV3Executor:
                     str(value) for value in topic.get("paper_ids") or () if str(value)
                 )
 
-        def add_prior_synthesis(value: Any) -> None:
+        def add_prior_synthesis(
+            value: Any, sealed_membership: Mapping[str, Any] | None = None,
+        ) -> None:
             if isinstance(value, Mapping):
+                self._load_semantic_reducer_result_ref(value, verify_closure=verify_closure)
+                coverage_manifest = self._load_semantic_reducer_coverage_ref(value, verify_closure=verify_closure)
+                if coverage_manifest is not None:
+                    sealed_membership = coverage_manifest
                 paper_ids = {
                     str(item) for item in value.get("paper_ids") or () if str(item)
                 }
                 if value.get("paper_key"):
                     paper_ids.add(str(value["paper_key"]))
+                if coverage_manifest is not None:
+                    paper_ids.update(str(item) for item in coverage_manifest.get("paper_ids") or () if str(item))
+                    allowed_result_ids.update(str(item) for item in coverage_manifest.get("result_ids") or () if str(item))
                 for paper_id in paper_ids:
                     allowed_papers.add(paper_id)
                 explicit_topic_members = value.get("topic_members_by_id")
+                if sealed_membership is not None:
+                    authoritative_members = sealed_membership.get("topic_members_by_id") or {}
+                    if isinstance(explicit_topic_members, Mapping) and any(
+                        key not in authoritative_members
+                        or not set(_as_list(members)).issubset(set(authoritative_members[key]))
+                        for key, members in explicit_topic_members.items()
+                    ):
+                        raise OutlineV3ExecutionError("semantic topic membership exceeds its sealed manifest")
+                    explicit_topic_members = authoritative_members
                 if isinstance(explicit_topic_members, Mapping):
                     for member_topic_id, members in explicit_topic_members.items():
                         member_key = str(member_topic_id or "")
@@ -10267,6 +15426,8 @@ class OutlineV3Executor:
                                 str(item) for item in _as_list(members) if str(item)
                             )
                 explicit_relation_members = value.get("relation_members_by_id")
+                if sealed_membership is not None:
+                    explicit_relation_members = sealed_membership.get("relation_members_by_id") or {}
                 if isinstance(explicit_relation_members, Mapping):
                     for member_relation_id, members in explicit_relation_members.items():
                         member_key = str(member_relation_id or "")
@@ -10276,6 +15437,8 @@ class OutlineV3Executor:
                                 str(item) for item in _as_list(members) if str(item)
                             )
                 explicit_fragment_members = value.get("fragment_members_by_id")
+                if sealed_membership is not None:
+                    explicit_fragment_members = sealed_membership.get("fragment_members_by_id") or {}
                 if isinstance(explicit_fragment_members, Mapping):
                     for member_fragment_id, members in explicit_fragment_members.items():
                         member_key = str(member_fragment_id or "")
@@ -10336,7 +15499,7 @@ class OutlineV3Executor:
                         for paper_id in paper_ids:
                             locator_owner.setdefault(key, set()).add((paper_id, study_id))
                 topic_id = str(value.get("topic_id") or "")
-                if topic_id:
+                if topic_id and sealed_membership is None:
                     allowed_topics.add(topic_id)
                     topic_members.setdefault(topic_id, set()).update(paper_ids)
                 for inherited_topic_id in (
@@ -10345,8 +15508,9 @@ class OutlineV3Executor:
                 ):
                     if str(inherited_topic_id or ""):
                         key = str(inherited_topic_id)
-                        allowed_topics.add(key)
-                        if key not in (explicit_topic_members or {}):
+                        if sealed_membership is None or key in (explicit_topic_members or {}):
+                            allowed_topics.add(key)
+                        if sealed_membership is None and key not in (explicit_topic_members or {}):
                             topic_members.setdefault(key, set()).update(paper_ids)
                 for inherited_relation_id in (
                     *_as_list(value.get("relation_id")),
@@ -10355,11 +15519,12 @@ class OutlineV3Executor:
                 ):
                     if str(inherited_relation_id or ""):
                         key = str(inherited_relation_id)
-                        allowed_relations.add(key)
-                        if key not in (explicit_relation_members or {}):
+                        if sealed_membership is None or key in (explicit_relation_members or {}):
+                            allowed_relations.add(key)
+                        if sealed_membership is None and key not in (explicit_relation_members or {}):
                             relation_members.setdefault(key, set()).update(paper_ids)
                 fragment_id = str(value.get("fragment_id") or "")
-                if fragment_id:
+                if fragment_id and sealed_membership is None:
                     allowed_fragments.add(fragment_id)
                     if fragment_id not in (explicit_fragment_members or {}):
                         fragment_members.setdefault(fragment_id, set()).update(paper_ids)
@@ -10369,8 +15534,9 @@ class OutlineV3Executor:
                 ):
                     if str(fragment_id or ""):
                         key = str(fragment_id)
-                        allowed_fragments.add(key)
-                        if key not in (explicit_fragment_members or {}):
+                        if sealed_membership is None or key in (explicit_fragment_members or {}):
+                            allowed_fragments.add(key)
+                        if sealed_membership is None and key not in (explicit_fragment_members or {}):
                             fragment_members.setdefault(key, set()).update(paper_ids)
                 for result_id in (
                     *_as_list(value.get("result_id")),
@@ -10432,20 +15598,41 @@ class OutlineV3Executor:
                             if not isinstance(relation, Mapping):
                                 continue
                             relation_id = str(relation.get("relation_id") or "")
-                            if relation_id:
+                            if relation_id and sealed_membership is None:
                                 allowed_relations.add(relation_id)
                                 relation_members.setdefault(relation_id, set()).update(
                                     str(item) for item in relation.get("paper_keys") or () if str(item)
                                 )
+                    elif key == "fragment_aggregation" and value is cross:
+                        # This exact local aggregate was verified above. Its
+                        # provenance joins are not additional scientific
+                        # claims or stand-alone reducer request objects.
+                        continue
                     else:
-                        add_prior_synthesis(child)
+                        add_prior_synthesis(child, sealed_membership)
             elif isinstance(value, list):
                 for child in value:
-                    add_prior_synthesis(child)
+                    add_prior_synthesis(child, sealed_membership)
 
         for topic_fragment in request.get("topic_synthesis") or ():
             if not isinstance(topic_fragment, Mapping):
                 continue
+            fragment_papers = {
+                str(value) for value in (
+                    *list(topic_fragment.get("paper_ids") or ()),
+                    *list(topic_fragment.get("bridge_paper_ids") or ()),
+                )
+            }
+            if "paper_ids" not in topic_fragment:
+                # Wire-only cohort omission is recoverable solely through
+                # both verified reducer references, never a claim-owner union.
+                verified_result = self._load_semantic_reducer_result_ref(topic_fragment, verify_closure=verify_closure)
+                if verified_result is not None:
+                    coverage_manifest = self._load_semantic_reducer_coverage_ref(topic_fragment, verify_closure=verify_closure)
+                    if coverage_manifest is not None:
+                        fragment_papers = {
+                            str(value) for value in coverage_manifest.get("paper_ids") or ()
+                        }
             context = topic_fragment.get("interpretation_context")
             if not isinstance(context, Mapping):
                 continue
@@ -10463,13 +15650,7 @@ class OutlineV3Executor:
                     ) from exc
                 paper_id = str(raw_field.get("paper_key") or "")
                 owner_study_id = str(raw_field.get("owner_study_id") or "")
-                if not paper_id or paper_id not in {
-                    str(value)
-                    for value in (
-                        *list(topic_fragment.get("paper_ids") or ()),
-                        *list(topic_fragment.get("bridge_paper_ids") or ()),
-                    )
-                }:
+                if not paper_id or paper_id not in fragment_papers:
                     raise OutlineV3ExecutionError(
                         f"{node_id} prior interpretation field is outside its topic fragment"
                     )
@@ -10494,13 +15675,7 @@ class OutlineV3Executor:
                     )
                 paper_id = str(raw_dependency.get("paper_key") or "")
                 owner_study_id = str(raw_dependency.get("owner_study_id") or "")
-                if not paper_id or paper_id not in {
-                    str(value)
-                    for value in (
-                        *list(topic_fragment.get("paper_ids") or ()),
-                        *list(topic_fragment.get("bridge_paper_ids") or ()),
-                    )
-                }:
+                if not paper_id or paper_id not in fragment_papers:
                     raise OutlineV3ExecutionError(
                         f"{node_id} prior interpretation dependency is outside its topic fragment"
                     )
@@ -10788,7 +15963,15 @@ class OutlineV3Executor:
                 require_exact_coverage("processed_fragment_ids", allowed_fragments)
                 require_exact_coverage("processed_result_ids", allowed_result_ids)
             if request.get("shared_synthesis_contract_version") == SHARED_SYNTHESIS_CONTRACT_VERSION:
-                if allowed_topics and (
+                deferred_reasons = global_deferred_reasons if ":reduce:" in prefix else []
+                if deferred_reasons:
+                    unresolved = result.get("unresolved_questions")
+                    if (result.get("synthesis_claims") or result.get("organizing_principles")
+                            or not isinstance(unresolved, list)
+                            or not all(isinstance(reason, str) for reason in unresolved)
+                            or not set(deferred_reasons).issubset(unresolved)):
+                        raise OutlineV3ExecutionError(f"{node_id} deferred-only sources require unchanged explicit unresolved reasons")
+                elif allowed_topics and (
                     not result.get("synthesis_claims")
                     or not result.get("organizing_principles")
                 ):
@@ -11127,6 +16310,16 @@ class OutlineV3Executor:
                 "factual without evidence or source-claim support: "
                 + "; ".join(unsupported_facts[:20])
             )
+        if global_scope_records:
+            current_records = self.registry.verify_ready_artifact_closures(global_scope_records)
+            if [self._artifact_record_hash(record) for record in current_records] != [
+                self._artifact_record_hash(record) for record in global_scope_records
+            ]:
+                raise OutlineV3ExecutionError("GLOBAL source authority changed during semantic validation")
+            revision, records = self.registry.capture_record_snapshot()
+            if (revision != global_scope_revision
+                    or hash_json({record.artifact_id: asdict(record) for record in records}) != global_scope_map_hash):
+                raise OutlineV3ExecutionError("GLOBAL Registry snapshot changed during semantic validation")
 
     @staticmethod
     def _interpretation_context_for_units(
@@ -11416,27 +16609,11 @@ class OutlineV3Executor:
             return "global_synthesis"
         return text
 
-    def _provider_call(
-        self,
-        node_id: str,
-        request: Mapping[str, Any],
-        *,
-        expect_json: bool = True,
-        input_artifact_hashes: Sequence[str] = (),
-        transport_node_id: str | None = None,
-        output_tokens: int | None = None,
+    @staticmethod
+    def _attach_critique_output_contract(
+        request: Mapping[str, Any], request_base_node: str,
     ) -> dict[str, Any]:
-        request = self._attach_prompt_authority(node_id, request)
-        if self.outline_pilot is not None and hash_json(request) != self._pilot_request_hashes.get(node_id):
-            raise OutlineV3ExecutionError(
-                f"topic pilot request {node_id} differs from its admitted exact plan"
-            )
-        # Critics must return an explicit envelope (passed + blocking
-        # diagnostics).  Inject the contract centrally so the main path and
-        # every stability variant carry the same schema authority.
-        request_base_node = str(transport_node_id or node_id or "")
-        if request_base_node.startswith("stability:"):
-            request_base_node = request_base_node.rsplit(":", 1)[-1]
+        """Use the same critique schema for packing and provider dispatch."""
         if (
             request_base_node in {"structure_critique", "coverage_critique", "evidence_critique"}
             and not isinstance(request.get("output_contract"), Mapping)
@@ -11482,6 +16659,21 @@ class OutlineV3Executor:
                 "must_include": must_include,
                 "critique_disposition_version": CRITIQUE_DISPOSITION_VERSION,
             }}
+        return dict(request)
+
+    @staticmethod
+    def _attach_arbitration_output_contract(request: Mapping[str, Any]) -> dict[str, Any]:
+        """Finalize arbitration schema before exact request planning."""
+        if request.get("schema_version") in {
+            "arbitration_assessment_input/v2", "arbitration_reduction_input/v2",
+            "arbitration_selection_input/v3", "arbitration_selection_detail_request/v1",
+            "arbitration_selection_final_input/v1", "selected_candidate_layout_extract_request/v1",
+            "selected_candidate_layout_reduce_request/v1", "selected_candidate_navigation_request/v3",
+            "selected_candidate_merge_detail_slice_request/v1", "selected_candidate_merge_detail_reduce_request/v1",
+            "selected_candidate_merge_group_adjudication_request/v1",
+        }:
+            return dict(request)  # The versioned compiler owns its exact response schema.
+        request_base_node = "arbitration"
         if (
             request_base_node == "arbitration"
             and not isinstance(request.get("output_contract"), Mapping)
@@ -11502,6 +16694,78 @@ class OutlineV3Executor:
                 },
                 "must_include": ["selected_candidate_id", "selection_reasons"],
             }}
+        return dict(request)
+
+    def _arbitration_request_estimate(
+        self, node_id: str, request: Mapping[str, Any], profile: ProviderContextProfile,
+        *, force_formal: bool = False,
+    ) -> dict[str, Any]:
+        logical = dict(profile.estimate_request(request))
+        policy = getattr(self, "arbitration_work_policy_record", None)
+        if not force_formal:
+            if policy is None:
+                return logical
+            if self._arbitration_surface_body is None:
+                from runtime.arbitration_work_policy import verify_arbitration_surface
+
+                self._arbitration_surface_body = verify_arbitration_surface(self.registry, policy)
+            if self._arbitration_surface_body["legacy_request_measurement"] != "full_formal_text_wire_v1":
+                return logical
+        try:
+            route = self._node_route(node_id, "arbitration")
+            transport = self._resolve_node_transport(node_id, route)
+        except AttributeError:
+            return logical  # Direct, non-socket component fixtures have no adapter.
+        system = getattr(transport, "system_prompt", None)
+        if not isinstance(system, str):
+            return logical
+        wire_node_id = "arbitration" if node_id.startswith("stability:") else node_id
+        outer = {"node_id": wire_node_id, "request": dict(request)}
+        wire = {"system": system, "user": json.dumps(outer, ensure_ascii=False, sort_keys=True)}
+        structured = {"system": system, "user": outer}
+        tokens = max(
+            int(profile.estimate_request(wire)["estimated_input_tokens"]),
+            int(profile.estimate_request(structured)["estimated_input_tokens"]),
+        )
+        return {
+            **logical, "estimated_input_tokens": tokens,
+            "estimated_total_tokens": tokens + int(profile.max_output_tokens)
+            + int(profile.reasoning_reserve) + int(profile.safety_margin),
+            "within_budget": tokens <= int(profile.input_budget),
+            "estimation_scope": "formal_outline_text_wire/v1",
+            "wire_request_hash": hash_json(wire),
+            "wire_serialized_bytes": len(json.dumps(wire, ensure_ascii=False, sort_keys=True).encode("utf-8")),
+        }
+
+    def _provider_call(
+        self,
+        node_id: str,
+        request: Mapping[str, Any],
+        *,
+        expect_json: bool = True,
+        input_artifact_hashes: Sequence[str] = (),
+        transport_node_id: str | None = None,
+        output_tokens: int | None = None,
+        force_provider: bool = False,
+        semantic_dependency_hashes: Mapping[str, str] | None = None,
+        before_provider_admission: Callable[[str, Mapping[str, Any], Mapping[str, Any]], None] | None = None,
+        retained_response_lookup: Callable[[ExpectedProviderCall], tuple[Mapping[str, Any], ProviderCallReceiptV1] | None] | None = None,
+        response_snapshot_sink_override: ProviderResponseSnapshotSink | None = None,
+    ) -> dict[str, Any]:
+        request = self._attach_prompt_authority(node_id, request)
+        if self.outline_pilot is not None and hash_json(request) != self._pilot_request_hashes.get(node_id):
+            raise OutlineV3ExecutionError(
+                f"topic pilot request {node_id} differs from its admitted exact plan"
+            )
+        # Critics must return an explicit envelope (passed + blocking
+        # diagnostics).  Inject the contract centrally so the main path and
+        # every stability variant carry the same schema authority.
+        request_base_node = str(transport_node_id or node_id or "")
+        if request_base_node.startswith("stability:"):
+            request_base_node = request_base_node.rsplit(":", 1)[-1]
+        request = self._attach_critique_output_contract(request, request_base_node)
+        if request_base_node == "arbitration":
+            request = self._attach_arbitration_output_contract(request)
         # The route is the runtime authority for this node. Budget, binding,
         # replay identity, receipt and the actual transport all derive from it;
         # using the executor-level profile here would collapse every node onto
@@ -11563,7 +16827,9 @@ class OutlineV3Executor:
         call_id = self._register_expected_from_binding(node_id, binding)
         semantic_node_id = self._semantic_node_id(node_id)
         replay_key = ModelCallReplayKey(
-            node_id=self._semantic_receipt_node_id(semantic_node_id),
+            # Receipt closure groups semantic stages; replay distinguishes
+            # each physical child request within the stage.
+            node_id=semantic_node_id,
             node_version="v3",
             schema_version="outline-v3",
             model_route=route.config_section or route.provider_name,
@@ -11594,11 +16860,67 @@ class OutlineV3Executor:
             requested_output_tokens=int(output_tokens or profile.max_output_tokens),
         )
         replay_lookup = self._replay_store.lookup(replay_key)
+        retained_response_recovered = False
+        if (
+            not force_provider and replay_lookup.status == "missing"
+            and node_id.startswith("topic_synthesis_provider:batch:")
+            and semantic_dependency_hashes is not None
+        ):
+            from outline.semantic_response_recovery import find_verified_topic_response
+
+            verified_receipts = self._replay_receipt_index()
+            audit = self._request_payload_audit[audit_index]
+            retained = find_verified_topic_response(
+                self.registry, self._receipt_ledger, self.job_id, node_id,
+                replay_key.key_hash, str(binding["prompt_payload_hash"]),
+                str(binding["prompt_hash"]), str(binding["schema_hash"]),
+                str(binding["provider_config_hash"]), audit["route"],
+                str(audit["route_fingerprint"]), audit["input_artifact_hashes"],
+                self.workspace.root_dir,
+                receipt_source_records=self._replay_receipt_sources,
+                verified_receipts=verified_receipts,
+            )
+            if retained is not None:
+                payload = dict(retained.payload)
+                self._validate_semantic_provider_output(node_id, request, payload)
+                audit_source = self.registry.get(retained.audit_record_id)
+                receipt_source = self._replay_receipt_sources.get(retained.receipt_id)
+                if (
+                    audit_source is None or receipt_source is None
+                    or audit_source.content_hash != retained.audit_record_hash
+                ):
+                    raise OutlineV3ExecutionError("retained topic response lost its Registry sources")
+                self._expected_provider_calls[call_id] = replace(
+                    self._expected_provider_calls[call_id],
+                    provider_response_hash=retained.normalized_hash,
+                    output_hash=retained.normalized_hash,
+                    normalized_output_hash=retained.normalized_hash,
+                )
+                self._pending_replays[node_id] = (
+                    replay_key, retained.normalized_hash, retained.receipt_id,
+                )
+                self._persist_semantic_provider_output(
+                    node_id, payload, dependency_hashes=semantic_dependency_hashes,
+                    update_parent_node=False,
+                    recovery_sources=(audit_source, receipt_source),
+                )
+                self._finish_request_payload_audit(
+                    audit_index, semantic_validation_status="accepted",
+                    raw_response_refs=[dict(retained.raw_ref)],
+                    recovered_audit_artifact_id=audit_source.artifact_id,
+                    recovered_audit_artifact_hash=audit_source.content_hash,
+                )
+                replay_lookup = self._replay_store.lookup(replay_key)
+                retained_response_recovered = True
         self._finish_request_payload_audit(
             audit_index,
             replay_status=replay_lookup.status,
         )
-        if replay_lookup.reusable and replay_lookup.record is not None:
+        if force_provider:
+            self.replay_diagnostics.append(
+                f"replay bypassed for {node_id}: prior merged candidate Registry closure is invalid"
+            )
+        if not force_provider and replay_lookup.reusable and replay_lookup.record is not None:
             for artifact_id in replay_lookup.record.output_artifact_ids:
                 replay_record = self.registry.get(artifact_id)
                 if replay_record is None or replay_record.status != "ready":
@@ -11612,16 +16934,37 @@ class OutlineV3Executor:
                     continue
                 payload = replay_payload.get("payload") if isinstance(replay_payload, Mapping) else None
                 normalized_hash = replay_lookup.record.normalized_output_hash or replay_lookup.record.output_hash
+                dynamic_canonical_candidate = bool(
+                    "_provider_generation:local:" in node_id
+                    and replay_record.artifact_type == "outline_candidate"
+                    and replay_record.artifact_version == "v3"
+                    and replay_record.metadata.get("source_validation_status") == "validated"
+                    and self._candidate_output_scope is not None
+                    and isinstance(payload, Mapping)
+                )
+                if dynamic_canonical_candidate:
+                    if self._candidate_output_scope is None or not isinstance(payload, Mapping):
+                        raise OutlineV3ExecutionError("candidate replay lost its verified source scope")
+                    assigned = (request.get("hierarchy") or {}).get("claim_group_ids")
+                    if not isinstance(assigned, list) or not assigned:
+                        raise OutlineV3ExecutionError("retained candidate replay has no exact group assignment")
+                    local = self._candidate_output_scope.for_groups(assigned)
+                    self._validate_candidate_payload(
+                        str(request.get("candidate_id") or ""), payload,
+                        allowed_paper_keys=local.paper_keys, allowed_relation_ids=local.selected_relation_ids,
+                        allowed_claim_group_ids=assigned,
+                    )
                 canonical_candidate_replay = bool(
                     isinstance(payload, Mapping)
                     and (
                         node_id.endswith("_provider_generation")
+                        or dynamic_canonical_candidate
                         or (
                             node_id.endswith("_semantic_repair")
                             and replay_record.artifact_type == "outline_candidate_repair"
                         )
                     )
-                    and (self._alias_enabled or self._repair_enabled)
+                    and (self._alias_enabled or self._repair_enabled or dynamic_canonical_candidate)
                     and replay_lookup.record.registered_artifact_hash
                     == str(replay_payload.get("content_hash") or "")
                     and replay_lookup.record.node_output_hash
@@ -11729,16 +17072,101 @@ class OutlineV3Executor:
                             for artifact_id in replay_lookup.record.output_artifact_ids
                         ],
                     )
+                    # A fresh executor must expose the verified physical
+                    # output to direct stage-closure dependency projection.
+                    self.artifact_paths[node_id] = replay_record.path
+                    self.artifact_records[node_id] = replay_record
                     return dict(payload)
         if replay_lookup.status == "stale":
             self.replay_diagnostics.append(
                 f"replay stale for {node_id}: {','.join(replay_lookup.stale_reasons)}"
             )
+        if retained_response_recovered:
+            raise OutlineV3ExecutionError("retained topic response did not produce verified replay authority")
+        if not force_provider and retained_response_lookup is not None:
+            expected = self._expected_provider_calls[call_id]
+            retained = retained_response_lookup(expected)
+            if retained is not None:
+                from runtime.arbitration_dispatch import validate_retained_arbitration_receipt
+
+                content, receipt = retained
+                try:
+                    validate_retained_arbitration_receipt(
+                        expected, receipt, content, route=semantic_node_id,
+                        node_id=self._semantic_receipt_node_id(semantic_node_id), config_section=route.config_section,
+                    )
+                except ValueError as exc:
+                    raise OutlineV3ExecutionError(str(exc)) from exc
+                self.receipts.append(receipt.receipt_id)
+                normalized_hash = hash_json(content)
+                self._expected_provider_calls[call_id] = replace(
+                    expected, provider_response_hash=normalized_hash,
+                    output_hash=normalized_hash, normalized_output_hash=normalized_hash,
+                )
+                self._pending_replays[node_id] = (replay_key, normalized_hash, receipt.receipt_id)
+                self._finish_request_payload_audit(
+                    audit_index, physical_attempt_id=receipt.receipt_id,
+                    provider_invoked=False, status="retained_response_pending_semantic_validation",
+                    receipt_ids=[receipt.receipt_id],
+                )
+                return dict(content)
+        if (
+            not force_provider and self.source_revision_replay_context is not None
+            and node_id.startswith("topic_synthesis_provider:batch:")
+        ):
+            from runtime.source_revision_replay import build_outline_source_revision_scope_v1
+
+            expected = self._expected_provider_calls[call_id]
+            controller = provider_budget_controller_from_environment()
+            if controller is None:
+                raise OutlineV3ExecutionError("SourceRevision reuse requires the original finite child budget")
+            controller.assert_response_reuse_allowed(
+                job_id=self.job_id, stage_name=expected.stage_name, call_id=call_id,
+            )
+            lookup = self.source_revision_replay_context.lookup_response(
+                expected_call=expected, request_payload=request,
+                current_scope=build_outline_source_revision_scope_v1(request),
+                parent_scope_record=None,
+                route_identity={
+                    "route": route.config_section,
+                    "route_fingerprint": route.safe_config_fingerprint(),
+                    **{key: getattr(expected, key) for key in (
+                        "provider", "model", "endpoint", "endpoint_type", "config_hash", "schema_hash",
+                    )},
+                },
+            )
+            self._finish_request_payload_audit(
+                audit_index, source_revision_lookup_status=lookup.status,
+                source_revision_lookup_reason=lookup.reason,
+            )
+            if lookup.match is not None:
+                match = lookup.match
+                normalized_hash = hash_json(match.response)
+                if normalized_hash != match.receipt.response_hash:
+                    raise OutlineV3ExecutionError("SourceRevision response differs from parent receipt")
+                self._expected_provider_calls[call_id] = replace(
+                    expected, provider_response_hash=normalized_hash,
+                    output_hash=normalized_hash, normalized_output_hash=normalized_hash,
+                )
+                self._pending_source_revision_replays[node_id] = match
+                self._finish_request_payload_audit(
+                    audit_index, provider_invoked=False, status="source_revision_response_pending_validation",
+                    parent_receipt_id=match.receipt.receipt_id,
+                )
+                # The ordinary semantic parser validates this response before
+                # publishing a child output and its reuse proof.
+                return _as_dict(match.response)
         # Re-check after replay lookup: replay is local and may be usable while
         # a paused job must still refuse any new provider admission.
         self._pause_state.assert_runnable(node_id=node_id)
         self._materialize_primary_repair_request(node_id, request, route, binding)
-        self._assert_primary_repair_fresh_attempt(node_id)
+        primary_scope = self._primary_repair_scope_for_request(
+            node_id, request, route, binding,
+        )
+        repair_journal = (
+            PrimaryRepairResponseJournal(self._path("outline_v3/primary_repair_responses"))
+            if primary_scope is not None else None
+        )
         runtime = ProviderRuntime(
             budget=ProviderBudgetV1(
                 max_calls=1,
@@ -11758,6 +17186,8 @@ class OutlineV3Executor:
             prompt_id=self._outline_prompt_identity.prompt_id,
             prompt_version=self._outline_prompt_identity.version,
             prompt_sha256=self._outline_prompt_identity.sha256,
+            primary_repair_response_journal=repair_journal,
+            response_snapshot_sink=response_snapshot_sink_override or self.response_snapshot_sink,
         )
         if not budget["within_budget"]:
             receipt = runtime.blocked_receipt(prompt=json.dumps(request, sort_keys=True, ensure_ascii=False), input_payload=request, api_config=api_config, message="provider input exceeds verified context budget")
@@ -11769,6 +17199,102 @@ class OutlineV3Executor:
                 receipt_ids=[receipt.receipt_id],
             )
             raise OutlineV3ExecutionError(f"provider budget blocked node {node_id}")
+
+        if primary_scope is not None:
+            recovered = runtime.recover_primary_repair_response(
+                primary_scope,
+                prompt=json.dumps(request, sort_keys=True, ensure_ascii=False),
+                input_payload=request,
+                api_config=api_config,
+            )
+            if recovered is not None:
+                response_ref, recovered_result = recovered
+                matching_receipts = [
+                    item for item in self._receipt_ledger.list_receipts()
+                    if item.job_id == self.job_id
+                    and item.call_id == call_id
+                    and item.logical_attempt_identity == self.logical_attempt_identity
+                    and item.closure_epoch_id == self.closure_epoch_id
+                    and isinstance(item.metadata, Mapping)
+                    and item.metadata.get("primary_repair_scope_id") == primary_scope.scope_id
+                    and item.metadata.get("primary_repair_scope_fingerprint_sha256")
+                    == primary_scope.fingerprint_sha256
+                    and item.metadata.get("primary_repair_response_ref") == response_ref.to_dict()
+                ]
+                if len(matching_receipts) != 1:
+                    raise OutlineV3ExecutionError(
+                        "PRIMARY repair recovery did not produce exactly one bound provider receipt"
+                    )
+                receipt = matching_receipts[0]
+                completion = ProviderCompletionEvaluator.evaluate(
+                    recovered_result,
+                    minimum_output=2,
+                    expect_json=expect_json,
+                )
+                normalized_hash = (
+                    hash_json(completion.content) if completion.status == "complete" else ""
+                )
+                if (
+                    receipt.status == "success"
+                    and receipt.response_hash != normalized_hash
+                ):
+                    raise OutlineV3ExecutionError(
+                        f"recovered provider response hash for {node_id} differs from its receipt"
+                    )
+                if receipt.receipt_id not in self.receipts:
+                    self.receipts.append(receipt.receipt_id)
+                self._expected_provider_calls[call_id] = replace(
+                    self._expected_provider_calls[call_id],
+                    provider_response_hash=normalized_hash,
+                    output_hash=normalized_hash,
+                    normalized_output_hash=normalized_hash,
+                )
+                if receipt.status == "success" and normalized_hash:
+                    self._pending_replays[node_id] = (
+                        replay_key, normalized_hash, receipt.receipt_id,
+                    )
+                raw_response_refs = []
+                raw_path = recovered_result.get("raw_response_path")
+                raw_hash = recovered_result.get("raw_response_sha256")
+                raw_bytes = recovered_result.get("response_bytes")
+                if (
+                    isinstance(raw_path, str) and raw_path.strip()
+                    and isinstance(raw_hash, str)
+                    and re.fullmatch(r"[0-9a-f]{64}", raw_hash)
+                    and type(raw_bytes) is int and raw_bytes > 0
+                ):
+                    raw_response_refs.append({
+                        "path": raw_path,
+                        "sha256": raw_hash,
+                        "bytes": raw_bytes,
+                        "normalized_response_hash": normalized_hash,
+                    })
+                self._finish_request_payload_audit(
+                    audit_index,
+                    physical_attempt_id=receipt.receipt_id,
+                    provider_invoked=False,
+                    status="response_journal_recovered",
+                    receipt_ids=[receipt.receipt_id],
+                    raw_response_refs=raw_response_refs,
+                )
+                self._replay_evidence.append({
+                    "node_id": node_id,
+                    "semantic_node_id": semantic_node_id,
+                    "closure_epoch_id": self.closure_epoch_id,
+                    "key_hash": replay_key.key_hash,
+                    "lookup_status": "response_journal_recovered",
+                    "provider_invoked": False,
+                    "reused_artifact_ids": [],
+                    "reused_receipt_ids": [receipt.receipt_id],
+                    "reused_artifact_id": "",
+                    "reused_receipt_id": receipt.receipt_id,
+                })
+                if completion.status != "complete":
+                    raise OutlineV3ExecutionError(
+                        f"recovered provider output for {node_id} is {completion.status}"
+                    )
+                return _as_dict(completion.content)
+
         configured_retries = max(0, int(api_config.get("transport_retries") or 0))
         requested_attempts = configured_retries + 1
         effective_attempts = runtime.max_attempts_for_call(requested_attempts)
@@ -11796,6 +17322,23 @@ class OutlineV3Executor:
             # Validate the local fixture before taking a durable budget slot.
             # A malformed/missing fixture is not a provider attempt.
             fixture_response = self._fixture_response(node_id, request)
+        self._assert_primary_repair_fresh_attempt(node_id)
+        if request_base_node == "arbitration":
+            budget = self._arbitration_request_estimate(node_id, request, profile, force_formal=True)
+            if int(budget["estimated_input_tokens"]) > effective_cap or not budget["within_budget"]:
+                raise OutlineV3ExecutionError(
+                    f"BLOCKED_BUDGET: complete formal arbitration request {node_id} exceeds its effective cap"
+                )
+            self._finish_request_payload_audit(
+                audit_index, estimated_input_tokens=budget["estimated_input_tokens"],
+                estimation_scope=budget.get("estimation_scope", "logical_direct_callback"),
+                wire_request_hash=budget.get("wire_request_hash", ""),
+                wire_serialized_bytes=budget.get("wire_serialized_bytes", 0),
+            )
+        if before_provider_admission is not None:
+            budget["effective_attempts"] = effective_attempts
+            budget["requested_output_tokens_per_attempt"] = int(output_tokens or profile.max_output_tokens)
+            before_provider_admission(node_id, request, budget)
         admission = runtime.admit(
             estimated_tokens=int(budget["estimated_input_tokens"]),
             # The Outline transport reports usage summed across physical
@@ -11804,6 +17347,8 @@ class OutlineV3Executor:
                 int(output_tokens or profile.max_output_tokens) * effective_attempts
             ),
             requested_retry_attempts=max(0, effective_attempts - 1),
+            primary_repair_scope=primary_scope,
+            request_hash=(primary_scope.request_hash if primary_scope is not None else ""),
         )
         self._provider_call_count += 1
         transport = transport_for_audit
@@ -11816,6 +17361,38 @@ class OutlineV3Executor:
             # binding, while the transport receives its logical role for
             # schema dispatch. Other dynamic nodes need their concrete ID so
             # topic/cross/global cannot be mistaken for candidate generation.
+            primary_raw_response_callback = None
+            primary_attempt_started_callback = None
+            if primary_scope is not None:
+                primary_metadata = {
+                    "node_id": node_id,
+                    "semantic_node_id": semantic_node_id,
+                    "config_section": route.config_section,
+                    "route_fingerprint": route.safe_config_fingerprint(),
+                    "closure_epoch_id": self.closure_epoch_id,
+                    "estimation": budget,
+                    "replay_status": replay_lookup.status,
+                    "replay_stale_reasons": list(replay_lookup.stale_reasons),
+                }
+                primary_prompt = json.dumps(
+                    request, sort_keys=True, ensure_ascii=False
+                )
+                primary_attempt_started_callback = (
+                    runtime.primary_provider_attempt_started_callback(
+                        admission, primary_scope
+                    )
+                )
+                primary_raw_response_callback = (
+                    runtime.primary_repair_raw_response_callback(
+                        admission,
+                        primary_scope,
+                        prompt=primary_prompt,
+                        input_payload=request,
+                        api_config=api_config,
+                        response_format="json" if expect_json else "text",
+                        metadata=primary_metadata,
+                    )
+                )
             provider_node_id = (
                 str(transport_node_id)
                 if node_id.startswith("stability:") and transport_node_id
@@ -11830,14 +17407,23 @@ class OutlineV3Executor:
             try:
                 call_with_runtime = getattr(transport, "call_with_runtime", None)
                 if callable(call_with_runtime):
+                    callbacks = ({
+                        "primary_raw_response_retention_callback": primary_raw_response_callback,
+                        "primary_provider_attempt_started_callback": primary_attempt_started_callback,
+                    } if primary_scope is not None else {})
                     raw = call_with_runtime(
                         provider_node_id,
                         request,
                         runtime=runtime,
                         attempt_limit=effective_attempts,
                         output_tokens=output_tokens,
+                        **callbacks,
                     )
                 else:
+                    if primary_scope is not None:
+                        raise OutlineV3ExecutionError(
+                            "PRIMARY repair transport lacks durable raw-response callbacks"
+                        )
                     raw = (
                         transport(provider_node_id, request)
                         if callable(transport)
@@ -11878,6 +17464,7 @@ class OutlineV3Executor:
             },
         )
         self.receipts.append(receipt.receipt_id)
+        self._replay_receipt_index_cache = None
         normalized_hash = hash_json(completion.content) if completion.status == "complete" else ""
         raw_response_refs = []
         raw_path = response.get("raw_response_path")
@@ -11946,7 +17533,16 @@ class OutlineV3Executor:
             or (node_id.startswith("stability:") and f":{role}:" in node_id)
             for role in ("structure_critique", "coverage_critique", "evidence_critique")
         )
-        if is_relation_shard:
+        if response_snapshot_sink_override is not None:
+            # Overflow callers publish their typed accepted result before
+            # registering replay. The transport snapshot is already durable.
+            return _as_dict(completion.content)
+        if ":leaf:arbitration-leaf:" in node_id or ":final:" in node_id and "arbitration" in node_id:
+            self._persist_semantic_provider_output(
+                node_id, _as_dict(completion.content), dependency_hashes=dynamic_dependencies,
+                update_parent_node=False,
+            )
+        elif is_relation_shard:
             # Hierarchical local/cross-shard calls are provider calls outside
             # the static DAG.  Their outputs still need Registry identity and
             # replay authority so receipt closure cannot leave dynamic calls
@@ -11962,6 +17558,7 @@ class OutlineV3Executor:
                 node_id,
                 _as_dict(completion.content),
                 dependency_hashes=dynamic_dependencies,
+                source_validated=False,
             )
         elif is_critique_shard:
             self._persist_critique_shard_output(
@@ -12591,6 +18188,7 @@ class OutlineV3Executor:
         allowed_paper_keys: Sequence[str],
         allowed_relation_ids: Sequence[str],
         alias_map: Mapping[str, Any] | None = None,
+        allowed_claim_group_ids: Sequence[str] | None = None,
     ) -> None:
         scope = self._candidate_output_scope
         if scope is not None:
@@ -12599,7 +18197,16 @@ class OutlineV3Executor:
             try:
                 if payload.get("candidate_id") not in (None, candidate_id):
                     raise CandidateOutputScopeError("candidate identity differs from its request")
-                scope.for_papers(allowed_paper_keys).validate(payload)
+                local_scope = (scope.for_groups(allowed_claim_group_ids, allowed_paper_keys=allowed_paper_keys)
+                               if allowed_claim_group_ids is not None else scope.for_papers(allowed_paper_keys))
+                local_scope.validate(payload)
+                consumed = {str(row.get("claim_slot_id") or "")
+                            for section in payload.get("sections") or () if isinstance(section, Mapping)
+                            for row in section.get("claim_support") or () if isinstance(row, Mapping)}
+                required_groups = self._required_candidate_group_ids(scope)
+                for group in local_scope.claim_groups:
+                    if group.claim_group_id in required_groups and not set(group.support_slot_ids).issubset(consumed):
+                        raise CandidateOutputScopeError(f"required comparison group {group.claim_group_id} was not completed")
             except CandidateOutputScopeError as exc:
                 raise OutlineV3ExecutionError(f"{candidate_id} finite output contract: {exc}") from exc
         sections = payload.get("sections")
@@ -12621,6 +18228,12 @@ class OutlineV3Executor:
             for field in (tables.get("source_fields") or ())
             if isinstance(field, Mapping) and str(field.get("source_field_id") or "")
         } if isinstance(tables, Mapping) else {}
+        table_claims = {
+            str(claim.get("claim_id") or ""): dict(claim)
+            for claim in (tables.get("source_claims") or ())
+            if isinstance(claim, Mapping) and str(claim.get("claim_id") or "")
+        } if isinstance(tables, Mapping) else {}
+        scope_slots = {slot.claim_slot_id: slot.to_dict() for slot in scope.claim_slots} if scope is not None else {}
         explicit_dependencies: list[tuple[dict[str, Any], str]] = []
         if isinstance(tables, Mapping):
             for raw_dependency in tables.get("dependencies") or ():
@@ -12697,6 +18310,21 @@ class OutlineV3Executor:
                         flags=re.IGNORECASE,
                     )
                 }
+                quoted_occurrences: set[tuple[int, int]] = set()
+                if support_rows and scope_slots:
+                    per_source_occurrences = []
+                    for row in support_rows:
+                        slot = scope_slots.get(str(row.get("claim_slot_id") or ""), {})
+                        source_claim = table_claims.get(str(row.get("primary_claim_id") or ""), {})
+                        proofs = paper_level_study_mention_occurrences_v1(
+                            claim, source_claim=source_claim, support_row=row, scope_slot=slot,
+                        )
+                        per_source_occurrences.append({(proof.start, proof.end) for proof in proofs})
+                    # Every source side must carry the unchanged paper-level
+                    # Stage 1 author interpretation, not a proven PDF quotation.
+                    # Novel or partly supported Study claims
+                    # retain the explicit-study ownership checks below.
+                    quoted_occurrences = set.intersection(*per_source_occurrences)
                 study_mentions = {
                     match.group(1).upper()
                     for match in re.finditer(
@@ -12704,6 +18332,7 @@ class OutlineV3Executor:
                         claim,
                         flags=re.IGNORECASE,
                     )
+                    if match.span() not in quoted_occurrences
                 }
                 for mentioned_study in sorted(study_mentions):
                     candidates_for_study = [
@@ -13139,31 +18768,88 @@ class OutlineV3Executor:
         if row.request_estimate.request_hash != binding.get("prompt_payload_hash"):
             raise OutlineV3ExecutionError("primary candidate repair materialization differs from its transport binding")
 
-    def _assert_primary_repair_fresh_attempt(self, node_id: str) -> None:
-        """Refuse a second primary repair after exact replay was considered.
+    def _primary_repair_scope_for_request(
+        self,
+        node_id: str,
+        request: Mapping[str, Any],
+        route: OutlineRoleRoute,
+        binding: Mapping[str, Any],
+    ) -> PrimaryRepairScopeV1 | None:
+        if re.fullmatch(r"candidate_[1-9]\d*_semantic_repair", node_id) is None:
+            return None
+        if self._unbound_component_repair_transport(route):
+            return None
+        if self.runtime_spec_binding is None:
+            return None
+        plan = self._initialize_primary_candidate_repair_plan()
+        return PrimaryRepairScopeV1(
+            job_id=self.job_id,
+            logical_attempt_identity=self.logical_attempt_identity,
+            candidate_id=node_id.removesuffix("_semantic_repair"),
+            request_hash=str(binding.get("prompt_payload_hash") or ""),
+            route_identity=hash_json(route.binding_identity),
+            route_config_fingerprint_sha256=route.safe_config_fingerprint(),
+            source_authority_sha256=plan.canonical_source_authority_sha256,
+            plan_contract_sha256=plan.contract_sha256,
+            schema_hash=str(binding.get("schema_hash") or ""),
+        )
 
-        A completed receipt without a verified output and an explicitly failed
-        repair both require recovery, even if their transport outcome is unknown.
-        Stability variants have separate node identities and budgets.
-        """
+    def _assert_primary_repair_fresh_attempt(self, node_id: str) -> None:
+        """Block a fresh PRIMARY POST when indexed failure or receipt evidence exists."""
+
         if re.fullmatch(r"candidate_[1-9]\d*_semantic_repair", node_id) is None:
             return
         candidate_id = node_id.removesuffix("_semantic_repair")
+        expected_index = {
+            "scope": "PRIMARY",
+            "candidate_id": candidate_id,
+            "repair_node_id": node_id,
+            "attempt_identity": self.logical_attempt_identity,
+        }
         for record in self.registry.list_records():
             if record.artifact_type != "outline_candidate_repair_failure" or record.status != "ready":
                 continue
+            metadata = record.metadata if isinstance(record.metadata, Mapping) else {}
+            if metadata.get("scope") and metadata.get("scope") != "PRIMARY":
+                continue
+            if any(
+                key in metadata and str(metadata.get(key) or "") != str(value)
+                for key, value in expected_index.items()
+            ):
+                continue
+            metadata_indexed = all(key in metadata for key in expected_index)
+            if metadata_indexed:
+                self.registry.verify_ready_artifact_closure(record)
             payload = json.loads(Path(record.path).read_text(encoding="utf-8"))
+            if not isinstance(payload, Mapping):
+                raise OutlineV3ExecutionError(
+                    f"repair failure artifact cannot be classified safely: {record.artifact_id}"
+                )
+            if metadata_indexed and any(
+                str(payload.get(key) or "") != str(value) for key, value in expected_index.items()
+            ):
+                raise OutlineV3ExecutionError(
+                    f"{node_id} repair failure Registry index differs from its payload"
+                )
             if (
-                isinstance(payload, Mapping)
-                and payload.get("candidate_id") == candidate_id
+                payload.get("candidate_id") == candidate_id
                 and payload.get("repair_node_id") == node_id
                 and payload.get("attempt_identity") == self.logical_attempt_identity
+                and payload.get("scope", "PRIMARY") == "PRIMARY"
             ):
-                self.registry.verify_ready_artifact_closure(record)
+                if not metadata_indexed:
+                    self.registry.verify_ready_artifact_closure(record)
+                if any(
+                    key in metadata and str(metadata.get(key) or "") != str(payload.get(key) or "")
+                    for key in expected_index
+                ):
+                    raise OutlineV3ExecutionError(
+                        f"{node_id} repair failure Registry index differs from its payload"
+                    )
                 if payload.get("provider_attempted") is False:
                     continue
                 raise OutlineV3ExecutionError(
-                    f"{node_id} was already attempted; recover its recorded failure before new transport"
+                    f"{node_id} was already attempted; recover its recorded response before new transport"
                 )
         call_id = self._provider_call_id(node_id)
         for receipt in self._receipt_ledger.list_receipts():
@@ -13174,7 +18860,7 @@ class OutlineV3Executor:
                 and receipt.status != "blocked"
             ):
                 raise OutlineV3ExecutionError(
-                    f"{node_id} was already attempted without reusable output; preserve its receipt for recovery"
+                    f"{node_id} was already attempted without a recoverable response journal"
                 )
 
     def _persist_repair_output(
@@ -13254,8 +18940,14 @@ class OutlineV3Executor:
             and receipt.status != "blocked"
             for receipt in self._receipt_ledger.list_receipts()
         )
+        failure_scope = (
+            "PRIMARY"
+            if re.fullmatch(r"candidate_[1-9]\d*_semantic_repair", repair_node_id)
+            else "NON_PRIMARY"
+        )
         payload = {
             "artifact_type": "outline_candidate_repair_failure",
+            "scope": failure_scope,
             "artifact_version": "v1",
             "candidate_id": candidate_id,
             "repair_node_id": repair_node_id,
@@ -13280,6 +18972,13 @@ class OutlineV3Executor:
             artifact_type="outline_candidate_repair_failure",
             artifact_version="v1",
             producer="outline.v3_executor.OutlineV3Executor",
+            metadata={
+                "scope": failure_scope,
+                "candidate_id": candidate_id,
+                "repair_node_id": repair_node_id,
+                "attempt_identity": str(self.logical_attempt_identity or ""),
+                "provider_attempted": provider_attempted,
+            },
         )
 
     def _register_receipt_ledger(self) -> None:
@@ -13435,9 +19134,38 @@ class OutlineV3Executor:
         for call_id, expected in self._expected_provider_calls.items():
             if not call_id.endswith("_semantic_repair"):
                 continue
+            if call_id.startswith("outline:stability:"):
+                continue
+            if re.fullmatch(r"outline:candidate_[1-9]\d*_semantic_repair", call_id) is None:
+                raise OutlineV3ExecutionError(
+                    f"unsupported canonical repair-call scope during exact replay: {call_id}"
+                )
+            repair_node_id = call_id.removeprefix("outline:")
+            if (
+                expected.call_id != call_id
+                or expected.attempt_id != call_id
+                or expected.job_id != self.job_id
+                or expected.stage_name != "outline_v3"
+                or expected.node_id != repair_node_id
+                or expected.closure_epoch_id != self.closure_epoch_id
+                or expected.logical_attempt_identity != self.logical_attempt_identity
+                or not expected.artifact_path
+                or not expected.registry_file_hash
+                or not expected.artifact_payload_hash
+                or not expected.artifact_content_hash
+            ):
+                raise OutlineV3ExecutionError(
+                    f"canonical repair output identity is incomplete or out of scope for {call_id}"
+                )
             matching = [
                 receipt for receipt in receipt_index.values()
                 if str(getattr(receipt, "call_id", "") or "") == call_id
+                and str(getattr(receipt, "job_id", "") or "") == expected.job_id
+                and str(getattr(receipt, "attempt_id", "") or "") == expected.attempt_id
+                and str(getattr(receipt, "stage_name", "") or "") == expected.stage_name
+                and str(getattr(receipt, "node_id", "") or "") == expected.node_id
+                and str(getattr(receipt, "logical_attempt_identity", "") or "")
+                == expected.logical_attempt_identity
                 and str(getattr(receipt, "closure_epoch_id", "") or "") == self.closure_epoch_id
                 and str(getattr(receipt, "status", "") or "") == "success"
                 and str(getattr(receipt, "response_hash", "") or "")
@@ -13447,6 +19175,79 @@ class OutlineV3Executor:
                 raise OutlineV3ExecutionError(
                     f"canonical recovery lacks verified repair-call authority for {call_id}"
                 )
+            repair_record = self.artifact_records.get(repair_node_id)
+            if (
+                repair_record is None
+                or repair_record.status != "ready"
+                or repair_record.job_id != expected.job_id
+                or repair_record.artifact_role != "outline_v3_repair_output"
+                or repair_record.artifact_type != "outline_candidate_repair"
+                or repair_record.artifact_version != "v1"
+                or repair_record.content_hash != expected.registry_file_hash
+                or str(repair_record.path) != str(expected.artifact_path)
+                or (repair_record.metadata or {}).get("job_id") != expected.job_id
+                or (repair_record.metadata or {}).get("node_id") != expected.node_id
+                or (repair_record.metadata or {}).get("content_hash") != expected.artifact_content_hash
+            ):
+                raise OutlineV3ExecutionError(
+                    f"canonical repair output Registry record differs from expected call {call_id}"
+                )
+            current_repair_record = second_registry.get(repair_record.artifact_id)
+            if (
+                current_repair_record is None
+                or current_repair_record.status != "ready"
+                or current_repair_record.job_id != expected.job_id
+                or current_repair_record.artifact_role != "outline_v3_repair_output"
+                or current_repair_record.artifact_type != "outline_candidate_repair"
+                or current_repair_record.artifact_version != "v1"
+                or current_repair_record.path != expected.artifact_path
+                or current_repair_record.content_hash != expected.registry_file_hash
+                or (current_repair_record.metadata or {}).get("job_id") != expected.job_id
+                or (current_repair_record.metadata or {}).get("node_id") != expected.node_id
+                or (current_repair_record.metadata or {}).get("content_hash") != expected.artifact_content_hash
+            ):
+                raise OutlineV3ExecutionError(
+                    f"current READY repair output Registry record is foreign or changed for {call_id}"
+                )
+            try:
+                second_registry.verify_ready_artifact_closure(current_repair_record)
+                repair_envelope = json.loads(
+                    Path(current_repair_record.path).read_text(encoding="utf-8")
+                )
+            except (OSError, UnicodeError, json.JSONDecodeError, RegistryError, ValueError, TypeError) as exc:
+                raise OutlineV3ExecutionError(
+                    f"canonical repair output is not a verified READY artifact for {call_id}: {exc}"
+                ) from exc
+            repair_payload = (
+                repair_envelope.get("payload")
+                if isinstance(repair_envelope, Mapping)
+                else None
+            )
+            if (
+                not isinstance(repair_payload, Mapping)
+                or repair_envelope.get("artifact_type") != "outline_artifact"
+                or repair_envelope.get("artifact_version") != "v3"
+                or str(repair_envelope.get("job_id") or "") != self.job_id
+                or str(repair_envelope.get("content_hash") or "") != expected.artifact_content_hash
+                or hash_json(repair_payload) != expected.artifact_payload_hash
+                or str(repair_payload.get("candidate_id") or "")
+                != repair_node_id.removesuffix("_semantic_repair")
+            ):
+                raise OutlineV3ExecutionError(
+                    f"canonical repair output payload/hash differs from verified call {call_id}"
+                )
+            existing_repair_record = second_executor.artifact_records.get(repair_node_id)
+            if existing_repair_record is not None and (
+                existing_repair_record.artifact_id != current_repair_record.artifact_id
+                or existing_repair_record.path != current_repair_record.path
+                or existing_repair_record.content_hash != current_repair_record.content_hash
+            ):
+                raise OutlineV3ExecutionError(
+                    f"fresh executor has a conflicting repair output for {call_id}"
+                )
+            second_executor.artifact_records[repair_node_id] = current_repair_record
+            second_executor.artifact_paths[repair_node_id] = current_repair_record.path
+            second_executor._payloads[repair_node_id] = dict(repair_payload)
             second_executor._expected_provider_calls[call_id] = expected
             verified_repair_call_ids.append(str(call_id))
             for receipt in matching:
@@ -13556,6 +19357,16 @@ class OutlineV3Executor:
                 "second-executor exact replay changed decision artifacts: "
                 + ",".join(sorted(differing_nodes))
             )
+        durable_dag = self._node_store.load()
+        verified_dag = second_executor._dag
+        if (durable_dag is None or durable_dag.job_id != self.job_id
+                or durable_dag.snapshot_sequence != verified_dag.snapshot_sequence
+                or durable_dag.content_hash != verified_dag.content_hash):
+            raise OutlineV3ExecutionError("durable DAG changed after the verified second-executor replay")
+        # The intentional replay owns these writes in our shared workspace.
+        # Continue CAS publication from its exact verified snapshot, while
+        # retaining the guard against any subsequent concurrent writer.
+        self._dag = verified_dag
         replay_hits = [
             item for item in second_executor._replay_evidence
             if not item.get("provider_invoked")
@@ -13704,7 +19515,10 @@ class OutlineV3Executor:
                 and not self._unbound_component_repair_transport(self._node_route("candidate_1_provider_generation"))
             ):
                 self._initialize_primary_candidate_repair_plan()
-            candidate_map_model = build_global_relation_map(evidence_model, matrix_model, ledger_model)
+            candidate_map_model = build_global_relation_map(
+                evidence_model, matrix_model, ledger_model,
+                required_comparisons=build_review_intent(self.review_intent_input).required_comparisons,
+            )
             candidate_map = self._run_node("relation_candidates", lambda: (
                 self._artifact(OutlineArtifact, candidate_map_model.to_dict(), {"multi_view_matrix": _hash_payload(matrix)}),
                 ("multi_view_matrix",), "deterministic", "local",
@@ -13828,11 +19642,14 @@ class OutlineV3Executor:
                         "context_profile_hash",
                         "relevant_runtime_config_hash",
                     )
-                    return all(
+                    compatible = all(
                         hash_json(existing.execution_binding.get(field))
                         == hash_json(current.get(field))
                         for field in identity_fields
                     )
+                    if compatible and node_id == "cross_group_comparison" and cached_payload.get("execution_mode") == "source_closed_retention":
+                        self._restore_local_final_fold("cross_group_comparison_provider", cached_payload)
+                    return compatible
                 except (KeyError, ValueError, TypeError):
                     return False
 
@@ -13912,15 +19729,17 @@ class OutlineV3Executor:
                             content_layers_hash=topic_content_layers_hash,
                         )
                     )
+                    provider_node_id = self._topic_provider_node_id(request, batch_index)
+                    self._verify_topic_request_matches_plan(provider_node_id, request)
                     raw = self._run_semantic_provider_call(
-                        f"topic_synthesis_provider:batch:{batch_index}",
+                        provider_node_id,
                         request,
                         {"global_navigation": _hash_payload(global_navigation), "semantic_chunk_plan": _hash_payload(semantic_chunk_plan)},
                     )
                     semantic_provider_results.append({
                         "node_id": "topic_synthesis",
-                        "provider_node_id": f"topic_synthesis_provider:batch:{batch_index}",
-                        "batch_id": f"topic_batch_{batch_index}",
+                        "provider_node_id": provider_node_id,
+                        "batch_id": str(request["hierarchy"]["batch_id"]),
                         "topic_ids": sorted({topic.topic_id for topic in batch}),
                         "fragment_ids": sorted(
                             {str(topic.fragment_id or topic.topic_id) for topic in batch}
@@ -13968,25 +19787,19 @@ class OutlineV3Executor:
                         ],
                         "result_id": hash_json(
                             {
-                                "provider_node_id": f"topic_synthesis_provider:batch:{batch_index}",
+                                "provider_node_id": provider_node_id,
                                 "provider_output_hash": hash_json(raw),
                             }
                         ),
                         "paper_ids": paper_ids,
                         "provider_output": raw,
                     })
-                    if pilot_requests is not None:
-                        result = semantic_provider_results[-1]
-                        record = self._persist_semantic_provider_output(
-                            str(result["provider_node_id"]),
-                            raw,
-                            dependency_hashes={
-                                "global_navigation": _hash_payload(global_navigation),
-                                "semantic_chunk_plan": _hash_payload(semantic_chunk_plan),
-                            },
-                        )
-                        result["artifact_id"] = record.artifact_id
-                        result["artifact_hash"] = record.content_hash
+                    result = semantic_provider_results[-1]
+                    record = self.artifact_records.get(str(result["provider_node_id"]))
+                    if record is None:
+                        raise OutlineV3ExecutionError("validated topic batch has no durable provider output")
+                    result["artifact_id"] = record.artifact_id
+                    result["artifact_hash"] = record.content_hash
                 if pilot_requests is not None:
                     return self._finish_topic_pilot(
                         provider_results=semantic_provider_results,
@@ -14024,17 +19837,6 @@ class OutlineV3Executor:
                 "provider" if semantic_provider_results else "deterministic",
                 "local",
             ))
-            for result in semantic_provider_results:
-                record = self._persist_semantic_provider_output(
-                    str(result["provider_node_id"]),
-                    result.get("provider_output") if isinstance(result.get("provider_output"), Mapping) else {},
-                    dependency_hashes={
-                        "global_navigation": _hash_payload(global_navigation),
-                        "semantic_chunk_plan": _hash_payload(semantic_chunk_plan),
-                    },
-                )
-                result["artifact_id"] = record.artifact_id
-                result["artifact_hash"] = record.content_hash
             persisted_topics = topic_synthesis.get("topics")
             persisted_topics = persisted_topics if isinstance(persisted_topics, list) else []
             # Rehydrate the exact completed topic outputs from the Registry
@@ -14233,6 +20035,13 @@ class OutlineV3Executor:
                 [str(item.get("relation_id") or "") for item in semantic_relation_candidates],
                 cross_provider_result,
             )
+            cross_retention = self._final_fold_results.get("cross_group_comparison_provider")
+            cross_registry_dependencies = ("topic_synthesis", "semantic_chunk_plan")
+            if cross_retention is not None:
+                cross_registry_dependencies += (
+                    "cross_group_comparison_provider",
+                    "cross_group_comparison_provider:retention_catalog",
+                )
             cross_group = self._run_node("cross_group_comparison", lambda: (
                 self._artifact(
                     OutlineArtifact,
@@ -14241,7 +20050,7 @@ class OutlineV3Executor:
                         "semantic_contract_version": "semantic-evidence-graph-v2",
                         "interpretation_contract_version": INTERPRETATION_CONTRACT_VERSION,
                         "shared_synthesis_contract_version": SHARED_SYNTHESIS_CONTRACT_VERSION,
-                        "execution_mode": "provider_synthesis" if cross_provider_result is not None else "local_question_projection",
+                        "execution_mode": "source_closed_retention" if cross_retention is not None else "provider_synthesis" if cross_provider_result is not None else "local_question_projection",
                         "status": "completed",
                         "shared_semantic_chunk_plan_hash": semantic_chunk_plan_model.content_hash,
                         "questions": list(semantic_chunk_plan_model.cross_group_questions),
@@ -14253,14 +20062,18 @@ class OutlineV3Executor:
                         ],
                         "coverage_ledger": cross_coverage_ledger,
                         "provider_output": cross_provider_result,
+                        **({"semantic_retention": {
+                            **cross_retention, "provider_invoked": False,
+                            "scientific_generation": "retained_from_validated_source_reducers",
+                        }} if cross_retention is not None else {}),
                     },
                     {
                         "topic_synthesis": _hash_payload(topic_synthesis),
                         "semantic_chunk_plan": _hash_payload(semantic_chunk_plan),
                     },
                 ),
-                ("topic_synthesis", "semantic_chunk_plan"),
-                "provider" if cross_provider_result is not None else "deterministic",
+                cross_registry_dependencies,
+                "deterministic" if cross_retention is not None else "provider" if cross_provider_result is not None else "deterministic",
                 "local",
             ))
             loaded_cross_provider_result = (
@@ -14268,6 +20081,15 @@ class OutlineV3Executor:
                 if isinstance(cross_group.get("provider_output"), Mapping)
                 else None
             )
+            if cross_group.get("execution_mode") == "source_closed_retention":
+                self._restore_local_final_fold("cross_group_comparison_provider", cross_group)
+                parent_record = self.artifact_records.get("cross_group_comparison")
+                if parent_record is None:
+                    raise OutlineV3ExecutionError("local final fold parent lost its Registry authority")
+                self.registry.verify_ready_artifact_closure(parent_record)
+                for dependency in ("cross_group_comparison_provider", "cross_group_comparison_provider:retention_catalog"):
+                    if ArtifactDependencyRefV2.from_record(self.artifact_records[dependency]) not in parent_record.depends_on:
+                        raise OutlineV3ExecutionError("local final fold parent lost a typed aggregate dependency")
             if cross_provider_result is not None:
                 self._persist_semantic_provider_output(
                     "cross_group_comparison_provider",
@@ -14295,6 +20117,10 @@ class OutlineV3Executor:
                             "content_hash": str((cross_group.get("coverage_ledger") or {}).get("content_hash") or ""),
                             "topic_count": len((cross_group.get("coverage_ledger") or {}).get("topic_ids") or ()),
                         },
+                        "questions": list(semantic_chunk_plan_model.cross_group_questions),
+                        "topic_questions": [{"topic_id": item.topic_id, "question": item.question}
+                                            for item in semantic_chunk_plan_model.topics],
+                        "required_comparison_obligations": list(self.review_intent_input.get("required_comparisons") or []),
                         "relation_candidates": [],
                         "output_contract": {
                             "synthesis_claims": "array of claims with claim_id='synthesis:global_synthesis:<local-id>', paper_key or paper_keys, evidence_ids, and optional source_claim_ids",
@@ -14305,6 +20131,10 @@ class OutlineV3Executor:
                     },
                     {"cross_group_comparison": _hash_payload(cross_group), "relation_candidates": _hash_payload(candidate_map), "semantic_chunk_plan": _hash_payload(semantic_chunk_plan)},
                 )
+            global_expansion = self._semantic_identifier_outputs.get("global_synthesis_provider")
+            global_dependencies = ("cross_group_comparison", "relation_candidates", "semantic_chunk_plan")
+            if global_expansion is not None:
+                global_dependencies += ("global_synthesis_provider", "global_synthesis_provider:identifier_expanded", "global_synthesis_provider:identifier_map")
             global_synthesis = self._run_node("global_synthesis", lambda: (
                 self._artifact(
                     OutlineArtifact,
@@ -14329,6 +20159,7 @@ class OutlineV3Executor:
                         "conclusions": ([global_provider_result] if global_provider_result is not None else ["Shared global synthesis base materialized from topic routes and evidence references; offline route retained local projection."]),
                         "unresolved_questions": list(semantic_chunk_plan_model.cross_group_questions),
                         "provider_output": global_provider_result,
+                        **({"semantic_identifier_expansion": global_expansion} if global_expansion is not None else {}),
                     },
                     {
                         "cross_group_comparison": _hash_payload(cross_group),
@@ -14336,7 +20167,7 @@ class OutlineV3Executor:
                         "semantic_chunk_plan": _hash_payload(semantic_chunk_plan),
                     },
                 ),
-                ("cross_group_comparison", "relation_candidates", "semantic_chunk_plan"),
+                global_dependencies,
                 "provider" if global_provider_result is not None else "deterministic",
                 "local",
             ))
@@ -14345,6 +20176,18 @@ class OutlineV3Executor:
                 if isinstance(global_synthesis.get("provider_output"), Mapping)
                 else None
             )
+            if isinstance(global_synthesis.get("semantic_identifier_expansion"), Mapping):
+                self._restore_semantic_identifier_output(
+                    "global_synthesis_provider", loaded_global_provider_result or {},
+                    global_synthesis["semantic_identifier_expansion"],
+                )
+                parent_record = self.artifact_records.get("global_synthesis")
+                if parent_record is None:
+                    raise OutlineV3ExecutionError("expanded semantic parent lost Registry authority")
+                self.registry.verify_ready_artifact_closure(parent_record)
+                for dependency in ("global_synthesis_provider", "global_synthesis_provider:identifier_expanded", "global_synthesis_provider:identifier_map"):
+                    if ArtifactDependencyRefV2.from_record(self.artifact_records[dependency]) not in parent_record.depends_on:
+                        raise OutlineV3ExecutionError("expanded semantic parent lost a typed expansion dependency")
             if global_provider_result is not None:
                 self._persist_semantic_provider_output(
                     "global_synthesis_provider",
@@ -14586,11 +20429,51 @@ class OutlineV3Executor:
                 ("relation_adjudication", "relation_candidates", "semantic_chunk_plan"), self.profile.model, self.profile.provider,
             ))
 
+            fragment_bank_state: tuple[dict[str, Any], ArtifactRecord] | None = None
             if self.semantic_provider_synthesis_enabled:
                 from outline.candidate_output_scope import build_candidate_output_scope_v1
                 from services.writer_source_inventory import load_writer_source_inventory_v1
 
                 source_inventory = load_writer_source_inventory_v1(self.registry)
+                # Selected relation tasks can depend on a real source claim
+                # that was not the representative emitted by a topic reducer.
+                # Restore its source text from verified inventory, never from
+                # the relation ID or a guessed synthesis conclusion.
+                source_fields = {
+                    str(row["source_field_id"]): dict(row)
+                    for row in self._candidate_interpretation_tables.get("source_fields") or ()
+                }
+                source_claims = []
+                dependencies = {
+                    str(row["dependency_id"]): dict(row)
+                    for row in self._candidate_interpretation_tables.get("dependencies") or ()
+                }
+                for paper in source_inventory.papers:
+                    claim_by_id = {claim.claim_id: claim for claim in paper.claims}
+                    source_claims.extend(asdict(claim) for claim in paper.claims)
+                    for source_field in paper.source_fields:
+                        prior = source_fields.get(source_field.source_field_id)
+                        if prior is not None and (
+                            str(prior.get("source_value", "")) != source_field.source_value
+                            or str(prior.get("paper_key") or "") != paper.paper_key
+                        ):
+                            raise OutlineV3ExecutionError("candidate shared qualifier text differs from verified source inventory")
+                        source_fields.setdefault(source_field.source_field_id, asdict(source_field))
+                    for dependency in paper.interpretation_dependencies:
+                        row = asdict(dependency)
+                        # Inventory's immutable dependency identity excludes
+                        # the repeated ID and primary evidence projection.
+                        dependency_id = "interpretation-dependency:" + hash_json(row)[:24]
+                        primary = claim_by_id.get(dependency.primary_claim_id)
+                        dependencies.setdefault(dependency_id, {
+                            "dependency_id": dependency_id, **row,
+                            "primary_evidence_ids": list(primary.evidence_ids) if primary is not None else [],
+                        })
+                self._candidate_interpretation_tables = {
+                    "source_fields": [source_fields[key] for key in sorted(source_fields)],
+                    "dependencies": [dependencies[key] for key in sorted(dependencies)],
+                    "source_claims": source_claims,
+                }
                 task_ids_by_topic = {
                     topic.topic_id: topic.logical_node_id for topic in semantic_chunk_plan_model.topics
                 }
@@ -14598,17 +20481,25 @@ class OutlineV3Executor:
                     {**route, "logical_node_id": task_ids_by_topic[str(route.get("topic_id") or "")]}
                     for route in semantic_topic_context
                 ]
+                fragment_bridge_claims = [
+                    {"task_id": node, "result_id": self.artifact_records[node].artifact_id,
+                     "provider_output": output}
+                    for node, output in (
+                        ("cross_group_comparison", loaded_cross_provider_result or cross_provider_result),
+                        ("global_synthesis", loaded_global_provider_result or global_provider_result),
+                    )
+                    if isinstance(output, Mapping)
+                ]
+                verified_lineage_claims = load_verified_semantic_lineage_claims(
+                    self.registry, (self.artifact_records["cross_group_comparison"],
+                                    self.artifact_records["global_synthesis"]),
+                )
                 self._candidate_output_scope = build_candidate_output_scope_v1(
                     source_inventory, scoped_routes, selected_relation_ids=confirmed_ids,
-                    bridge_claims=[
-                        {"task_id": node, "result_id": self.artifact_records[node].artifact_id,
-                         "provider_output": output}
-                        for node, output in (
-                            ("cross_group_comparison", loaded_cross_provider_result or cross_provider_result),
-                            ("global_synthesis", loaded_global_provider_result or global_provider_result),
-                        )
-                        if isinstance(output, Mapping)
-                    ],
+                    relation_bundles=[bundle_by_id[relation_id].to_dict()
+                                      for relation_id in confirmed_ids if relation_id in bundle_by_id],
+                    bridge_claims=fragment_bridge_claims,
+                    lineage_claims=verified_lineage_claims,
                 )
                 scope_record = publish_json_artifact(
                     self.publication_context, self.registry,
@@ -14625,6 +20516,11 @@ class OutlineV3Executor:
                 )
                 self.artifact_records["candidate_output_scope"] = scope_record
                 self.artifact_paths["candidate_output_scope"] = scope_record.path
+                if str(self._node_route("candidate_1_provider_generation").profile.endpoint_type).casefold() not in {"internal", "fixture"}:
+                    fragment_bank_state = self._prepare_candidate_fragment_bank(
+                        self._candidate_output_scope, source_inventory, scoped_routes, fragment_bridge_claims,
+                        lineage_claims=verified_lineage_claims,
+                    )
 
             intent_model = build_review_intent(self.review_intent_input)
             intent = self._run_node("review_intent", lambda: (
@@ -14640,6 +20536,8 @@ class OutlineV3Executor:
                 relations=[candidate_map_model.relations[index] for index, item in enumerate(relation_candidates) if item["relation_id"] in set(confirmed_ids)],
                 paper_keys=sorted({key for item in confirmed for key in item.get("paper_keys", [])}),
                 source_artifact_hashes={"relation_candidates": _hash_payload(candidate_map)},
+                cohorts=list(candidate_map_model.cohorts),
+                comparison_coverage=dict(candidate_map_model.comparison_coverage),
             )
             plans_model = build_outline_candidate_plans(
                 ledger_model,
@@ -14657,6 +20555,13 @@ class OutlineV3Executor:
                 self._artifact(OutlineArtifact, axes_payload, {"global_corpus_ledger": _hash_payload(ledger), "multi_view_matrix": _hash_payload(matrix), "global_relation_map": _hash_payload(confirmed_map), "semantic_chunk_plan": _hash_payload(semantic_chunk_plan), "global_synthesis": _hash_payload(global_synthesis), "review_intent": _hash_payload(intent), "coverage_contract": _hash_payload(contract)}),
                 ("global_corpus_ledger", "multi_view_matrix", "global_relation_map", "semantic_chunk_plan", "global_synthesis", "review_intent", "coverage_contract"), "deterministic", "local",
             ))
+
+            if fragment_bank_state is not None:
+                self._plan_candidate_fragment_organization(
+                    *fragment_bank_state, plans_model.candidates, axes_by_id,
+                    sorted(entry.paper_key for entry in ledger_model.entries
+                           if entry.assignment_status != "excluded_with_reason"),
+                )
 
             candidate_ids: list[str] = []
             primary_candidate_requests: dict[str, dict[str, Any]] = {}
@@ -14696,6 +20601,11 @@ class OutlineV3Executor:
                 request = {
                     "candidate_id": candidate_id,
                     "organizing_logic": plan.organizing_logic,
+                    "required_corpus_coverage": {
+                        "paper_keys": sorted(entry.paper_key for entry in ledger_model.entries
+                                             if entry.assignment_status != "excluded_with_reason"),
+                        "contract_hash": contract_model.content_hash,
+                    },
                     **({"candidate_output_scope": self._candidate_output_scope_wire(paper_keys)}
                        if self._candidate_output_scope is not None else {}),
                     **({"organizing_axis": axes_by_id[plan.axis_id].to_dict()}
@@ -14785,10 +20695,27 @@ class OutlineV3Executor:
                         ),
                     },
                     "output_contract": {
+                        "preferred_candidate_wire_version": "candidate-slot-output/v1",
+                        "claim_prose_reserve_tokens": 256,
+                        "section_prose_reserve_tokens": 64,
+                        "compact_output": (
+                            "Return candidate_wire_version='candidate-slot-output/v1'. In each section, "
+                            "claims is an array of {text, claim_group_indices}; text is your concise authored "
+                            "assertion and the indices address candidate_output_scope.claim_group_ids in order. "
+                            "The runtime restores every support slot and qualifier ID of each selected group "
+                            "from the verified scope. Do not echo claim_support in compact output, omit a side, "
+                            "reuse a group, or infer a finding from a relation ID. Retain section_id/title/goal/"
+                            "rationale/relation_ids and explicit paper_roles where a source serves distinct sections. "
+                            "Explain the actual comparison counterpart or distinct source contribution in each role; "
+                            "a physical shard or different identifier is not an organizing role. "
+                            "The prose reserves are planning estimates, not permission to omit scientific qualifications. "
+                            "Legacy full claim_support remains accepted under the same source validator."
+                        ),
                         **({"finite_scope_rule": (
                             "Use only the supplied candidate_output_scope claim slots. "
-                            "Every section lists task_ids; every support row echoes its claim_slot_id and task_id "
-                            "with complete source/qualifier IDs. Consume a slot at most once. "
+                            "In compact output, select complete claim_group_indices; the runtime restores "
+                            "task_ids and every actual claim_slot_id/source/qualifier ID. In full output, "
+                            "echo those task and support identities directly. Consume a group at most once. "
                             "Choose claims with organizing value; unused slots remain available and need not become prose. "
                             "A multi-paper claim group must retain all of its support slots in one section. "
                             "Slots with the same claim_group_index belong to one assertion group. "
@@ -14802,11 +20729,13 @@ class OutlineV3Executor:
                             "sections": (
                                 "non-empty array of outline sections; each section is an "
                                 "object with section_id, title, goal (one short sentence "
-                                "stating the section's purpose in the review), paper_keys "
-                                "(subset of the provided evidence paper_keys), relation_ids "
-                                "(subset of provided relation_ids), claims (non-empty array "
-                                "of planned claim strings) and rationale. Every planned claim "
-                                "must include claim_support with its exact claim text, paper_key, "
+                                "stating the section's purpose in the review), relation_ids "
+                                "(subset of provided relation_ids), claims and rationale. In preferred "
+                                "candidate-slot-output/v1, claims is a nonempty array of {text, "
+                                "claim_group_indices}; paper_keys, task_ids and complete claim_support "
+                                "are deterministically restored from those verified group indices. "
+                                "In legacy full output, claims is an array of planned strings and "
+                                "every claim must include claim_support with exact text, paper_key, "
                                 "source_claim_ids, evidence_ids and complete qualifier source_field_ids "
                                 "from the supplied shared semantic context. Include study_id only "
                                 "when the supplied sources verify that study; do not invent a study "
@@ -14889,6 +20818,21 @@ class OutlineV3Executor:
                     "outline_content_layers": _hash_payload(content_layers),
                 }
                 generation_node_id = f"{candidate_id}_provider_generation"
+                if fragment_bank_state is not None:
+                    bank, bank_record = fragment_bank_state
+                    content, compiled_deps, compiled_binding = self._run_candidate_fragment_organization(
+                        candidate_id=candidate_id, generation_node_id=generation_node_id,
+                        axis=axes_by_id[plan.axis_id], plan=plan, bank=bank, bank_record=bank_record,
+                        required_papers=sorted(entry.paper_key for entry in ledger_model.entries
+                                               if entry.assignment_status != "excluded_with_reason"),
+                    )
+                    self._expected_provider_calls.pop(self._provider_call_id(generation_node_id), None)
+                    self._persist(
+                        generation_node_id, self._artifact(OutlineCandidate, content, compiled_deps),
+                        depends_on=tuple(compiled_deps), model="deterministic", provider="local",
+                        execution_binding=compiled_binding, receipt_ids=(),
+                    )
+                    continue
                 generation_binding = self._provider_binding(
                     generation_node_id, provider_request, expect_json=True,
                     input_artifact_hashes=tuple(generation_deps.values()),
@@ -14907,10 +20851,18 @@ class OutlineV3Executor:
                 generation_budget = generation_route.profile.estimate_request(
                     self._attach_prompt_authority(generation_node_id, provider_request)
                 )
+                complete_output_estimate = 0
+                if self._candidate_output_scope is not None:
+                    from outline.candidate_request_packing import estimate_candidate_output
+
+                    complete_output_estimate = estimate_candidate_output(
+                        self._candidate_output_scope, request, generation_route.profile.estimate_tokens,
+                    )
                 sharded_generation = bool(
                     int(generation_budget.get("estimated_input_tokens") or 0)
                     > self._relation_packing_target(generation_route.profile)
                     or not bool(generation_budget.get("within_budget"))
+                    or complete_output_estimate > int(generation_route.profile.max_output_tokens)
                 )
                 # Transport first (registers the expected call + receipt), then
                 # validate, then bounded repair, then persist ONLY the adopted
@@ -14944,7 +20896,7 @@ class OutlineV3Executor:
                             input_artifact_hashes=tuple(generation_deps.values()),
                             output_tokens=min(
                                 int(generation_route.profile.max_output_tokens),
-                                4_096,
+                                max(4_096, complete_output_estimate),
                             ),
                         )
                     content = (
@@ -14952,6 +20904,7 @@ class OutlineV3Executor:
                         if alias_map is not None
                         else dict(raw_generation)
                     )
+                    content = self._expand_candidate_wire_payload(content, paper_keys)
                     try:
                         self._validate_candidate_payload(
                             candidate_id,
@@ -14990,6 +20943,8 @@ class OutlineV3Executor:
                         provider=generation_route.provider_name,
                         execution_binding=generation_binding,
                     )
+                    if sharded_generation:
+                        self._finalize_logical_candidate_reuse_projection(generation_node_id)
                 except Exception as exc:
                     # Mirror _run_node failure semantics: the failed candidate
                     # generation node must remain visible in the durable DAG so
@@ -15248,15 +21203,29 @@ class OutlineV3Executor:
                             request=request,
                             dependency_hashes=critique_deps,
                         )
+                        aggregate_deps = dict(critique_deps)
+                        coverage_hashes = {
+                            str(shard_id): str(row["claim_support_coverage"]["content_hash"])
+                            for shard_id, row in (merged_critique.get("candidate_shard_results") or {}).items()
+                            if isinstance(row, Mapping)
+                            and isinstance(row.get("claim_support_coverage"), Mapping)
+                        }
+                        aggregate_binding = critique_binding
+                        if coverage_hashes:
+                            aggregate_deps["critique_claim_support_coverage"] = hash_json(coverage_hashes)
+                            aggregate_binding = self._provider_binding(
+                                node_id, request, expect_json=True,
+                                input_artifact_hashes=tuple(aggregate_deps.values()),
+                            )
                         critiques[node_id] = self._run_node(
                             node_id,
-                            lambda merged=merged_critique, cls=cls, critique_deps=critique_deps: (
-                                self._artifact(cls, merged, critique_deps),
+                            lambda merged=merged_critique, cls=cls, aggregate_deps=aggregate_deps: (
+                                self._artifact(cls, merged, aggregate_deps),
                                 ("candidate_generations",),
                                 "hierarchical",
                                 "local",
                             ),
-                            expected_binding=critique_binding,
+                            expected_binding=aggregate_binding,
                         )
                         self._expected_provider_calls.pop(
                             self._provider_call_id(node_id),
@@ -15339,25 +21308,41 @@ class OutlineV3Executor:
                     "output_fields": (
                         "For a selected sharded candidate return section_coordination with candidate_id, "
                         "merge_groups and section_order. Every source section appears exactly once. "
-                        "Merge only identical title/goal sections, echo exact source_section_hashes, "
-                        "and preserve all claims/support; otherwise keep separate and order explicitly."
+                        "Echo exact source_section_hashes and preserve all claims/support. "
+                        "For different source title/goal wording, provide canonical_intent with the "
+                        "merged title and goal, and source_intents keyed by every source_section_id. "
+                        "Each source_intents entry echoes the exact original title/goal and explains "
+                        "its contribution to the canonical intent. Retain scientific distinctions "
+                        "in claims/support and integration_reason; if they cannot be integrated, "
+                        "keep sections separate and order explicitly."
                     ),
                 },
             }
             primary_arbitration_request = copy.deepcopy(arbitration_request)
+            arbitration_request = pack_arbitration_candidate_support(arbitration_request)
             arbitration_deps = {
                 "structure_critique": self._node_execution_identity_hash("structure_critique"),
                 "coverage_critique": self._node_execution_identity_hash("coverage_critique"),
                 "evidence_critique": self._node_execution_identity_hash("evidence_critique"),
             }
+            arbitration_hierarchy = self._prepare_arbitration_hierarchy(arbitration_request)
             arbitration = self._run_node(
                 "arbitration",
-                lambda: self._run_provider_node("arbitration", arbitration_request, ArbitrationDecision, arbitration_deps),
+                lambda: (
+                    (
+                        self._artifact(ArbitrationDecision, self._run_arbitration_hierarchy(arbitration_hierarchy, arbitration_deps), arbitration_deps),
+                        tuple(arbitration_deps), "hierarchical", "local",
+                    )
+                    if arbitration_hierarchy is not None else
+                    self._run_provider_node("arbitration", arbitration_request, ArbitrationDecision, arbitration_deps)
+                ),
                 expected_binding=self._provider_binding(
                     "arbitration", arbitration_request, expect_json=True,
                     input_artifact_hashes=tuple(arbitration_deps.values()),
                 ),
             )
+            if arbitration_hierarchy is not None:
+                self._expected_provider_calls.pop(self._provider_call_id("arbitration"), None)
             if not candidate_ids:
                 raise OutlineV3ExecutionError("outline arbitration has no candidates")
             selected_id = str(arbitration.get("selected_candidate_id") or "").strip()
@@ -15763,7 +21748,10 @@ class OutlineV3Executor:
                     variant_evidence,
                     job_id=self.job_id,
                 )
-                variant_candidates = build_global_relation_map(variant_evidence, variant_matrix, variant_ledger)
+                variant_candidates = build_global_relation_map(
+                    variant_evidence, variant_matrix, variant_ledger,
+                    required_comparisons=build_review_intent(self.review_intent_input).required_comparisons,
+                )
                 variant_semantic_plan = build_semantic_chunk_plan(
                     variant_content_layers,
                     variant_candidates,
@@ -15875,6 +21863,8 @@ class OutlineV3Executor:
                     paper_keys=list(variant_candidates.paper_keys),
                     source_artifact_hashes=dict(variant_candidates.source_artifact_hashes),
                     blocking_diagnostics=list(variant_candidates.blocking_diagnostics),
+                    cohorts=list(variant_candidates.cohorts),
+                    comparison_coverage=dict(variant_candidates.comparison_coverage),
                 )
                 variant_intent = build_review_intent(self.review_intent_input)
                 variant_contract = build_coverage_contract(variant_ledger, variant_intent)
@@ -16232,8 +22222,17 @@ class OutlineV3Executor:
                 arbitration_key_hash = hash_json(
                     {"variant": variant_name, "role": "arbitration"}
                 )[:16]
-                arbitration_raw = self._provider_call(
-                    f"stability:{arbitration_key_hash}:arbitration",
+                arbitration_request = pack_arbitration_candidate_support(arbitration_request)
+                variant_arbitration_node = f"stability:{arbitration_key_hash}:arbitration"
+                variant_arbitration_hierarchy = self._prepare_arbitration_hierarchy(
+                    arbitration_request, node_id=variant_arbitration_node,
+                )
+                arbitration_raw = self._run_arbitration_hierarchy(
+                    variant_arbitration_hierarchy,
+                    {"coverage_contract": variant_contract.content_hash,
+                     **{candidate: hash_json(value) for candidate, value in variant_contents.items()}},
+                ) if variant_arbitration_hierarchy is not None else self._provider_call(
+                    variant_arbitration_node,
                     arbitration_request,
                     expect_json=True,
                     input_artifact_hashes=(
@@ -16764,8 +22763,14 @@ class OutlineV3Executor:
                 out_of_scope=out_of_scope_receipts,
             )
             self._check("provider_receipt_closure")
+            logical_candidate_reuse_projections = [
+                dict(self._logical_candidate_reuse_projections[node_id])
+                for node_id in sorted(self._logical_candidate_reuse_projections)
+            ]
             closure_contract = {
                 **closure.to_dict(),
+                "logical_candidate_reuse_projections": logical_candidate_reuse_projections,
+                "logical_candidate_reuse_projection_hash": hash_json(logical_candidate_reuse_projections),
                 "job_id": self.job_id,
                 "stage_name": "stage2_outline",
                 "attempt_id": self.logical_attempt_identity,
@@ -16773,6 +22778,11 @@ class OutlineV3Executor:
                 "closure_epoch_id": self.closure_epoch_id,
                 "expected_call_graph_hash": self.expected_call_graph_hash,
                 "expected_calls": [asdict(expected) for expected in canonical_expected],
+                "observed_receipt_ids": sorted({
+                    str(receipt.receipt_id or receipt.call_id)
+                    for receipt in current_receipts
+                    if receipt.call_id in closure.observed_call_ids
+                }),
                 "verified_reuse_evidence_ids": [
                     record.artifact_id for record in reuse_evidence_records
                 ],
@@ -16782,6 +22792,11 @@ class OutlineV3Executor:
                 closure_dependency_ids.append("provider_receipts")
             closure_dependency_ids.extend(
                 record.artifact_id for record in reuse_evidence_records
+            )
+            closure_dependency_ids.extend(
+                str(projection.get("merged_node_id") or "")
+                for projection in logical_candidate_reuse_projections
+                if str(projection.get("merged_node_id") or "") in self.artifact_records
             )
             closure_dependency_ids.extend(
                 expected.node_id
@@ -16804,6 +22819,37 @@ class OutlineV3Executor:
                 for artifact_id, record in self.artifact_records.items()
                 if str(record.path).lower() in expected_artifact_paths
             )
+            # Dynamic relation shards may be exact-replayed from a prior
+            # Registry snapshot without appearing in this executor's DAG map.
+            # Resolve their durable output from the expected path and file
+            # hash, then publish that exact READY record as a direct closure
+            # dependency; never synthesize an artifact ID from the call node.
+            for expected in canonical_expected:
+                if not (
+                    expected.node_id == "relation_adjudication"
+                    or expected.node_id.startswith("relation_adjudication:")
+                ):
+                    continue
+                relation_record = _resolve_outline_relation_shard_dependency_record(
+                    self.registry, expected,
+                )
+                existing = self.artifact_records.get(relation_record.artifact_id)
+                if existing is not None and (
+                    existing.job_id != relation_record.job_id
+                    or existing.path != relation_record.path
+                    or existing.content_hash != relation_record.content_hash
+                    or existing.artifact_type != relation_record.artifact_type
+                    or existing.artifact_version != relation_record.artifact_version
+                ):
+                    raise OutlineV3ExecutionError(
+                        f"BLOCKED_CLOSURE: conflicting in-memory relation output for {expected.call_id}"
+                    )
+                self.artifact_records.setdefault(relation_record.artifact_id, relation_record)
+                if not any(
+                    self.artifact_records[key].artifact_id == relation_record.artifact_id
+                    for key in closure_dependency_ids if key in self.artifact_records
+                ):
+                    closure_dependency_ids.append(relation_record.artifact_id)
             closure_dependencies = {
                 key: self.artifact_records[key].content_hash
                 for key in closure_dependency_ids

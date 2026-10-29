@@ -8,7 +8,7 @@ the *replay binding* -- not merely on the presence of config keys.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import pytest
 
@@ -47,6 +47,12 @@ TARGET_ROUTES: dict[str, tuple[str, str, str]] = {
 }
 
 
+def _source_bound_test_provider(node_id: str, request: Any) -> Any:
+    from tests.test_current_runtime_full_e2e import _outline_provider_response
+
+    return _outline_provider_response(node_id, request)
+
+
 def _route(role: str, identity: tuple[str, str, str], *, transport: Any = None) -> OutlineRoleRoute:
     provider, model, endpoint_type = identity
     return OutlineRoleRoute(
@@ -62,7 +68,8 @@ def _route(role: str, identity: tuple[str, str, str], *, transport: Any = None) 
             model_context_limit=200_000,
             max_output_tokens=8_000,
         ),
-        transport=transport,
+        transport=transport if transport is not None else _source_bound_test_provider,
+        config_identity={"transport_retries": "0"},
     )
 
 
@@ -156,12 +163,20 @@ def test_call_plans_carry_per_node_route_identity(tmp_path: Path) -> None:
     plans = executor.provider_call_plans
     assert plans, "expected the executor to build provider call plans"
 
-    by_node = {plan.node_id: plan for plan in plans}
-    for node_id in executor._provider_node_ids():
-        expected = TARGET_ROUTES[semantic_role(node_id)]
-        plan = by_node[node_id]
+    planned_node_ids = {plan.node_id for plan in plans}
+    provider_nodes = set(executor._provider_node_ids())
+    required_plan_nodes = provider_nodes - {"relation_adjudication"}
+    assert required_plan_nodes <= planned_node_ids
+    # An explicit empty source comparison has no relation transport call.
+    missing_optional = provider_nodes - planned_node_ids
+    assert missing_optional <= {"relation_adjudication"}
+    if "relation_adjudication" in missing_optional:
+        assert executor._payloads["relation_adjudication"]["selection_status"] == "explicit_empty"
+
+    for plan in plans:
+        expected = TARGET_ROUTES[semantic_role(plan.node_id)]
         assert (plan.provider, plan.model, plan.endpoint_type) == expected, (
-            f"{node_id} was planned against the wrong provider identity"
+            f"{plan.node_id} was planned against the wrong provider identity"
         )
 
 

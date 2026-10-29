@@ -5,13 +5,33 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from runtime.provider_context import ProviderContextProfile, ProviderRequestEstimateV1
 
 
 class StagePlanError(ValueError):
     """Raised when a requested stage policy cannot be executed safely."""
+
+
+def _validate_conditional_path_tags(
+    conditional_path_id: str,
+    alternative_group_id: str,
+    conditional_on: str,
+) -> tuple[str, str]:
+    """Validate the paired, projection-only labels for an exclusive path."""
+
+    values = (conditional_path_id, alternative_group_id)
+    if any(not isinstance(value, str) for value in values):
+        raise StagePlanError("conditional path and alternative group ids must be strings")
+    if any(value and not value.strip() for value in values):
+        raise StagePlanError("conditional path and alternative group ids must be non-empty when provided")
+    path_id, group_id = (value.strip() for value in values)
+    if bool(path_id) != bool(group_id):
+        raise StagePlanError("conditional path and alternative group ids must be provided together")
+    if path_id and (not isinstance(conditional_on, str) or not conditional_on.strip()):
+        raise StagePlanError("conditional path rows and exposures must state their condition")
+    return path_id, group_id
 
 
 _DEFAULTS: dict[str, tuple[str, ...]] = {
@@ -197,6 +217,8 @@ class ProviderRequestPlanRowV1:
     pricing_source: str = ""
     wall_seconds_upper_bound: float | None = None
     retry_policy: Literal["configured_reserve", "shared_optional"] = "configured_reserve"
+    conditional_path_id: str = ""
+    alternative_group_id: str = ""
 
     def __post_init__(self) -> None:
         if not str(self.stage_name).strip() or not str(self.semantic_role).strip():
@@ -213,6 +235,13 @@ class ProviderRequestPlanRowV1:
             raise StagePlanError("provider request retry reserve must be non-negative or unknown")
         if self.retry_policy not in ("configured_reserve", "shared_optional"):
             raise StagePlanError("provider request retry policy is unsupported")
+        conditional_path_id, alternative_group_id = _validate_conditional_path_tags(
+            self.conditional_path_id,
+            self.alternative_group_id,
+            self.conditional_on,
+        )
+        object.__setattr__(self, "conditional_path_id", conditional_path_id)
+        object.__setattr__(self, "alternative_group_id", alternative_group_id)
         if self.estimated_cost is not None and (
             not math.isfinite(float(self.estimated_cost)) or float(self.estimated_cost) < 0
         ):
@@ -255,7 +284,7 @@ class ProviderRequestPlanRowV1:
 
     def to_dict(self) -> dict[str, Any]:
         estimate = self.request_estimate.to_dict()
-        return {
+        payload = {
             "stage_name": self.stage_name,
             "semantic_role": self.semantic_role,
             "request_key_hash": self.request_key_hash,
@@ -284,6 +313,10 @@ class ProviderRequestPlanRowV1:
             "pricing_source": self.pricing_source or None,
             "wall_seconds_upper_bound": self.wall_seconds_upper_bound,
         }
+        if self.conditional_path_id:
+            payload["conditional_path_id"] = self.conditional_path_id
+            payload["alternative_group_id"] = self.alternative_group_id
+        return payload
 
 
 @dataclass(frozen=True)
@@ -372,16 +405,54 @@ class UnplannedProviderExposureV1:
     cardinality_basis: ProviderExposureCardinalityBasisV1 | Mapping[str, Any] | None = None
     context_tokens_per_call_upper_bound: int | None = None
     context_limit_tokens_per_call: int | None = None
+    logical_calls_known_lower_bound: int = 0
+    known_lower_bound_basis: Mapping[str, Any] | None = None
+    conditional_path_id: str = ""
+    alternative_group_id: str = ""
 
     def __post_init__(self) -> None:
         if not str(self.stage_name).strip() or not str(self.semantic_role).strip():
             raise StagePlanError("unplanned provider exposure stage and semantic role are required")
         if not str(self.reason).strip():
             raise StagePlanError("unplanned provider exposure requires a reason")
+        conditional_path_id, alternative_group_id = _validate_conditional_path_tags(
+            self.conditional_path_id,
+            self.alternative_group_id,
+            self.conditional_on,
+        )
+        object.__setattr__(self, "conditional_path_id", conditional_path_id)
+        object.__setattr__(self, "alternative_group_id", alternative_group_id)
         if self.request_builder_id and not str(self.request_builder_id).strip():
             raise StagePlanError("request builder id must be non-empty when provided")
         if self.exposure_status not in ("bounded_conditional", "unbounded"):
             raise StagePlanError("provider exposure status is unsupported")
+        lower_bound = self.logical_calls_known_lower_bound
+        if isinstance(lower_bound, bool) or not isinstance(lower_bound, int) or lower_bound < 0:
+            raise StagePlanError("logical_calls_known_lower_bound must be a non-negative integer")
+        if (
+            self.logical_calls_upper_bound is not None
+            and lower_bound > self.logical_calls_upper_bound
+        ):
+            raise StagePlanError("known provider call lower bound exceeds its upper bound")
+        lower_basis = self.known_lower_bound_basis
+        if lower_bound:
+            if self.conditional_on:
+                raise StagePlanError("conditional provider exposure cannot claim an unconditional call floor")
+            if not isinstance(lower_basis, Mapping):
+                raise StagePlanError("known provider call lower bound requires a source basis")
+            basis_count = lower_basis.get("paper_work_item_count")
+            basis_hash = str(lower_basis.get("paper_work_items_sha256") or "")
+            if (
+                lower_basis.get("schema_version") != "stage1-paper-work-items/v1"
+                or isinstance(basis_count, bool)
+                or not isinstance(basis_count, int)
+                or basis_count != lower_bound
+                or len(basis_hash) != 64
+                or any(character not in "0123456789abcdef" for character in basis_hash)
+            ):
+                raise StagePlanError("known provider call lower-bound source basis is invalid")
+        elif lower_basis is not None:
+            raise StagePlanError("zero provider call lower bound must not carry a source basis")
         basis = self.cardinality_basis
         if isinstance(basis, Mapping):
             basis = ProviderExposureCardinalityBasisV1.from_mapping(basis)
@@ -456,7 +527,7 @@ class UnplannedProviderExposureV1:
         return int(self.logical_calls_upper_bound) * (1 + int(self.retry_attempts_per_call_upper_bound))
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "stage_name": self.stage_name,
             "semantic_role": self.semantic_role,
             "reason": self.reason,
@@ -464,6 +535,12 @@ class UnplannedProviderExposureV1:
             "route_identity": list(self.route_identity),
             "conditional_on": self.conditional_on or None,
             "logical_calls_upper_bound": self.logical_calls_upper_bound,
+            "logical_calls_known_lower_bound": self.logical_calls_known_lower_bound,
+            "known_lower_bound_basis": (
+                dict(self.known_lower_bound_basis)
+                if self.known_lower_bound_basis is not None
+                else None
+            ),
             "input_tokens_per_call_upper_bound": self.input_tokens_per_call_upper_bound,
             "output_tokens_per_call_upper_bound": self.output_tokens_per_call_upper_bound,
             "reasoning_tokens_per_call_upper_bound": self.reasoning_tokens_per_call_upper_bound,
@@ -479,6 +556,10 @@ class UnplannedProviderExposureV1:
             "context_tokens_per_call_upper_bound": self.context_tokens_per_call_upper_bound,
             "context_limit_tokens_per_call": self.context_limit_tokens_per_call,
         }
+        if self.conditional_path_id:
+            payload["conditional_path_id"] = self.conditional_path_id
+            payload["alternative_group_id"] = self.alternative_group_id
+        return payload
 
 
 @dataclass(frozen=True)
@@ -538,6 +619,8 @@ def build_provider_request_plan_row_v1(
     requested_output_tokens: int | None = None,
     reasoning_reserve_tokens: int | None = None,
     conditional_on: str = "",
+    conditional_path_id: str = "",
+    alternative_group_id: str = "",
     verified_reuse: VerifiedProviderReuseAuthorityV1 | None = None,
     pricing_per_1k_tokens: Mapping[str, float] | None = None,
     pricing_source: str = "",
@@ -620,10 +703,23 @@ def build_provider_request_plan_row_v1(
 
     from runtime.provider_runtime import hash_json
 
+    conditional_path_id, alternative_group_id = _validate_conditional_path_tags(
+        conditional_path_id,
+        alternative_group_id,
+        str(conditional_on or "").strip(),
+    )
+    request_key_identity: dict[str, str] = {
+        "stage": str(stage_name).strip(),
+        "request_id": str(request_id),
+    }
+    if conditional_path_id:
+        request_key_identity["conditional_path_id"] = conditional_path_id
+        request_key_identity["alternative_group_id"] = alternative_group_id
+
     return ProviderRequestPlanRowV1(
         stage_name=str(stage_name).strip(),
         semantic_role=str(_route_field(route, "semantic_role", "") or _route_field(route, "role", "") or "unknown"),
-        request_key_hash=hash_json({"stage": str(stage_name).strip(), "request_id": str(request_id)}),
+        request_key_hash=hash_json(request_key_identity),
         source_builder=str(source_builder).strip(),
         route_identity=identity,
         request_estimate=estimate,
@@ -635,6 +731,8 @@ def build_provider_request_plan_row_v1(
         price_status=price_status,
         pricing_source=str(pricing_source or "").strip(),
         wall_seconds_upper_bound=wall_seconds_upper_bound,
+        conditional_path_id=conditional_path_id,
+        alternative_group_id=alternative_group_id,
     )
 
 
@@ -784,6 +882,82 @@ def build_full_stage_request_plan_v1(
     unbounded_exposures = [
         item for item in active_exposures if item.exposure_status != "bounded_conditional"
     ]
+    conditional_path_groups: dict[
+        str,
+        dict[str, tuple[list[ProviderRequestPlanRowV1], list[UnplannedProviderExposureV1]]],
+    ] = {}
+    for item in rows:
+        if not item.conditional_path_id:
+            continue
+        conditional_path_groups.setdefault(item.alternative_group_id, {}).setdefault(
+            item.conditional_path_id, ([], [])
+        )[0].append(item)
+    for item in exposures:
+        if not item.conditional_path_id:
+            continue
+        conditional_path_groups.setdefault(item.alternative_group_id, {}).setdefault(
+            item.conditional_path_id, ([], [])
+        )[1].append(item)
+    has_conditional_paths = bool(conditional_path_groups)
+    untagged_fresh_rows = [item for item in fresh_rows if not item.conditional_path_id]
+    untagged_active_exposures = [
+        item for item in active_exposures if not item.conditional_path_id
+    ]
+
+    def conditional_path_metric_bounds(
+        row_upper: Callable[[ProviderRequestPlanRowV1], int | float | None],
+        exposure_per_call_upper: Callable[[UnplannedProviderExposureV1], int | float | None],
+        *,
+        row_floor: Callable[[ProviderRequestPlanRowV1], int | float | None] | None = None,
+    ) -> tuple[int | float | None, int | float]:
+        """Sum co-occurring work per path, then max upper/min known floor per group."""
+
+        upper_total: int | float = 0
+        floor_total: int | float = 0
+        upper_unknown = False
+        for group_id in sorted(conditional_path_groups):
+            path_upper_values: list[int | float | None] = []
+            path_floor_values: list[int | float] = []
+            paths = conditional_path_groups[group_id]
+            for path_id in sorted(paths):
+                path_rows, path_exposures = paths[path_id]
+                path_upper: int | float = 0
+                path_upper_unknown = False
+                path_floor: int | float = 0
+                for row in path_rows:
+                    if row.verified_reuse:
+                        continue
+                    value = row_upper(row)
+                    if value is None:
+                        path_upper_unknown = True
+                    else:
+                        path_upper += value
+                    if row_floor is not None:
+                        floor_value = row_floor(row)
+                        if floor_value is not None:
+                            path_floor += floor_value
+                for exposure in path_exposures:
+                    count = exposure.logical_calls_upper_bound
+                    if count == 0:
+                        continue
+                    per_call = exposure_per_call_upper(exposure)
+                    if per_call == 0:
+                        continue
+                    if count is None or per_call is None:
+                        path_upper_unknown = True
+                    else:
+                        path_upper += count * per_call
+                path_upper_values.append(None if path_upper_unknown else path_upper)
+                path_floor_values.append(path_floor)
+            if any(value is None for value in path_upper_values):
+                upper_unknown = True
+            else:
+                upper_total += max(
+                    (value for value in path_upper_values if value is not None),
+                    default=0,
+                )
+            floor_total += min(path_floor_values, default=0)
+        return (None if upper_unknown else upper_total), floor_total
 
     def nonnegative_int(value: Any) -> bool:
         return isinstance(value, int) and not isinstance(value, bool) and value >= 0
@@ -836,25 +1010,89 @@ def build_full_stage_request_plan_v1(
     )
     envelope_complete = not unbounded_exposures and exact_rows_envelope_complete
     exact_requests_materialized = not active_exposures
-    unknown_count = any(item.logical_calls_upper_bound is None for item in active_exposures)
-    exposure_logical_upper = sum(
-        int(item.logical_calls_upper_bound or 0)
-        for item in active_exposures
-        if item.logical_calls_upper_bound is not None
-    )
-    logical_upper = None if unknown_count else known_logical + exposure_logical_upper
     bounded_logical_call_exposure_count = len(bounded_exposures)
     unbounded_logical_call_exposure_count = len(unbounded_exposures)
-    conditional_exposure_upper = sum(
-        int(item.logical_calls_upper_bound or 0)
-        for item in bounded_exposures
-        if item.conditional_on
-    )
-    conditional_calls_upper = (
-        None
-        if any(item.conditional_on for item in unbounded_exposures)
-        else len(conditional_rows) + conditional_exposure_upper
-    )
+    logical_path_floor = 0
+    output_path_floor = 0
+    if has_conditional_paths:
+        path_logical_upper, logical_path_floor = conditional_path_metric_bounds(
+            lambda _item: 1,
+            lambda _item: 1,
+            row_floor=lambda _item: 1,
+        )
+        path_known_rows_upper, _ = conditional_path_metric_bounds(
+            lambda _item: 1,
+            lambda _item: 0,
+        )
+        known_logical = len(untagged_fresh_rows) + int(path_known_rows_upper or 0)
+        known_conditional_rows = sum(
+            bool(item.conditional_on) for item in untagged_fresh_rows
+        ) + int(path_known_rows_upper or 0)
+        unknown_count = any(
+            item.logical_calls_upper_bound is None
+            for item in untagged_active_exposures
+        )
+        untagged_exposure_logical_upper = sum(
+            int(item.logical_calls_upper_bound or 0)
+            for item in untagged_active_exposures
+            if item.logical_calls_upper_bound is not None
+        )
+        logical_upper = (
+            None
+            if unknown_count or path_logical_upper is None
+            else len(untagged_fresh_rows)
+            + untagged_exposure_logical_upper
+            + path_logical_upper
+        )
+        untagged_bounded_exposures = [
+            item
+            for item in untagged_active_exposures
+            if item.exposure_status == "bounded_conditional"
+        ]
+        untagged_unbounded_exposures = [
+            item
+            for item in untagged_active_exposures
+            if item.exposure_status != "bounded_conditional"
+        ]
+        conditional_exposure_upper = sum(
+            int(item.logical_calls_upper_bound or 0)
+            for item in untagged_bounded_exposures
+            if item.conditional_on
+        )
+        conditional_calls_upper = (
+            None
+            if path_logical_upper is None
+            or any(item.conditional_on for item in untagged_unbounded_exposures)
+            else sum(
+                bool(item.conditional_on) for item in untagged_fresh_rows
+            )
+            + conditional_exposure_upper
+            + path_logical_upper
+        )
+        _, output_path_floor = conditional_path_metric_bounds(
+            lambda item: item.request_estimate.requested_output_tokens,
+            lambda _item: 0,
+            row_floor=lambda item: item.request_estimate.requested_output_tokens,
+        )
+    else:
+        unknown_count = any(item.logical_calls_upper_bound is None for item in active_exposures)
+        exposure_logical_upper = sum(
+            int(item.logical_calls_upper_bound or 0)
+            for item in active_exposures
+            if item.logical_calls_upper_bound is not None
+        )
+        logical_upper = None if unknown_count else known_logical + exposure_logical_upper
+        conditional_exposure_upper = sum(
+            int(item.logical_calls_upper_bound or 0)
+            for item in bounded_exposures
+            if item.conditional_on
+        )
+        conditional_calls_upper = (
+            None
+            if any(item.conditional_on for item in unbounded_exposures)
+            else len(conditional_rows) + conditional_exposure_upper
+        )
+        known_conditional_rows = len(conditional_rows)
 
     def retry_slot_upper_bound(
         logical_calls: int | None,
@@ -888,11 +1126,35 @@ def build_full_stage_request_plan_v1(
     configured_retry_slots = [
         item.retry_attempts for item in fresh_rows
     ] + configured_exposure_retry_slots
-    configured_retry_upper = (
-        None
-        if any(item is None for item in configured_retry_slots)
-        else sum(int(item or 0) for item in configured_retry_slots)
-    )
+    if has_conditional_paths:
+        untagged_configured_exposure_slots = [
+            slots
+            for item, slots in zip(active_exposures, configured_exposure_retry_slots)
+            if not item.conditional_path_id
+        ]
+        untagged_configured_retry_slots = [
+            item.retry_attempts for item in untagged_fresh_rows
+        ] + untagged_configured_exposure_slots
+        configured_retry_base = (
+            None
+            if any(item is None for item in untagged_configured_retry_slots)
+            else sum(int(item or 0) for item in untagged_configured_retry_slots)
+        )
+        configured_retry_path_upper, _ = conditional_path_metric_bounds(
+            lambda item: item.retry_attempts,
+            lambda item: item.retry_attempts_per_call_upper_bound,
+        )
+        configured_retry_upper = (
+            None
+            if configured_retry_base is None or configured_retry_path_upper is None
+            else configured_retry_base + configured_retry_path_upper
+        )
+    else:
+        configured_retry_upper = (
+            None
+            if any(item is None for item in configured_retry_slots)
+            else sum(int(item or 0) for item in configured_retry_slots)
+        )
     retry_upper = (
         configured_retry_upper
         if shared_retry_limit is None
@@ -909,6 +1171,14 @@ def build_full_stage_request_plan_v1(
         if any(item.retry_attempts is None for item in required_rows)
         else sum(int(item.retry_attempts or 0) for item in required_rows)
     )
+    if has_conditional_paths:
+        _, required_retry_path_floor = conditional_path_metric_bounds(
+            lambda item: item.required_retry_attempts,
+            lambda _item: 0,
+            row_floor=lambda item: item.required_retry_attempts or 0,
+        )
+        if required_retry_reserve is not None:
+            required_retry_reserve += int(required_retry_path_floor)
 
     def retry_resource_upper_bound(
         row_demands: Sequence[tuple[int | float | None, int | None]],
@@ -952,10 +1222,118 @@ def build_full_stage_request_plan_v1(
                 break
         return total
 
-    physical_lower = len(definite_rows)
+    def retry_resource_upper_bound_with_paths(
+        row_demands: Sequence[tuple[int | float | None, int | None]],
+        exposure_demands: Sequence[tuple[int | float | None, int | None]],
+    ) -> int | float | None:
+        if not has_conditional_paths:
+            return retry_resource_upper_bound(row_demands, exposure_demands)
+
+        untagged_row_demands = [
+            demand
+            for item, demand in zip(fresh_rows, row_demands)
+            if not item.conditional_path_id
+        ]
+        untagged_exposure_demands = [
+            demand
+            for item, demand in zip(active_exposures, exposure_demands)
+            if not item.conditional_path_id
+        ]
+        path_demands: dict[str, dict[str, list[tuple[int | float | None, int | None]]]] = {
+            group_id: {path_id: [] for path_id in paths}
+            for group_id, paths in conditional_path_groups.items()
+        }
+        for item, demand in zip(fresh_rows, row_demands):
+            if item.conditional_path_id:
+                path_demands[item.alternative_group_id][item.conditional_path_id].append(demand)
+        for item, demand in zip(active_exposures, exposure_demands):
+            if item.conditional_path_id:
+                path_demands[item.alternative_group_id][item.conditional_path_id].append(demand)
+
+        if shared_retry_limit is None:
+            untagged_upper = retry_resource_upper_bound(
+                untagged_row_demands,
+                untagged_exposure_demands,
+            )
+            if untagged_upper is None:
+                return None
+            path_upper: int | float = 0
+            for group_id in sorted(path_demands):
+                alternatives: list[int | float | None] = []
+                for path_id in sorted(path_demands[group_id]):
+                    demands = path_demands[group_id][path_id]
+                    if any(count is None for _, count in demands):
+                        alternatives.append(None)
+                        continue
+                    if any(cost is None and int(count or 0) > 0 for cost, count in demands):
+                        alternatives.append(None)
+                        continue
+                    alternatives.append(
+                        sum(
+                            cost * int(count or 0)
+                            for cost, count in demands
+                            if cost is not None
+                        )
+                    )
+                if any(value is None for value in alternatives):
+                    return None
+                path_upper += max(
+                    (value for value in alternatives if value is not None),
+                    default=0,
+                )
+            return untagged_upper + path_upper
+
+        shared_limit = int(shared_retry_limit)
+        if shared_limit == 0:
+            return 0
+        alternative_demands: list[tuple[int | float | None, int | None]] = []
+        for group_id in sorted(path_demands):
+            maximum_eligible = 0
+            maximum_rate: int | float = 0
+            unknown_rate = False
+            for path_id in sorted(path_demands[group_id]):
+                demands = path_demands[group_id][path_id]
+                path_eligible = 0
+                for cost, count in demands:
+                    eligible = shared_limit if count is None else max(0, int(count))
+                    path_eligible += eligible
+                    if eligible > 0:
+                        if cost is None:
+                            unknown_rate = True
+                        else:
+                            maximum_rate = max(maximum_rate, cost)
+                maximum_eligible = max(maximum_eligible, path_eligible)
+            maximum_eligible = min(maximum_eligible, shared_limit)
+            if maximum_eligible > 0:
+                alternative_demands.append(
+                    (None if unknown_rate else maximum_rate, maximum_eligible)
+                )
+        return retry_resource_upper_bound(
+            untagged_row_demands + alternative_demands,
+            untagged_exposure_demands,
+        )
+
+    definite_calls_by_role: dict[tuple[str, str], int] = {}
+    for row in definite_rows:
+        key = (row.stage_name, row.semantic_role)
+        definite_calls_by_role[key] = definite_calls_by_role.get(key, 0) + 1
+    lower_bound_by_role: dict[tuple[str, str], int] = {}
+    for item in active_exposures:
+        if item.logical_calls_known_lower_bound:
+            key = (item.stage_name, item.semantic_role)
+            lower_bound_by_role[key] = max(
+                lower_bound_by_role.get(key, 0),
+                item.logical_calls_known_lower_bound,
+            )
+    additional_known_calls = sum(
+        max(0, lower_bound - definite_calls_by_role.get(key, 0))
+        for key, lower_bound in lower_bound_by_role.items()
+    )
+    logical_known_lower = len(definite_rows) + additional_known_calls + logical_path_floor
+    physical_lower = logical_known_lower
     output_reserved_lower = sum(
         int(item.request_estimate.requested_output_tokens) for item in definite_rows
-    )
+    ) + int(output_path_floor)
     physical_upper = (
         None
         if logical_upper is None or retry_upper is None
@@ -969,18 +1347,41 @@ def build_full_stage_request_plan_v1(
             int(value or 0) for value in exposure_values
         )
 
-    input_once = total_or_unknown(
-        [item.request_estimate.estimated_input_tokens for item in fresh_rows],
-        [
+    def one_attempt_resource_total(
+        row_value: Callable[[ProviderRequestPlanRowV1], int | None],
+        exposure_per_call_value: Callable[[UnplannedProviderExposureV1], int | None],
+    ) -> int | None:
+        resource_rows = untagged_fresh_rows if has_conditional_paths else fresh_rows
+        resource_exposures = (
+            untagged_active_exposures if has_conditional_paths else active_exposures
+        )
+        exposure_values = [
             0
             if item.logical_calls_upper_bound == 0
             else None
-            if item.logical_calls_upper_bound is None or item.input_tokens_per_call_upper_bound is None
-            else int(item.logical_calls_upper_bound) * int(item.input_tokens_per_call_upper_bound)
-            for item in active_exposures
-        ],
+            if item.logical_calls_upper_bound is None
+            or exposure_per_call_value(item) is None
+            else int(item.logical_calls_upper_bound)
+            * int(exposure_per_call_value(item) or 0)
+            for item in resource_exposures
+        ]
+        base_total = total_or_unknown(
+            [row_value(item) for item in resource_rows],
+            exposure_values,
+        )
+        if not has_conditional_paths:
+            return base_total
+        path_upper, _ = conditional_path_metric_bounds(
+            row_value,
+            exposure_per_call_value,
+        )
+        return None if base_total is None or path_upper is None else base_total + int(path_upper)
+
+    input_once = one_attempt_resource_total(
+        lambda item: item.request_estimate.estimated_input_tokens,
+        lambda item: item.input_tokens_per_call_upper_bound,
     )
-    input_retry_extra = retry_resource_upper_bound(
+    input_retry_extra = retry_resource_upper_bound_with_paths(
         [
             (item.request_estimate.estimated_input_tokens, retry_slots)
             for item, retry_slots in zip(fresh_rows, row_retry_slots)
@@ -995,18 +1396,11 @@ def build_full_stage_request_plan_v1(
         if input_once is None or input_retry_extra is None
         else input_once + input_retry_extra
     )
-    output_reserved = total_or_unknown(
-        [item.request_estimate.requested_output_tokens for item in fresh_rows],
-        [
-            0
-            if item.logical_calls_upper_bound == 0
-            else None
-            if item.logical_calls_upper_bound is None or item.output_tokens_per_call_upper_bound is None
-            else int(item.logical_calls_upper_bound) * int(item.output_tokens_per_call_upper_bound)
-            for item in active_exposures
-        ],
+    output_reserved = one_attempt_resource_total(
+        lambda item: item.request_estimate.requested_output_tokens,
+        lambda item: item.output_tokens_per_call_upper_bound,
     )
-    output_retry_extra = retry_resource_upper_bound(
+    output_retry_extra = retry_resource_upper_bound_with_paths(
         [
             (item.request_estimate.requested_output_tokens, retry_slots)
             for item, retry_slots in zip(fresh_rows, row_retry_slots)
@@ -1021,20 +1415,11 @@ def build_full_stage_request_plan_v1(
         if output_reserved is None or output_retry_extra is None
         else output_reserved + output_retry_extra
     )
-    reasoning_once = total_or_unknown(
-        [item.request_estimate.reasoning_reserve_tokens for item in fresh_rows],
-        [
-            0
-            if item.logical_calls_upper_bound == 0
-            else None
-            if item.logical_calls_upper_bound is None
-            or item.reasoning_tokens_per_call_upper_bound is None
-            else int(item.logical_calls_upper_bound)
-            * int(item.reasoning_tokens_per_call_upper_bound)
-            for item in active_exposures
-        ],
+    reasoning_once = one_attempt_resource_total(
+        lambda item: item.request_estimate.reasoning_reserve_tokens,
+        lambda item: item.reasoning_tokens_per_call_upper_bound,
     )
-    reasoning_retry_extra = retry_resource_upper_bound(
+    reasoning_retry_extra = retry_resource_upper_bound_with_paths(
         [
             (item.request_estimate.reasoning_reserve_tokens, retry_slots)
             for item, retry_slots in zip(fresh_rows, row_retry_slots)
@@ -1049,20 +1434,11 @@ def build_full_stage_request_plan_v1(
         if reasoning_once is None or reasoning_retry_extra is None
         else reasoning_once + reasoning_retry_extra
     )
-    context_once = total_or_unknown(
-        [item.request_estimate.estimated_total_tokens for item in fresh_rows],
-        [
-            0
-            if item.logical_calls_upper_bound == 0
-            else None
-            if item.logical_calls_upper_bound is None
-            or item.context_tokens_per_call_upper_bound is None
-            else int(item.logical_calls_upper_bound)
-            * int(item.context_tokens_per_call_upper_bound)
-            for item in active_exposures
-        ],
+    context_once = one_attempt_resource_total(
+        lambda item: item.request_estimate.estimated_total_tokens,
+        lambda item: item.context_tokens_per_call_upper_bound,
     )
-    context_retry_extra = retry_resource_upper_bound(
+    context_retry_extra = retry_resource_upper_bound_with_paths(
         [
             (item.request_estimate.estimated_total_tokens, retry_slots)
             for item, retry_slots in zip(fresh_rows, row_retry_slots)
@@ -1082,16 +1458,46 @@ def build_full_stage_request_plan_v1(
         item.wall_seconds_per_call_upper_bound is None
         for item in active_exposures
     )
-    wall_upper = (
-        None
-        if wall_unknown
-        else sum(float(item.wall_seconds_upper_bound or 0.0) for item in fresh_rows)
-        + sum(
-            int(item.logical_calls_upper_bound or 0)
-            * float(item.wall_seconds_per_call_upper_bound or 0.0)
-            for item in active_exposures
+    if not has_conditional_paths:
+        wall_upper = (
+            None
+            if wall_unknown
+            else sum(float(item.wall_seconds_upper_bound or 0.0) for item in fresh_rows)
+            + sum(
+                int(item.logical_calls_upper_bound or 0)
+                * float(item.wall_seconds_per_call_upper_bound or 0.0)
+                for item in active_exposures
+            )
         )
-    )
+    else:
+        untagged_wall_unknown = any(
+            item.wall_seconds_upper_bound is None for item in untagged_fresh_rows
+        ) or any(
+            item.wall_seconds_per_call_upper_bound is None
+            for item in untagged_active_exposures
+        )
+        untagged_wall_base = (
+            None
+            if untagged_wall_unknown
+            else sum(
+                float(item.wall_seconds_upper_bound or 0.0)
+                for item in untagged_fresh_rows
+            )
+            + sum(
+                int(item.logical_calls_upper_bound or 0)
+                * float(item.wall_seconds_per_call_upper_bound or 0.0)
+                for item in untagged_active_exposures
+            )
+        )
+        wall_path_upper, _ = conditional_path_metric_bounds(
+            lambda item: item.wall_seconds_upper_bound,
+            lambda item: item.wall_seconds_per_call_upper_bound,
+        )
+        wall_upper = (
+            None
+            if untagged_wall_base is None or wall_path_upper is None
+            else untagged_wall_base + float(wall_path_upper)
+        )
 
     calls_unbounded = (
         not strict_budget and not aggregate_budget.max_provider_calls_total
@@ -1180,7 +1586,7 @@ def build_full_stage_request_plan_v1(
     )
 
     priced_rows = [item for item in fresh_rows if item.estimated_cost is not None]
-    retry_cost_extra = retry_resource_upper_bound(
+    retry_cost_extra = retry_resource_upper_bound_with_paths(
         [
             (item.estimated_cost, retry_slots)
             for item, retry_slots in zip(fresh_rows, row_retry_slots)
@@ -1192,13 +1598,31 @@ def build_full_stage_request_plan_v1(
         or bool(active_exposures)
         or retry_cost_extra is None
     )
+    cost_path_upper: int | float | None = 0
+    if has_conditional_paths:
+        cost_path_upper, _ = conditional_path_metric_bounds(
+            lambda item: item.estimated_cost,
+            lambda _item: None,
+        )
+        cost_unknown = cost_unknown or cost_path_upper is None
     if cost_unknown:
         total_cost = None
         cost_status = "unknown_no_complete_route_pricing"
     else:
-        total_cost = sum(float(item.estimated_cost or 0.0) for item in priced_rows) + float(
-            retry_cost_extra or 0.0
-        )
+        if has_conditional_paths:
+            untagged_cost = sum(
+                float(item.estimated_cost or 0.0)
+                for item in untagged_fresh_rows
+            )
+            total_cost = (
+                untagged_cost
+                + float(cost_path_upper or 0.0)
+                + float(retry_cost_extra or 0.0)
+            )
+        else:
+            total_cost = sum(float(item.estimated_cost or 0.0) for item in priced_rows) + float(
+                retry_cost_extra or 0.0
+            )
         cost_status = "estimate" if priced_rows else "zero_provider_posts"
 
     output = {
@@ -1223,8 +1647,9 @@ def build_full_stage_request_plan_v1(
         },
         "totals": {
             "logical_calls_known": known_logical,
+            "logical_calls_known_lower_bound": logical_known_lower,
             "logical_calls_unconditional": len(definite_rows),
-            "logical_calls_conditional": len(conditional_rows),
+            "logical_calls_conditional": known_conditional_rows,
             "logical_calls_conditional_upper_bound": conditional_calls_upper,
             "logical_calls_upper_bound": logical_upper,
             "physical_attempts_known_lower_bound": physical_lower,
@@ -1288,6 +1713,18 @@ def build_full_stage_request_plan_v1(
             "unknown_or_conditional_stage_work_is_not_inferred_from_other_stage_counts": True,
         },
     }
+    if has_conditional_paths:
+        output["boundary"].update(
+            {
+                "conditional_paths_are_projection_only": True,
+                "exclusive_alternatives_use_minimum_floors_and_maximum_uppers": True,
+                "independent_alternative_groups_cooccur": True,
+                "shared_retry_cap_remains_global_across_paths": True,
+                "shared_retry_resource_upper_bound_may_be_conservative_across_alternatives": (
+                    shared_retry_limit is not None
+                ),
+            }
+        )
     return output
 
 

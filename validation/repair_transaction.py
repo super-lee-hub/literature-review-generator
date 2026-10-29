@@ -707,6 +707,128 @@ class RepairTransactionService:
             current_artifact_record(self.registry, "validation_run_result"),
         )
 
+    def _paper_authority_inputs(
+        self, validation_record: ArtifactRecord | None,
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, ArtifactRecord], ArtifactRecord | None]:
+        """Read current papers and the exact upstream authority used by Validator."""
+        papers: dict[str, dict[str, Any]] = {}
+        local_records: dict[str, ArtifactRecord] = {}
+        for record in self.registry.list_records():
+            if record.status != "ready" or record.artifact_type not in {"paper_artifact", "stage1_paper_artifact"}:
+                continue
+            ArtifactRegistry._verify_ready_artifact(record)
+            if record.job_id != self.workspace.job_id:
+                raise ValueError("repair local paper artifact belongs to a different job")
+            payload = _load_json(record)
+            identity = payload.get("paper_identity") if isinstance(payload, Mapping) else None
+            key = str(identity.get("canonical_paper_key") or "").strip() if isinstance(identity, Mapping) else ""
+            if key and payload is not None:
+                if key in papers and papers[key] != payload:
+                    raise ValueError(f"repair paper authority is ambiguous: {key}")
+                papers[key], local_records[key] = payload, record
+
+        if validation_record is not None:
+            ArtifactRegistry._verify_ready_artifact(validation_record)
+            if validation_record.job_id != self.workspace.job_id:
+                raise ValueError("repair validation artifact belongs to a different job")
+        validation_payload = _load_json(validation_record) or {}
+        inputs = validation_payload.get("input_artifacts") or {}
+        if not isinstance(inputs, Mapping):
+            raise ValueError("repair validation input artifacts are invalid")
+        binding_id = str(inputs.get("validation_source_binding_id") or "")
+        if not binding_id:
+            return papers, local_records, None
+
+        from runtime.runner import AgentRuntimeRunner
+        from validation.source_binding import (
+            resolve_bound_paper_artifacts,
+            validation_source_binding_semantic_hash,
+        )
+
+        binding_record = self.registry.get(binding_id)
+        if (binding_record is None or binding_record.status != "ready"
+                or binding_record.job_id != self.workspace.job_id
+                or binding_record.artifact_type != "validation_source_binding"
+                or binding_record.artifact_version != "v1"):
+            raise ValueError("repair validation source binding is not a ready current artifact")
+        ArtifactRegistry._verify_ready_artifact(binding_record)
+        binding = _load_json(binding_record)
+        if (binding is None or binding.get("artifact_type") != "validation_source_binding"
+                or binding.get("artifact_version") != "v1"
+                or binding.get("job_id") != self.workspace.job_id):
+            raise ValueError("repair validation source binding identity is invalid")
+        semantic_hash = validation_source_binding_semantic_hash(binding)
+        declared_content = str(inputs.get("validation_source_binding_content_hash") or "")
+        declared_semantic = str(inputs.get("validation_source_binding_semantic_hash") or "")
+        declared_legacy = str(inputs.get("validation_source_binding_hash") or "")
+        if (not (declared_content or declared_semantic or declared_legacy)
+                or (declared_content and declared_content != binding_record.content_hash)
+                or (declared_semantic and declared_semantic != semantic_hash)
+                or (declared_legacy and declared_legacy not in {semantic_hash, binding_record.content_hash})):
+            raise ValueError("repair validation source binding hash differs from current validation")
+        resolver = AgentRuntimeRunner._external_registry_resolver(self.workspace)
+        self.registry.verify_ready_artifact_closure(binding_record, external_registry_resolver=resolver)
+        bound_papers = binding.get("papers")
+        if not isinstance(bound_papers, Mapping):
+            raise ValueError("repair validation source binding papers are invalid")
+        if bound_papers:
+            resolved, problems = resolve_bound_paper_artifacts(
+                binding, external_registry_resolver=resolver, present_paper_keys=bound_papers,
+            )
+            if problems:
+                raise ValueError("repair source authority is invalid: " + ";".join(problems))
+            external = {
+                str(payload.get("paper_identity", {}).get("canonical_paper_key") or ""): payload
+                for payload in resolved
+            }
+            if set(external) != set(bound_papers) or len(resolved) != len(external):
+                raise ValueError("repair source authority did not resolve every bound paper")
+            for key, bound in external.items():
+                local = papers.get(key)
+                if local is not None:
+                    local_inputs = local.get("stage1_inputs")
+                    local_inputs = local_inputs if isinstance(local_inputs, Mapping) else {}
+                    local_binding = local.get("_validation_source_binding")
+                    if (isinstance(local_binding, Mapping) or local_inputs.get("evidence_manifest_path")
+                            or local_inputs.get("evidence_manifest_hash")):
+                        authority = bound["_validation_source_binding"]
+                        local_record = local_records[key]
+                        manifest_record = self.registry.get(authority["evidence_manifest_artifact_id"])
+                        if (
+                            local_record.job_id != authority["source_workspace_job_id"]
+                            or local_record.artifact_id != authority["stage1_paper_artifact_id"]
+                            or local_record.artifact_type != authority["stage1_paper_artifact_type"]
+                            or local_record.artifact_version != authority["stage1_paper_artifact_version"]
+                            or local_record.content_hash != authority["stage1_paper_artifact_hash"]
+                            or Path(local_record.path).resolve() != Path(authority["stage1_paper_artifact_path"]).resolve()
+                            or manifest_record is None
+                            or manifest_record.status != "ready"
+                            or manifest_record.artifact_type != "evidence_manifest"
+                            or manifest_record.artifact_version != "v1"
+                            or manifest_record.job_id != authority["evidence_manifest_job_id"]
+                            or manifest_record.content_hash != authority["evidence_manifest_hash"]
+                            or Path(manifest_record.path).resolve() != Path(authority["evidence_manifest_path"]).resolve()
+                            or local_inputs.get("evidence_manifest_hash") != authority["evidence_manifest_hash"]
+                            or Path(str(local_inputs.get("evidence_manifest_path") or "")).resolve()
+                            != Path(authority["evidence_manifest_path"]).resolve()
+                        ):
+                            raise ValueError(f"repair paper authority is ambiguous: {key}")
+                        ArtifactRegistry._verify_ready_artifact(manifest_record)
+                        if isinstance(local_binding, Mapping) and any(
+                            local_binding.get(field) != authority.get(field)
+                            for field in (
+                                "source_workspace_job_id", "stage1_paper_artifact_id",
+                                "stage1_paper_artifact_hash", "evidence_manifest_job_id",
+                                "evidence_manifest_artifact_id", "evidence_manifest_hash", "evidence",
+                            )
+                        ):
+                            raise ValueError(f"repair paper authority is ambiguous: {key}")
+                        continue
+                    # Summary projections carry no original-text authority.
+                    local_records.pop(key, None)
+                papers[key] = bound
+        return papers, local_records, binding_record
+
     def _dependency_bundle(self, closure: ValidationClosureResult) -> DependencyHashBundle:
         records = [record for record in self.registry.list_records() if record.status == "ready"]
         inputs = closure.input_artifacts
@@ -1295,28 +1417,16 @@ class RepairTransactionService:
                 "mutation_performed": False,
             }
 
-        paper_records = [
-            record
-            for record in self.registry.list_records()
-            if record.status == "ready"
-            and record.artifact_type in {"paper_artifact", "stage1_paper_artifact"}
-        ]
-        paper_payload_by_key: dict[str, dict[str, Any]] = {}
-        paper_record_by_key: dict[str, ArtifactRecord] = {}
-        for record in paper_records:
-            payload = _load_json(record)
-            identity = payload.get("paper_identity") if isinstance(payload, Mapping) else None
-            paper_key = str(
-                identity.get("canonical_paper_key") if isinstance(identity, Mapping) else ""
-            ).strip()
-            if paper_key and payload is not None:
-                paper_payload_by_key[paper_key] = payload
-                paper_record_by_key[paper_key] = record
+        try:
+            paper_payload_by_key, paper_record_by_key, source_binding_record = self._paper_authority_inputs(validation_record)
+        except (OSError, ValueError, TypeError, RuntimeError) as exc:
+            return {"status": "blocked", "plan_id": source_plan_id,
+                    "reason": str(exc), "mutation_performed": False}
         if not set(source_evidence_ids).issubset(paper_payload_by_key):
             return {
                 "status": "blocked",
                 "plan_id": source_plan_id,
-                "reason": "manual proposal source evidence is not a ready current paper artifact",
+                "reason": "manual proposal source evidence has no verified current or bound paper authority",
                 "mutation_performed": False,
             }
 
@@ -1531,6 +1641,16 @@ class RepairTransactionService:
         manual_plan_record = self.registry.get(manual_plan_artifact_id)
         approval: ManualRepairApprovalV1
         if manual_plan_record is not None:
+            try:
+                from runtime.runner import AgentRuntimeRunner
+
+                self.registry.verify_ready_artifact_closure(
+                    manual_plan_record,
+                    external_registry_resolver=AgentRuntimeRunner._external_registry_resolver(self.workspace),
+                )
+            except (OSError, ValueError, TypeError, RuntimeError) as exc:
+                return {"status": "blocked", "plan_id": source_plan_id,
+                        "reason": f"existing manual repair plan is untrusted: {exc}", "mutation_performed": False}
             existing_plan = _load_json(manual_plan_record)
             if not isinstance(existing_plan, Mapping):
                 return {
@@ -1563,6 +1683,16 @@ class RepairTransactionService:
             }
             if (
                 manual_plan_record.status != "ready"
+                or manual_plan_record.job_id != self.workspace.job_id
+                or manual_plan_record.artifact_type != "repair_plan"
+                or manual_plan_record.artifact_version != "v1"
+                or existing_plan.get("plan_id") != manual_plan_id
+                or existing_plan.get("created_from_job_id") != self.workspace.job_id
+                or existing_approval.get("approval_id") != approval_id
+                or existing_approval.get("job_id") != self.workspace.job_id
+                or existing_approval.get("artifact_type") != "manual_repair_approval"
+                or existing_approval.get("artifact_version") != "v1"
+                or existing_approval.get("schema_version") != "manual_repair_approval_v1"
                 or _hash(existing_approval_seed) != _hash(approval_seed)
             ):
                 return {
@@ -2037,6 +2167,8 @@ class RepairTransactionService:
 
         if manual_plan_record is None:
             dependencies = [source_plan_record, draft_record, manifest_record, validation_record]
+            if source_binding_record is not None:
+                dependencies.append(source_binding_record)
             dependencies.extend(
                 paper_record_by_key[key]
                 for key in source_evidence_ids
@@ -2254,14 +2386,12 @@ class RepairTransactionService:
                 "plan_id": plan_id,
                 "mutation_performed": False,
             }
-        paper_artifacts = [
-            payload
-            for record in self.registry.list_records()
-            if record.status == "ready"
-            and record.artifact_type in {"paper_artifact", "stage1_paper_artifact"}
-            for payload in [_load_json(record)]
-            if payload is not None
-        ]
+        try:
+            paper_inputs, _local_papers, source_binding_record = self._paper_authority_inputs(validation_record)
+        except (OSError, ValueError, TypeError, RuntimeError) as exc:
+            return {"status": "blocked", "plan_id": plan_id,
+                    "reason": str(exc), "mutation_performed": False}
+        paper_artifacts = list(paper_inputs.values())
         visual_manifest: dict[str, Any] = {}
         for record in self.registry.list_records():
             if record.status != "ready" or record.artifact_type != "visual_manifest":
@@ -2381,6 +2511,8 @@ class RepairTransactionService:
             for item in (plan_record, draft_record, manifest_record, validation_record)
             if item is not None
         ]
+        if source_binding_record is not None:
+            base_dependencies.append(source_binding_record)
         dependency_payloads = [
             ArtifactDependencyRefV2.from_record(item)
             for item in base_dependencies
@@ -2694,6 +2826,20 @@ class RepairTransactionService:
                 "mutation_performed": False,
             }
 
+        from validation.closure import required_review_comparison_issues
+
+        comparison_issues = required_review_comparison_issues(
+            self.registry, draft_payload, manifest_payload,
+        )
+        if comparison_issues:
+            return {
+                "status": "blocked",
+                "reason": "repair lost required comparison source coverage",
+                "issues": comparison_issues,
+                "transaction_id": transaction_id,
+                "mutation_performed": False,
+            }
+
         draft_record, manifest_record, canonical_validation_record = self._canonical_inputs()
         previous_docx_record = current_artifact_record(self.registry, "review_docx")
         previous_validation_record = canonical_validation_record
@@ -2704,14 +2850,12 @@ class RepairTransactionService:
                 "transaction_id": transaction_id,
                 "mutation_performed": False,
             }
-        paper_artifacts = [
-            payload
-            for record in self.registry.list_records()
-            if record.status == "ready"
-            and record.artifact_type in {"paper_artifact", "stage1_paper_artifact"}
-            for payload in [_load_json(record)]
-            if payload is not None
-        ]
+        try:
+            paper_inputs, _local_papers, _source_binding_record = self._paper_authority_inputs(registered_revalidation)
+        except (OSError, ValueError, TypeError, RuntimeError) as exc:
+            return {"status": "blocked", "transaction_id": transaction_id,
+                    "reason": str(exc), "mutation_performed": False}
+        paper_artifacts = list(paper_inputs.values())
         catalog_payload: dict[str, Any] = {}
         catalog_record = self.registry.get("citation_ref_catalog")
         if catalog_record is not None and catalog_record.status == "ready":

@@ -12,6 +12,9 @@ import json
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, TypedDict
 
+from outline.critique_paper_role_projection import project_critique_paper_roles_v1
+from runtime.provider_runtime import hash_json
+
 CRITIQUE_DISPOSITION_VERSION = "outline_critique_disposition/v1"
 
 _SCOPES = {"global", "candidate", "section", "claim"}
@@ -301,6 +304,7 @@ def derive_critique_disposition(
                 critic_id=critic_id,
                 candidate_ids=candidate_id_set,
                 normalized_hashes=normalized_hashes,
+                candidate_contents=normalized_contents,
                 sections_by_candidate=sections_by_candidate,
                 claims_by_candidate=claims_by_candidate,
                 hash_to_candidate=hash_to_candidate,
@@ -612,6 +616,7 @@ def _parse_candidate_shards(
     critic_id: str,
     candidate_ids: set[str],
     normalized_hashes: Mapping[str, str],
+    candidate_contents: Mapping[str, Any],
     sections_by_candidate: Mapping[str, set[str]],
     claims_by_candidate: Mapping[str, set[str]],
     hash_to_candidate: Mapping[str, str],
@@ -654,6 +659,9 @@ def _parse_candidate_shards(
     failed_candidates: set[str] = set()
     seen_shards: set[tuple[str, str]] = set()
     covered_sections: dict[str, set[str]] = {candidate_id: set() for candidate_id in candidate_ids}
+    whole_sections: dict[str, set[str]] = {candidate_id: set() for candidate_id in candidate_ids}
+    partial_sections: dict[str, set[str]] = {candidate_id: set() for candidate_id in candidate_ids}
+    partial_coverage: dict[tuple[str, str], dict[str, Any]] = {}
     seen_candidates: set[str] = set()
     malformed = False
 
@@ -731,6 +739,7 @@ def _parse_candidate_shards(
             allow_empty=False,
         )
         expected_sections = sections_by_candidate.get(candidate_id, set())
+        coverage_present = "claim_support_coverage" in raw_row
         if (
             not reviewed_valid
             or not expected_sections
@@ -745,22 +754,130 @@ def _parse_candidate_shards(
                 message="candidate shard reviewed_section_ids are missing or outside its candidate",
             )
         else:
-            overlapping_sections = sorted(
-                covered_sections[candidate_id].intersection(reviewed_sections)
-            )
-            if overlapping_sections:
-                malformed = True
-                _append_synthetic_issue(
-                    issues,
-                    seen_issue_ids,
-                    source_critic=critic_id,
-                    locator=f"{locator}:section_overlap",
-                    message=(
-                        "candidate shard results assign sections to more than one shard: "
-                        + ", ".join(overlapping_sections)
-                    ),
-                )
             covered_sections[candidate_id].update(reviewed_sections)
+            if coverage_present:
+                coverage_ok = False
+                coverage_value: dict[str, Any] | None = None
+                section_id = reviewed_sections[0] if len(reviewed_sections) == 1 else ""
+                if len(reviewed_sections) != 1:
+                    malformed = True
+                    _append_synthetic_issue(
+                        issues,
+                        seen_issue_ids,
+                        source_critic=critic_id,
+                        locator=f"{locator}:claim_support_coverage:section_ids",
+                        message="claim/support atom results must review exactly their parent section",
+                    )
+                elif section_id in whole_sections[candidate_id]:
+                    malformed = True
+                    _append_synthetic_issue(
+                        issues,
+                        seen_issue_ids,
+                        source_critic=critic_id,
+                        locator=f"{locator}:claim_support_coverage:mixed",
+                        message="whole-section and claim/support atom results cannot be mixed",
+                    )
+                else:
+                    partial_sections[candidate_id].add(section_id)
+                    source_candidate = candidate_contents.get(candidate_id)
+                    source_section = _candidate_section(source_candidate, section_id)
+                    coverage_value, coverage_error = _validate_claim_support_coverage(
+                        raw_row.get("claim_support_coverage"),
+                        raw_row=raw_row,
+                        candidate_id=candidate_id,
+                        section_id=section_id,
+                        parent_candidate_hash=normalized_hashes.get(candidate_id, ""),
+                        source_section=source_section,
+                    )
+                    if coverage_error:
+                        malformed = True
+                        _append_synthetic_issue(
+                            issues,
+                            seen_issue_ids,
+                            source_critic=critic_id,
+                            locator=f"{locator}:claim_support_coverage",
+                            message=coverage_error,
+                        )
+                    elif coverage_value is not None:
+                        coverage_ok = True
+                        key = (candidate_id, section_id)
+                        state = partial_coverage.get(key)
+                        if state is None:
+                            state = {
+                                "parent_source_section_hash": coverage_value["parent_source_section_hash"],
+                                "parent_section_hash": coverage_value["parent_section_hash"],
+                                "parent_claim_count": coverage_value["parent_claim_count"],
+                                "parent_support_count": coverage_value["parent_support_count"],
+                                "claim_indices": set(),
+                                "support_indices": set(),
+                                "part_indices": set(),
+                            }
+                            partial_coverage[key] = state
+                        elif any(
+                            state[name] != coverage_value[name]
+                            for name in (
+                                "parent_source_section_hash",
+                                "parent_section_hash",
+                                "parent_claim_count",
+                                "parent_support_count",
+                            )
+                        ):
+                            coverage_ok = False
+                            malformed = True
+                            _append_synthetic_issue(
+                                issues,
+                                seen_issue_ids,
+                                source_critic=critic_id,
+                                locator=f"{locator}:claim_support_coverage:parent_collision",
+                                message="claim/support atom results disagree on their parent section binding",
+                            )
+                        claim_indices = set(coverage_value["claim_indices"])
+                        support_indices = set(coverage_value["support_indices"])
+                        if coverage_value["part_index"] in state["part_indices"] or state["claim_indices"].intersection(claim_indices) or state[
+                            "support_indices"
+                        ].intersection(support_indices):
+                            coverage_ok = False
+                            malformed = True
+                            _append_synthetic_issue(
+                                issues,
+                                seen_issue_ids,
+                                source_critic=critic_id,
+                                locator=f"{locator}:claim_support_coverage:overlap",
+                                message="claim/support atom results overlap parent claim or support occurrences",
+                            )
+                        if coverage_ok:
+                            state["claim_indices"].update(claim_indices)
+                            state["support_indices"].update(support_indices)
+                            state["part_indices"].add(coverage_value["part_index"])
+            else:
+                overlapping_sections = sorted(
+                    whole_sections[candidate_id].intersection(reviewed_sections)
+                )
+                mixed_sections = sorted(
+                    partial_sections[candidate_id].intersection(reviewed_sections)
+                )
+                if overlapping_sections:
+                    malformed = True
+                    _append_synthetic_issue(
+                        issues,
+                        seen_issue_ids,
+                        source_critic=critic_id,
+                        locator=f"{locator}:section_overlap",
+                        message=(
+                            "candidate shard results assign sections to more than one shard: "
+                            + ", ".join(overlapping_sections)
+                        ),
+                    )
+                if mixed_sections:
+                    malformed = True
+                    _append_synthetic_issue(
+                        issues,
+                        seen_issue_ids,
+                        source_critic=critic_id,
+                        locator=f"{locator}:claim_support_coverage:mixed",
+                        message="whole-section and claim/support atom results cannot be mixed",
+                    )
+                whole_sections[candidate_id].update(reviewed_sections)
 
         row_parent_hash = raw_row.get("parent_candidate_hash")
         expected_parent_hash = normalized_hashes.get(candidate_id, "")
@@ -905,6 +1022,22 @@ def _parse_candidate_shards(
                 message="candidate shard results do not cover every reviewed section exactly by identity",
             )
 
+    for (candidate_id, section_id), state in sorted(partial_coverage.items()):
+        expected_claims = set(range(state["parent_claim_count"]))
+        expected_supports = set(range(state["parent_support_count"]))
+        if (
+            state["claim_indices"] != expected_claims
+            or state["support_indices"] != expected_supports
+            or state["part_indices"] != set(range(1, len(state["part_indices"]) + 1))
+        ):
+            malformed = True
+            _append_synthetic_issue(
+                issues,
+                seen_issue_ids,
+                source_critic=critic_id,
+                locator=f"candidate_shard_results:claim_support_coverage:{candidate_id}:{section_id}",
+                message="claim/support atom results do not exhaustively cover every parent occurrence",
+            )
     return failed_candidates, malformed, bool(failed_candidates)
 
 
@@ -925,6 +1058,381 @@ def _shard_diagnostics(raw_shards: Any) -> list[str] | None:
         if present:
             diagnostics.extend(values)
     return diagnostics
+
+
+def _candidate_section(candidate_content: Any, section_id: str) -> Mapping[str, Any] | None:
+    if not isinstance(candidate_content, Mapping):
+        return None
+    sections = candidate_content.get("sections")
+    if not isinstance(sections, Sequence) or isinstance(sections, (str, bytes)):
+        return None
+    matches = [
+        section for section in sections
+        if isinstance(section, Mapping) and section.get("section_id") == section_id
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _validate_claim_support_coverage(
+    raw_coverage: Any,
+    *,
+    raw_row: Mapping[str, Any],
+    candidate_id: str,
+    section_id: str,
+    parent_candidate_hash: str,
+    source_section: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any] | None, str]:
+    """Validate a caller-attached certificate for one local claim/support slice."""
+
+    if not isinstance(raw_coverage, Mapping):
+        return None, "claim/support coverage certificate must be an object"
+    if set(raw_coverage) != {
+        "schema_version",
+        "parent_source_section_hash",
+        "atom_coverage_index",
+        "content_hash",
+    }:
+        return None, "claim/support coverage certificate fields do not match v1"
+    if raw_coverage.get("schema_version") != "outline_critique_claim_support_coverage/v1":
+        return None, "claim/support coverage certificate schema version is invalid"
+    if source_section is None:
+        return None, "claim/support coverage parent section is unavailable"
+    try:
+        source_section_hash = hash_json(dict(source_section))
+        wrapper_body = {
+            key: raw_coverage[key]
+            for key in (
+                "schema_version",
+                "parent_source_section_hash",
+                "atom_coverage_index",
+            )
+        }
+        wrapper_hash = hash_json(wrapper_body)
+    except (TypeError, ValueError):
+        return None, "claim/support coverage certificate contains non-JSON values"
+    if raw_coverage.get("parent_source_section_hash") != source_section_hash:
+        return None, "claim/support coverage source parent hash differs from the candidate section"
+    if raw_coverage.get("content_hash") != wrapper_hash:
+        return None, "claim/support coverage certificate content hash is invalid"
+
+    atom = raw_coverage.get("atom_coverage_index")
+    if not isinstance(atom, Mapping):
+        return None, "claim/support atom coverage index must be an object"
+    atom_body = {key: value for key, value in atom.items() if key != "content_hash"}
+    try:
+        atom_hash = hash_json(atom_body)
+    except (TypeError, ValueError):
+        return None, "claim/support atom coverage index contains non-JSON values"
+    if atom.get("content_hash") != atom_hash:
+        return None, "claim/support atom coverage index content hash is invalid"
+    required_atom_fields = {
+        "schema_version",
+        "candidate_id",
+        "section_id",
+        "shard_index",
+        "parent_candidate_hash",
+        "parent_section_hash",
+        "parent_claim_count",
+        "parent_support_count",
+        "parent_paper_key_count",
+        "parent_paper_keys_hash",
+        "parent_relation_ids_hash",
+        "local_to_parent_claim_indices",
+        "local_to_parent_support_indices",
+        "atomic_claim_groups",
+        "comparison_groups",
+        "content_hash",
+    }
+    if set(atom) != required_atom_fields:
+        return None, "claim/support atom coverage index fields do not match v1"
+    if atom.get("schema_version") != "critique-claim-support-atom-coverage/v1":
+        return None, "claim/support atom coverage index schema version is invalid"
+    if atom.get("candidate_id") != candidate_id or atom.get("section_id") != section_id:
+        return None, "claim/support atom coverage candidate or section identity is foreign"
+    if atom.get("parent_candidate_hash") != parent_candidate_hash:
+        return None, "claim/support atom coverage parent candidate hash is foreign"
+    if raw_row.get("parent_candidate_hash") != parent_candidate_hash:
+        return None, "claim/support shard result lacks its exact parent candidate hash"
+    # The packer's index is local to this parent section. The result row uses
+    # the candidate-wide execution index, which can have preceding sections.
+    if type(atom.get("shard_index")) is not int or atom.get("shard_index", 0) < 1:
+        return None, "claim/support atom parent part index is invalid"
+    parent_section_hash = atom.get("parent_section_hash")
+    if not isinstance(parent_section_hash, str) or not _is_sha256(parent_section_hash):
+        return None, "claim/support atom parent section hash is invalid"
+
+    parent_claims, parent_support_claim_indices, parent_papers, parent_relations, projection_error = (
+        _claim_support_parent_projection(candidate_id, section_id, source_section)
+    )
+    if projection_error:
+        return None, projection_error
+    assert parent_claims is not None
+    assert parent_support_claim_indices is not None
+    assert parent_papers is not None
+    assert parent_relations is not None
+    parent_claim_count = len(parent_claims)
+    parent_support_count = len(parent_support_claim_indices)
+    if type(atom.get("parent_claim_count")) is not int or atom.get("parent_claim_count") != parent_claim_count:
+        return None, "claim/support atom parent claim count differs from its source section"
+    if type(atom.get("parent_support_count")) is not int or atom.get("parent_support_count") != parent_support_count:
+        return None, "claim/support atom parent support count differs from its source section"
+    if type(atom.get("parent_paper_key_count")) is not int or atom.get("parent_paper_key_count") != len(parent_papers):
+        return None, "claim/support atom parent paper count differs from its source section"
+    if atom.get("parent_paper_keys_hash") != hash_json(parent_papers):
+        return None, "claim/support atom parent paper hash differs from its source section"
+    if atom.get("parent_relation_ids_hash") != hash_json(parent_relations):
+        return None, "claim/support atom parent relation hash differs from its source section"
+    if not _parent_section_hash_matches(
+        candidate_id,
+        source_section,
+        expected_hash=parent_section_hash,
+        parent_claims=parent_claims,
+        parent_support_claim_indices=parent_support_claim_indices,
+    ):
+        return None, "claim/support atom parent section hash differs from its source closure"
+
+    claim_indices, claims_valid = _coverage_indices(
+        atom.get("local_to_parent_claim_indices"), upper_bound=parent_claim_count
+    )
+    support_indices, supports_valid = _coverage_indices(
+        atom.get("local_to_parent_support_indices"), upper_bound=parent_support_count
+    )
+    if not claims_valid or not claim_indices:
+        return None, "claim/support atom parent claim indices are invalid or empty"
+    if not supports_valid or not support_indices:
+        return None, "claim/support atom parent support indices are invalid or empty"
+    expected_support_indices = {
+        support_index
+        for support_index, support_claim_index in enumerate(parent_support_claim_indices)
+        if support_claim_index in set(claim_indices)
+    }
+    if set(support_indices) != expected_support_indices:
+        return None, "claim/support atom omits or adds support rows for its selected parent claims"
+
+    groups = atom.get("atomic_claim_groups")
+    if not isinstance(groups, Sequence) or isinstance(groups, (str, bytes)) or not groups:
+        return None, "claim/support atom atomic claim groups are invalid"
+    group_claims: set[int] = set()
+    for group in groups:
+        values, valid = _coverage_indices(group, upper_bound=parent_claim_count)
+        if not valid or not values or not set(values).issubset(claim_indices):
+            return None, "claim/support atom group contains an invalid or foreign claim occurrence"
+        if group_claims.intersection(values):
+            return None, "claim/support atom groups repeat a parent claim occurrence"
+        group_claims.update(values)
+    if group_claims != set(claim_indices):
+        return None, "claim/support atom groups do not cover its local claim occurrences"
+
+    raw_comparison_groups = atom.get("comparison_groups")
+    if not isinstance(raw_comparison_groups, Mapping):
+        return None, "claim/support atom comparison groups must be an object"
+    parent_paper_set = set(parent_papers)
+    parent_relation_set = set(parent_relations)
+    for group_id, raw_group in raw_comparison_groups.items():
+        if not isinstance(group_id, str) or not group_id or not isinstance(raw_group, Mapping):
+            return None, "claim/support atom comparison group identity is invalid"
+        if set(raw_group) != {"claim_indices", "required_paper_keys", "relation_ids"}:
+            return None, "claim/support atom comparison group fields do not match v1"
+        comparison_claim_indices, group_indices_valid = _coverage_indices(
+            raw_group.get("claim_indices"), upper_bound=parent_claim_count
+        )
+        required_papers, papers_valid = _string_list(
+            raw_group.get("required_paper_keys"), allow_empty=False
+        )
+        relation_ids, relations_valid = _string_list(
+            raw_group.get("relation_ids"), allow_empty=True
+        )
+        if (
+            not group_indices_valid
+            or not comparison_claim_indices
+            or not set(comparison_claim_indices).issubset(claim_indices)
+            or not papers_valid
+            or not set(required_papers).issubset(parent_paper_set)
+            or not relations_valid
+            or not set(relation_ids).issubset(parent_relation_set)
+        ):
+            return None, "claim/support atom comparison group exceeds its parent claim or context"
+
+    return {
+        "parent_source_section_hash": source_section_hash,
+        "parent_section_hash": parent_section_hash,
+        "parent_claim_count": parent_claim_count,
+        "parent_support_count": parent_support_count,
+        "claim_indices": claim_indices,
+        "support_indices": support_indices,
+        "part_index": atom["shard_index"],
+    }, ""
+
+
+def _claim_support_parent_projection(
+    candidate_id: str,
+    section_id: str,
+    source_section: Mapping[str, Any],
+) -> tuple[list[str] | None, list[int] | None, list[str] | None, list[str] | None, str]:
+    raw_claims = source_section.get("claims")
+    if (
+        not isinstance(raw_claims, Sequence)
+        or isinstance(raw_claims, (str, bytes))
+        or not raw_claims
+        or any(not isinstance(claim, str) or not claim.strip() for claim in raw_claims)
+    ):
+        return None, None, None, None, "claim/support parent claims must be a nonempty exact-text array"
+    claims: list[str] = list(raw_claims)
+    raw_supports = source_section.get("claim_support")
+    if not isinstance(raw_supports, Sequence) or isinstance(raw_supports, (str, bytes)) or not raw_supports:
+        return None, None, None, None, "claim/support parent section lacks its complete support rows"
+    raw_papers = source_section.get("paper_keys")
+    raw_relations = source_section.get("relation_ids") or ()
+    if (
+        not isinstance(raw_papers, Sequence)
+        or isinstance(raw_papers, (str, bytes))
+        or any(not isinstance(item, str) or not item.strip() for item in raw_papers)
+        or len(raw_papers) != len(set(raw_papers))
+    ):
+        return None, None, None, None, "claim/support parent paper keys are invalid"
+    if (
+        not isinstance(raw_relations, Sequence)
+        or isinstance(raw_relations, (str, bytes))
+        or any(not isinstance(item, str) or not item.strip() for item in raw_relations)
+        or len(raw_relations) != len(set(raw_relations))
+    ):
+        return None, None, None, None, "claim/support parent relation IDs are invalid"
+    papers: list[str] = list(raw_papers)
+    relations: list[str] = list(raw_relations)
+    paper_set = set(papers)
+    relation_set = set(relations)
+
+    support_claim_indices: list[int] = []
+    support_slots: set[str] = set()
+    for support in raw_supports:
+        if not isinstance(support, Mapping):
+            return None, None, None, None, "claim/support parent support row is invalid"
+        support_section_id = support.get("section_id")
+        support_candidate_id = support.get("candidate_id")
+        if support_section_id is not None and support_section_id != section_id:
+            return None, None, None, None, "claim/support parent support row has a foreign section"
+        if support_candidate_id is not None and support_candidate_id != candidate_id:
+            return None, None, None, None, "claim/support parent support row has a foreign candidate"
+        claim_index_present = "claim_index" in support
+        raw_claim_index = support.get("claim_index")
+        raw_claim = support.get("claim")
+        if claim_index_present:
+            if type(raw_claim_index) is not int or not 0 <= raw_claim_index < len(claims):
+                return None, None, None, None, "claim/support parent support row has an invalid claim occurrence index"
+            claim_index = raw_claim_index
+            if raw_claim is not None and raw_claim != claims[claim_index]:
+                return None, None, None, None, "claim/support parent support text differs from its claim occurrence"
+        elif isinstance(raw_claim, str):
+            matches = [index for index, claim in enumerate(claims) if claim == raw_claim]
+            if len(matches) != 1:
+                return None, None, None, None, "claim/support parent support text has no unique claim occurrence index"
+            claim_index = matches[0]
+        else:
+            return None, None, None, None, "claim/support parent support row needs claim text or an occurrence index"
+        paper_key = support.get("paper_key")
+        if not isinstance(paper_key, str) or paper_key not in paper_set:
+            return None, None, None, None, "claim/support parent support paper is outside its section"
+        support_relations = support.get("relation_ids") or ()
+        if (
+            not isinstance(support_relations, Sequence)
+            or isinstance(support_relations, (str, bytes))
+            or any(not isinstance(item, str) or not item for item in support_relations)
+            or not set(support_relations).issubset(relation_set)
+        ):
+            return None, None, None, None, "claim/support parent support relation is outside its section"
+        slot_id = support.get("claim_slot_id")
+        if not isinstance(slot_id, str) or not slot_id or slot_id in support_slots:
+            return None, None, None, None, "claim/support parent support slot is missing or duplicated"
+        support_slots.add(slot_id)
+        support_claim_indices.append(claim_index)
+    if any(not any(index == claim_index for index in support_claim_indices) for claim_index in range(len(claims))):
+        return None, None, None, None, "claim/support parent claims must all have complete support rows"
+
+    return claims, support_claim_indices, papers, relations, ""
+
+
+def _parent_section_hash_matches(
+    candidate_id: str,
+    source_section: Mapping[str, Any],
+    *,
+    expected_hash: str,
+    parent_claims: Sequence[str],
+    parent_support_claim_indices: Sequence[int],
+) -> bool:
+    """Rebuild the packer's parent projection so its hash binds exact source rows."""
+
+    section_id = source_section.get("section_id")
+    if not isinstance(section_id, str) or not section_id:
+        return False
+    raw_supports = source_section.get("claim_support")
+    if not isinstance(raw_supports, Sequence) or isinstance(raw_supports, (str, bytes)):
+        return False
+    roles = source_section.get("paper_roles")
+    candidate_parent = {
+        "section_id": section_id,
+        "title": str(source_section.get("title") or ""),
+        "goal": str(source_section.get("goal") or ""),
+        "paper_keys": [str(item) for item in source_section.get("paper_keys") or () if str(item)],
+        "paper_roles": dict(roles) if isinstance(roles, Mapping) else {},
+        "relation_ids": [str(item) for item in source_section.get("relation_ids") or () if str(item)],
+        "claims": list(parent_claims),
+        "claim_count": len(parent_claims),
+    }
+    try:
+        candidate_parent = project_critique_paper_roles_v1(candidate_id, candidate_parent)
+        evidence_source = project_critique_paper_roles_v1(candidate_id, source_section)
+        compact_supports = [
+            {
+                **{key: value for key, value in support.items() if key != "claim"},
+                "claim_index": parent_support_claim_indices[index],
+            }
+            for index, support in enumerate(raw_supports)
+            if isinstance(support, Mapping)
+        ]
+        if len(compact_supports) != len(raw_supports):
+            return False
+        evidence_parent = {
+            **{
+                key: value for key, value in evidence_source.items()
+                if key not in {"claims", "claim_support"}
+            },
+            "candidate_id": candidate_id,
+            "claim_array_ref": {
+                "candidate_id": candidate_id,
+                "section_id": section_id,
+                "field": "candidate_contents.sections.claims",
+            },
+            "claim_support": compact_supports,
+        }
+        candidate_roles = dict(candidate_parent.get("paper_roles") or {})
+        candidate_role_ref = candidate_parent.get("paper_role_claim_array_ref")
+        evidence_parent["paper_roles"] = candidate_roles
+        if candidate_role_ref is not None:
+            evidence_parent["paper_role_claim_array_ref"] = dict(candidate_role_ref)
+        elif "paper_role_claim_array_ref" in evidence_parent:
+            evidence_parent.pop("paper_role_claim_array_ref")
+        return hash_json({
+            "candidate_section": candidate_parent,
+            "section_evidence": evidence_parent,
+        }) == expected_hash
+    except (TypeError, ValueError):
+        return False
+
+
+def _coverage_indices(value: Any, *, upper_bound: int) -> tuple[list[int], bool]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return [], False
+    values = list(value)
+    if any(type(index) is not int or not 0 <= index < upper_bound for index in values):
+        return [index for index in values if type(index) is int], False
+    valid = len(values) == len(set(values)) and values == sorted(values)
+    return values, valid
+
+
+def _is_sha256(value: Any) -> bool:
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    return all(character in "0123456789abcdef" for character in value)
 
 
 def _string_list(value: Any, *, allow_empty: bool) -> tuple[list[str], bool]:

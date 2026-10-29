@@ -260,19 +260,22 @@ def _executor(
     technical_shard_target_tokens: int = 0,
     max_source_prompt_tokens: int | None = None,
     enabled_semantic_roles: tuple[str, ...] | None = None,
+    review_intent: Mapping[str, Any] | None = None,
+    summaries: list[dict[str, Any]] | None = None,
 ) -> OutlineV3Executor:
     workspace = JobWorkspace.create(str(tmp_path), "outline", job_id="outline-job")
     registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
     return OutlineV3Executor(
         job_id=workspace.job_id,
-        summaries=[
+        summaries=(summaries if summaries is not None else [
             _summary("paper-a", "Study A", "The treatment improved the outcome."),
             _summary("paper-b", "Study B", "The treatment improved the outcome under a different context."),
-        ],
+        ]),
         workspace=workspace,
         artifact_registry=registry,
         provider=provider or _configured_test_provider,
         enabled_semantic_roles=enabled_semantic_roles,
+        review_intent=review_intent,
         candidate_count=candidate_count,
         stability_mode=stability_mode,
         max_provider_calls=max_provider_calls,
@@ -369,6 +372,66 @@ def _materialized_claims(unit: Mapping[str, Any]) -> list[Mapping[str, Any]]:
         if isinstance(claim, Mapping)
     )
     return claims
+
+
+def _required_source_comparison(
+    paper_pairs: list[tuple[str, str]] | None = None,
+) -> dict[str, Any]:
+    pairs = paper_pairs or [("paper-a", "paper-b")]
+    return {
+        "review_question": "Compare treatment effects across source-backed study contexts.",
+        "required_comparisons": [{
+            "paper_keys": [left, right],
+            "question": f"Compare the treatment effect across {left} and {right}.",
+        } for left, right in pairs],
+    }
+
+
+def _purposeful_relation_summaries() -> list[dict[str, Any]]:
+    """Six source-bound fixture records supporting three planned two-paper tasks."""
+    rows = [
+        _summary("paper-a", "Study A", "The treatment improved the outcome in a short follow-up."),
+        _summary("paper-b", "Study B", "The treatment had no effect in a longer follow-up."),
+        _summary("paper-c", "Study C", "The intervention reduced symptoms in rural clinics."),
+        _summary("paper-d", "Study D", "The intervention did not change symptoms in urban clinics."),
+        _summary("paper-e", "Study E", "The treatment increased adherence among novice users."),
+        _summary("paper-f", "Study F", "The treatment did not increase adherence among experienced users."),
+    ]
+    for row in rows:
+        paper_key = str(row["paper_info"]["canonical_paper_key"])
+        row["paper_metadata"]["doi"] = f"10.1000/{paper_key}"
+    return rows
+
+
+def _selected_required_relation_ids(executor: OutlineV3Executor) -> set[str]:
+    """Assert the test reaches a complete, source-backed required relation."""
+    evidence = build_outline_evidence_views(executor.summaries, executor.job_id)
+    ledger = build_global_corpus_ledger(evidence)
+    matrix = build_multi_view_matrix(evidence)
+    required = executor.review_intent_input.get("required_comparisons") or []
+    relation_map = build_global_relation_map(
+        evidence, matrix, ledger, required_comparisons=required,
+    )
+    layers = build_paper_content_layers(
+        executor.summaries, evidence, job_id=executor.job_id,
+    )
+    semantic_plan = build_semantic_chunk_plan(
+        layers, relation_map, candidate_count=executor.candidate_count,
+        physical_call_limit=24,
+    )
+    required_rows = relation_map.comparison_coverage.get("required_comparisons") or []
+    required_ids = {
+        str(row.get("relation_id") or "") for row in required_rows
+        if isinstance(row, Mapping) and str(row.get("relation_id") or "")
+    }
+    selected_ids = {
+        str(value) for value in semantic_plan.coverage.get("selected_relation_ids") or () if str(value)
+    }
+    bundles = {item.relation_id: item for item in semantic_plan.relation_bundles}
+    assert required_ids
+    assert required_ids.issubset(selected_ids)
+    assert all(relation_id in bundles and bundles[relation_id].is_complete for relation_id in required_ids)
+    return required_ids
 
 
 def test_outline_v3_fixture_executes_evidence_bound_adoption(tmp_path: Path) -> None:
@@ -616,7 +679,7 @@ def test_relation_shard_plan_is_lossless_and_estimate_is_bounded(tmp_path: Path)
 
 
 def test_shard_target_changes_real_relation_subrequest_membership(tmp_path: Path) -> None:
-    def run_with_target(target_tokens: int) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    def run_with_target(target_tokens: int) -> tuple[dict[str, Any], list[dict[str, Any]], set[str]]:
         calls: list[dict[str, Any]] = []
 
         def provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -640,17 +703,29 @@ def test_shard_target_changes_real_relation_subrequest_membership(tmp_path: Path
                 },
             }
 
+        paper_pairs = [("paper-a", "paper-b"), ("paper-c", "paper-d"), ("paper-e", "paper-f")]
+        review_intent = _required_source_comparison(paper_pairs)
         executor = _executor(
             tmp_path / str(target_tokens),
             provider=provider,
             stability_mode="off",
             technical_shard_target_tokens=target_tokens,
+            review_intent=review_intent,
+            summaries=_purposeful_relation_summaries(),
         )
+        required_relation_ids = _selected_required_relation_ids(executor)
         evidence = build_outline_evidence_views(executor.summaries, executor.job_id)
         ledger = build_global_corpus_ledger(evidence)
         matrix = build_multi_view_matrix(evidence)
-        relation_map = build_global_relation_map(evidence, matrix, ledger)
-        relations = [item.to_dict() for item in relation_map.relations]
+        relation_map = build_global_relation_map(
+            evidence, matrix, ledger,
+            required_comparisons=review_intent["required_comparisons"],
+        )
+        relations = [
+            item.to_dict() for item in relation_map.relations
+            if item.relation_id in required_relation_ids
+        ]
+        assert len(relations) == len(paper_pairs)
         plan = executor._build_relation_shard_plan(evidence.views, relations)
         executor._run_hierarchical_relation_adjudication(
             evidence_views=evidence.views,
@@ -663,10 +738,11 @@ def test_shard_target_changes_real_relation_subrequest_membership(tmp_path: Path
             },
             relation_dependencies={"evidence": hash_json(evidence.to_dict())},
         )
-        return plan, calls
+        return plan, calls, required_relation_ids
 
-    small_plan, small_calls = run_with_target(500)
-    large_plan, large_calls = run_with_target(5_000)
+    small_plan, small_calls, small_required_ids = run_with_target(500)
+    large_plan, large_calls, large_required_ids = run_with_target(5_000)
+    assert small_required_ids == large_required_ids
 
     assert small_plan["shard_count"] > large_plan["shard_count"]
     assert len(small_calls) > len(large_calls)
@@ -684,6 +760,13 @@ def test_shard_target_changes_real_relation_subrequest_membership(tmp_path: Path
         for item in [*small_calls, *large_calls]
         for request in [item["request"]]
     )
+    called_relation_ids = {
+        str(candidate.get("relation_id") or "")
+        for item in [*small_calls, *large_calls]
+        for candidate in item["request"].get("relation_candidates") or ()
+        if isinstance(candidate, Mapping)
+    }
+    assert small_required_ids.issubset(called_relation_ids)
 
 
 def test_oversized_cross_relation_blocks_before_any_local_provider_call(tmp_path: Path) -> None:
@@ -2373,7 +2456,11 @@ def test_semantic_preflight_accounts_for_input_output_and_retry_reserves(
     )
     assert executor.stability_preflight["estimated_output_tokens"] >= 2 * semantic_output
     assert executor.stability_preflight["estimated_input_tokens"] >= 2 * semantic_input
-    assert executor.stability_preflight["estimated_cost"] == pytest.approx(expected_cost)
+    preflight = executor.stability_preflight
+    assert preflight["estimated_cost_projected_before_materialization"] == pytest.approx(expected_cost)
+    assert preflight["estimated_cost_projected_before_materialization_status"] == "partial_future_request_projection"
+    assert preflight["estimated_cost"] is None
+    assert preflight["cost_status"] == "unknown"
 
 
 def test_semantic_validator_enforces_paper_study_evidence_ownership_and_namespace(
@@ -2738,14 +2825,21 @@ def test_topic_conclusions_require_bound_support_and_rejections_are_not_persiste
 
 
 def test_outline_preflight_counts_hierarchical_relation_calls(tmp_path: Path) -> None:
+    paper_pairs = [("paper-a", "paper-b"), ("paper-c", "paper-d"), ("paper-e", "paper-f")]
+    review_intent = _required_source_comparison(paper_pairs)
     executor = _executor(
         tmp_path,
         stability_mode="off",
         technical_shard_target_tokens=1,
+        review_intent=review_intent,
+        summaries=_purposeful_relation_summaries(),
     )
+    required_relation_ids = _selected_required_relation_ids(executor)
     executor._preflight_stability_budget()
 
+    assert required_relation_ids
     assert executor.stability_preflight["hierarchical_relation_shard_calls"] > 0
+    assert any(item.node_id == "relation_adjudication" for item in executor.provider_call_plans)
     assert executor.stability_preflight["estimated_provider_calls"] > len(
         executor._provider_node_ids()
     )
@@ -2841,11 +2935,14 @@ def test_outline_v3_call_plan_has_exact_transport_count(
     stability_mode: str,
     expected_transport_calls: int,
 ) -> None:
+    review_intent = _required_source_comparison()
     executor = _executor(
         tmp_path,
         candidate_count=candidate_count,
         stability_mode=stability_mode,
+        review_intent=review_intent,
     )
+    required_relation_ids = _selected_required_relation_ids(executor)
 
     executor._preflight_stability_budget()
 
@@ -2853,6 +2950,8 @@ def test_outline_v3_call_plan_has_exact_transport_count(
     replay_plans = [item for item in executor.provider_call_plans if not item.transport_expected]
     assert len(transport_plans) == expected_transport_calls
     assert len(replay_plans) == (0 if stability_mode == "off" else candidate_count + 5)
+    assert required_relation_ids
+    assert any(item.node_id == "relation_adjudication" for item in transport_plans)
     assert executor.stability_preflight["estimated_provider_calls"] == expected_transport_calls
     assert all(item.cost_status == "estimate" for item in transport_plans)
 
@@ -2864,11 +2963,18 @@ def test_twelve_candidate_graph_keeps_all_nodes_when_request_capacity_blocks(tmp
         calls.append(node_id)
         return _configured_test_provider(node_id, request)
 
-    executor = _executor(tmp_path, provider=provider, candidate_count=12, stability_mode="off")
+    review_intent = _required_source_comparison()
+    executor = _executor(
+        tmp_path, provider=provider, candidate_count=12, stability_mode="off",
+        review_intent=review_intent,
+    )
+    required_relation_ids = _selected_required_relation_ids(executor)
     with pytest.raises(OutlineV3ExecutionError, match="source_prompt_exceeds_effective_input_cap"):
         executor._preflight_stability_budget()
     plans = [item for item in executor.provider_call_plans if item.transport_expected]
     assert len(plans) == 17
+    assert required_relation_ids
+    assert any(item.node_id == "relation_adjudication" for item in plans)
     assert {item.node_id for item in plans if item.node_id.endswith("_provider_generation")} == {
         f"candidate_{index}_provider_generation" for index in range(1, 13)
     }
@@ -2890,13 +2996,18 @@ def test_outline_v3_transport_trace_matches_call_plan(
         transport_calls.append(node_id)
         return _configured_test_provider(node_id, request)
 
-    result = _executor(
+    review_intent = _required_source_comparison()
+    executor = _executor(
         tmp_path,
         provider=provider,
         stability_mode=stability_mode,
         candidate_count=2,
-    ).run()
+        review_intent=review_intent,
+    )
+    required_relation_ids = _selected_required_relation_ids(executor)
+    result = executor.run()
 
+    assert required_relation_ids
     assert result.ok is True
     assert len(transport_calls) == expected_transport_calls
     stability = json.loads(
@@ -3028,8 +3139,14 @@ def test_outline_v3_actual_usage_and_cost_are_reported_without_billing_claim(tmp
         )
         return response
 
-    result = _executor(tmp_path, provider=provider, stability_mode="smoke").run()
+    review_intent = _required_source_comparison()
+    executor = _executor(
+        tmp_path, provider=provider, stability_mode="smoke", review_intent=review_intent,
+    )
+    required_relation_ids = _selected_required_relation_ids(executor)
+    result = executor.run()
 
+    assert required_relation_ids
     assert result.ok is True
     stability = json.loads(
         Path(result.artifacts["stability_audit"]).read_text(encoding="utf-8")
@@ -3048,8 +3165,15 @@ def test_outline_v3_actual_usage_and_cost_are_reported_without_billing_claim(tmp
 
 
 def test_outline_v3_relation_adjudication_unknown_id_is_fail_closed(tmp_path: Path) -> None:
+    relation_calls: list[list[str]] = []
+
     def provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
         if node_id == "relation_adjudication":
+            relation_calls.append([
+                str(item.get("relation_id") or "")
+                for item in request.get("relation_candidates") or ()
+                if isinstance(item, Mapping)
+            ])
             return {
                 "status": "success",
                 "content": {
@@ -3060,16 +3184,28 @@ def test_outline_v3_relation_adjudication_unknown_id_is_fail_closed(tmp_path: Pa
             }
         return {"status": "success", "content": {"node_id": node_id, "accepted": True}}
 
-    result = _executor(tmp_path, provider=provider).run()
+    review_intent = _required_source_comparison()
+    executor = _executor(tmp_path, provider=provider, review_intent=review_intent)
+    required_relation_ids = _selected_required_relation_ids(executor)
+    result = executor.run()
 
+    assert relation_calls
+    assert required_relation_ids.issubset(set(relation_calls[0]))
     assert result.ok is False
     assert result.status == "blocked"
     assert any("unknown relation" in item for item in result.diagnostics)
 
 
 def test_outline_v3_relation_adjudication_rejected_unknown_id_is_fail_closed(tmp_path: Path) -> None:
+    relation_calls: list[list[str]] = []
+
     def provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
         if node_id == "relation_adjudication":
+            relation_calls.append([
+                str(item.get("relation_id") or "")
+                for item in request.get("relation_candidates") or ()
+                if isinstance(item, Mapping)
+            ])
             return {
                 "status": "success",
                 "content": {
@@ -3080,8 +3216,13 @@ def test_outline_v3_relation_adjudication_rejected_unknown_id_is_fail_closed(tmp
             }
         return {"status": "success", "content": {"node_id": node_id, "accepted": True}}
 
-    result = _executor(tmp_path, provider=provider).run()
+    review_intent = _required_source_comparison()
+    executor = _executor(tmp_path, provider=provider, review_intent=review_intent)
+    required_relation_ids = _selected_required_relation_ids(executor)
+    result = executor.run()
 
+    assert relation_calls
+    assert required_relation_ids.issubset(set(relation_calls[0]))
     assert result.ok is False
     assert result.status == "blocked"
     assert any("rejected an unknown relation" in item for item in result.diagnostics)

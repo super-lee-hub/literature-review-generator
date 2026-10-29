@@ -198,6 +198,8 @@ def semantic_role(node_id: str) -> str:
         "topic_synthesis_provider:",
         "cross_group_comparison_provider:",
         "global_synthesis_provider:",
+        "candidate_organization_provider:",
+        "candidate_comparison_fragments_provider:",
     )) or node in {
         "topic_synthesis_provider",
         "cross_group_comparison_provider",

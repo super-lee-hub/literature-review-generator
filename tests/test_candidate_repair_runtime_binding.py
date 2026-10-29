@@ -4,6 +4,7 @@ import configparser
 import json
 import logging
 import threading
+from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping
@@ -26,7 +27,14 @@ from runtime.orchestrator import (
     InternalStageExecutorRegistry,
     _OutlineProviderTransportAdapter,
 )
-from runtime.provider_runtime import hash_json
+from runtime.provider_runtime import (
+    ProviderAggregateBudgetV2,
+    ProviderBudgetController,
+    RuntimeControlIdentityV1,
+    bind_provider_run_budget,
+    bind_runtime_control_context,
+    hash_json,
+)
 from runtime.runtime_spec_binding import (
     RuntimeSpecBindingError,
     read_runtime_spec_binding_v1,
@@ -43,8 +51,20 @@ from tests.test_outline_v3_semantic_execution import _summary
 from tests.writer_source_fixture import bind_production_writer_sources
 
 
+_REPAIR_LOOPBACK_BUDGET = ProviderAggregateBudgetV2(
+    max_provider_calls_total=32,
+    max_output_tokens_total=512_000,
+    max_retry_attempts_total=0,
+    max_wall_seconds=120,
+)
+_REPAIR_BUDGET_PATH = Path(
+    "output/candidate-repair-binding__candidate-repair-binding-job/logs/acceptance_budget_state_v1.json"
+)
+
+
 class _LocalRepairProvider:
     def __init__(self) -> None:
+        self.budget_context = ExitStack()
         self.calls: list[dict[str, Any]] = []
         self.errors: list[str] = []
 
@@ -140,6 +160,7 @@ def local_repair_provider() -> Any:
     try:
         yield provider
     finally:
+        provider.budget_context.close()
         provider.close()
 
 
@@ -173,7 +194,7 @@ def _repair_input(paper_key: str) -> tuple[dict[str, Any], dict[str, Any]]:
 def _prepare_runtime_executor(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    api_base: str,
+    provider: _LocalRepairProvider,
 ) -> tuple[OutlineV3Executor, Any, Any, Path, Any]:
     config_path = _test_config(tmp_path)
     parser = configparser.ConfigParser()
@@ -181,7 +202,7 @@ def _prepare_runtime_executor(
     parser["Outline_API"].update({
         "api_key": "loopback-repair-fixture-key",
         "model": "gpt-4.1-mini",
-        "api_base": api_base,
+        "api_base": provider.api_base,
         "provider_family": "generic",
         "endpoint_type": "chat_completions",
         "proxy_mode": "direct",
@@ -207,12 +228,22 @@ def _prepare_runtime_executor(
         config=str(config_path),
         action="run_all",
         queue_file=str(tmp_path / "queue.json"),
+        metadata={"provider_budget": _REPAIR_LOOPBACK_BUDGET.to_dict()},
     )
     observed: dict[str, Any] = {}
     original_bootstrap = AgentRuntimeBridge.bootstrap
 
     def capture_bootstrap(self: Any, *args: Any, **kwargs: Any) -> Any:
         session = original_bootstrap(self, *args, **kwargs)
+        # Bootstrap owns creation of the fresh workspace. The direct substage
+        # continues after Runner stops, so retain its finite binding until teardown.
+        controller = ProviderBudgetController(_REPAIR_LOOPBACK_BUDGET)
+        controller.bind_state_path(
+            Path(session.context.workspace.root_dir) / "logs" / "acceptance_budget_state_v1.json",
+            acceptance_run_id=f"run:{session.context.workspace.job_id}",
+            state_started=False,
+        )
+        provider.budget_context.enter_context(bind_provider_run_budget(controller))
         observed["bridge"] = self
         observed["session"] = session
         return session
@@ -229,6 +260,18 @@ def _prepare_runtime_executor(
     route_factory = InternalStageExecutorRegistry(observed["bridge"])
     workspace = session.context.workspace
     registry = session.context.registry
+    # Runner clears its control context on return; bind the direct repair's
+    # identity only after that cleanup has completed.
+    provider.budget_context.enter_context(bind_runtime_control_context(
+        RuntimeControlIdentityV1(
+            job_id=workspace.job_id,
+            workspace_path=str(Path(workspace.root_dir).resolve()),
+            acceptance_run_id=f"run:{workspace.job_id}",
+            provider_budget_started=True,
+        ),
+        workspace=workspace,
+        registry=registry,
+    ))
     spec_record = registry.get("runtime_job_spec")
     assert spec_record is not None and spec_record.status == "ready"
     registry.verify_ready_artifact_closure(spec_record)
@@ -363,7 +406,7 @@ def test_runtime_bound_primary_repair_materializes_exact_wire_row_and_replays(
     executor, _routes, runtime_binding, _config_path, layers_record = _prepare_runtime_executor(
         tmp_path,
         monkeypatch,
-        local_repair_provider.api_base,
+        local_repair_provider,
     )
     node_id, original, repaired = _repair_call(executor)
 
@@ -419,6 +462,10 @@ def test_runtime_bound_primary_repair_materializes_exact_wire_row_and_replays(
     assert len(local_repair_provider.calls) == 1
     assert executor._replay_evidence[-1]["provider_invoked"] is False
     assert executor._replay_evidence[-1]["lookup_status"] == "hit"
+    state = json.loads((tmp_path / _REPAIR_BUDGET_PATH).read_text(encoding="utf-8"))
+    assert state["calls_used"] == 1
+    assert state["retry_attempts_used"] == 0
+    assert state["reservations"] == []
 
 
 @pytest.mark.parametrize(
@@ -443,7 +490,7 @@ def test_primary_repair_runtime_drift_rejects_before_http_transport(
     executor, routes, _runtime_binding, config_path, layers_record = _prepare_runtime_executor(
         tmp_path,
         monkeypatch,
-        local_repair_provider.api_base,
+        local_repair_provider,
     )
     node_id = "candidate_1_semantic_repair"
     original, request_payload = _repair_input("repair-paper")
@@ -519,7 +566,7 @@ def test_opaque_transport_cannot_create_a_finite_primary_repair_plan(
     executor, routes, _runtime_binding, _config_path, _layers_record = _prepare_runtime_executor(
         tmp_path,
         monkeypatch,
-        local_repair_provider.api_base,
+        local_repair_provider,
     )
     current_route = routes["candidate_provider_generation"]
     calls: list[str] = []
@@ -567,7 +614,7 @@ def test_explicit_offline_testdeps_keep_opaque_repair_in_component_lane(
     executor, routes, runtime_binding, _config_path, _layers_record = _prepare_runtime_executor(
         tmp_path,
         monkeypatch,
-        local_repair_provider.api_base,
+        local_repair_provider,
     )
     assert executor.runtime_spec_binding == runtime_binding
     assert executor._primary_candidate_repair_plan is None

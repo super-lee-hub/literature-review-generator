@@ -9,11 +9,15 @@ checkpoints.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from contextlib import AbstractContextManager, nullcontext
+import hashlib
 import json
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping, cast
+import uuid
 
 from services.artifact_registry import ArtifactRecord, ArtifactRegistry, file_sha256
+from services.durable_io import interprocess_file_lock
 from services.job_workspace import JobWorkspace, atomic_write_json, utc_now_iso
 
 
@@ -34,6 +38,7 @@ class CancellationRequestV1:
     requested_by: str
     reason: str
     checkpoint: str = "cooperative"
+    request_token: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -48,6 +53,7 @@ class CancellationRequestV1:
             requested_by=str(payload.get("requested_by") or ""),
             reason=str(payload.get("reason") or ""),
             checkpoint=str(payload.get("checkpoint") or "cooperative"),
+            request_token=str(payload.get("request_token") or ""),
         )
 
 
@@ -59,8 +65,17 @@ class CancellationRequestStore:
         self.artifact_id = f"cancel_request:{workspace.job_id}"
 
     def read(self) -> CancellationRequestV1 | None:
+        # A read-only probe must not reserve a not-yet-created workspace.
+        # New writers create this lock before mutating a marker; legacy reads
+        # remain byte-verified without creating a new lock file.
+        lock_path = self.path.with_name(self.path.name + ".lock")
+        with interprocess_file_lock(self.path) if lock_path.is_file() else nullcontext():
+            return self._read_unlocked()
+
+    def _read_unlocked(self) -> CancellationRequestV1 | None:
         try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            raw = self.path.read_bytes()
+            payload = json.loads(raw.decode("utf-8"))
         except FileNotFoundError:
             if self.registry is not None:
                 self.registry.reload()
@@ -77,6 +92,8 @@ class CancellationRequestStore:
             raise CancellationRequestError("CONTROL_STATE_INVALID: cancellation marker must be an object")
         if type(payload.get("active")) is not bool:
             raise CancellationRequestError("CONTROL_STATE_INVALID: cancellation active flag must be boolean")
+        if "request_token" in payload and not isinstance(payload["request_token"], str):
+            raise CancellationRequestError("CONTROL_STATE_INVALID: cancellation token must be a string")
         request = CancellationRequestV1.from_dict(payload)
         if (
             request.job_id != self.workspace.job_id
@@ -91,6 +108,7 @@ class CancellationRequestStore:
                 record is None
                 or record.status != "ready"
                 or str(record.path) != str(self.path)
+                or str(record.content_hash or "") != hashlib.sha256(raw).hexdigest()
                 or str(record.content_hash or "") != file_sha256(self.path)
             ):
                 raise CancellationRequestError(
@@ -98,11 +116,22 @@ class CancellationRequestStore:
                 )
         return request
 
-    def _persist(self, request: CancellationRequestV1, *, producer: str) -> ArtifactRecord | None:
+    def read_snapshot(self) -> tuple[CancellationRequestV1 | None, str]:
+        """Capture verified marker bytes for an explicit retry transition."""
+        lock_path = self.path.with_name(self.path.name + ".lock")
+        if not self.path.exists() and not lock_path.exists():
+            if self._read_unlocked() is None:
+                return None, ""
+        with interprocess_file_lock(self.path):
+            request = self._read_unlocked()
+            return request, file_sha256(self.path) if request is not None else ""
+
+    def _persist(self, request: CancellationRequestV1, *, producer: str, register_file=None) -> ArtifactRecord | None:
         atomic_write_json(str(self.path), request.to_dict())
         if self.registry is None:
             return None
-        return self.registry.register_file(
+        register = register_file or self.registry.register_file
+        return register(
             artifact_id=self.artifact_id,
             artifact_role="cancel_request",
             artifact_type=CANCEL_REQUEST_ARTIFACT_TYPE,
@@ -110,6 +139,17 @@ class CancellationRequestStore:
             path=self.path,
             producer=producer,
             metadata={"active": request.active, "requested_by": request.requested_by},
+        )
+
+    def _mutation_guard(
+        self, *, clearing: bool = False,
+    ) -> AbstractContextManager[Callable[..., ArtifactRecord] | None]:
+        guard = getattr(self.registry, "control_mutation_guard", None)
+        if not callable(guard):
+            return nullcontext(None)
+        return cast(
+            AbstractContextManager[Callable[..., ArtifactRecord] | None],
+            guard(clearing=clearing),
         )
 
     def request(
@@ -127,11 +167,22 @@ class CancellationRequestStore:
             requested_by=requested_by,
             reason=reason,
             checkpoint=checkpoint,
+            request_token=uuid.uuid4().hex,
         )
-        self._persist(request, producer="runtime.cancellation.request")
+        with interprocess_file_lock(self.path):
+            with self._mutation_guard() as register:
+                self._persist(request, producer="runtime.cancellation.request", register_file=register)
         return request
 
-    def clear(self, *, cleared_by: str = "reviewctl", reason: str = "new_attempt") -> CancellationRequestV1:
+    def clear(
+        self, *, cleared_by: str = "reviewctl", reason: str = "new_attempt",
+        expected_hash: str | None = None,
+    ) -> CancellationRequestV1:
+        if expected_hash is not None and (
+            not isinstance(expected_hash, str)
+            or (expected_hash and (len(expected_hash) != 64 or any(char not in "0123456789abcdef" for char in expected_hash)))
+        ):
+            raise CancellationRequestError("CONTROL_STATE_INVALID: expected cancellation hash is invalid")
         request = CancellationRequestV1(
             request_id=f"cancel:{self.workspace.job_id}",
             job_id=self.workspace.job_id,
@@ -140,8 +191,16 @@ class CancellationRequestStore:
             requested_by=cleared_by,
             reason=reason,
             checkpoint="cooperative",
+            request_token=uuid.uuid4().hex,
         )
-        self._persist(request, producer="runtime.cancellation.clear")
+        with interprocess_file_lock(self.path):
+            with self._mutation_guard(clearing=True) as register:
+                if expected_hash is not None:
+                    current = self._read_unlocked()
+                    current_hash = file_sha256(self.path) if current is not None else ""
+                    if current_hash != expected_hash:
+                        raise CancellationRequestError("cancellation marker changed after retry was requested")
+                self._persist(request, producer="runtime.cancellation.clear", register_file=register)
         return request
 
     def is_requested(self) -> bool:

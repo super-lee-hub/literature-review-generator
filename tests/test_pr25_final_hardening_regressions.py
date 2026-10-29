@@ -664,7 +664,7 @@ def test_source_field_ledger_round_trip_preserves_numeric_zero() -> None:
     assert entry.derived_value == "0"
 
 
-def test_method_theory_pairing_does_not_remove_other_shared_topics() -> None:
+def test_method_theory_topics_and_other_shared_topics_keep_full_membership() -> None:
     paper_ids = {"paper-a", "paper-b", "paper-c"}
     cards = [
         PaperIndexCard(
@@ -681,6 +681,8 @@ def test_method_theory_pairing_does_not_remove_other_shared_topics() -> None:
     groups, _paper_topics = _topic_candidates(PaperContentLayers(index_cards=cards))
 
     for dimension, label in (
+        ("method", "survey"),
+        ("theory", "equity theory"),
         ("construct", "fairness"),
         ("mechanism", "reference-price comparison"),
         ("context", "online retail"),
@@ -692,6 +694,4 @@ def test_method_theory_pairing_does_not_remove_other_shared_topics() -> None:
             for group in groups.values()
         ), f"shared {dimension} task {label!r} disappeared after adding method labels"
 
-    paired_topics = [group for group in groups.values() if group.get("paired_dimensions")]
-    assert len(paired_topics) == len(paper_ids)
-    assert all(topic.get("theory_labels") == ["equity theory"] for topic in paired_topics)
+    assert not any(group.get("paired_dimensions") for group in groups.values())

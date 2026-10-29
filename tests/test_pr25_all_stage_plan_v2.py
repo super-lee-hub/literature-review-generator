@@ -229,7 +229,7 @@ def _family_plan(summaries: list[dict[str, Any]]):
     return evidence, layers, plan
 
 
-def test_method_theory_pairing_shares_per_paper_reads_and_keeps_family_metadata(tmp_path) -> None:
+def test_method_theory_family_routes_keep_exact_membership_and_share_physical_evidence_reads(tmp_path) -> None:
     summaries = [
         _source_summary(
             "paper-a",
@@ -243,21 +243,21 @@ def test_method_theory_pairing_shares_per_paper_reads_and_keeps_family_metadata(
         ),
     ]
     evidence, layers, plan = _family_plan(summaries)
-    paired_topics = [
+    method_topics = [
         item for item in plan.topics
-        if item.topic_id.startswith("topic:method_theory:paper:")
+        if item.dimensions == ["method"]
     ]
-    assert len(paired_topics) == 2
-    assert {item.paper_ids[0] for item in paired_topics} == {"paper-a", "paper-b"}
-    for topic in paired_topics:
-        assert len(topic.paper_ids) == 1
-        assert topic.dimensions == ["method", "theory"]
-        assert len(topic.comparison_questions) == 2
-        assert topic.comparison_questions[0].startswith("METHOD QUESTION")
-        assert topic.comparison_questions[1].startswith("THEORY QUESTION")
-        assert "answer the two dimensions separately" in topic.question
+    theory_topics = [
+        item for item in plan.topics
+        if item.dimensions == ["theory"]
+    ]
+    assert len(method_topics) == len(theory_topics) == 1
+    method_topic, theory_topic = method_topics[0], theory_topics[0]
+    assert method_topic.paper_ids == theory_topic.paper_ids == ["paper-a", "paper-b"]
+    assert "family membership" in method_topic.question
+    assert "equivalence" in theory_topic.question
     family_groups = plan.coverage["topic_family_grouping"]["groups"]
-    assert plan.coverage["topic_family_grouping"]["version"] == "method-theory-paper-pairs-v3"
+    assert plan.coverage["topic_family_grouping"]["version"] == "method-theory-full-membership-v4"
     assert plan.coverage["topic_family_grouping"]["method_family_group_count"] == 1
     assert plan.coverage["topic_family_grouping"]["theory_family_group_count"] == 1
     assert plan.coverage["topic_family_grouping"]["source_label_occurrence_count"] == 4
@@ -268,17 +268,20 @@ def test_method_theory_pairing_shares_per_paper_reads_and_keeps_family_metadata(
     assert "paper-a" in " ".join(plan.cross_group_questions)
     assert "paper-b" in " ".join(plan.cross_group_questions)
 
-    for topic in paired_topics:
-        paper_id = topic.paper_ids[0]
-        expected_evidence = {
-            evidence_id
-            for field_name in (
-                "research_questions", "operationalizations", "findings", "zero_results",
-                "theoretical_derivation", "concept_definitions",
-            )
-            for evidence_id in layers.dossier_by_paper[paper_id].evidence_ids_by_field.get(field_name, [])
-        }
-        assert set(topic.required_evidence_ids) == expected_evidence
+    expected_method_evidence = {
+        evidence_id
+        for paper_id in method_topic.paper_ids
+        for field_name in ("research_questions", "operationalizations", "findings", "zero_results")
+        for evidence_id in layers.dossier_by_paper[paper_id].evidence_ids_by_field.get(field_name, [])
+    }
+    expected_theory_evidence = {
+        evidence_id
+        for paper_id in theory_topic.paper_ids
+        for field_name in ("research_questions", "theoretical_derivation", "concept_definitions")
+        for evidence_id in layers.dossier_by_paper[paper_id].evidence_ids_by_field.get(field_name, [])
+    }
+    assert set(method_topic.required_evidence_ids) == expected_method_evidence
+    assert set(theory_topic.required_evidence_ids) == expected_theory_evidence
 
     for paper_id in ("paper-a", "paper-b"):
         dossier = layers.dossier_by_paper[paper_id]
@@ -328,55 +331,34 @@ def test_method_theory_pairing_shares_per_paper_reads_and_keeps_family_metadata(
         max_provider_calls=24,
         max_source_prompt_tokens=32_000,
     )
-    topic_plan = build_topic_synthesis_plan(plan)
+    topic_plan = [
+        item for item in build_topic_synthesis_plan(plan)
+        if item.topic_id in {method_topic.topic_id, theory_topic.topic_id}
+    ]
     topic_routes = {item.topic_id: item for item in plan.topics}
-    _expanded, batches, _rows = executor._plan_topic_provider_batches(
+    request = executor._build_topic_provider_request(
         topic_plan,
         topic_routes=topic_routes,
         evidence_model=evidence,
         content_layers_model=layers,
-        profile=profile,
+        batch_index=1,
     )
-    for topic in paired_topics:
-        batch_number, batch = next(
-            (index, batch)
-            for index, batch in enumerate(batches, start=1)
-            if topic.topic_id in {item.topic_id for item in batch}
-        )
-        request = executor._build_topic_provider_request(
-            batch,
-            topic_routes=topic_routes,
-            evidence_model=evidence,
-            content_layers_model=layers,
-            batch_index=batch_number,
-        )
-        topic_row = next(
-            item for item in request.get("topics") or ()
-            if isinstance(item, dict) and item.get("topic_id") == topic.topic_id
-        )
-        assert topic_row["dimensions"] == ["method", "theory"]
-        assert topic_row["comparison_questions"][0].startswith("METHOD QUESTION")
-        assert topic_row["comparison_questions"][1].startswith("THEORY QUESTION")
-        paper_id = topic.paper_ids[0]
-        evidence_units = [
-            item for item in request.get("evidence_units") or () if isinstance(item, dict)
-        ]
-        paper_units = [item for item in evidence_units if item.get("paper_key") == paper_id]
-        unit_ids = [str(item.get("evidence_unit_id") or "") for item in paper_units]
-        assert paper_units
-        assert len(unit_ids) == len(set(unit_ids))
-        assert all(unit_ids)
-        serialized = json.dumps(request, ensure_ascii=False)
-        summary = next(
-            item for item in summaries
-            if item["paper_metadata"]["doi"].endswith(paper_id)
-        )
+    topic_rows = [
+        item for item in request.get("topics") or () if isinstance(item, dict)
+    ]
+    assert {item["topic_id"] for item in topic_rows} == {method_topic.topic_id, theory_topic.topic_id}
+    evidence_units = [item for item in request.get("evidence_units") or () if isinstance(item, dict)]
+    unit_ids = [str(item.get("evidence_unit_id") or "") for item in evidence_units]
+    assert len(unit_ids) == len(set(unit_ids))
+    assert {str(item.get("paper_key") or "") for item in evidence_units} == {"paper-a", "paper-b"}
+    serialized = json.dumps(request, ensure_ascii=False)
+    for summary in summaries:
         assert summary["core_analysis"]["methodology"] in serialized
         assert summary["core_analysis"]["theoretical_framework"] in serialized
-        assert "Only under the condition reported for" in serialized
+    assert "Only under the condition reported for" in serialized
 
 
-def test_method_theory_grouping_keeps_all_497_residual_ids_in_outlier_route() -> None:
+def test_shared_method_theory_routes_keep_all_497_unmapped_ids_for_unrouted_paper() -> None:
     cards = [
         PaperIndexCard(paper_id="paper-a", method_category="three scenario experiments", theories=["dual entitlement principle"]),
         PaperIndexCard(paper_id="paper-b", method_category="online randomized experiment", theories=["price fairness and dual entitlement"]),
@@ -408,13 +390,10 @@ def test_method_theory_grouping_keeps_all_497_residual_ids_in_outlier_route() ->
 
     plan = build_semantic_chunk_plan(layers, candidate_count=1, physical_call_limit=24)
 
-    paired = [
-        item for item in plan.topics
-        if item.topic_id.startswith("topic:method_theory:paper:")
-    ]
+    method = next(item for item in plan.topics if item.dimensions == ["method"])
+    theory = next(item for item in plan.topics if item.dimensions == ["theory"])
     outlier = next(item for item in plan.topics if item.topic_id == "topic:outlier_pool")
-    assert {item.paper_ids[0] for item in paired} == {"paper-a", "paper-b"}
-    assert all(item.dimensions == ["method", "theory"] for item in paired)
+    assert method.paper_ids == theory.paper_ids == ["paper-a", "paper-b"]
     assert outlier.paper_ids == ["paper-outlier"]
     assert len(outlier.required_evidence_ids) == 497
     assert set(outlier.required_evidence_ids) == set(residual_ids)

@@ -16,8 +16,6 @@ from services.paper_identity import build_canonical_paper_key
 from services.queue_service import LocalPublicationContext
 from services.summary_correction import (
     CANDIDATE_ARTIFACT_TYPE,
-    PROPOSAL_ARTIFACT_TYPE,
-    SOURCE_SNAPSHOT_ARTIFACT_TYPE,
     SourceSummaryCorrectionError,
     prepare_source_summary_correction_candidate,
     verify_source_summary_correction_candidate,

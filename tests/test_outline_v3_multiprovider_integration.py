@@ -29,10 +29,7 @@ from services.job_workspace import JobWorkspace
 from services.model_capabilities import resolve_model_capability
 from services.model_selection import get_api_config_for_section
 
-from test_outline_v3_semantic_execution import (
-    _configured_test_provider,
-    _summary,
-)
+from test_outline_v3_semantic_execution import _summary
 
 # A configuration shaped like the real thing: three providers, three protocols.
 CONFIG: dict[str, dict[str, str]] = {
@@ -100,7 +97,9 @@ class RecordingTransport:
 
     def __call__(self, node_id: str, request: Mapping[str, Any]) -> Any:
         self.invocations.append(str(node_id))
-        return _configured_test_provider(node_id, request)
+        from tests.test_current_runtime_full_e2e import _outline_provider_response
+
+        return _outline_provider_response(node_id, request)
 
 
 class _Settings:
@@ -295,14 +294,28 @@ def test_receipts_record_three_distinct_provider_identities(tmp_path: Path) -> N
 
     # The receipt must close against the node's real binding, including the
     # gateway host and route-specific config fingerprint, not merely the plan.
+    dag_nodes = executor._dag.node_map()
+    dynamic_nodes_seen: set[str] = set()
     for receipt in receipts:
-        binding = executor._dag.get(receipt.node_id).execution_binding
+        if receipt.node_id in dag_nodes:
+            binding = dag_nodes[receipt.node_id].execution_binding
+        else:
+            # Fragment and organization tasks have their own exact transport
+            # binding; the candidate aggregate in the static DAG is local.
+            assert receipt.node_id.startswith((
+                "candidate_comparison_fragments_provider:",
+                "candidate_organization_provider:",
+            )), receipt.node_id
+            binding = executor._dynamic_provider_bindings[receipt.node_id]
+            dynamic_nodes_seen.add(receipt.node_id)
         assert receipt.provider == binding["provider_family"]
         assert receipt.model == binding["model_name"]
         assert receipt.endpoint_type == binding["endpoint_type"]
         assert receipt.endpoint == binding["api_base_host"]
         assert receipt.config_hash == binding["provider_config_hash"]
         assert binding["route_fingerprint"]
+    assert any(node.startswith("candidate_comparison_fragments_provider:") for node in dynamic_nodes_seen)
+    assert any(node.startswith("candidate_organization_provider:") for node in dynamic_nodes_seen)
 
 
 def test_node_bindings_carry_the_executing_section(tmp_path: Path) -> None:

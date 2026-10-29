@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import hashlib
 import re
 import json
@@ -1827,13 +1827,99 @@ class RuntimeReconciler:
         self._validated_record_keys: set[tuple[str, ...]] = set()
         self.stage_store = StageTerminalStore(workspace, registry)
         self.last_completion_diagnostics: tuple[str, ...] = ()
+        self._completion_snapshots: dict[tuple[str, str], tuple[ArtifactRegistry, int, dict[str, str]]] | None = None
+        self._completion_used_records: dict[tuple[str, str], dict[str, str]] = {}
+        self._completion_files: dict[str, str] = {}
+        self._completion_refreshed: set[tuple[str, str]] | None = None
+
+    @staticmethod
+    def _completion_registry_key(registry: ArtifactRegistry) -> tuple[str, str]:
+        return (os.path.normcase(os.path.abspath(registry.registry_path)), registry.job_id)
+
+    @staticmethod
+    def _completion_record_signature(record: ArtifactRecord) -> str:
+        encoded = json.dumps(asdict(record), sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _refresh_completion_registry(self, registry: ArtifactRegistry) -> ArtifactRegistry:
+        snapshots = self._completion_snapshots
+        if snapshots is None:
+            registry.reload()
+            return registry
+        key = self._completion_registry_key(registry)
+        if key not in snapshots:
+            revision, records = registry.capture_record_snapshot()
+            snapshots[key] = (registry, revision, {
+                record.artifact_id: self._completion_record_signature(record) for record in records
+            })
+        return snapshots[key][0]
+
+    def _remember_completion_record(self, registry: ArtifactRegistry, record: ArtifactRecord) -> None:
+        if self._completion_snapshots is None:
+            return
+        self._refresh_completion_registry(registry)
+        key = self._completion_registry_key(registry)
+        expected = self._completion_snapshots[key][2].get(record.artifact_id)
+        if expected is None or expected != self._completion_record_signature(record):
+            raise ReconcileValidationError(f"participating Registry record changed during completion query: {record.artifact_id}")
+        self._completion_used_records.setdefault(key, {})[record.artifact_id] = expected
+
+    def _remember_completion_file(self, path: Path, content_hash: str) -> None:
+        if self._completion_snapshots is None:
+            return
+        locator = str(path.expanduser().absolute())
+        prior = self._completion_files.get(locator)
+        if prior is not None and prior != content_hash:
+            raise ReconcileValidationError(f"source identity changed during completion query: {locator}")
+        self._completion_files[locator] = content_hash
+
+    def _finish_completion_query(self) -> None:
+        for path, expected_hash in self._completion_files.items():
+            if file_sha256(path) != expected_hash:
+                raise ReconcileValidationError(f"source bytes changed during completion query: {path}")
+        for key, (registry, revision, _records) in (self._completion_snapshots or {}).items():
+            final_revision, records = registry.capture_record_snapshot()
+            current = {record.artifact_id: record for record in records}
+            if final_revision < revision:
+                raise ReconcileValidationError("Registry revision regressed during completion query")
+            # A diagnostic append may advance the revision without changing
+            # any authority used by this operation. Compare complete used
+            # records, including metadata and typed dependency edges.
+            for artifact_id, expected in self._completion_used_records.get(key, {}).items():
+                record = current.get(artifact_id)
+                if record is None or self._completion_record_signature(record) != expected:
+                    raise ReconcileValidationError(f"participating Registry record changed during completion query: {artifact_id}")
+
+    def _run_completion_query(self, stage_name: str, operation: Callable[[], Any]) -> Any:
+        if self._completion_snapshots is not None:
+            raise ReconcileValidationError("completion query is already active")
+        self._completion_snapshots = {}
+        self._completion_refreshed = set()
+        try:
+            if not self._begin_completion_query():
+                return None
+            result = operation()
+            self._finish_completion_query()
+            return result
+        except (OSError, UnicodeError, ValueError, RegistryError) as exc:
+            code = self._completion_failure_code(stage_name, exc)
+            self.last_completion_diagnostics = (f"{code}:{exc}",)
+            return None
+        finally:
+            self._completion_snapshots = None
+            self._completion_refreshed = None
+            self._completion_used_records.clear()
+            self._completion_files.clear()
+            self._validated_record_keys.clear()
 
     def _begin_completion_query(self) -> bool:
         """Refresh durable authority before answering a completion query."""
 
         self.last_completion_diagnostics = ()
         try:
-            self.registry.reload()
+            self._refresh_completion_registry(self.registry)
+            if self._completion_refreshed is not None:
+                self._completion_refreshed.add(self._completion_registry_key(self.registry))
         except (OSError, UnicodeError, ValueError, RegistryError) as exc:
             self.last_completion_diagnostics = (f"registry_reload_failed:{exc}",)
             return False
@@ -1920,12 +2006,17 @@ class RuntimeReconciler:
                 refreshed_registries=refreshed_registries,
             )
         target_registry = self._registry_for_ref(ref, local_registry=registry)
-        active_refreshed = refreshed_registries if refreshed_registries is not None else set()
+        active_refreshed = refreshed_registries if refreshed_registries is not None else (
+            self._completion_refreshed if self._completion_refreshed is not None else set()
+        )
         registry_key = (
             os.path.normcase(os.path.abspath(target_registry.registry_path)),
             target_registry.job_id,
         )
-        if registry_key not in active_refreshed:
+        if self._completion_snapshots is not None:
+            target_registry = self._refresh_completion_registry(target_registry)
+            active_refreshed.add(registry_key)
+        elif registry_key not in active_refreshed:
             target_registry.reload()
             active_refreshed.add(registry_key)
         record = target_registry.get(ref.artifact_id)
@@ -1978,8 +2069,13 @@ class RuntimeReconciler:
             os.path.normcase(os.path.abspath(registry.registry_path)),
             registry.job_id,
         )
-        active_refreshed = refreshed_registries if refreshed_registries is not None else set()
-        if registry_key not in active_refreshed:
+        active_refreshed = refreshed_registries if refreshed_registries is not None else (
+            self._completion_refreshed if self._completion_refreshed is not None else set()
+        )
+        if self._completion_snapshots is not None:
+            registry = self._refresh_completion_registry(registry)
+            active_refreshed.add(registry_key)
+        elif registry_key not in active_refreshed:
             registry.reload()
             active_refreshed.add(registry_key)
         registered = registry.get(ref.artifact_id)
@@ -2041,6 +2137,7 @@ class RuntimeReconciler:
             raise ReconcileValidationError(
                 f"lease publication target hash mismatch: {owner_record.artifact_id}"
             )
+        self._remember_completion_file(target, declared_hash)
         self.validate_record(
             registered,
             registry=registry,
@@ -2058,10 +2155,13 @@ class RuntimeReconciler:
         refreshed_registries: set[tuple[str, str]] | None = None,
     ) -> None:
         active_registry = registry or self.registry
+        self._remember_completion_record(active_registry, record)
         validation_cache_key = self._validation_cache_key(active_registry, record)
         if validation_cache_key in self._validated_record_keys:
             return
-        active_refreshed = refreshed_registries if refreshed_registries is not None else set()
+        active_refreshed = refreshed_registries if refreshed_registries is not None else (
+            self._completion_refreshed if self._completion_refreshed is not None else set()
+        )
         key = (record.job_id, record.artifact_id)
         active_visited = visited if visited is not None else set()
         if key in active_visited:
@@ -2084,6 +2184,7 @@ class RuntimeReconciler:
             actual_hash = file_sha256(path)
             if actual_hash != record.content_hash:
                 raise ReconcileValidationError(f"artifact content hash mismatch: {record.artifact_id}")
+            self._remember_completion_file(path, record.content_hash)
             if record.artifact_type == "review_batch_manifest":
                 validate_review_batch_manifest_location(record, path, active_registry)
             validator = self.schema_validators.get(record.artifact_type)
@@ -2128,8 +2229,6 @@ class RuntimeReconciler:
             )
 
     def _completed_stage_record(self, stage_name: str) -> TerminalStageRecordV1 | None:
-        if not self._begin_completion_query():
-            return None
         candidates = [
             (record, path)
             for record, path in self.stage_store.load_records()
@@ -2170,9 +2269,12 @@ class RuntimeReconciler:
         return None
 
     def stage_is_complete(self, stage_name: str) -> bool:
-        return self._completed_stage_record(stage_name) is not None
+        return self._run_completion_query(stage_name, lambda: self._completed_stage_record(stage_name)) is not None
 
     def load_completed_stage_result(self, stage_name: str) -> StageResult | None:
+        return self._run_completion_query(stage_name, lambda: self._load_completed_stage_result(stage_name))
+
+    def _load_completed_stage_result(self, stage_name: str) -> StageResult | None:
         """Rehydrate a completed stage from its durable terminal outputs."""
 
         terminal = self._completed_stage_record(stage_name)

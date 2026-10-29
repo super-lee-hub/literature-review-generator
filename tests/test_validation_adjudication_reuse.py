@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import asdict, replace
 import json
 from pathlib import Path
 import types
@@ -15,13 +15,13 @@ from services.job_workspace import JobWorkspace
 from services.settings import ApplicationSettings
 from validation.adjudication_checkpoint import AdjudicationCheckpointStore
 from validation.adjudication_reuse import (
-    ADJUDICATION_REUSE_ARTIFACT_TYPE,
     adjudication_call_id,
     build_reuse_key,
     durable_reuse_authority_issues,
     reuse_record_artifact_id,
     verify_reuse_record,
 )
+from validation.closure import _adjudication_reuse_call_issues
 from validation.execution_service import ValidationExecutionService
 from validation.llm_adjudicator import AdjudicationPacket
 import validation.current_validation as current_validation
@@ -623,3 +623,81 @@ def test_adjudication_reuse_before_publication_makes_fresh_call(
             )
         )
     ) is not None
+
+
+def test_durable_reuse_closure_matches_expected_provider_config_hash(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    first_service = _service(tmp_path)
+    calls: list[int] = []
+    _patch_ai_call(monkeypatch, calls)
+    current_validation._adjudicate(first_service, [_result()])
+    first_finalization = first_service.finalize_provider_receipts()
+    assert first_finalization["closure"].complete is True
+    assert len(calls) == 1
+
+    second_service = _service(tmp_path)
+    current_validation._adjudicate(second_service, [_result()])
+    finalization = second_service.finalize_provider_receipts()
+    assert finalization["closure"].complete is True
+
+    call_id = adjudication_call_id(_packet())
+    closure_record = finalization["closure_record"]
+    assert closure_record is not None and closure_record.status == "ready"
+    closure_document = json.loads(Path(closure_record.path).read_text(encoding="utf-8"))
+    closure_payload = closure_document["payload"]
+    serialized_expected = next(
+        item for item in closure_payload["expected_calls"] if item["call_id"] == call_id
+    )
+    expected = ExpectedProviderCall.from_mapping(serialized_expected)
+    expected_call = asdict(expected)
+    assert expected_call["verified_reuse"] is True
+
+    reuse_record = second_service.artifact_registry.get(
+        expected_call["reuse_evidence_artifact_id"]
+    )
+    assert reuse_record is not None and reuse_record.status == "ready"
+    reuse_payload = json.loads(Path(reuse_record.path).read_text(encoding="utf-8"))
+    durable_config_hash = str(reuse_payload["redacted_provider_config_hash"])
+    assert expected_call["config_hash"] == durable_config_hash
+    assert "config_hash" not in reuse_payload
+
+    dependency_records = []
+    for dependency in closure_record.depends_on:
+        record = second_service.artifact_registry.get(dependency.artifact_id)
+        assert record is not None
+        dependency_records.append(record)
+
+    def closure_issues(expected_row: Mapping[str, Any]) -> list[str]:
+        return _adjudication_reuse_call_issues(
+            stage=str(expected_row["stage_name"]),
+            expected_call=expected_row,
+            registry=second_service.artifact_registry,
+            dependency_records=dependency_records,
+            closure_epoch_id=str(closure_payload["closure_epoch_id"]),
+        )
+
+    assert closure_issues(expected_call) == []
+
+    mismatch_issue = (
+        "provider_closure_adjudication_reuse_redacted_provider_config_hash_mismatch:"
+        f"{expected_call['stage_name']}:{call_id}"
+    )
+    malformed_expected_calls: list[tuple[str, dict[str, Any]]] = []
+    wrong_hash = dict(expected_call)
+    wrong_hash["config_hash"] = "0" * 64
+    wrong_hash["redacted_provider_config_hash"] = durable_config_hash
+    malformed_expected_calls.append(("wrong", wrong_hash))
+    missing_hash = dict(expected_call)
+    missing_hash.pop("config_hash")
+    missing_hash["redacted_provider_config_hash"] = durable_config_hash
+    malformed_expected_calls.append(("missing", missing_hash))
+    empty_hash = dict(expected_call)
+    empty_hash["config_hash"] = ""
+    empty_hash["redacted_provider_config_hash"] = durable_config_hash
+    malformed_expected_calls.append(("empty", empty_hash))
+
+    for label, malformed in malformed_expected_calls:
+        issues = closure_issues(malformed)
+        assert mismatch_issue in issues, (label, issues)

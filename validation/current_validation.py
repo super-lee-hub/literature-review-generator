@@ -460,6 +460,7 @@ def _load_inputs(
                     str(binding.get("source_workspace_job_id") or ""),
                     str(binding.get("stage1_paper_artifact_id") or ""),
                     str(binding.get("stage1_paper_artifact_hash") or ""),
+                    str(binding.get("evidence_manifest_job_id") or ""),
                     str(binding.get("evidence_manifest_artifact_id") or ""),
                     str(binding.get("evidence_manifest_hash") or ""),
                 )
@@ -549,15 +550,32 @@ def _load_inputs(
                 bound_by_key.setdefault(key, []).append(bound)
 
         for key, bound_candidates in bound_by_key.items():
-            authorities = [*local_by_key.get(key, []), *bound_candidates]
+            # A current summary projection without a source manifest cannot
+            # compete with the fully verified upstream authority. A local
+            # artifact declaring either manifest field still participates in
+            # the existing conflict checks, including incomplete declarations.
+            local_authorities = []
+            for candidate in local_by_key.get(key, []):
+                inputs = candidate.get("stage1_inputs")
+                inputs = inputs if isinstance(inputs, Mapping) else {}
+                if (
+                    isinstance(candidate.get("_validation_source_binding"), Mapping)
+                    or inputs.get("evidence_manifest_path")
+                    or inputs.get("evidence_manifest_hash")
+                ):
+                    local_authorities.append(candidate)
+            authorities = [*local_authorities, *bound_candidates]
             identities = {authority_identity(candidate) for candidate in authorities}
             if len(identities) > 1:
                 source_authority_diagnostics.append(
                     f"validation_source_authority_ambiguous:{key}"
                 )
                 continue
-            if not local_by_key.get(key):
+            if not local_authorities:
                 chosen = bound_candidates[0]
+                paper_artifacts = [
+                    artifact for artifact in paper_artifacts if paper_key(artifact) != key
+                ]
                 paper_artifacts.append(chosen)
                 local_by_key[key] = [chosen]
 
@@ -1328,20 +1346,37 @@ def _preflight_validator_aggregate_scope(
         stage_inventories=(stage_inventory,),
         aggregate_budget=remaining_budget,
     )
-    budget_status = projection["budget_status"]
+    budget_status = dict(projection["budget_status"])
+    # The configured timeout sum is a worst-case diagnostic. Actual active
+    # transports share the durable run deadline, so fast requests can finish
+    # within a smaller remaining wall allowance. Verified local reuse needs
+    # no provider wall allowance.
+    configured_timeout_sum_status = budget_status["wall_time"]
+    budget_status["wall_time"] = (
+        "exceeded" if any(not row.verified_reuse for row in rows)
+        and remaining_budget.max_wall_seconds <= 0 else "within_limit"
+    )
+    resource_keys = (
+        "provider_calls", "requested_output_tokens", "provider_retries",
+        "per_request_context", "wall_time",
+    )
     preflight_status = (
         "blocked_budget"
-        if any(value == "exceeded" for value in budget_status.values())
+        if any(budget_status.get(key) == "exceeded" for key in resource_keys)
         else "within_budget"
-        if projection["ready_for_transport"]
+        if projection["envelope_complete"] and projection["exact_requests_materialized"]
+        and all(budget_status.get(key) == "within_limit" for key in resource_keys)
         else "incomplete_envelope"
     )
+    budget_status["admission"] = preflight_status
     inventory["aggregate_preflight"] = {
         "schema_version": "validator-aggregate-preflight/v1",
         "status": preflight_status,
         "provider_posts_emitted": 0,
         "remaining_budget": remaining_budget.to_dict(),
         "budget_status": budget_status,
+        "configured_timeout_sum_status": configured_timeout_sum_status,
+        "wall_deadline_policy": "shared_durable_run_deadline",
         "totals": projection["totals"],
         "projection_identity_hash": projection["projection_identity_hash"],
     }
@@ -1489,6 +1524,7 @@ def _adjudicate(
     dependencies.extend(getattr(service, "visual_artifact_records", ()) or ())
     dependencies.append(getattr(service, "validation_source_binding_record", None))
     unique_dependencies = {record.artifact_id: record for record in dependencies if record is not None}
+    external_registry_resolver = getattr(service, "validation_external_registry_resolver", None)
     provisional = False
     for record in unique_dependencies.values():
         if (scope == "repair_revalidation" and record.status == "quarantined"
@@ -1513,7 +1549,9 @@ def _adjudicate(
                 raise RuntimeError("provisional repair input binding changed before Validator inventory")
             provisional = True
         else:
-            service.artifact_registry.verify_ready_artifact_closure(record)
+            service.artifact_registry.verify_ready_artifact_closure(
+                record, external_registry_resolver=external_registry_resolver,
+            )
     if provisional:
         if repair_transaction_record is None:
             raise RuntimeError("provisional Validator inventory has no repair transaction")
@@ -1534,6 +1572,7 @@ def _adjudicate(
         artifact_version="v1", producer="validation.current_validation",
         status="quarantined" if provisional else "ready",
         depends_on=[ArtifactDependencyRefV2.from_record(record) for record in unique_dependencies.values()],
+        external_registry_resolver=external_registry_resolver,
     )
     service._validator_stage_pretransport_inventory_record = inventory_record
     output: list[CitationValidationResult] = []
@@ -1598,13 +1637,14 @@ def _adjudicate(
                 if isinstance(report, Mapping):
                     expected = getattr(service, "_expected_provider_calls", {}).get(call_id)
                     if expected is not None and expected.artifact_path:
+                        expected_resolved = Path(expected.artifact_path).resolve()
                         output_record = next(
                             (
                                 record
                                 for record in service.artifact_registry.list_records()
                                 if record.status == "ready"
                                 and Path(record.path).resolve()
-                                == Path(expected.artifact_path).resolve()
+                                == expected_resolved
                             ),
                             None,
                         )

@@ -20,7 +20,9 @@ from outline.v3_executor import OutlineV3ExecutionError
 from runtime.provider_context import ProviderContextProfile
 from runtime.outline_v3_dag import OutlineNodeRecord
 from runtime.provider_runtime import ProviderRuntimeLedger, hash_json, hash_text
-from test_outline_v3_semantic_execution import _configured_test_provider, _executor
+from test_outline_v3_semantic_execution import (
+    _configured_test_provider, _executor, _purposeful_relation_summaries,
+)
 
 
 @pytest.mark.parametrize("target_tokens", [0, 50_000])
@@ -50,7 +52,7 @@ def test_v3_01_preflight_uses_effective_cap_when_choosing_hierarchical_relation_
     monkeypatch.setattr(
         executor_module,
         "build_global_relation_map",
-        lambda *_: SimpleNamespace(relations=[relation]),
+        lambda *_args, **_kwargs: SimpleNamespace(relations=[relation]),
     )
     monkeypatch.setattr(executor_module, "build_paper_content_layers", lambda *_args, **_kwargs: content_layers)
     monkeypatch.setattr(executor_module, "build_semantic_chunk_plan", lambda *_args, **_kwargs: semantic_plan)
@@ -447,7 +449,7 @@ def test_v3_01_candidate_preflight_reserves_all_shards_under_effective_cap(
     monkeypatch.setattr(executor_module, "build_outline_evidence_views", lambda *_: evidence)
     monkeypatch.setattr(executor_module, "build_global_corpus_ledger", lambda *_: object())
     monkeypatch.setattr(executor_module, "build_multi_view_matrix", lambda *_: object())
-    monkeypatch.setattr(executor_module, "build_global_relation_map", lambda *_: candidates)
+    monkeypatch.setattr(executor_module, "build_global_relation_map", lambda *_args, **_kwargs: candidates)
     monkeypatch.setattr(executor_module, "build_paper_content_layers", lambda *_args, **_kwargs: content_layers)
     monkeypatch.setattr(executor_module, "build_semantic_chunk_plan", lambda *_args, **_kwargs: semantic_plan)
     monkeypatch.setattr(executor, "_compact_candidate_evidence_refs", lambda *_: [])
@@ -1085,6 +1087,18 @@ def test_v3_05_explicit_empty_relation_selection_selects_no_candidates(
     assert excluded == ["R1", "R2"]
 
 
+def _optional_source_contrast_summaries() -> list[dict[str, Any]]:
+    """Source-backed treatment/outcome contrast; no user-required task."""
+    summaries = _purposeful_relation_summaries()[:2]
+    contrast = "The treatment failed to improve the outcome in a longer follow-up."
+    core = summaries[1]["core_analysis"]
+    core["summary"] = contrast
+    core["key_points"] = [contrast]
+    core["findings"] = contrast
+    core["conclusions"] = contrast
+    return summaries
+
+
 def test_v3_05_runtime_empty_selection_defers_candidates_without_relation_post_or_reservation(
     tmp_path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1094,7 +1108,11 @@ def test_v3_05_runtime_empty_selection_defers_candidates_without_relation_post_o
         provider_calls.append(node_id)
         return _configured_test_provider(node_id, request)
 
-    executor = _executor(tmp_path, provider=provider, stability_mode="off")
+    executor = _executor(
+        tmp_path, provider=provider, stability_mode="off",
+        summaries=_optional_source_contrast_summaries(),
+    )
+    assert not (executor.review_intent_input.get("required_comparisons") or ())
     original_relation_request = executor._relation_provider_request
     candidate_ids_seen: list[str] = []
 
@@ -1127,6 +1145,7 @@ def test_v3_05_runtime_empty_selection_defers_candidates_without_relation_post_o
         Path(result.artifacts["global_relation_map"]).read_text(encoding="utf-8")
     )["payload"]
     assert relation_map["deferred_relation_ids"] == sorted(set(candidate_ids_seen))
+    assert not (executor.review_intent_input.get("required_comparisons") or ())
     assert relation_map["confirmed_relation_ids"] == []
     assert relation_map["rejected_relation_ids"] == []
 
@@ -1163,7 +1182,9 @@ def test_v3_05_disabled_relation_role_keeps_explicit_empty_selection_local(
             "candidate_provider_generation", "structure_critique",
             "coverage_critique", "evidence_critique", "arbitration",
         ),
+        summaries=_optional_source_contrast_summaries(),
     )
+    assert not (executor.review_intent_input.get("required_comparisons") or ())
     result = executor.run()
 
     assert result.ok is True, result.diagnostics
@@ -1171,6 +1192,7 @@ def test_v3_05_disabled_relation_role_keeps_explicit_empty_selection_local(
         Path(result.artifacts["global_relation_map"]).read_text(encoding="utf-8")
     )["payload"]
     assert relation_map["deferred_relation_ids"]
+    assert not (executor.review_intent_input.get("required_comparisons") or ())
     assert relation_map["confirmed_relation_ids"] == []
     assert relation_map["rejected_relation_ids"] == []
     assert not any("relation_adjudication" in node_id for node_id in provider_calls)
@@ -1203,7 +1225,9 @@ def test_v3_05_disabled_relation_role_blocks_selected_work_before_provider(
             "candidate_provider_generation", "structure_critique",
             "coverage_critique", "evidence_critique", "arbitration",
         ),
+        summaries=_optional_source_contrast_summaries(),
     )
+    assert not (executor.review_intent_input.get("required_comparisons") or ())
     with pytest.raises(OutlineV3ExecutionError, match="selected relations require"):
         executor._preflight_stability_budget()
     assert provider_calls == []
@@ -1431,51 +1455,205 @@ def _run_cross_global_contract_fixture(
 
     def provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
         if node_id.startswith("topic_synthesis_provider"):
-            return _configured_test_provider(node_id, request)
+            from tests.test_current_runtime_full_e2e import _source_bound_topic_response
+
+            return _source_bound_topic_response(node_id, request, None)
         if node_id.startswith("cross_group_comparison_provider"):
             identities = _semantic_identity_sets(request)
             topic_ids = sorted(identities["topic"])
             topic_rows = [
                 item for item in request.get("topic_synthesis") or ()
-                if isinstance(item, Mapping) and str(item.get("topic_id") or "") in topic_ids
+                if isinstance(item, Mapping)
             ]
             bridge_claims: list[dict[str, Any]] = []
-            integrated_topic = ""
-            if not all_topics_unresolved:
-                supported_topic = next(
-                    (
-                        item for item in topic_rows
-                        if item.get("paper_ids") and item.get("supporting_evidence_ids")
-                    ),
-                    None,
+            dispositions: list[dict[str, Any]] = []
+            comparisons: list[dict[str, Any]] = []
+            unresolved_questions: list[Any] = []
+            topic_members_by_id: dict[str, list[str]] = {}
+            fragment_members_by_id: dict[str, list[str]] = {}
+            processed_topic_ids = sorted(identities["topic"])
+            processed_fragment_ids = sorted(identities["fragment"])
+            processed_result_ids = sorted(identities["result"])
+            processed_relation_ids = sorted(identities["relation"])
+            resolved_children: list[Mapping[str, Any]] = []
+
+            # Final-fold input contains Registry-backed result references.
+            # Resolve and carry forward the exact child outputs; do not make
+            # replacement claims from absent inline topic bodies.
+            for item in topic_rows:
+                if isinstance(item.get("semantic_result_ref"), Mapping):
+                    child_result = executor._load_semantic_reducer_result_ref(item)
+                    assert isinstance(child_result, Mapping), (
+                        "final cross fold must resolve its exact Registry result reference"
+                    )
+                    resolved_children.append(child_result)
+            if resolved_children:
+                assert len(resolved_children) == len(topic_rows), (
+                    "a final cross fold cannot mix resolved refs and unbound topic inputs"
                 )
-                if isinstance(supported_topic, Mapping):
-                    integrated_topic = str(supported_topic.get("topic_id") or "")
-                    paper_key = str((supported_topic.get("paper_ids") or [""])[0] or "")
-                    fragment_id = str(supported_topic.get("fragment_id") or "")
-                    evidence_id = str((supported_topic.get("supporting_evidence_ids") or [""])[0] or "")
-                    bridge_claims = [{
-                        "claim_id": f"synthesis:cross_group_comparison:integrated-{hash_text(integrated_topic)[:10]}",
-                        "topic_ids": [integrated_topic],
-                        "fragment_id": fragment_id,
-                        "paper_key": paper_key,
-                        "text": "The supported topic finding holds under the stated condition.",
-                        "evidence_ids": [evidence_id],
-                    }]
-            dispositions = []
-            for topic_id in topic_ids:
-                if topic_id == integrated_topic:
-                    dispositions.append({
-                        "topic_id": topic_id,
-                        "status": "integrated",
-                        "synthesis_claim_ids": [bridge_claims[0]["claim_id"]],
-                    })
+                claims_by_id: dict[str, dict[str, Any]] = {}
+                dispositions_by_topic: dict[str, dict[str, Any]] = {}
+                for child in resolved_children:
+                    for raw_claim in child.get("bridge_claims") or ():
+                        if not isinstance(raw_claim, Mapping):
+                            continue
+                        claim = dict(raw_claim)
+                        claim_id = str(claim.get("claim_id") or "")
+                        assert claim_id, "child bridge claim must retain its canonical identity"
+                        prior = claims_by_id.get(claim_id)
+                        assert prior is None or hash_json(prior) == hash_json(claim), (
+                            "same bridge claim identity cannot carry changed content"
+                        )
+                        claims_by_id[claim_id] = claim
+                    for raw_disposition in child.get("topic_dispositions") or ():
+                        if not isinstance(raw_disposition, Mapping):
+                            continue
+                        disposition = dict(raw_disposition)
+                        topic_id = str(disposition.get("topic_id") or "")
+                        assert topic_id and topic_id not in dispositions_by_topic, (
+                            "child result references must partition topic dispositions exactly"
+                        )
+                        dispositions_by_topic[topic_id] = disposition
+                    comparisons.extend(
+                        dict(item) for item in child.get("comparisons") or ()
+                        if isinstance(item, Mapping)
+                    )
+                    unresolved_questions.extend(child.get("unresolved_questions") or ())
+                    for source_key, target in (
+                        ("topic_members_by_id", topic_members_by_id),
+                        ("fragment_members_by_id", fragment_members_by_id),
+                    ):
+                        child_members = child.get(source_key)
+                        assert isinstance(child_members, Mapping), (
+                            f"child Registry result must retain {source_key}"
+                        )
+                        for identity, members in child_members.items():
+                            key = str(identity)
+                            assert key and key not in target, (
+                                f"child results must partition {source_key} identities"
+                            )
+                            target[key] = [str(value) for value in members or () if str(value)]
+                bridge_claims = [claims_by_id[key] for key in sorted(claims_by_id)]
+                assert set(dispositions_by_topic) == set(topic_ids), (
+                    "resolved child dispositions must exactly cover parent topics"
+                )
+                dispositions = [dispositions_by_topic[key] for key in topic_ids]
+                child_topic_ids = {
+                    str(value) for child in resolved_children
+                    for value in child.get("processed_topic_ids") or () if str(value)
+                }
+                processed_fragment_ids = sorted({
+                    str(value) for child in resolved_children
+                    for value in child.get("processed_fragment_ids") or () if str(value)
+                })
+                processed_result_ids = sorted({
+                    str(value) for child in resolved_children
+                    for value in child.get("processed_result_ids") or () if str(value)
+                })
+                processed_relation_ids = sorted({
+                    str(value) for child in resolved_children
+                    for value in child.get("processed_relation_ids") or () if str(value)
+                })
+                processed_topic_ids = sorted(child_topic_ids)
+                assert child_topic_ids == set(topic_ids)
+                assert set(topic_members_by_id) == child_topic_ids
+                assert set(fragment_members_by_id) == set(processed_fragment_ids)
+                assert set(identities["fragment"]).issubset(set(processed_fragment_ids))
+                assert set(identities["result"]).issubset(set(processed_result_ids))
+                assert set(identities["relation"]).issubset(set(processed_relation_ids))
+                if all_topics_unresolved:
+                    assert not bridge_claims
+                    assert all(row.get("status") == "unresolved" for row in dispositions)
                 else:
-                    dispositions.append({
-                        "topic_id": topic_id,
-                        "status": "unresolved",
-                        "reason": f"The supplied findings do not establish a comparable conclusion for {topic_id}.",
-                    })
+                    assert any(row.get("status") == "integrated" for row in dispositions)
+                    assert bridge_claims
+            else:
+                integrated_topic = ""
+                if not all_topics_unresolved:
+                    supported_topic = next(
+                        (
+                            item for item in topic_rows
+                            if item.get("paper_ids") and item.get("supporting_evidence_ids")
+                        ),
+                        None,
+                    )
+                    if isinstance(supported_topic, Mapping):
+                        integrated_topic = str(supported_topic.get("topic_id") or "")
+                        fragment_id = str(supported_topic.get("fragment_id") or "")
+                        context = supported_topic.get("interpretation_context") or {}
+                        topic_evidence_ids = {
+                            str(value) for value in supported_topic.get("supporting_evidence_ids") or () if str(value)
+                        }
+                        dependencies = [
+                            dependency for dependency in context.get("dependencies") or ()
+                            if isinstance(dependency, Mapping)
+                        ]
+                        for paper_key in sorted({
+                            str(value) for value in supported_topic.get("paper_ids") or () if str(value)
+                        }):
+                            support_dependency = next(
+                                (dependency for dependency in dependencies
+                                 if str(dependency.get("paper_key") or "") == paper_key
+                                 and topic_evidence_ids.intersection({
+                                     *[str(value) for value in dependency.get("primary_evidence_ids") or () if str(value)],
+                                     *[str(value) for value in dependency.get("required_evidence_ids") or () if str(value)],
+                                 })),
+                                None,
+                            )
+                            assert isinstance(support_dependency, Mapping), (
+                                f"integrated bridge requires a source-owned dependency for {paper_key}"
+                            )
+                            source_claim_ids = sorted({
+                                *[str(support_dependency.get("primary_claim_id") or "")],
+                                *[str(value) for value in support_dependency.get("required_source_claim_ids") or () if str(value)],
+                            } - {""})
+                            evidence_ids = sorted({
+                                *[str(value) for value in support_dependency.get("primary_evidence_ids") or () if str(value)],
+                                *[str(value) for value in support_dependency.get("required_evidence_ids") or () if str(value)],
+                            })
+                            source_field_ids = sorted({
+                                str(value) for value in support_dependency.get("required_source_field_ids") or () if str(value)
+                            })
+                            bridge_claims.append({
+                                "claim_id": f"synthesis:cross_group_comparison:integrated-{hash_text(integrated_topic + ':' + paper_key)[:10]}",
+                                "topic_ids": [integrated_topic],
+                                "fragment_id": fragment_id,
+                                "paper_key": paper_key,
+                                "text": "The supported topic finding holds under the stated condition.",
+                                "source_claim_ids": source_claim_ids,
+                                "evidence_ids": evidence_ids,
+                                "source_field_ids": source_field_ids,
+                            })
+                for topic_id in topic_ids:
+                    if topic_id == integrated_topic:
+                        dispositions.append({
+                            "topic_id": topic_id,
+                            "status": "integrated",
+                            "synthesis_claim_ids": [
+                                claim["claim_id"] for claim in bridge_claims
+                                if topic_id in claim.get("topic_ids") or ()
+                            ],
+                        })
+                    else:
+                        dispositions.append({
+                            "topic_id": topic_id,
+                            "status": "unresolved",
+                            "reason": f"The supplied findings do not establish a comparable conclusion for {topic_id}.",
+                        })
+                topic_members_by_id = {
+                    str(item.get("topic_id") or ""): [
+                        str(paper) for paper in item.get("paper_ids") or () if str(paper)
+                    ]
+                    for item in topic_rows
+                    if str(item.get("topic_id") or "")
+                }
+                fragment_members_by_id = {
+                    str(item.get("fragment_id") or ""): [
+                        str(paper) for paper in item.get("paper_ids") or () if str(paper)
+                    ]
+                    for item in topic_rows
+                    if str(item.get("fragment_id") or "")
+                }
             if omit_topic_disposition and dispositions:
                 dispositions.pop(0)
             cross_requests.append(dict(request))
@@ -1484,28 +1662,16 @@ def _run_cross_global_contract_fixture(
             return {
                 "status": "success",
                 "content": {
-                    "comparisons": [],
+                    "comparisons": comparisons,
                     "bridge_claims": bridge_claims,
                     "topic_dispositions": dispositions,
-                    "processed_topic_ids": topic_ids,
-                    "processed_fragment_ids": sorted(identities["fragment"]),
-                    "processed_result_ids": sorted(identities["result"]),
-                    "processed_relation_ids": sorted(identities["relation"]),
-                    "topic_members_by_id": {
-                        str(item.get("topic_id") or ""): [
-                            str(paper) for paper in item.get("paper_ids") or () if str(paper)
-                        ]
-                        for item in topic_rows
-                        if str(item.get("topic_id") or "")
-                    },
-                    "fragment_members_by_id": {
-                        str(item.get("fragment_id") or ""): [
-                            str(paper) for paper in item.get("paper_ids") or () if str(paper)
-                        ]
-                        for item in topic_rows
-                        if str(item.get("fragment_id") or "")
-                    },
-                    "unresolved_questions": [],
+                    "processed_topic_ids": processed_topic_ids,
+                    "processed_fragment_ids": processed_fragment_ids,
+                    "processed_result_ids": processed_result_ids,
+                    "processed_relation_ids": processed_relation_ids,
+                    "topic_members_by_id": topic_members_by_id,
+                    "fragment_members_by_id": fragment_members_by_id,
+                    "unresolved_questions": unresolved_questions,
                 },
             }
         if node_id.startswith("global_synthesis_provider"):
@@ -1518,17 +1684,30 @@ def _run_cross_global_contract_fixture(
                 else []
             )
             synthesis_claims: list[dict[str, Any]] = []
-            if bridge_claims:
-                bridge = dict(bridge_claims[0])
-                synthesis_claims = [{
-                    "claim_id": "synthesis:global_synthesis:integrated-topic",
+            dispositions = (
+                [item for item in cross_result.get("topic_dispositions") or () if isinstance(item, Mapping)]
+                if isinstance(cross_result, Mapping)
+                else []
+            )
+            integrated = next((item for item in dispositions if item.get("status") == "integrated"), None)
+            integrated_claim_ids = {
+                str(value) for value in (integrated or {}).get("synthesis_claim_ids") or () if str(value)
+            }
+            retained_bridges = [
+                dict(item) for item in bridge_claims
+                if str(item.get("claim_id") or "") in integrated_claim_ids
+            ]
+            for bridge in sorted(retained_bridges, key=lambda item: str(item.get("claim_id") or "")):
+                bridge_id = str(bridge.get("claim_id") or "")
+                synthesis_claims.append({
+                    "claim_id": f"synthesis:global_synthesis:integrated-{hash_text(bridge_id)[:10]}",
                     "topic_ids": list(bridge.get("topic_ids") or ()),
                     "fragment_id": str(bridge.get("fragment_id") or ""),
                     "paper_key": str(bridge.get("paper_key") or ""),
                     "text": "The integrated cross-topic finding is supported by its stated condition. 综合结论保留了该条件。",
-                    "source_claim_ids": [str(bridge.get("claim_id") or "")],
+                    "source_claim_ids": [bridge_id],
                     "evidence_ids": [str(value) for value in bridge.get("evidence_ids") or () if str(value)],
-                }]
+                })
             global_output = {
                 "synthesis_claims": synthesis_claims,
                 "organizing_principles": ["Synthesize integrated claims while retaining unresolved topics."],
@@ -1542,6 +1721,10 @@ def _run_cross_global_contract_fixture(
                 "status": "success",
                 "content": global_output,
             }
+        if "_provider_generation" in node_id:
+            from tests.test_current_runtime_full_e2e import _outline_provider_response
+
+            return _outline_provider_response(node_id, request)
         return _configured_test_provider(node_id, request)
 
     executor = _executor(tmp_path, provider=provider, stability_mode="off")
@@ -1561,14 +1744,34 @@ def test_cross_to_global_uses_validated_cross_result_without_topic_body_replay(t
 
     assert result is not None and result.ok is True, getattr(result, "diagnostics", ())
     assert cross_requests and global_requests
-    assert cross_requests[0]["shared_synthesis_contract_version"] == "v1"
+    assert cross_requests[-1]["shared_synthesis_contract_version"] == "v1"
+    assert cross_requests[-1]["task"] == "substantive_cross_group_comparison"
+    cross_topic_inputs = cross_requests[-1]["topic_synthesis"]
+    assert cross_topic_inputs
+    ref_rows = [row for row in cross_topic_inputs if isinstance(row.get("semantic_result_ref"), Mapping)]
+    if ref_rows:
+        assert len(ref_rows) == len(cross_topic_inputs)
     assert cross_dispositions
     global_request = global_requests[0]
     assert global_request["topic_synthesis"] == []
     cross_result = global_request["cross_group_comparison"]
     dispositions = cross_result["topic_dispositions"]
+    expected_topic_ids = _semantic_identity_sets(cross_requests[-1])["topic"]
     assert dispositions
+    assert len({row["topic_id"] for row in dispositions}) == len(dispositions)
+    assert {row["topic_id"] for row in dispositions} == expected_topic_ids
     assert {row["status"] for row in dispositions} == {"integrated", "unresolved"}
+    bounded_child_bridge_ids = {
+        str(claim.get("claim_id") or "")
+        for request, claims in zip(cross_requests, cross_bridge_claims)
+        if request.get("task") == "cross_group_comparison_bounded_reduction"
+        for claim in claims
+    }
+    expected_bridge_ids = bounded_child_bridge_ids or {
+        str(claim.get("claim_id") or "") for claim in cross_bridge_claims[-1]
+    }
+    assert expected_bridge_ids
+    assert {str(claim.get("claim_id") or "") for claim in cross_result.get("bridge_claims") or ()} == expected_bridge_ids
     assert any(str(row.get("reason") or "").strip() for row in dispositions if row["status"] == "unresolved")
     bridge_claim_by_id = {
         str(claim.get("claim_id") or ""): claim
@@ -1579,12 +1782,28 @@ def test_cross_to_global_uses_validated_cross_result_without_topic_body_replay(t
     bridge_claim = bridge_claim_by_id[integrated["synthesis_claim_ids"][0]]
     assert bridge_claim["topic_ids"] == [integrated["topic_id"]]
     assert bridge_claim["evidence_ids"]
+    assert bridge_claim["source_claim_ids"]
+    assert bridge_claim["source_field_ids"]
+    assert bridge_claim["claim_id"] in expected_bridge_ids
     global_result_claims = [
         claim for claim in global_outputs[0].get("synthesis_claims") or ()
         if isinstance(claim, Mapping)
     ]
     assert global_result_claims
-    assert bridge_claim["claim_id"] in global_result_claims[0]["source_claim_ids"]
+    global_source_claim_ids = {
+        str(source_claim_id)
+        for claim in global_result_claims
+        for source_claim_id in claim.get("source_claim_ids") or ()
+    }
+    assert global_source_claim_ids == expected_bridge_ids
+    assert bridge_claim["claim_id"] in global_source_claim_ids
+    for global_claim in global_result_claims:
+        source_bridge_id = str((global_claim.get("source_claim_ids") or [""])[0])
+        source_bridge = bridge_claim_by_id[source_bridge_id]
+        assert global_claim["paper_key"] == source_bridge["paper_key"]
+        assert global_claim["topic_ids"] == source_bridge["topic_ids"]
+        assert global_claim["fragment_id"] == source_bridge["fragment_id"]
+        assert global_claim["evidence_ids"] == source_bridge["evidence_ids"]
 
 
 def test_missing_cross_topic_disposition_blocks_before_global_provider_call(tmp_path) -> None:
@@ -1611,8 +1830,9 @@ def test_all_unresolved_cross_output_cannot_produce_successful_global_path(tmp_p
 
     assert cross_requests
     assert cross_dispositions
-    assert all(row["status"] == "unresolved" for row in cross_dispositions[0])
-    assert bridge_claims == [[]]
+    assert len(cross_requests) == len(cross_dispositions) == len(bridge_claims)
+    assert all(all(row["status"] == "unresolved" for row in group) for group in cross_dispositions)
+    assert all(not group for group in bridge_claims)
     assert global_requests == []
     if result is not None and result.ok:
         cross_record = json.loads(
@@ -2481,6 +2701,15 @@ def test_shared_v1_multilevel_reducer_persists_lineage_and_keeps_receipts_raw(
     )
     captured_calls: dict[str, tuple[dict[str, Any], tuple[str, ...]]] = {}
     original_provider_call = executor._provider_call
+    original_semantic_request_contract = executor._semantic_request_contract
+    expanded_requests: dict[str, dict[str, Any]] = {}
+
+    def capture_expanded_request(node_id: str, expanded_request: Mapping[str, Any], **kwargs: Any) -> Any:
+        if ":reduce:" in node_id:
+            expanded_requests[node_id] = dict(expanded_request)
+        return original_semantic_request_contract(node_id, expanded_request, **kwargs)
+
+    monkeypatch.setattr(executor, "_semantic_request_contract", capture_expanded_request)
 
     def capture_provider_call(node_id: str, provider_request: Mapping[str, Any], **kwargs: Any) -> Any:
         if ":reduce:" in node_id:
@@ -2489,10 +2718,17 @@ def test_shared_v1_multilevel_reducer_persists_lineage_and_keeps_receipts_raw(
             manifest = json.loads(Path(manifest_record.path).read_text(encoding="utf-8"))["payload"]
             assert manifest["provider_request_hash"] == hash_json(dict(provider_request))
             assert manifest_record.content_hash in tuple(kwargs.get("input_artifact_hashes") or ())
-            assert manifest["source_item_hashes"] == [
-                hash_json(item) for item in provider_request.get("topic_synthesis") or ()
-            ]
-            assert set(manifest["topic_ids"]) == _semantic_identity_sets(provider_request)["topic"]
+            expanded_request = expanded_requests.get(node_id, dict(provider_request))
+            source_items = expanded_request.get("topic_synthesis") or ()
+            assert manifest["source_item_hashes"] == [hash_json(item) for item in source_items]
+            assert manifest["source_input_hash"] == hash_json(list(source_items))
+            expected_child_hashes = sorted(
+                executor.artifact_records[f"{item['reducer_id']}:input_manifest"].content_hash
+                for item in source_items
+                if isinstance(item, Mapping) and str(item.get("reducer_id") or "")
+            )
+            assert manifest["child_input_manifest_hashes"] == expected_child_hashes
+            assert set(manifest["topic_ids"]) == _semantic_identity_sets(expanded_request)["topic"]
             captured_calls[node_id] = (
                 dict(provider_request),
                 tuple(kwargs.get("input_artifact_hashes") or ()),

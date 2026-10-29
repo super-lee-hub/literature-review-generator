@@ -71,7 +71,7 @@ PREPROCESS_ACTIVE_POINTER_SCHEMA_VERSION = "preprocess-active-generation-v1"
 PREPROCESS_GENERATION_LEASE_SCHEMA_VERSION = "preprocess-generation-lease-v1"
 DEFAULT_PREPROCESS_GENERATION_LEASE_TTL_SECONDS = 6 * 60 * 60
 STAGE1_INPUT_SELECTOR_VERSION = "stage1-input-selector-v1"
-PREPROCESS_IMPLEMENTATION_VERSION = "preprocess-service-20260915-v3"
+PREPROCESS_IMPLEMENTATION_VERSION = "preprocess-service-20261022-v4"
 
 
 class MineruArtifactError(RuntimeError):
@@ -3355,8 +3355,13 @@ class PreprocessManager:
 
         plain_text, page_diagnostics, page_blocks = self._extract_local_page_data(pdf_path, allow_ocr=True)
         page_index = self._build_page_index(page_blocks, page_diagnostics)
+        used_ocr = any(item.used_ocr for item in page_diagnostics)
 
-        if not markdown_text:
+        if used_ocr:
+            # Native-text Markdown cannot include the managed OCR additions.
+            markdown_text = self._fallback_markdown_from_text(plain_text)
+            extractor_used = "fitz"
+        elif not markdown_text:
             markdown_text = self._fallback_markdown_from_text(plain_text)
 
         if not markdown_text and not plain_text:
@@ -3375,7 +3380,7 @@ class PreprocessManager:
             "extractor_used": extractor_used,
             "layout_fidelity": "page_markdown" if extractor_used == "pymupdf4llm" else "page_text",
             "conversion_used": "native_pdf",
-            "used_ocr": any(item.used_ocr for item in page_diagnostics),
+            "used_ocr": used_ocr,
             "ocr_engine": self._ocr_engine_label(),
         }
 
@@ -3473,7 +3478,9 @@ class PreprocessManager:
             try:
                 # 使用线程锁确保同一时间只有一个线程使用 PyMuPDF4LLM
                 with self._pymupdf4llm_lock:
-                    markdown_output = pymupdf4llm.to_markdown(pdf_path)
+                    # OCR belongs to the page worker, with our policy,
+                    # timeout and diagnostics, rather than this text extractor.
+                    markdown_output = pymupdf4llm.to_markdown(pdf_path, use_ocr=False)
                     if isinstance(markdown_output, str):
                         return markdown_output
                     if isinstance(markdown_output, list):

@@ -1595,13 +1595,18 @@ def test_acceptance_execution_context_is_the_provider_budget_authority(tmp_path:
 
 
 def test_acceptance_run_binds_spec_budget_to_runtime_context(tmp_path: Path, monkeypatch) -> None:
+    from tests.test_current_runtime_full_e2e import _test_config
+
+    config_path = _test_config(tmp_path)
     runtime_spec = tmp_path / "runtime.json"
     runtime_spec.write_text(
         json.dumps(
             {
                 "project_name": "acceptance-budget",
+                "job_id": "job-acceptance-budget",
+                "workspace_path": str(tmp_path / "workspace"),
                 "source": {"mode": "direct", "pdf_folder": str(tmp_path / "pdfs")},
-                "config": str(tmp_path / "config.ini"),
+                "config": str(config_path),
             }
         ),
         encoding="utf-8",
@@ -1614,6 +1619,7 @@ def test_acceptance_run_binds_spec_budget_to_runtime_context(tmp_path: Path, mon
                 "state_path": "state.json",
                 "gates": ["C"],
                 "budget": {
+                    "schema_version": "provider-aggregate-budget-contract-v2",
                     "max_provider_calls_total": 1,
                     "max_output_tokens_total": 4,
                     "max_retry_attempts_total": 1,
@@ -1632,7 +1638,7 @@ def test_acceptance_run_binds_spec_budget_to_runtime_context(tmp_path: Path, mon
     monkeypatch.setattr(
         control,
         "_acceptance_checkout_sha",
-        lambda *_args, **_kwargs: "a" * 40,
+        lambda *_args, **_kwargs: "4b0ffe73726d7a32ec46122be22965576e0edd50",
     )
     monkeypatch.setattr(control, "provider_preflight", lambda **_kwargs: {"route_plan": {}})
     seen: dict[str, object] = {}
@@ -1649,7 +1655,9 @@ def test_acceptance_run_binds_spec_budget_to_runtime_context(tmp_path: Path, mon
     monkeypatch.setattr(control, "run", fake_run)
     result = control.acceptance_run(acceptance_spec)
 
-    assert seen["controller"] is not None
+    assert seen.get("controller") is not None, f"acceptance run did not reach runtime: {result!r}"
+    assert result["final_sha"] == "4b0ffe73726d7a32ec46122be22965576e0edd50"
+    assert result["acceptance_execution_context"]["final_executable_sha"] == result["final_sha"]
     assert result["acceptance_execution_context"]["provider_budget"]["max_provider_calls_total"] == 1
     assert Path(result["provider_budget_state_path"]).is_file()
     assert Path(result["provider_budget_state_path"]).parent.name == result["run_id"]

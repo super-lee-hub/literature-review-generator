@@ -292,7 +292,8 @@ def test_in_process_test_adapter_does_not_exempt_active_validator_from_budget(
 
     assert calls == []
     assert result["status"] == "blocked"
-    assert "aggregate acceptance run" in result["reason"]
+    # The fixture has no ready ordinary-V2 run envelope; this durable authority fence precedes budget restoration.
+    assert "existing ready provider run envelope" in result["reason"]
 
 
 def test_public_validate_bound_acceptance_context_control(
@@ -399,12 +400,17 @@ def test_direct_validator_admission_excludes_unrun_remote_parser(
         metadata={"requested_stages": ["validate"]},
     )
     control = ReviewControlPlane(repo_root=tmp_path)
-    with pytest.raises(ControlPlaneError, match="aggregate acceptance run"):
+    # This is the first-stage route/host admission API. Ordinary V2 budget
+    # authority is restored only after Runner opens the job's ready run envelope.
+    admitted_fingerprint, admitted_acknowledgement = (
         control._admit_direct_validator_execution(
             spec,
             validator_host_acknowledgement=acknowledgement,
             operation="external validation",
         )
+    )
+    assert admitted_fingerprint == direct_policy.route_fingerprint
+    assert admitted_acknowledgement == acknowledgement
 
     context, controller = _acceptance_binding(tmp_path)
     with monkeypatch.context() as isolated:

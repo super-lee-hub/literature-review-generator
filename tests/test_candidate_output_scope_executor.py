@@ -7,7 +7,7 @@ from dataclasses import replace
 import pytest
 
 from outline.v3_executor import OutlineV3ExecutionError
-from tests.test_candidate_output_scope import _valid_payload, source_scope
+from tests.test_candidate_output_scope import _valid_payload, source_scope as source_scope
 from tests.test_outline_v3_semantic_execution import _executor
 
 

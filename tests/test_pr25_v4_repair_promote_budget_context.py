@@ -296,7 +296,8 @@ def test_official_validator_host_still_requires_aggregate_budget(
     assert acknowledgement["required_hosts"] == []
     assert calls == []
     assert result["status"] == "blocked"
-    assert "aggregate acceptance run" in result["reason"]
+    # No ready ordinary-V2 run envelope exists in this fixture, so this earlier authority fence blocks before budget restoration.
+    assert "existing ready provider run envelope" in result["reason"]
 
 
 def test_active_loopback_validator_still_requires_aggregate_budget(
@@ -313,4 +314,5 @@ def test_active_loopback_validator_still_requires_aggregate_budget(
     assert acknowledgement["required_hosts"] == []
     assert calls == []
     assert result["status"] == "blocked"
-    assert "aggregate acceptance run" in result["reason"]
+    # No ready ordinary-V2 run envelope exists in this fixture, so this earlier authority fence blocks before budget restoration.
+    assert "existing ready provider run envelope" in result["reason"]

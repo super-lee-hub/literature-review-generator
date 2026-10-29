@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any
 
 from runtime.provider_runtime import hash_json
@@ -27,6 +27,109 @@ _HEX64 = re.compile(r"[0-9a-f]{64}")
 
 class CandidateOutputScopeError(ValueError):
     """A candidate output scope or its submitted payload is not source-closed."""
+
+
+def validate_candidate_output_scope_intrinsic_v1(payload: Mapping[str, Any]) -> None:
+    """Check a persisted scope's internal identity, without granting source authority."""
+    expected_keys = {
+        "schema_version", "source_inventory_binding", "task_ids", "selected_relation_ids",
+        "claim_groups", "claim_slots", "limits", "scope_policy", "content_hash",
+    }
+    if not isinstance(payload, Mapping) or set(payload) != expected_keys:
+        raise CandidateOutputScopeError("candidate scope has unknown or missing fields")
+    limits = payload.get("limits")
+    if (not isinstance(limits, Mapping) or set(limits) != {"max_sections", "max_claims", "max_support_rows"}
+            or any(type(value) is not int or value < 1 for value in limits.values())):
+        raise CandidateOutputScopeError("candidate scope limits must be positive integers")
+    if payload.get("content_hash") != hash_json({key: value for key, value in payload.items() if key != "content_hash"}):
+        raise CandidateOutputScopeError("candidate scope hash differs from its exact serialized body")
+    binding = payload.get("source_inventory_binding")
+    if not isinstance(binding, Mapping) or set(binding) != {
+        "registry_job_id", "artifact_id", "artifact_hash", "content_hash",
+    }:
+        raise CandidateOutputScopeError("candidate scope has an invalid source inventory binding")
+    if any(not isinstance(binding[key], str) or not binding[key].strip()
+           for key in ("registry_job_id", "artifact_id")):
+        raise CandidateOutputScopeError("candidate scope lacks its source owner/identity")
+    if any(not isinstance(binding[key], str) or not _HEX64.fullmatch(binding[key])
+           for key in ("artifact_hash", "content_hash")):
+        raise CandidateOutputScopeError("candidate scope has an invalid source inventory hash")
+    raw_groups, raw_slots = payload.get("claim_groups"), payload.get("claim_slots")
+    if not isinstance(raw_groups, list) or not raw_groups or not isinstance(raw_slots, list) or not raw_slots:
+        raise CandidateOutputScopeError("candidate scope requires nonempty groups and support slots")
+    groups: list[CandidateOutputClaimGroupV1] = []
+    slots: list[CandidateOutputSupportSlotV1] = []
+    group_fields = {field.name for field in fields(CandidateOutputClaimGroupV1)}
+    slot_fields = {field.name for field in fields(CandidateOutputSupportSlotV1)}
+    for rows, names, list_fields, cls in (
+        (raw_groups, group_fields, ("paper_keys", "support_slot_ids", "relation_ids"), CandidateOutputClaimGroupV1),
+        (raw_slots, slot_fields, ("source_claim_ids", "evidence_ids", "source_field_ids", "relation_ids"), CandidateOutputSupportSlotV1),
+    ):
+        for row in rows:
+            if not isinstance(row, Mapping) or set(row) - names:
+                raise CandidateOutputScopeError("candidate scope has an invalid group/support row")
+            converted = dict(row)
+            if any(not isinstance(value, str) for key, value in row.items()
+                   if key not in {*list_fields, "claim_seed", "task_contract"}):
+                raise CandidateOutputScopeError("candidate scope row has a non-string identity")
+            if any(not str(row.get(key) or "").strip() for key in ("claim_group_id", "task_id", "synthesis_claim_id")):
+                raise CandidateOutputScopeError("candidate scope row lacks its claim/task identity")
+            if cls is CandidateOutputSupportSlotV1 and not str(row.get("claim_slot_id") or "").strip():
+                raise CandidateOutputScopeError("candidate scope support lacks its slot identity")
+            for key in list_fields:
+                converted[key] = _string_ids(row.get(key), key)
+            if cls is CandidateOutputClaimGroupV1:
+                if "claim_seed" in row and row["claim_seed"] is not True:
+                    raise CandidateOutputScopeError("candidate scope seed marker must be true when present")
+                contract = row.get("task_contract", {})
+                if not isinstance(contract, Mapping):
+                    raise CandidateOutputScopeError("candidate scope task contract must be an object")
+                converted["task_contract"] = tuple(contract.items())
+            try:
+                parsed = cls(**converted)
+                if isinstance(parsed, CandidateOutputClaimGroupV1):
+                    groups.append(parsed)
+                else:
+                    slots.append(parsed)
+            except TypeError as exc:
+                raise CandidateOutputScopeError("candidate scope row lacks its typed identity") from exc
+    for group in groups:
+        if (not isinstance(group.claim_hash, str) or not _HEX64.fullmatch(group.claim_hash)
+                or not group.paper_keys or not group.support_slot_ids):
+            raise CandidateOutputScopeError("candidate scope group has no complete claim/support identity")
+    for slot in slots:
+        if (not slot.source_claim_ids or not slot.evidence_ids
+                or slot.primary_claim_id not in slot.source_claim_ids):
+            raise CandidateOutputScopeError("candidate scope support has no primary source closure")
+    group_by_id = {group.claim_group_id: group for group in groups}
+    if len(group_by_id) != len(groups) or len({slot.claim_slot_id for slot in slots}) != len(slots):
+        raise CandidateOutputScopeError("candidate scope repeats a group or support identity")
+    slots_by_group: dict[str, list[CandidateOutputSupportSlotV1]] = {}
+    for slot in slots:
+        group = group_by_id.get(slot.claim_group_id)
+        if group is None or any(getattr(slot, key) != getattr(group, key) for key in (
+            "task_id", "topic_id", "fragment_id", "provider_result_id", "synthesis_claim_id",
+        )) or not slot.paper_key:
+            raise CandidateOutputScopeError("candidate scope support belongs to another group/task")
+        slots_by_group.setdefault(slot.claim_group_id, []).append(slot)
+    for group in groups:
+        owned = slots_by_group.get(group.claim_group_id, ())
+        if ({slot.claim_slot_id for slot in owned} != set(group.support_slot_ids)
+                or {slot.paper_key for slot in owned} != set(group.paper_keys)
+                or {key for slot in owned for key in slot.relation_ids} != set(group.relation_ids)):
+            raise CandidateOutputScopeError("candidate scope group lost its complete support closure")
+    task_ids = _string_ids(payload.get("task_ids"), "task_ids", required=True)
+    relation_ids = _string_ids(payload.get("selected_relation_ids"), "selected_relation_ids")
+    if (not {group.task_id for group in groups}.issubset(task_ids)
+            or not {key for group in groups for key in group.relation_ids}.issubset(relation_ids)):
+        raise CandidateOutputScopeError("candidate scope task/relation table differs from its groups")
+    scope = CandidateOutputScopeV1(
+        registry_job_id=binding["registry_job_id"], source_inventory_artifact_id=binding["artifact_id"],
+        source_inventory_artifact_hash=binding["artifact_hash"], source_inventory_content_hash=binding["content_hash"],
+        task_ids=task_ids, selected_relation_ids=relation_ids, claim_groups=tuple(groups), claim_slots=tuple(slots),
+    )
+    if scope.to_dict() != dict(payload):
+        raise CandidateOutputScopeError("candidate scope canonical hash, policy or derived limits differ")
 
 
 def _string_ids(value: Any, label: str, *, required: bool = False) -> tuple[str, ...]:
@@ -86,7 +189,7 @@ class CandidateOutputSupportSlotV1:
 
 @dataclass(frozen=True, slots=True)
 class CandidateOutputClaimGroupV1:
-    """One provider-authored synthesis assertion and its complete paper support."""
+    """One source-closed output assertion and its complete paper support."""
 
     claim_group_id: str
     task_id: str
@@ -98,9 +201,12 @@ class CandidateOutputClaimGroupV1:
     paper_keys: tuple[str, ...]
     support_slot_ids: tuple[str, ...]
     relation_ids: tuple[str, ...] = ()
+    claim_kind: str = "provider_authored_source_closed_claim"
+    claim_seed: bool = False
+    task_contract: tuple[tuple[str, Any], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "claim_group_id": self.claim_group_id,
             "task_id": self.task_id,
             "topic_id": self.topic_id,
@@ -112,6 +218,12 @@ class CandidateOutputClaimGroupV1:
             "support_slot_ids": list(self.support_slot_ids),
             "relation_ids": list(self.relation_ids),
         }
+        if self.claim_seed:
+            result["claim_kind"] = self.claim_kind
+            result["claim_seed"] = True
+        if self.task_contract:
+            result["task_contract"] = dict(self.task_contract)
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +307,69 @@ class CandidateOutputScopeV1:
             selected_relation_ids=self.selected_relation_ids,
             claim_groups=kept_groups,
             claim_slots=kept_slots,
+        )
+
+    def for_groups(
+        self,
+        group_ids: Sequence[str],
+        *,
+        allowed_paper_keys: Sequence[str] | None = None,
+    ) -> CandidateOutputScopeV1:
+        """Project the exact source-closed claim groups assigned to one request.
+
+        Group assignment is an upstream packing decision. This method never
+        widens that assignment: it copies only the requested groups and their
+        complete support slots. When a paper set is supplied, every paper in
+        every selected group must be present in the request's evidence shard.
+        """
+
+        selected_ids = _string_ids(group_ids, "assigned_group_ids", required=True)
+        groups_by_id = {item.claim_group_id: item for item in self.claim_groups}
+        unknown_ids = sorted(set(selected_ids) - set(groups_by_id))
+        if unknown_ids:
+            raise CandidateOutputScopeError(
+                f"assigned scope references an unknown claim group: {unknown_ids[0]}"
+            )
+        selected_groups = tuple(groups_by_id[item] for item in selected_ids)
+        if allowed_paper_keys is not None:
+            allowed = set(_string_ids(allowed_paper_keys, "allowed_paper_keys"))
+            for group in selected_groups:
+                missing_papers = sorted(set(group.paper_keys) - allowed)
+                if missing_papers:
+                    raise CandidateOutputScopeError(
+                        f"claim group {group.claim_group_id} is missing paper support in the assigned shard: "
+                        f"{missing_papers[0]}"
+                    )
+        selected_set = set(selected_ids)
+        selected_slots = tuple(
+            slot for slot in self.claim_slots if slot.claim_group_id in selected_set
+        )
+        slot_ids_by_group = {
+            group.claim_group_id: {
+                slot.claim_slot_id for slot in selected_slots
+                if slot.claim_group_id == group.claim_group_id
+            }
+            for group in selected_groups
+        }
+        for group in selected_groups:
+            if slot_ids_by_group[group.claim_group_id] != set(group.support_slot_ids):
+                raise CandidateOutputScopeError(
+                    f"claim group {group.claim_group_id} does not have its complete support-slot closure"
+                )
+        selected_relation_ids = tuple(sorted({
+            relation_id
+            for group in selected_groups
+            for relation_id in group.relation_ids
+        }))
+        return CandidateOutputScopeV1(
+            registry_job_id=self.registry_job_id,
+            source_inventory_artifact_id=self.source_inventory_artifact_id,
+            source_inventory_artifact_hash=self.source_inventory_artifact_hash,
+            source_inventory_content_hash=self.source_inventory_content_hash,
+            task_ids=tuple(sorted({group.task_id for group in selected_groups})),
+            selected_relation_ids=selected_relation_ids,
+            claim_groups=selected_groups,
+            claim_slots=selected_slots,
         )
 
     def validate(self, payload: Mapping[str, Any]) -> None:
@@ -366,6 +541,7 @@ def _claim_papers(claim: Mapping[str, Any], label: str) -> tuple[str, ...]:
 def _collect_claim_graph(
     topic_routes: Sequence[Mapping[str, Any]],
     bridge_rows: Sequence[tuple[str, str, str, Mapping[str, Any]]],
+    lineage_claims: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Mapping[str, Any]]:
     graph: dict[str, Mapping[str, Any]] = {}
 
@@ -401,6 +577,8 @@ def _collect_claim_graph(
                     add(claim, "topic provider output")
     for _task_id, _result_id, _claim_id, claim in bridge_rows:
         add(claim, "bridge provider output")
+    for claim in lineage_claims:
+        add(claim, "lineage_claims")
     return graph
 
 
@@ -862,6 +1040,220 @@ def _claim_group(
     return group, slots
 
 
+def _relation_comparison_group(
+    *,
+    inventory: VerifiedWriterSourceInventoryV1,
+    indexes: Mapping[str, Any],
+    bundle: Mapping[str, Any],
+    selected_relation_ids: tuple[str, ...],
+) -> tuple[CandidateOutputClaimGroupV1, list[CandidateOutputSupportSlotV1]]:
+    """Make one two-sided comparison output slot from a selected source bundle.
+
+    This consumes only bundle identity/question and verified source closures.
+    It creates a model-authored output slot, never a relation conclusion.
+    """
+
+    relation_id = str(bundle.get("relation_id") or "").strip()
+    if not relation_id or relation_id not in set(selected_relation_ids):
+        raise CandidateOutputScopeError(
+            "relation comparison bundle must belong to a selected confirmed relation"
+        )
+    completeness = str(bundle.get("evidence_completeness") or "")
+    missing_evidence_ids = _string_ids(
+        bundle.get("missing_evidence_ids"), f"{relation_id}.missing_evidence_ids",
+    )
+    if completeness != "complete" or missing_evidence_ids:
+        raise CandidateOutputScopeError(
+            f"{relation_id} requires a complete selected relation bundle with no missing evidence"
+        )
+    paper_keys = _string_ids(bundle.get("paper_ids"), f"{relation_id}.paper_ids", required=True)
+    if len(paper_keys) != 2:
+        raise CandidateOutputScopeError(
+            f"{relation_id} relation comparison requires exactly two source papers"
+        )
+    required_evidence_ids = _string_ids(
+        bundle.get("required_evidence_ids"), f"{relation_id}.required_evidence_ids", required=True,
+    )
+    provided_evidence_ids = set(_string_ids(
+        bundle.get("provided_evidence_ids"), f"{relation_id}.provided_evidence_ids",
+    ))
+    if provided_evidence_ids != set(required_evidence_ids):
+        raise CandidateOutputScopeError(
+            f"{relation_id} complete relation bundle has a required/provided evidence mismatch"
+        )
+
+    required_by_paper: dict[str, set[str]] = {paper_key: set() for paper_key in paper_keys}
+    for evidence_id in required_evidence_ids:
+        owners = [
+            paper_key for paper_key in paper_keys
+            if evidence_id in indexes["evidence"].get(paper_key, {})
+        ]
+        if len(owners) != 1:
+            raise CandidateOutputScopeError(
+                f"{relation_id} required evidence {evidence_id} is absent or ambiguous in the verified two-paper inventory"
+            )
+        required_by_paper[owners[0]].add(evidence_id)
+
+    raw_claim_fields = ("claim_ids_left", "claim_ids_right")
+    candidate_claims_by_paper: dict[str, set[str]] = {paper_key: set() for paper_key in paper_keys}
+    for paper_key, field_name in zip(paper_keys, raw_claim_fields):
+        explicit_claim_ids = _string_ids(
+            bundle.get(field_name), f"{relation_id}.{field_name}",
+        )
+        claims_by_paper = indexes["claims"].get(paper_key, {})
+        for claim_id in explicit_claim_ids:
+            if claim_id not in claims_by_paper:
+                raise CandidateOutputScopeError(
+                    f"{relation_id} bundle source claim {claim_id} is not owned by {paper_key}"
+                )
+        candidate_claims_by_paper[paper_key].update(explicit_claim_ids)
+        for evidence_id in required_by_paper[paper_key]:
+            matching_claims = {
+                claim.claim_id
+                for claim in claims_by_paper.values()
+                if evidence_id in claim.evidence_ids
+            }
+            if not matching_claims:
+                raise CandidateOutputScopeError(
+                    f"{relation_id} required evidence {evidence_id} has no verified source claim"
+                )
+            candidate_claims_by_paper[paper_key].update(matching_claims)
+
+    closures: list[dict[str, Any]] = []
+    required_closure_by_paper: dict[str, set[str]] = {paper_key: set() for paper_key in paper_keys}
+    for paper_key in paper_keys:
+        candidate_ids = candidate_claims_by_paper[paper_key]
+        if not candidate_ids:
+            raise CandidateOutputScopeError(
+                f"{relation_id} selected relation bundle has no verified claims for {paper_key}"
+            )
+        qualifier_ids = {
+            str(required_id)
+            for primary_id in candidate_ids
+            for dependency in indexes["dependencies"].get(paper_key, {}).get(primary_id, ())
+            for required_id in dependency.required_source_claim_ids
+        }
+        primary_ids = sorted(candidate_ids - qualifier_ids) or sorted(candidate_ids)
+        for primary_id in primary_ids:
+            source_claim_ids, evidence_ids, closure_field_ids, study_id = _source_closure(
+                indexes["papers"][paper_key], primary_id, indexes,
+            )
+            evidence_id_set = set(evidence_ids)
+            required_closure_by_paper[paper_key].update(evidence_id_set)
+            source_field_ids = set(closure_field_ids)
+            # Bind direct finding/boundary fields when the verified field value
+            # exactly matches evidence in this claim closure. These references
+            # preserve source fields without inventing a qualifier edge.
+            for evidence_id in evidence_id_set:
+                evidence = indexes["evidence"].get(paper_key, {}).get(evidence_id)
+                evidence_text = str(evidence.text or "").strip() if evidence is not None else ""
+                if not evidence_text:
+                    continue
+                normalized_text = evidence_text.casefold()
+                for source_field in indexes["fields"].get(paper_key, {}).values():
+                    values = {
+                        str(source_field.source_value or "").strip().casefold(),
+                        str(source_field.derived_value or "").strip().casefold(),
+                    }
+                    if normalized_text not in values:
+                        continue
+                    field_owners = {str(value) for value in source_field.owner_study_ids if str(value)}
+                    if field_owners and (not study_id or not field_owners.issubset({study_id})):
+                        continue
+                    if source_field.scope == "explicit_study" and (
+                        not field_owners or not study_id or study_id not in field_owners
+                    ):
+                        continue
+                    source_field_ids.add(source_field.source_field_id)
+            closures.append({
+                "paper_key": paper_key,
+                "primary_claim_id": primary_id,
+                "study_id": study_id,
+                "source_claim_ids": source_claim_ids,
+                "evidence_ids": evidence_ids,
+                "source_field_ids": tuple(sorted(source_field_ids)),
+            })
+
+    for paper_key, required_ids in required_by_paper.items():
+        if not required_ids or not required_ids.issubset(required_closure_by_paper[paper_key]):
+            raise CandidateOutputScopeError(
+                f"{relation_id} required evidence is not closed by verified claims and qualifiers for {paper_key}"
+            )
+
+    task_id = f"relation_comparison:{relation_id}"
+    task_contract = {
+        "schema_version": "relation-comparison-task/v1",
+        "task_id": task_id,
+        "relation_id": relation_id,
+        "relation_type": str(bundle.get("relation_type") or ""),
+        "comparison_question": str(bundle.get("comparison_question") or ""),
+        "output_semantics": "model_authored_comparison_using_both_source_sides_and_their_qualifiers",
+        "relation_id_is_not_a_conclusion": True,
+    }
+    seed = {
+        "schema_version": "relation-comparison-claim-seed/v1",
+        "task_contract": task_contract,
+        "paper_keys": list(paper_keys),
+        "support": [
+            {
+                "paper_key": item["paper_key"],
+                "primary_claim_id": item["primary_claim_id"],
+                "study_id": item["study_id"],
+                "source_claim_ids": list(item["source_claim_ids"]),
+                "evidence_ids": list(item["evidence_ids"]),
+                "source_field_ids": list(item["source_field_ids"]),
+            }
+            for item in closures
+        ],
+    }
+    seed_hash = hash_json(seed)
+    group_id = f"candidate-relation-comparison-group:v1:{seed_hash[:24]}"
+    synthesis_claim_id = f"synthesis:relation_comparison:{seed_hash[:24]}"
+    slots = [
+        CandidateOutputSupportSlotV1(
+            claim_slot_id="candidate-relation-comparison-slot:v1:" + hash_json({
+                "group_id": group_id,
+                "paper_key": item["paper_key"],
+                "primary_claim_id": item["primary_claim_id"],
+            })[:24],
+            claim_group_id=group_id,
+            task_id=task_id,
+            topic_id="",
+            fragment_id="",
+            provider_result_id="",
+            synthesis_claim_id=synthesis_claim_id,
+            paper_key=str(item["paper_key"]),
+            primary_claim_id=str(item["primary_claim_id"]),
+            study_id=str(item["study_id"]),
+            source_claim_ids=tuple(item["source_claim_ids"]),
+            evidence_ids=tuple(item["evidence_ids"]),
+            source_field_ids=tuple(item["source_field_ids"]),
+            relation_ids=(relation_id,),
+        )
+        for item in closures
+    ]
+    if {item.paper_key for item in slots} != set(paper_keys):
+        raise CandidateOutputScopeError(
+            f"{relation_id} selected relation bundle lost one of its verified source sides"
+        )
+    group = CandidateOutputClaimGroupV1(
+        claim_group_id=group_id,
+        task_id=task_id,
+        topic_id="",
+        fragment_id="",
+        provider_result_id="",
+        synthesis_claim_id=synthesis_claim_id,
+        claim_hash=seed_hash,
+        paper_keys=paper_keys,
+        support_slot_ids=tuple(sorted(item.claim_slot_id for item in slots)),
+        relation_ids=(relation_id,),
+        claim_kind="model_authored_relation_comparison_slot",
+        claim_seed=True,
+        task_contract=tuple(sorted(task_contract.items())),
+    )
+    return group, slots
+
+
 def _topic_claims(
     inventory: VerifiedWriterSourceInventoryV1,
     indexes: Mapping[str, Any],
@@ -982,13 +1374,24 @@ def build_candidate_output_scope_v1(
     selected_relation_ids: Sequence[str] = (),
     *,
     bridge_claims: Sequence[Mapping[str, Any]] = (),
+    lineage_claims: Sequence[Mapping[str, Any]] = (),
+    relation_bundles: Sequence[Any] = (),
 ) -> CandidateOutputScopeV1:
     """Build finite output slots from verified source and existing task results.
 
     ``topic_routes`` must be the real persisted semantic task/fragment result
     projection and include each task's existing ``logical_node_id``. Optional
     bridge envelopes carry ``task_id``, ``result_id``, and ``provider_output``
-    from a ready cross-group or global synthesis result.
+    from a ready cross-group or global synthesis result. ``lineage_claims``
+    contains retained ancestor claim mappings from the same Registry-verified
+    root dependency closure. They participate only in source resolution and
+    conflict checks, never in output group, slot or task generation. The caller
+    verifies their artifact ownership, readiness, schema, hashes and closure;
+    source resolution still terminates in the verified inventory below.
+    ``relation_bundles``
+    contains only confirmed selected relation bundles; each complete bundle
+    contributes a model-authored two-sided comparison slot backed by the
+    verified source inventory.
     """
 
     if type(inventory) is not VerifiedWriterSourceInventoryV1 or not inventory.is_verified:
@@ -1005,12 +1408,16 @@ def build_candidate_output_scope_v1(
         raise CandidateOutputScopeError("topic_routes must be an array of existing task results")
     if not isinstance(bridge_claims, Sequence) or isinstance(bridge_claims, (str, bytes)):
         raise CandidateOutputScopeError("bridge_claims must be an array")
+    if not isinstance(lineage_claims, Sequence) or isinstance(lineage_claims, (str, bytes)):
+        raise CandidateOutputScopeError("lineage_claims must be an array of retained ancestor claims")
+    if not isinstance(relation_bundles, Sequence) or isinstance(relation_bundles, (str, bytes)):
+        raise CandidateOutputScopeError("relation_bundles must be an array of selected relation bundles")
     if not isinstance(selected_relation_ids, Sequence) or isinstance(selected_relation_ids, (str, bytes)):
         raise CandidateOutputScopeError("selected_relation_ids must be an array")
     relation_ids = _string_ids(selected_relation_ids, "selected_relation_ids")
     indexes = _inventory_indexes(inventory)
     bridge_rows = _bridge_claim_rows(bridge_claims)
-    claim_graph = _collect_claim_graph(topic_routes, bridge_rows)
+    claim_graph = _collect_claim_graph(topic_routes, bridge_rows, lineage_claims)
     task_ids, groups, slots = _topic_claims(
         inventory,
         indexes,
@@ -1070,6 +1477,27 @@ def build_candidate_output_scope_v1(
         groups.append(group)
         slots.extend(group_slots)
         task_ids.add(task_id)
+    for index, raw_bundle in enumerate(relation_bundles):
+        if isinstance(raw_bundle, Mapping):
+            bundle = dict(raw_bundle)
+        else:
+            to_dict = getattr(raw_bundle, "to_dict", None)
+            if not callable(to_dict):
+                raise CandidateOutputScopeError(f"relation_bundles[{index}] must be a relation bundle object")
+            bundle = to_dict()
+            if not isinstance(bundle, Mapping):
+                raise CandidateOutputScopeError(f"relation_bundles[{index}] did not serialize to an object")
+        group, group_slots = _relation_comparison_group(
+            inventory=inventory,
+            indexes=indexes,
+            bundle=bundle,
+            selected_relation_ids=relation_ids,
+        )
+        if group.claim_group_id in {item.claim_group_id for item in groups}:
+            raise CandidateOutputScopeError("selected relation bundles repeat a comparison group identity")
+        groups.append(group)
+        slots.extend(group_slots)
+        task_ids.add(group.task_id)
     if len({item.claim_group_id for item in groups}) != len(groups):
         raise CandidateOutputScopeError("candidate output scope contains duplicate claim groups")
     if len({item.claim_slot_id for item in slots}) != len(slots):
@@ -1092,4 +1520,5 @@ __all__ = [
     "CandidateOutputScopeV1",
     "CandidateOutputSupportSlotV1",
     "build_candidate_output_scope_v1",
+    "validate_candidate_output_scope_intrinsic_v1",
 ]

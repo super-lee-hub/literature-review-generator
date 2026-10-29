@@ -1,0 +1,49 @@
+{
+  "schema_version": "run-first-current80-candidate-replay/v1",
+  "provenance": {
+    "job_id": "job_fb4625cad2cd",
+    "failed_node_id": "candidate_1_provider_generation:local:candidate_group_584e7b2693818703",
+    "failed_payload_sha256": "524a61db1b9e4a8199acc7557e202cbbab88a03a70ff847db1653f1b2b74635b",
+    "failed_request_serialized_bytes": 83202,
+    "candidate_output_scope_content_hash": "ec5b84b06b8e041a755b0c7f461885133da18b7557b14d005398bb8625c64a54",
+    "candidate_output_scope_file_sha256": "6af4b9ff2b806172aaafeb83675bf7ce93267358089bc110e163b79db92adcf6",
+    "source_inventory_artifact_id": "outline-v3:outline_content_layers",
+    "source_inventory_artifact_hash": "9a7cdd44728700c04fa5e863a68b1b7fdbeb212127fea00f8898253cf7d61bbb",
+    "source_inventory_content_hash": "a0c5f737dbe4151169b48183053a09d0a979814833611f5cbe9194121125f993",
+    "study_c_synthetic_pdf_sha256": "0ca9077fa119e6b9193da78a337e876e4d3a567220cace4ba7fc59a93e58576d",
+    "source_text": "Descriptive comparison of observed group means.",
+    "source_text_origin": "The exact Analysis line in the one-page synthetic study-c.pdf used by the failed current80 GUI case.",
+    "full_serialized_request_retained": false,
+    "replay_boundary": "The hash-bound persisted output-scope slot is exact. The full 83,202-byte provider request was not retained; this replay isolates that slot and its primary claim/evidence projection without HTTP."
+  },
+  "slot": {
+    "claim_slot_id": "candidate-claim-slot:v1:7a607880a027dc615aff356a",
+    "claim_group_id": "candidate-claim-group:v1:2927486539a0f554516c46ca",
+    "task_id": "topic_synthesis:construct:ed606af0981c",
+    "topic_id": "topic:construct:ed606af0981c",
+    "fragment_id": "topic:construct:ed606af0981c",
+    "provider_result_id": "fragment-result:3d078cb4c8cf16b1c625b41b",
+    "synthesis_claim_id": "synthesis:topic_synthesis:fixture-31095d37b6fcbf2a8411",
+    "paper_key": "studyc_unknown_author",
+    "primary_claim_id": "claim:studyc_unknown_author:operationalizations:eafa2c457e93d9a0",
+    "study_id": "",
+    "source_claim_ids": [
+      "claim:studyc_unknown_author:operationalizations:eafa2c457e93d9a0"
+    ],
+    "evidence_ids": [
+      "evidence:studyc_unknown_author:operationalizations:99e365d237eb06cc"
+    ],
+    "source_field_ids": [],
+    "relation_ids": []
+  },
+  "primary_source_claim": {
+    "claim_id": "claim:studyc_unknown_author:operationalizations:eafa2c457e93d9a0",
+    "paper_key": "studyc_unknown_author",
+    "text": "Descriptive comparison of observed group means.",
+    "evidence_ids": [
+      "evidence:studyc_unknown_author:operationalizations:99e365d237eb06cc"
+    ]
+  },
+  "dependencies": [],
+  "source_fields": []
+}

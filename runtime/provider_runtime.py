@@ -8,25 +8,31 @@ facts needed to audit that decision.  Secrets and raw prompts never belong in
 a receipt.
 """
 
-from contextlib import contextmanager
-from contextvars import ContextVar, Token
-from dataclasses import asdict, dataclass, field, fields, replace
 import ctypes
 import hashlib
 import json
 import math
 import os
-from pathlib import Path
 import re
 import socket
 import threading
 import time
-from typing import Any, Callable, ClassVar, Iterable, Literal, Mapping, cast
 import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar, Token
+from dataclasses import asdict, dataclass, field, fields, replace
+from pathlib import Path
+from typing import Any, Callable, ClassVar, Iterable, Literal, Mapping, Protocol, cast
 
+from runtime.primary_repair_recovery import (
+    PrimaryRepairRecoveryError,
+    PrimaryRepairResponseEntryV1,
+    PrimaryRepairResponseJournal,
+    PrimaryRepairResponseRefV1,
+    PrimaryRepairScopeV1,
+)
 from services.durable_io import atomic_replace_with_retry, interprocess_file_lock
 from services.job_workspace import atomic_write_json, utc_now_iso
-
 
 PROVIDER_RECEIPT_ARTIFACT_TYPE = "provider_call_receipt"
 PROVIDER_RECEIPT_ARTIFACT_VERSION = "v2"
@@ -127,6 +133,10 @@ class ProviderRuntimeContractError(ValueError):
 
 class ProviderBudgetExceeded(RuntimeError):
     """Raised only by explicit callers that request strict admission."""
+
+
+class ProviderCancellationRequested(ProviderBudgetExceeded):
+    """A verified cancellation blocked admission before a new transport."""
 
 
 class ProviderReceiptConflict(RuntimeError):
@@ -886,6 +896,253 @@ _ACTIVE_ACCEPTANCE_CONTROLLER: ContextVar["ProviderBudgetController | None"] = C
     "active_acceptance_budget_controller",
     default=None,
 )
+_ACTIVE_RUN_PROVIDER_CONTROLLER: ContextVar["ProviderBudgetController | None"] = ContextVar(
+    "active_run_provider_budget_controller",
+    default=None,
+)
+_ACTIVE_PROVIDER_RUN_SCOPE_PROOF: ContextVar["ProviderRunScopeProofV1 | None"] = ContextVar(
+    "active_provider_run_scope_proof",
+    default=None,
+)
+_ACTIVE_PROVIDER_RUN_SCOPE_AUTHORIZATION: ContextVar[
+    "ProviderRunScopeAuthorizationV1 | None"
+] = ContextVar(
+    "active_provider_run_scope_authorization",
+    default=None,
+)
+_ACTIVE_PROVIDER_RUN_PLAN_BINDING: ContextVar[
+    "ProviderRunPlanBindingV1 | None"
+] = ContextVar(
+    "active_provider_run_plan_binding",
+    default=None,
+)
+
+
+_PROVIDER_RUN_SCOPE_HASH_FIELDS = frozenset(
+    {
+        "runtime_spec_sha256",
+        "effective_config_sha256",
+        "source_snapshot_sha256",
+        "review_goal_sha256",
+        "route_plan_sha256",
+        "stage_work_contract_sha256",
+    }
+)
+_PROVIDER_RUN_SCOPE_PROOF_TOKEN = object()
+_PROVIDER_RUN_SCOPE_AUTHORIZATION_TOKEN = object()
+_PROVIDER_RUN_PLAN_BINDING_TOKEN = object()
+
+
+@dataclass(frozen=True)
+class ProviderRunScopeProofV1:
+    """An in-process proof binding an accepted continuation to one run scope.
+
+    Instances are made only after the caller verifies the ready Registry
+    ``provider_run_envelope`` artifact. The proof is deliberately not decoded
+    from environment variables: inherited serialized context alone cannot
+    authorize a new RuntimeJobSpec.
+    """
+
+    job_id: str
+    run_id: str
+    provider_budget_sha256: str
+    scope_hashes: Mapping[str, str]
+    artifact_id: str
+    artifact_sha256: str
+    _verification_token: object = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self._verification_token is not _PROVIDER_RUN_SCOPE_PROOF_TOKEN:
+            raise ProviderRuntimeContractError(
+                "provider run scope proof must come from a verified Registry envelope"
+            )
+        if not str(self.job_id or "").strip() or not str(self.run_id or "").strip():
+            raise ProviderRuntimeContractError(
+                "provider run scope proof requires job_id and run_id"
+            )
+        if self.artifact_id != "provider_run_envelope":
+            raise ProviderRuntimeContractError(
+                "provider run scope proof must reference the run envelope artifact"
+            )
+        for name, value in (
+            ("provider_budget_sha256", self.provider_budget_sha256),
+            ("artifact_sha256", self.artifact_sha256),
+        ):
+            if re.fullmatch(r"[0-9a-f]{64}", str(value or "")) is None:
+                raise ProviderRuntimeContractError(
+                    f"provider run scope proof {name} is invalid"
+                )
+        if not isinstance(self.scope_hashes, Mapping):
+            raise ProviderRuntimeContractError(
+                "provider run scope proof hashes must be a mapping"
+            )
+        if set(self.scope_hashes) != _PROVIDER_RUN_SCOPE_HASH_FIELDS:
+            raise ProviderRuntimeContractError(
+                "provider run scope proof hashes do not match the run envelope contract"
+            )
+        normalized: dict[str, str] = {}
+        for name in sorted(_PROVIDER_RUN_SCOPE_HASH_FIELDS):
+            value = str(self.scope_hashes.get(name) or "")
+            if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                raise ProviderRuntimeContractError(
+                    f"provider run scope proof hash is invalid: {name}"
+                )
+            normalized[name] = value
+        object.__setattr__(self, "scope_hashes", normalized)
+
+
+@dataclass(frozen=True)
+class SharedRetryProjectionV1:
+    """Potential physical attempts under per-call ceilings and a shared pool."""
+
+    logical_calls: int | None
+    configured_retry_slots_upper_bound: int | None
+    aggregate_retry_pool_remaining: int | None
+    retry_attempts_upper_bound: int | None
+    physical_attempts_upper_bound: int | None
+    retry_bound_source: str
+
+
+@dataclass(frozen=True)
+class ProviderRunScopeAuthorizationV1:
+    """ControlPlane-verified exact scope approved for one accepted run.
+
+    The artifact payload is created from a verified acceptance plan by the
+    ControlPlane. It is distinct from the Runner-produced budget envelope: it
+    authorizes the first envelope to be minted for this scope.
+    """
+
+    job_id: str
+    run_id: str
+    provider_budget_sha256: str
+    scope_hashes: Mapping[str, str]
+    artifact_id: str
+    artifact_sha256: str
+    acceptance_plan_sha256: str
+    acceptance_spec_file_sha256: str
+    scenario_id: str
+    runtime_spec_file_sha256: str
+    input_identity_sha256: str
+    workspace_identity_sha256: str
+    final_executable_sha: str
+    _verification_token: object = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self._verification_token is not _PROVIDER_RUN_SCOPE_AUTHORIZATION_TOKEN:
+            raise ProviderRuntimeContractError(
+                "provider run scope authorization must come from a verified accepted-plan artifact"
+            )
+        if not str(self.job_id or "").strip() or not str(self.run_id or "").strip():
+            raise ProviderRuntimeContractError(
+                "provider run scope authorization requires job_id and run_id"
+            )
+        for label, value in (
+            ("artifact_id", self.artifact_id),
+            ("scenario_id", self.scenario_id),
+        ):
+            if not str(value or "").strip():
+                raise ProviderRuntimeContractError(
+                    f"provider run scope authorization {label} is required"
+                )
+        for name, value in (
+            ("provider_budget_sha256", self.provider_budget_sha256),
+            ("artifact_sha256", self.artifact_sha256),
+            ("acceptance_plan_sha256", self.acceptance_plan_sha256),
+            ("acceptance_spec_file_sha256", self.acceptance_spec_file_sha256),
+            ("runtime_spec_file_sha256", self.runtime_spec_file_sha256),
+            ("input_identity_sha256", self.input_identity_sha256),
+            ("workspace_identity_sha256", self.workspace_identity_sha256),
+        ):
+            if re.fullmatch(r"[0-9a-f]{64}", str(value or "")) is None:
+                raise ProviderRuntimeContractError(
+                    f"provider run scope authorization {name} is invalid"
+                )
+        if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", self.final_executable_sha) is None:
+            raise ProviderRuntimeContractError(
+                "provider run scope authorization final executable SHA is invalid"
+            )
+        if not isinstance(self.scope_hashes, Mapping):
+            raise ProviderRuntimeContractError(
+                "provider run scope authorization hashes must be a mapping"
+            )
+        if set(self.scope_hashes) != _PROVIDER_RUN_SCOPE_HASH_FIELDS:
+            raise ProviderRuntimeContractError(
+                "provider run scope authorization hashes do not match the run envelope contract"
+            )
+        normalized: dict[str, str] = {}
+        for name in sorted(_PROVIDER_RUN_SCOPE_HASH_FIELDS):
+            value = str(self.scope_hashes.get(name) or "")
+            if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                raise ProviderRuntimeContractError(
+                    f"provider run scope authorization hash is invalid: {name}"
+                )
+            normalized[name] = value
+        object.__setattr__(self, "scope_hashes", normalized)
+
+
+@dataclass(frozen=True)
+class ProviderRunPlanBindingV1:
+    """Active ControlPlane binding from one verified acceptance child plan."""
+
+    acceptance_run_id: str
+    acceptance_plan_sha256: str
+    acceptance_spec_file_sha256: str
+    scenario_id: str
+    job_id: str
+    runtime_spec_sha256: str
+    runtime_spec_file_sha256: str
+    scope_hashes: Mapping[str, str]
+    input_identity_sha256: str
+    workspace_identity_sha256: str
+    provider_budget_sha256: str
+    final_executable_sha: str
+    _verification_token: object = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self._verification_token is not _PROVIDER_RUN_PLAN_BINDING_TOKEN:
+            raise ProviderRuntimeContractError(
+                "provider run plan binding must come from a verified active ControlPlane plan"
+            )
+        if not str(self.acceptance_run_id or "").strip():
+            raise ProviderRuntimeContractError("accepted run plan binding run ID is required")
+        if not str(self.scenario_id or "").strip() or not str(self.job_id or "").strip():
+            raise ProviderRuntimeContractError(
+                "accepted run plan binding scenario and job IDs are required"
+            )
+        for name in (
+            "acceptance_plan_sha256",
+            "acceptance_spec_file_sha256",
+            "runtime_spec_sha256",
+            "runtime_spec_file_sha256",
+            "input_identity_sha256",
+            "workspace_identity_sha256",
+            "provider_budget_sha256",
+        ):
+            if re.fullmatch(r"[0-9a-f]{64}", str(getattr(self, name) or "")) is None:
+                raise ProviderRuntimeContractError(
+                    f"accepted run plan binding {name} is invalid"
+                )
+        if not isinstance(self.scope_hashes, Mapping) or set(self.scope_hashes) != _PROVIDER_RUN_SCOPE_HASH_FIELDS:
+            raise ProviderRuntimeContractError(
+                "accepted run plan binding does not contain the six-hash scope contract"
+            )
+        normalized_scope: dict[str, str] = {}
+        for name in sorted(_PROVIDER_RUN_SCOPE_HASH_FIELDS):
+            value = str(self.scope_hashes.get(name) or "")
+            if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                raise ProviderRuntimeContractError(
+                    f"accepted run plan binding scope hash is invalid: {name}"
+                )
+            normalized_scope[name] = value
+        if normalized_scope["runtime_spec_sha256"] != self.runtime_spec_sha256:
+            raise ProviderRuntimeContractError(
+                "accepted run plan binding normalized RuntimeJobSpec hash differs from scope"
+            )
+        object.__setattr__(self, "scope_hashes", normalized_scope)
+        if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", self.final_executable_sha) is None:
+            raise ProviderRuntimeContractError(
+                "accepted run plan binding final executable SHA is invalid"
+            )
 
 
 def current_acceptance_execution_context() -> AcceptanceExecutionContextV1 | None:
@@ -915,6 +1172,33 @@ def bind_acceptance_execution_context(
     finally:
         _ACTIVE_ACCEPTANCE_CONTROLLER.reset(controller_token)
         _ACTIVE_ACCEPTANCE_CONTEXT.reset(context_token)
+
+
+@contextmanager
+def bind_provider_run_budget(controller: ProviderBudgetController):
+    """Bind a durable finite ordinary-run controller across shared stage paths.
+
+    This is a budget binding only. It does not create acceptance authority or
+    change the controller's persisted budget/run identity.
+    """
+
+    if not isinstance(controller, ProviderBudgetController):
+        raise ProviderRuntimeContractError(
+            "ordinary run provider budget binding requires a ProviderBudgetController"
+        )
+    if not isinstance(controller.budget, ProviderAggregateBudgetV2):
+        raise ProviderRuntimeContractError(
+            "ordinary run provider budget binding requires strict finite V2 limits"
+        )
+    if controller.state_path is None or not controller.state_started:
+        raise ProviderRuntimeContractError(
+            "ordinary run provider budget must be durably bound before stage execution"
+        )
+    token = _ACTIVE_RUN_PROVIDER_CONTROLLER.set(controller)
+    try:
+        yield controller
+    finally:
+        _ACTIVE_RUN_PROVIDER_CONTROLLER.reset(token)
 
 
 def acceptance_context_environment(
@@ -973,6 +1257,7 @@ class ProviderBudgetController:
         self._process_identity = process_identity_for_pid(os.getpid())
         self._lock = threading.RLock()
         self._reservations: dict[str, ProviderAggregateReservationV1] = {}
+        self._primary_repair_scopes: dict[str, dict[str, Any]] = {}
         self._calls_used = 0
         self._output_tokens_used = 0
         self._retry_attempts_used = 0
@@ -985,6 +1270,7 @@ class ProviderBudgetController:
         self._loaded_run_id = ""
         self._state_started = False
         self._ambiguous_reservation_ids: set[str] = set()
+        self._verified_downstream_continuation: Any | None = None
 
     def bind_state_path(
         self,
@@ -1187,6 +1473,14 @@ class ProviderBudgetController:
         return self._state_path
 
     @property
+    def durable_deadline_epoch(self) -> float | None:
+        """Read the existing durable deadline without starting a new clock."""
+
+        with self._lock:
+            deadline = float(self._absolute_deadline_epoch or 0.0)
+            return deadline if deadline > 0 else None
+
+    @property
     def acceptance_run_id(self) -> str:
         return self._acceptance_run_id
 
@@ -1235,10 +1529,17 @@ class ProviderBudgetController:
             "provider-aggregate-budget-v3",
             "provider-aggregate-budget-v4",
             "provider-aggregate-budget-v5",
+            "provider-aggregate-budget-v6",
         }:
             raise ProviderRuntimeContractError("provider aggregate budget state schema is invalid")
         strict_budget = isinstance(self.budget, ProviderAggregateBudgetV2)
-        if strict_budget != (state_schema == "provider-aggregate-budget-v5"):
+        strict_state_schema = state_schema == "provider-aggregate-budget-v5" or (
+            state_schema == "provider-aggregate-budget-v6"
+            and isinstance(payload.get("budget"), Mapping)
+            and payload.get("budget", {}).get("schema_version")
+            == ProviderAggregateBudgetV2.SCHEMA_VERSION
+        )
+        if strict_budget != strict_state_schema:
             raise ProviderRuntimeContractError(
                 "provider aggregate budget state semantics do not match the active run"
             )
@@ -1377,7 +1678,186 @@ class ProviderBudgetController:
                     "provider aggregate budget has legacy unreconciled reservations"
                 )
         self._reservations = reservations
+        raw_primary_scopes = payload.get("primary_repair_scopes", {})
+        if not isinstance(raw_primary_scopes, Mapping):
+            raise ProviderRuntimeContractError(
+                "provider aggregate primary repair scope state is invalid"
+            )
+        primary_scopes: dict[str, dict[str, Any]] = {}
+        for raw_scope_id, raw_scope_record in raw_primary_scopes.items():
+            if not isinstance(raw_scope_record, Mapping):
+                raise ProviderRuntimeContractError(
+                    "provider aggregate primary repair scope record is invalid"
+                )
+            try:
+                scope = PrimaryRepairScopeV1.from_dict(raw_scope_record.get("scope") or {})
+            except PrimaryRepairRecoveryError as exc:
+                raise ProviderRuntimeContractError(
+                    "provider aggregate primary repair scope identity is invalid"
+                ) from exc
+            scope_id = str(raw_scope_id or "")
+            status = str(raw_scope_record.get("status") or "")
+            reservation_id = str(raw_scope_record.get("reservation_id") or "")
+            if scope_id != scope.scope_id or status not in {
+                "reserved",
+                "transport_started",
+                "raw_retained",
+                "raw_semantically_complete",
+                "ambiguous_raw_response",
+                "response_retained",
+                "completed",
+                "ambiguous",
+            }:
+                raise ProviderRuntimeContractError(
+                    "provider aggregate primary repair scope status or identity is invalid"
+                )
+            response_ref_payload = raw_scope_record.get("response_ref")
+            response_ref: dict[str, Any] | None = None
+            if response_ref_payload is not None:
+                try:
+                    response_ref = PrimaryRepairResponseRefV1.from_dict(response_ref_payload).to_dict()
+                except (PrimaryRepairRecoveryError, TypeError) as exc:
+                    raise ProviderRuntimeContractError(
+                        "provider aggregate primary repair response reference is invalid"
+                    ) from exc
+                if (
+                    response_ref["scope_id"] != scope.scope_id
+                    or response_ref["scope_fingerprint_sha256"] != scope.fingerprint_sha256
+                    or response_ref["request_hash"] != scope.request_hash
+                    or response_ref["reservation_id"] != reservation_id
+                ):
+                    raise ProviderRuntimeContractError(
+                        "provider aggregate primary repair response reference binding is invalid"
+                    )
+            default_started = 1 if status in {
+                "transport_started",
+                "raw_retained",
+                "raw_semantically_complete",
+                "ambiguous_raw_response",
+                "response_retained",
+                "completed",
+                "ambiguous",
+            } else 0
+            physical_attempts_started = raw_scope_record.get(
+                "physical_attempts_started", default_started
+            )
+            raw_attempt_number = raw_scope_record.get(
+                "raw_attempt_number",
+                1 if status in {
+                    "raw_retained",
+                    "raw_semantically_complete",
+                    "ambiguous_raw_response",
+                    "response_retained",
+                    "completed",
+                    "ambiguous",
+                } else 0,
+            )
+            if (
+                isinstance(physical_attempts_started, bool)
+                or not isinstance(physical_attempts_started, int)
+                or physical_attempts_started < 0
+                or isinstance(raw_attempt_number, bool)
+                or not isinstance(raw_attempt_number, int)
+                or raw_attempt_number < 0
+                or raw_attempt_number > physical_attempts_started
+            ):
+                raise ProviderRuntimeContractError(
+                    "provider aggregate primary repair physical attempt state is invalid"
+                )
+            raw_http_status = raw_scope_record.get("raw_http_status")
+            if raw_http_status is not None and (
+                isinstance(raw_http_status, bool)
+                or not isinstance(raw_http_status, int)
+                or raw_http_status < 100
+            ):
+                raise ProviderRuntimeContractError(
+                    "provider aggregate PRIMARY raw response HTTP status is invalid"
+                )
+            raw_body_complete = raw_scope_record.get("raw_body_complete", False)
+            if not isinstance(raw_body_complete, bool):
+                raise ProviderRuntimeContractError(
+                    "provider aggregate PRIMARY raw response completeness flag is invalid"
+                )
+            if status in {
+                "reserved",
+                "transport_started",
+                "raw_retained",
+                "raw_semantically_complete",
+                "ambiguous_raw_response",
+                "response_retained",
+            }:
+                reservation = reservations.get(reservation_id)
+                if reservation is None:
+                    raise ProviderRuntimeContractError(
+                        "active primary repair scope has no aggregate reservation"
+                    )
+                reservation_scope_payload = reservation.context.get("primary_repair_scope")
+                try:
+                    reservation_scope = PrimaryRepairScopeV1.from_dict(
+                        reservation_scope_payload or {}
+                    )
+                except PrimaryRepairRecoveryError as exc:
+                    raise ProviderRuntimeContractError(
+                        "primary repair reservation scope binding is invalid"
+                    ) from exc
+                if (
+                    reservation_scope.scope_id != scope.scope_id
+                    or reservation_scope.fingerprint_sha256 != scope.fingerprint_sha256
+                ):
+                    raise ProviderRuntimeContractError(
+                        "primary repair reservation differs from its scope record"
+                    )
+                if status in {
+                    "raw_retained",
+                    "raw_semantically_complete",
+                    "ambiguous_raw_response",
+                    "response_retained",
+                } and response_ref is None:
+                    raise ProviderRuntimeContractError(
+                        "retained primary repair response has no journal reference"
+                    )
+            elif status == "completed" and not response_ref:
+                raise ProviderRuntimeContractError(
+                    "completed primary repair scope has no durable response reference"
+                )
+            primary_scopes[scope_id] = {
+                "scope": scope.to_dict(),
+                "reservation_id": reservation_id,
+                "status": status,
+                "response_ref": response_ref,
+                "physical_attempts_started": physical_attempts_started,
+                "raw_attempt_number": raw_attempt_number,
+                "raw_http_status": raw_http_status,
+                "raw_body_complete": raw_body_complete,
+            }
+        if state_schema == "provider-aggregate-budget-v6":
+            for reservation in reservations.values():
+                raw_scope = reservation.context.get("primary_repair_scope")
+                if raw_scope is None:
+                    continue
+                try:
+                    scope = PrimaryRepairScopeV1.from_dict(raw_scope)
+                except PrimaryRepairRecoveryError as exc:
+                    raise ProviderRuntimeContractError(
+                        "primary repair reservation scope is invalid"
+                    ) from exc
+                if scope.scope_id not in primary_scopes:
+                    raise ProviderRuntimeContractError(
+                        "primary repair reservation is missing its atomic scope record"
+                    )
+        self._primary_repair_scopes = primary_scopes
         self._ambiguous_reservation_ids = set()
+        self._ambiguous_reservation_ids.update(
+            str(record.get("reservation_id") or "")
+            for record in primary_scopes.values()
+            if record.get("status")
+            in {
+                "raw_semantically_complete",
+                "ambiguous_raw_response",
+                "ambiguous",
+            }
+            and str(record.get("reservation_id") or "")
+        )
         self._recompute_reserved_unlocked()
         stored_reserved = (
             payload.get("calls_reserved", self._calls_reserved),
@@ -1439,6 +1919,48 @@ class ProviderBudgetController:
     ) -> ProcessLiveness:
         return process_liveness(cls._reservation_process_identity(reservation))
 
+    def _scope_record_for_reservation_unlocked(
+        self,
+        reservation: ProviderAggregateReservationV1,
+    ) -> tuple[PrimaryRepairScopeV1, dict[str, Any]] | None:
+        raw_scope = reservation.context.get("primary_repair_scope")
+        if raw_scope is None:
+            return None
+        try:
+            scope = PrimaryRepairScopeV1.from_dict(raw_scope)
+        except PrimaryRepairRecoveryError as exc:
+            raise ProviderRuntimeContractError(
+                "primary repair reservation scope is invalid"
+            ) from exc
+        record = self._primary_repair_scopes.get(scope.scope_id)
+        if (
+            record is None
+            or str(record.get("reservation_id") or "") != reservation.reservation_id
+        ):
+            raise ProviderRuntimeContractError(
+                "primary repair scope reservation record is missing or stale"
+            )
+        try:
+            stored_scope = PrimaryRepairScopeV1.from_dict(record.get("scope") or {})
+        except PrimaryRepairRecoveryError as exc:
+            raise ProviderRuntimeContractError(
+                "primary repair scope reservation record is invalid"
+            ) from exc
+        if stored_scope.fingerprint_sha256 != scope.fingerprint_sha256:
+            raise ProviderRuntimeContractError(
+                "primary repair scope reservation fingerprint changed"
+            )
+        return scope, record
+
+    def _drop_scope_for_reservation_unlocked(
+        self,
+        reservation: ProviderAggregateReservationV1,
+    ) -> None:
+        matched = self._scope_record_for_reservation_unlocked(reservation)
+        if matched is not None:
+            scope, _record = matched
+            self._primary_repair_scopes.pop(scope.scope_id, None)
+
     def _reconcile_dead_reservations_unlocked(self) -> None:
         """Release only reservations proven to have died before transport."""
 
@@ -1451,7 +1973,9 @@ class ProviderBudgetController:
                 continue
             stale.append(reservation_id)
         for reservation_id in stale:
-            self._reservations.pop(reservation_id, None)
+            reservation = self._reservations.pop(reservation_id, None)
+            if reservation is not None:
+                self._drop_scope_for_reservation_unlocked(reservation)
         self._recompute_reserved_unlocked()
 
     def _persist_state_unlocked(self) -> None:
@@ -1488,6 +2012,10 @@ class ProviderBudgetController:
                     }
                     for reservation in self._reservations.values()
                 ],
+                "primary_repair_scopes": {
+                    scope_id: dict(scope_record)
+                    for scope_id, scope_record in sorted(self._primary_repair_scopes.items())
+                },
             },
         )
 
@@ -1501,16 +2029,33 @@ class ProviderBudgetController:
         ) >= self.budget.max_wall_seconds:
             raise ProviderBudgetExceeded("aggregate provider wall-clock budget exhausted")
 
+    @staticmethod
+    def _coerce_primary_repair_scope(
+        value: PrimaryRepairScopeV1 | Mapping[str, Any] | None,
+    ) -> PrimaryRepairScopeV1 | None:
+        if value is None:
+            return None
+        try:
+            return value if isinstance(value, PrimaryRepairScopeV1) else PrimaryRepairScopeV1.from_dict(value)
+        except (PrimaryRepairRecoveryError, TypeError) as exc:
+            raise ProviderRuntimeContractError("PRIMARY repair scope is invalid") from exc
+
     def admit(
         self,
         *,
         requested_output_tokens: int = 0,
         requested_retry_attempts: int = 0,
         context: Mapping[str, Any] | None = None,
+        primary_repair_scope: PrimaryRepairScopeV1 | Mapping[str, Any] | None = None,
     ) -> ProviderAggregateReservationV1:
         output_tokens = max(0, int(requested_output_tokens))
         retry_attempts = max(0, int(requested_retry_attempts))
         provider_calls = 1 + retry_attempts
+        scope = self._coerce_primary_repair_scope(primary_repair_scope)
+        if scope is not None and self._state_path is None:
+            raise ProviderRuntimeContractError(
+                "PRIMARY repair admission requires a bound durable aggregate budget state"
+            )
         with self._lock:
             lock = interprocess_file_lock(self._state_path) if self._state_path is not None else None
             if lock is None:
@@ -1519,6 +2064,7 @@ class ProviderBudgetController:
                     output_tokens=output_tokens,
                     retry_attempts=retry_attempts,
                     context=context,
+                    primary_repair_scope=scope,
                 )
             with lock:
                 self._load_state_unlocked()
@@ -1528,6 +2074,7 @@ class ProviderBudgetController:
                     output_tokens=output_tokens,
                     retry_attempts=retry_attempts,
                     context=context,
+                    primary_repair_scope=scope,
                 )
 
     def _admit_unlocked(
@@ -1537,12 +2084,42 @@ class ProviderBudgetController:
         output_tokens: int,
         retry_attempts: int,
         context: Mapping[str, Any] | None,
+        primary_repair_scope: PrimaryRepairScopeV1 | None = None,
     ) -> ProviderAggregateReservationV1:
+        continuation = getattr(self, "_verified_downstream_continuation", None)
+        if continuation is not None:
+            from runtime.downstream_continuation import validate_continuation_controller
+
+            validate_continuation_controller(continuation, self)
+            if (
+                not isinstance(context, Mapping)
+                or context.get("job_id") != continuation.job_id
+                or context.get("stage_name") not in continuation.allow_provider_stages
+            ):
+                raise ProviderRuntimeContractError(
+                    "downstream continuation admits only this job's Writer and Validator stages"
+                )
         self._check_wall()
         if self._ambiguous_reservation_ids:
             raise ProviderBudgetExceeded(
                 "provider aggregate budget has ambiguous reservations requiring durable receipt reconciliation"
             )
+        if primary_repair_scope is not None:
+            existing_scope = self._primary_repair_scopes.get(primary_repair_scope.scope_id)
+            if existing_scope is not None:
+                try:
+                    prior_scope = PrimaryRepairScopeV1.from_dict(existing_scope.get("scope") or {})
+                except PrimaryRepairRecoveryError as exc:
+                    raise ProviderRuntimeContractError(
+                        "existing PRIMARY repair scope state is invalid"
+                    ) from exc
+                if prior_scope.fingerprint_sha256 != primary_repair_scope.fingerprint_sha256:
+                    raise ProviderRuntimeContractError(
+                        "PRIMARY repair scope materialization changed; reconcile the prior attempt"
+                    )
+                raise ProviderBudgetExceeded(
+                    "PRIMARY repair scope is already reserved or attempted; recover its response before another POST"
+                )
         strict_budget = isinstance(self.budget, ProviderAggregateBudgetV2)
         if (
                 (strict_budget or self.budget.max_provider_calls_total)
@@ -1562,6 +2139,9 @@ class ProviderBudgetController:
                 > self.budget.max_retry_attempts_total
         ):
             raise ProviderBudgetExceeded("aggregate provider retry budget exhausted")
+        reservation_context = dict(context or {})
+        if primary_repair_scope is not None:
+            reservation_context["primary_repair_scope"] = primary_repair_scope.to_dict()
         reservation = ProviderAggregateReservationV1(
                 reservation_id=f"{os.getpid()}-{uuid.uuid4().hex}",
                 provider_calls=provider_calls,
@@ -1572,9 +2152,20 @@ class ProviderBudgetController:
                 owner_pid=self._process_identity.pid,
                 owner_process_creation_time=self._process_identity.creation_time,
                 owner_host_id=self._process_identity.host_id,
-                context=dict(context or {}),
+                context=reservation_context,
         )
         self._reservations[reservation.reservation_id] = reservation
+        if primary_repair_scope is not None:
+            self._primary_repair_scopes[primary_repair_scope.scope_id] = {
+                "scope": primary_repair_scope.to_dict(),
+                "reservation_id": reservation.reservation_id,
+                "status": "reserved",
+                "response_ref": None,
+                "physical_attempts_started": 0,
+                "raw_attempt_number": 0,
+                "raw_http_status": None,
+                "raw_body_complete": False,
+            }
         self._calls_reserved += provider_calls
         self._output_tokens_reserved += output_tokens
         self._retry_attempts_reserved += retry_attempts
@@ -1582,6 +2173,8 @@ class ProviderBudgetController:
             self._persist_state_unlocked()
         except BaseException:
             del self._reservations[reservation.reservation_id]
+            if primary_repair_scope is not None:
+                self._primary_repair_scopes.pop(primary_repair_scope.scope_id, None)
             self._calls_reserved -= provider_calls
             self._output_tokens_reserved -= output_tokens
             self._retry_attempts_reserved -= retry_attempts
@@ -1608,7 +2201,279 @@ class ProviderBudgetController:
             current,
             transport_started=True,
         )
+        matched = self._scope_record_for_reservation_unlocked(current)
+        if matched is not None:
+            _scope, scope_record = matched
+            if scope_record.get("status") == "transport_started":
+                return
+            if scope_record.get("status") != "reserved":
+                raise ProviderRuntimeContractError(
+                    "PRIMARY repair scope is not in its reserved state before transport"
+                )
+            scope_record["status"] = "transport_started"
+            scope_record["physical_attempts_started"] = 1
+            scope_record["raw_attempt_number"] = 0
+            scope_record["raw_http_status"] = None
+            scope_record["raw_body_complete"] = False
         self._persist_state_unlocked()
+
+    def mark_primary_repair_attempt_started(
+        self,
+        reservation: ProviderAggregateReservationV1,
+        scope: PrimaryRepairScopeV1 | Mapping[str, Any],
+        attempt_number: int,
+    ) -> int:
+        """Durably bind each physical PRIMARY POST before its transport hand-off."""
+
+        normalized_scope = self._coerce_primary_repair_scope(scope)
+        assert normalized_scope is not None
+        if isinstance(attempt_number, bool) or not isinstance(attempt_number, int) or attempt_number < 1:
+            raise ProviderRuntimeContractError("PRIMARY physical attempt number must be positive")
+        with self._lock:
+            lock = interprocess_file_lock(self._state_path) if self._state_path is not None else None
+            if lock is None:
+                return self._mark_primary_repair_attempt_started_unlocked(
+                    reservation, normalized_scope, attempt_number
+                )
+            with lock:
+                self._load_state_unlocked()
+                return self._mark_primary_repair_attempt_started_unlocked(
+                    reservation, normalized_scope, attempt_number
+                )
+
+    def _mark_primary_repair_attempt_started_unlocked(
+        self,
+        reservation: ProviderAggregateReservationV1,
+        scope: PrimaryRepairScopeV1,
+        attempt_number: int,
+    ) -> int:
+        current = self._reservations.get(reservation.reservation_id)
+        if current is None:
+            raise ProviderRuntimeContractError(
+                "PRIMARY physical attempt has no aggregate reservation"
+            )
+        if attempt_number > current.provider_calls:
+            raise ProviderBudgetExceeded(
+                "PRIMARY physical attempt exceeds its pre-admitted call allowance"
+            )
+        matched = self._scope_record_for_reservation_unlocked(current)
+        if matched is None or matched[0].fingerprint_sha256 != scope.fingerprint_sha256:
+            raise ProviderRuntimeContractError(
+                "PRIMARY physical attempt does not match its atomic scope reservation"
+            )
+        _stored_scope, record = matched
+        started = int(record.get("physical_attempts_started") or 0)
+        if started == 0:
+            if (
+                attempt_number != 1
+                or record.get("status") != "reserved"
+                or current.transport_started
+            ):
+                raise ProviderRuntimeContractError(
+                    "PRIMARY first POST boundary differs from its reserved scope"
+                )
+            # Check the durable global wall cap at the actual pre-POST
+            # boundary, after request materialization and immediately before
+            # the adapter hands the request to the network.
+            self._check_wall()
+            self._reservations[current.reservation_id] = replace(
+                current,
+                transport_started=True,
+            )
+            record["status"] = "transport_started"
+            record["physical_attempts_started"] = 1
+            record["raw_attempt_number"] = 0
+            record["raw_http_status"] = None
+            record["raw_body_complete"] = False
+            self._persist_state_unlocked()
+            return 1
+        if not current.transport_started:
+            raise ProviderRuntimeContractError(
+                "PRIMARY retry has no started aggregate reservation"
+            )
+        if (
+            attempt_number == 1
+            and started == 1
+            and int(record.get("raw_attempt_number") or 0) == 0
+            and record.get("status") == "transport_started"
+        ):
+            return started  # Attempt 1 was pre-marked by mark_transport_started.
+        if attempt_number == started:
+            raise ProviderRuntimeContractError(
+                "PRIMARY physical attempt was already marked before this POST"
+            )
+        if attempt_number != started + 1:
+            raise ProviderRuntimeContractError(
+                "PRIMARY physical attempts must start once, in order"
+            )
+        raw_attempt = int(record.get("raw_attempt_number") or 0)
+        if raw_attempt != started:
+            raise ProviderRuntimeContractError(
+                "PRIMARY retry is blocked because the preceding provider outcome is unknown"
+            )
+        if started:
+            if not bool(record.get("raw_body_complete")):
+                raise ProviderRuntimeContractError(
+                    "PRIMARY retry is blocked after an incomplete provider response"
+                )
+            if record.get("raw_http_status") == 200:
+                raise ProviderRuntimeContractError(
+                    "PRIMARY retry is blocked after a complete HTTP 200 response"
+                )
+        if record.get("status") not in {
+            "transport_started",
+            "raw_retained",
+            "ambiguous_raw_response",
+        }:
+            raise ProviderRuntimeContractError(
+                "PRIMARY scope cannot begin another physical attempt from its current state"
+            )
+        record["physical_attempts_started"] = attempt_number
+        record["status"] = "transport_started"
+        self._ambiguous_reservation_ids.discard(current.reservation_id)
+        self._persist_state_unlocked()
+        return attempt_number
+
+    def retain_primary_repair_raw_response(
+        self,
+        reservation: ProviderAggregateReservationV1,
+        scope: PrimaryRepairScopeV1 | Mapping[str, Any],
+        response_ref: PrimaryRepairResponseRefV1 | Mapping[str, Any],
+        *,
+        journal: PrimaryRepairResponseJournal,
+    ) -> str:
+        """Anchor a durable raw spool before the HTTP adapter returns."""
+
+        normalized_scope = self._coerce_primary_repair_scope(scope)
+        assert normalized_scope is not None
+        try:
+            normalized_ref = (
+                response_ref
+                if isinstance(response_ref, PrimaryRepairResponseRefV1)
+                else PrimaryRepairResponseRefV1.from_dict(response_ref)
+            )
+            entry = journal.load_entry_for_scope(
+                normalized_scope,
+                reservation_id=reservation.reservation_id,
+            )
+        except (PrimaryRepairRecoveryError, TypeError) as exc:
+            raise ProviderRuntimeContractError(
+                "raw PRIMARY response reference could not be verified"
+            ) from exc
+        if entry is None or entry.entry_kind not in {
+            "raw_response",
+            "semantic_raw_response",
+            "ambiguous_raw_response",
+        } or entry.reference != normalized_ref or entry.raw_spool is None:
+            raise ProviderRuntimeContractError(
+                "raw PRIMARY response reference does not identify a retained spool"
+            )
+        with self._lock:
+            lock = interprocess_file_lock(self._state_path) if self._state_path is not None else None
+            if lock is None:
+                return self._retain_primary_repair_raw_response_unlocked(
+                    reservation,
+                    normalized_scope,
+                    entry,
+                )
+            with lock:
+                self._load_state_unlocked()
+                return self._retain_primary_repair_raw_response_unlocked(
+                    reservation,
+                    normalized_scope,
+                    entry,
+                )
+
+    def _retain_primary_repair_raw_response_unlocked(
+        self,
+        reservation: ProviderAggregateReservationV1,
+        scope: PrimaryRepairScopeV1,
+        entry: PrimaryRepairResponseEntryV1,
+    ) -> str:
+        current = self._reservations.get(reservation.reservation_id)
+        if current is None or not current.transport_started:
+            raise ProviderRuntimeContractError(
+                "raw PRIMARY response has no started aggregate reservation"
+            )
+        matched = self._scope_record_for_reservation_unlocked(current)
+        if matched is None or matched[0].fingerprint_sha256 != scope.fingerprint_sha256:
+            raise ProviderRuntimeContractError(
+                "raw PRIMARY response does not match its atomic scope reservation"
+            )
+        _scope, scope_record = matched
+        if (
+            entry.raw_spool is None
+            or entry.raw_spool.attempt_number
+            != int(scope_record.get("physical_attempts_started") or 0)
+        ):
+            raise ProviderRuntimeContractError(
+                "raw PRIMARY response does not match the latest started physical attempt"
+            )
+        if scope_record.get("status") in {
+            "raw_retained",
+            "raw_semantically_complete",
+            "ambiguous_raw_response",
+        }:
+            if scope_record.get("response_ref") != entry.reference.to_dict():
+                raise ProviderRuntimeContractError(
+                    "PRIMARY response scope already retains a different raw spool"
+                )
+            return str(scope_record.get("status"))
+        if scope_record.get("status") != "transport_started":
+            if scope_record.get("status") in {"response_retained", "completed"}:
+                return str(scope_record.get("status"))
+            raise ProviderRuntimeContractError(
+                "PRIMARY response scope is not transport-started"
+            )
+        scope_record["status"] = (
+            "raw_retained"
+            if entry.entry_kind == "raw_response"
+            else "raw_semantically_complete"
+            if entry.entry_kind == "semantic_raw_response"
+            else "ambiguous_raw_response"
+        )
+        scope_record["response_ref"] = entry.reference.to_dict()
+        scope_record["raw_attempt_number"] = entry.raw_spool.attempt_number
+        scope_record["raw_http_status"] = entry.raw_spool.http_status
+        scope_record["raw_body_complete"] = entry.raw_spool.complete
+        if entry.entry_kind in {
+            "semantic_raw_response",
+            "ambiguous_raw_response",
+        }:
+            self._ambiguous_reservation_ids.add(current.reservation_id)
+        self._persist_state_unlocked()
+        return entry.entry_kind
+
+    def release_unstarted(
+        self,
+        reservation: ProviderAggregateReservationV1,
+    ) -> bool:
+        """Release an admission only while its transport-start marker is clear."""
+
+        with self._lock:
+            lock = interprocess_file_lock(self._state_path) if self._state_path is not None else None
+            if lock is None:
+                return self._release_unstarted_unlocked(reservation)
+            with lock:
+                self._load_state_unlocked()
+                return self._release_unstarted_unlocked(reservation)
+
+    def _release_unstarted_unlocked(
+        self,
+        reservation: ProviderAggregateReservationV1,
+    ) -> bool:
+        current = self._reservations.get(reservation.reservation_id)
+        if current is None:
+            return False
+        if current.transport_started:
+            raise ProviderRuntimeContractError(
+                "provider reservation cannot be released after transport started"
+            )
+        self._drop_scope_for_reservation_unlocked(current)
+        self._reservations.pop(current.reservation_id, None)
+        self._recompute_reserved_unlocked()
+        self._persist_state_unlocked()
+        return True
 
     def reconcile_orphaned_reservations(
         self,
@@ -1671,6 +2536,34 @@ class ProviderBudgetController:
                     raise ProviderRuntimeContractError(
                         "durable receipt exceeds its orphaned aggregate reservation"
                     )
+                matched_scope = self._scope_record_for_reservation_unlocked(reservation)
+                if matched_scope is not None:
+                    scope, scope_record = matched_scope
+                    metadata = receipt.get("metadata")
+                    raw_ref = (
+                        metadata.get("primary_repair_response_ref")
+                        if isinstance(metadata, Mapping)
+                        else None
+                    )
+                    try:
+                        response_ref = (
+                            None
+                            if raw_ref is None
+                            else PrimaryRepairResponseRefV1.from_dict(raw_ref)
+                        )
+                    except (PrimaryRepairRecoveryError, TypeError):
+                        response_ref = None
+                    if response_ref is not None and (
+                        response_ref.scope_id == scope.scope_id
+                        and response_ref.scope_fingerprint_sha256 == scope.fingerprint_sha256
+                        and response_ref.request_hash == scope.request_hash
+                        and response_ref.reservation_id == reservation_id
+                    ):
+                        scope_record["status"] = "completed"
+                        scope_record["response_ref"] = response_ref.to_dict()
+                    else:
+                        scope_record["status"] = "ambiguous"
+                        scope_record["response_ref"] = None
                 self._reservations.pop(reservation_id, None)
                 self._calls_used += attempts
                 self._output_tokens_used += actual_output
@@ -1678,9 +2571,67 @@ class ProviderBudgetController:
                 self._ambiguous_reservation_ids.discard(reservation_id)
                 recovered.append(reservation_id)
             elif reservation.transport_started:
-                self._ambiguous_reservation_ids.add(reservation_id)
-                ambiguous.append(reservation_id)
+                journal_entry = self._journaled_primary_repair_response_unlocked(
+                    reservation
+                )
+                if journal_entry is not None:
+                    matched_scope = self._scope_record_for_reservation_unlocked(reservation)
+                    if matched_scope is None:
+                        raise ProviderRuntimeContractError(
+                            "journaled PRIMARY response has no atomic scope reservation"
+                        )
+                    scope, scope_record = matched_scope
+                    reference = journal_entry.reference
+                    receipt_binding = journal_entry.receipt_binding
+                    if (
+                        receipt_binding.get("input_hash") != scope.request_hash
+                        or receipt_binding.get("job_id") != scope.job_id
+                        or receipt_binding.get("logical_attempt_identity")
+                        != scope.logical_attempt_identity
+                        or receipt_binding.get("call_id")
+                        != str(reservation.context.get("call_id") or "")
+                    ):
+                        raise ProviderRuntimeContractError(
+                            "journaled PRIMARY response receipt binding differs from its reservation"
+                        )
+                    physical_attempts = int(
+                        scope_record.get("physical_attempts_started") or 1
+                    )
+                    raw_spool = journal_entry.raw_spool
+                    if raw_spool is not None:
+                        scope_record["raw_attempt_number"] = raw_spool.attempt_number
+                        scope_record["raw_http_status"] = raw_spool.http_status
+                        scope_record["raw_body_complete"] = raw_spool.complete
+                    if (
+                        raw_spool is not None
+                        and raw_spool.attempt_number != physical_attempts
+                    ):
+                        # A later POST boundary without a retained body makes
+                        # this response stale. Never recover an earlier retry
+                        # response while a later physical attempt is unknown.
+                        scope_record["status"] = "ambiguous"
+                        scope_record["response_ref"] = reference.to_dict()
+                        ambiguous.append(reservation_id)
+                    elif journal_entry.entry_kind == "raw_response":
+                        scope_record["status"] = "raw_retained"
+                    elif journal_entry.entry_kind == "semantic_raw_response":
+                        scope_record["status"] = "raw_semantically_complete"
+                    elif journal_entry.entry_kind == "ambiguous_raw_response":
+                        scope_record["status"] = "ambiguous_raw_response"
+                        ambiguous.append(reservation_id)
+                    elif journal_entry.entry_kind == "normalized_response":
+                        scope_record["status"] = "response_retained"
+                    else:
+                        raise ProviderRuntimeContractError(
+                            "journaled PRIMARY response has an unsupported entry kind"
+                        )
+                    scope_record["response_ref"] = reference.to_dict()
+                    self._ambiguous_reservation_ids.add(reservation_id)
+                else:
+                    self._ambiguous_reservation_ids.add(reservation_id)
+                    ambiguous.append(reservation_id)
             else:
+                self._drop_scope_for_reservation_unlocked(reservation)
                 self._reservations.pop(reservation_id, None)
                 self._ambiguous_reservation_ids.discard(reservation_id)
                 released.append(reservation_id)
@@ -1693,10 +2644,218 @@ class ProviderBudgetController:
             )
         return {"released": released, "recovered": recovered, "ambiguous": ambiguous}
 
+    def _journaled_primary_repair_response_unlocked(
+        self,
+        reservation: ProviderAggregateReservationV1,
+    ) -> PrimaryRepairResponseEntryV1 | None:
+        scope_payload = reservation.context.get("primary_repair_scope")
+        journal_root = str(
+            reservation.context.get("primary_repair_response_journal_root") or ""
+        ).strip()
+        if not isinstance(scope_payload, Mapping) or not journal_root:
+            return None
+        try:
+            scope = PrimaryRepairScopeV1.from_dict(scope_payload)
+            journal = PrimaryRepairResponseJournal(journal_root)
+            entry = journal.load_entry_for_scope(
+                scope,
+                reservation_id=reservation.reservation_id,
+            )
+            if entry is None:
+                scope_record = self._primary_repair_scopes.get(scope.scope_id)
+                attempt_number = int(
+                    (scope_record or {}).get("physical_attempts_started") or 0
+                )
+                if attempt_number > 0:
+                    journal.recover_orphaned_raw_response(
+                        scope,
+                        reservation.reservation_id,
+                        attempt_number,
+                    )
+                    entry = journal.load_entry_for_scope(
+                        scope,
+                        reservation_id=reservation.reservation_id,
+                    )
+        except (PrimaryRepairRecoveryError, OSError, ValueError, TypeError):
+            return None
+        if entry is None or not entry.receipt_binding:
+            return None
+        return entry
+
+    def lookup_primary_repair_scopes(self) -> list[dict[str, Any]]:
+        """Return durable PRIMARY scope state for local response reconciliation."""
+
+        with self._lock:
+            lock = interprocess_file_lock(self._state_path) if self._state_path is not None else None
+            if lock is None:
+                return [
+                    dict(record)
+                    for _scope_id, record in sorted(self._primary_repair_scopes.items())
+                ]
+            with lock:
+                self._load_state_unlocked()
+                return [
+                    dict(record)
+                    for _scope_id, record in sorted(self._primary_repair_scopes.items())
+                ]
+
+    def lookup_primary_repair_scope(
+        self,
+        scope: PrimaryRepairScopeV1 | Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        normalized = self._coerce_primary_repair_scope(scope)
+        assert normalized is not None
+        with self._lock:
+            lock = interprocess_file_lock(self._state_path) if self._state_path is not None else None
+            if lock is None:
+                record = self._primary_repair_scopes.get(normalized.scope_id)
+            else:
+                with lock:
+                    self._load_state_unlocked()
+                    record = self._primary_repair_scopes.get(normalized.scope_id)
+            if record is None:
+                return None
+            try:
+                stored_scope = PrimaryRepairScopeV1.from_dict(record.get("scope") or {})
+            except PrimaryRepairRecoveryError as exc:
+                raise ProviderRuntimeContractError("stored PRIMARY repair scope is invalid") from exc
+            if stored_scope.fingerprint_sha256 != normalized.fingerprint_sha256:
+                raise ProviderRuntimeContractError(
+                    "stored PRIMARY repair scope has a different materialized binding"
+                )
+            result = {
+                "scope": stored_scope.to_dict(),
+                "reservation_id": str(record.get("reservation_id") or ""),
+                "status": str(record.get("status") or ""),
+                "response_ref": (
+                    dict(record["response_ref"])
+                    if isinstance(record.get("response_ref"), Mapping)
+                    else None
+                ),
+                "physical_attempts_started": int(
+                    record.get("physical_attempts_started") or 0
+                ),
+                "raw_attempt_number": int(record.get("raw_attempt_number") or 0),
+                "raw_http_status": record.get("raw_http_status"),
+                "raw_body_complete": bool(record.get("raw_body_complete")),
+            }
+            reservation = self._reservations.get(result["reservation_id"])
+            if reservation is not None:
+                result["response_journal_root"] = str(
+                    reservation.context.get("primary_repair_response_journal_root") or ""
+                )
+            return result
+
+    def recover_primary_repair_response(
+        self,
+        scope: PrimaryRepairScopeV1 | Mapping[str, Any],
+        response_ref: PrimaryRepairResponseRefV1 | Mapping[str, Any],
+        response: Mapping[str, Any],
+        *,
+        journal: PrimaryRepairResponseJournal,
+    ) -> dict[str, Any]:
+        """Account a journaled response after its transport owner has died.
+
+        This path converts an already-reserved, already-started call into used
+        budget.  It never admits or sends a replacement request.
+        """
+
+        normalized_scope = self._coerce_primary_repair_scope(scope)
+        assert normalized_scope is not None
+        try:
+            normalized_ref = (
+                response_ref
+                if isinstance(response_ref, PrimaryRepairResponseRefV1)
+                else PrimaryRepairResponseRefV1.from_dict(response_ref)
+            )
+            journal_response = journal.load(
+                normalized_ref,
+                scope=normalized_scope,
+                reservation_id=normalized_ref.reservation_id,
+            )
+        except (PrimaryRepairRecoveryError, TypeError) as exc:
+            raise ProviderRuntimeContractError(
+                "journaled PRIMARY repair response could not be verified"
+            ) from exc
+        if journal_response != dict(response):
+            raise ProviderRuntimeContractError(
+                "recovered PRIMARY repair response differs from its durable journal"
+            )
+        with self._lock:
+            lock = interprocess_file_lock(self._state_path) if self._state_path is not None else None
+            if lock is None:
+                return self._recover_primary_repair_response_unlocked(
+                    normalized_scope,
+                    normalized_ref,
+                    journal_response,
+                )
+            with lock:
+                self._load_state_unlocked()
+                return self._recover_primary_repair_response_unlocked(
+                    normalized_scope,
+                    normalized_ref,
+                    journal_response,
+                )
+
+    def _recover_primary_repair_response_unlocked(
+        self,
+        scope: PrimaryRepairScopeV1,
+        response_ref: PrimaryRepairResponseRefV1,
+        response: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        record = self._primary_repair_scopes.get(scope.scope_id)
+        if record is None:
+            raise ProviderRuntimeContractError("PRIMARY repair scope reservation is missing")
+        stored_scope = PrimaryRepairScopeV1.from_dict(record.get("scope") or {})
+        if stored_scope.fingerprint_sha256 != scope.fingerprint_sha256:
+            raise ProviderRuntimeContractError("PRIMARY repair scope changed during recovery")
+        if record.get("status") == "completed":
+            if record.get("response_ref") != response_ref.to_dict():
+                raise ProviderRuntimeContractError(
+                    "PRIMARY repair scope is complete with a different response"
+                )
+            return self.snapshot()
+        reservation = self._reservations.get(response_ref.reservation_id)
+        if reservation is None:
+            raise ProviderRuntimeContractError(
+                "journaled PRIMARY repair response has no pending aggregate reservation"
+            )
+        if self._reservation_owner_liveness(reservation) != "dead":
+            raise ProviderRuntimeContractError(
+                "PRIMARY repair response recovery requires its transport owner to be stopped"
+            )
+        if not reservation.transport_started:
+            raise ProviderRuntimeContractError(
+                "journaled PRIMARY repair response has no transport-started reservation"
+            )
+        matched = self._scope_record_for_reservation_unlocked(reservation)
+        if matched is None or matched[0].fingerprint_sha256 != scope.fingerprint_sha256:
+            raise ProviderRuntimeContractError(
+                "journaled PRIMARY repair response does not match its pending scope"
+            )
+        if (
+            response_ref.scope_id != scope.scope_id
+            or response_ref.scope_fingerprint_sha256 != scope.fingerprint_sha256
+            or response_ref.request_hash != scope.request_hash
+            or response_ref.reservation_id != reservation.reservation_id
+        ):
+            raise ProviderRuntimeContractError(
+                "journaled PRIMARY repair response reference is outside the pending scope"
+            )
+        snapshot = self._complete_unlocked(
+            reservation=reservation,
+            result=response,
+            primary_repair_response_ref=response_ref,
+        )
+        self._ambiguous_reservation_ids.discard(reservation.reservation_id)
+        return snapshot
+
     def complete(
         self,
         reservation: ProviderAggregateReservationV1,
         result: Mapping[str, Any],
+        *,
+        primary_repair_response_ref: PrimaryRepairResponseRefV1 | Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             lock = interprocess_file_lock(self._state_path) if self._state_path is not None else None
@@ -1704,12 +2863,14 @@ class ProviderBudgetController:
                 return self._complete_unlocked(
                     reservation=reservation,
                     result=result,
+                    primary_repair_response_ref=primary_repair_response_ref,
                 )
             with lock:
                 self._load_state_unlocked()
                 return self._complete_unlocked(
                     reservation=reservation,
                     result=result,
+                    primary_repair_response_ref=primary_repair_response_ref,
                 )
 
     def _complete_unlocked(
@@ -1717,6 +2878,7 @@ class ProviderBudgetController:
         *,
         reservation: ProviderAggregateReservationV1,
         result: Mapping[str, Any],
+        primary_repair_response_ref: PrimaryRepairResponseRefV1 | Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         current = self._reservations.get(reservation.reservation_id)
         if current is None:
@@ -1741,6 +2903,45 @@ class ProviderBudgetController:
                 raise ProviderRuntimeContractError(
                     "provider output tokens exceeded the pre-admitted aggregate reservation"
                 )
+        matched_scope = self._scope_record_for_reservation_unlocked(current)
+        if matched_scope is not None:
+            scope, scope_record = matched_scope
+            if not current.transport_started:
+                raise ProviderRuntimeContractError(
+                    "PRIMARY repair scope cannot complete before transport started"
+                )
+            if primary_repair_response_ref is None:
+                raise ProviderRuntimeContractError(
+                    "PRIMARY repair completion requires a durable response journal reference"
+                )
+            try:
+                response_ref = (
+                    primary_repair_response_ref
+                    if isinstance(primary_repair_response_ref, PrimaryRepairResponseRefV1)
+                    else PrimaryRepairResponseRefV1.from_dict(primary_repair_response_ref)
+                )
+            except (PrimaryRepairRecoveryError, TypeError) as exc:
+                raise ProviderRuntimeContractError(
+                    "PRIMARY repair response journal reference is invalid"
+                ) from exc
+            if (
+                response_ref.scope_id != scope.scope_id
+                or response_ref.scope_fingerprint_sha256 != scope.fingerprint_sha256
+                or response_ref.request_hash != scope.request_hash
+                or response_ref.reservation_id != current.reservation_id
+            ):
+                raise ProviderRuntimeContractError(
+                    "PRIMARY repair response reference does not match its reservation"
+                )
+            if scope_record.get("status") == "ambiguous_raw_response":
+                if str(result.get("status") or "") == "success":
+                    raise ProviderRuntimeContractError(
+                        "incomplete raw PRIMARY response cannot be settled as success"
+                    )
+                scope_record["status"] = "ambiguous"
+            else:
+                scope_record["status"] = "completed"
+            scope_record["response_ref"] = response_ref.to_dict()
         self._reservations.pop(reservation.reservation_id, None)
         self._calls_reserved -= current.provider_calls
         self._output_tokens_reserved -= current.output_tokens
@@ -1748,6 +2949,7 @@ class ProviderBudgetController:
         self._calls_used += attempts
         self._output_tokens_used += actual_output
         self._retry_attempts_used += actual_retries
+        self._ambiguous_reservation_ids.discard(reservation.reservation_id)
         self._persist_state_unlocked()
         return self._snapshot_unlocked()
 
@@ -1771,6 +2973,34 @@ class ProviderBudgetController:
             "absolute_deadline_epoch": self._absolute_deadline_epoch,
         }
 
+    def assert_response_reuse_allowed(self, *, job_id: str, stage_name: str, call_id: str) -> None:
+        """Keep a parent cache hit from hiding this child's unknown outcome.
+
+        A started, unsettled physical attempt remains charged/reserved until
+        the existing reconciliation workflow resolves it. Independent calls
+        may still reuse their own verified responses.
+        """
+        identity = {"job_id": job_id, "stage_name": stage_name, "call_id": call_id}
+        if any(not str(value).strip() for value in identity.values()):
+            raise ProviderRuntimeContractError("response reuse requires an exact child call identity")
+
+        def verify() -> None:
+            for reservation in self._reservations.values():
+                if reservation.transport_started and all(
+                    reservation.context.get(key) == value for key, value in identity.items()
+                ):
+                    raise ProviderRuntimeContractError(
+                        "response reuse requires reconciliation of the child's started provider attempt"
+                    )
+
+        with self._lock:
+            if self._state_path is None:
+                verify()
+            else:
+                with interprocess_file_lock(self._state_path):
+                    self._load_state_unlocked()
+                    verify()
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             if self._state_path is not None:
@@ -1785,18 +3015,13 @@ _ENV_BUDGET_CONTROLLER: ProviderBudgetController | None = None
 
 
 def provider_budget_controller_from_environment() -> ProviderBudgetController | None:
-    """Return one shared controller for the current acceptance subprocess."""
+    """Resolve accepted, bound ordinary-run, then legacy environment budgets."""
 
     global _ENV_BUDGET_RAW, _ENV_BUDGET_CONTROLLER
     active_controller = _ACTIVE_ACCEPTANCE_CONTROLLER.get()
     if active_controller is not None:
         return active_controller
     raw = str(os.getenv("AUTO_GENERATE_ACCEPTANCE_BUDGET_JSON", "")).strip()
-    if not raw:
-        with _ENV_BUDGET_LOCK:
-            _ENV_BUDGET_RAW = ""
-            _ENV_BUDGET_CONTROLLER = None
-        return None
     state_path = str(os.getenv("AUTO_GENERATE_ACCEPTANCE_BUDGET_STATE_PATH", "")).strip()
     serialized_context_raw = str(
         os.getenv("AUTO_GENERATE_ACCEPTANCE_CONTEXT_JSON", "")
@@ -1811,12 +3036,183 @@ def provider_budget_controller_from_environment() -> ProviderBudgetController | 
             raise ProviderRuntimeContractError(
                 "acceptance execution context budget state does not match its environment bridge"
             )
+    else:
+        # A public run binds its already-persisted controller around all stages.
+        # It takes precedence over any unbound compatibility environment
+        # budget; only explicit acceptance authority outranks it.
+        active_run_controller = _ACTIVE_RUN_PROVIDER_CONTROLLER.get()
+        if active_run_controller is not None:
+            return active_run_controller
+        if not raw:
+            with _ENV_BUDGET_LOCK:
+                _ENV_BUDGET_RAW = ""
+                _ENV_BUDGET_CONTROLLER = None
+            return None
     cache_key = raw + "\x00" + state_path + "\x00" + serialized_context_raw
     with _ENV_BUDGET_LOCK:
         if cache_key == _ENV_BUDGET_RAW and _ENV_BUDGET_CONTROLLER is not None:
             return _ENV_BUDGET_CONTROLLER
+        if raw:
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ProviderRuntimeContractError(
+                    "AUTO_GENERATE_ACCEPTANCE_BUDGET_JSON is not valid JSON"
+                ) from exc
+            if not isinstance(payload, Mapping):
+                raise ProviderRuntimeContractError(
+                    "AUTO_GENERATE_ACCEPTANCE_BUDGET_JSON must be a JSON object"
+                )
+            budget = provider_aggregate_budget_from_mapping(payload)
+        elif serialized_context is not None:
+            budget = serialized_context.provider_budget
+        else:
+            return None
+        controller = ProviderBudgetController(budget)
+        if serialized_context is not None and controller.budget != serialized_context.provider_budget:
+            raise ProviderRuntimeContractError(
+                "acceptance execution context budget does not match its environment bridge"
+            )
+        if serialized_context is not None:
+            controller.bind_state_path(
+                serialized_context.provider_budget_state_path,
+                acceptance_run_id=serialized_context.acceptance_run_id,
+                state_started=serialized_context.provider_budget_state_started,
+            )
+        elif state_path:
+            controller.bind_state_path(
+                state_path,
+                acceptance_run_id=str(
+                    os.getenv("AUTO_GENERATE_ACCEPTANCE_RUN_ID", "")
+                ).strip(),
+                state_started=None,
+            )
+        _ENV_BUDGET_RAW = cache_key
+        _ENV_BUDGET_CONTROLLER = controller
+        return controller
+
+
+def provider_run_budget_controller_from_environment(
+    *,
+    runtime_spec_budget: ProviderAggregateBudgetV2 | Mapping[str, Any] | None = None,
+) -> ProviderBudgetController | None:
+    """Resolve a controller for a new public RuntimeJobSpec run.
+
+    Legacy V1 environment budgets remain readable through
+    ``provider_budget_controller_from_environment`` for historical acceptance
+    and recovery tools. They are not authority for a newly invoked runtime job.
+    In particular, this function inspects an unbound V1 payload before the
+    legacy factory can bind or initialize its state file.
+
+    Serialized acceptance contexts are inherited data, not an in-process
+    accepted entry. The controlling process must revalidate and bind one with
+    ``bind_acceptance_execution_context`` before a V2 accepted continuation
+    can proceed. A verified run-scope proof is checked separately after the
+    Runner has reopened its Registry envelope.
+    """
+
+    explicit_budget = (
+        ProviderAggregateBudgetV2.from_mapping(runtime_spec_budget)
+        if isinstance(runtime_spec_budget, Mapping)
+        else runtime_spec_budget
+    )
+    if explicit_budget is not None and not isinstance(
+        explicit_budget, ProviderAggregateBudgetV2
+    ):
+        raise ProviderRuntimeContractError(
+            "runtime-spec provider budget must be strict finite V2"
+        )
+
+    active_acceptance_context = _ACTIVE_ACCEPTANCE_CONTEXT.get()
+    active_acceptance_controller = _ACTIVE_ACCEPTANCE_CONTROLLER.get()
+    active_run_controller = _ACTIVE_RUN_PROVIDER_CONTROLLER.get()
+    raw_context = str(os.getenv("AUTO_GENERATE_ACCEPTANCE_CONTEXT_JSON", "")).strip()
+    raw_budget = str(os.getenv("AUTO_GENERATE_ACCEPTANCE_BUDGET_JSON", "")).strip()
+    raw_state_path = str(
+        os.getenv("AUTO_GENERATE_ACCEPTANCE_BUDGET_STATE_PATH", "")
+    ).strip()
+    raw_run_id = str(os.getenv("AUTO_GENERATE_ACCEPTANCE_RUN_ID", "")).strip()
+
+    if active_acceptance_context is not None or active_acceptance_controller is not None:
+        if active_acceptance_context is None or active_acceptance_controller is None:
+            raise ProviderRuntimeContractError(
+                "accepted runtime entry requires both the typed context and controller"
+            )
+        if active_acceptance_controller.budget != active_acceptance_context.provider_budget:
+            raise ProviderRuntimeContractError(
+                "accepted runtime entry context and controller budgets differ"
+            )
+        if (
+            explicit_budget is not None
+            and explicit_budget != active_acceptance_controller.budget
+        ):
+            raise ProviderRuntimeContractError(
+                "runtime-spec budget conflicts with the active accepted-run budget"
+            )
+        if raw_context:
+            inherited = acceptance_execution_context_from_environment()
+            if inherited != active_acceptance_context:
+                raise ProviderRuntimeContractError(
+                    "inherited acceptance context conflicts with the active typed entry"
+                )
+            if (
+                raw_state_path
+                != active_acceptance_context.provider_budget_state_path
+                or raw_run_id != active_acceptance_context.acceptance_run_id
+            ):
+                raise ProviderRuntimeContractError(
+                    "inherited acceptance state identity conflicts with the active typed entry"
+                )
+            if raw_budget:
+                try:
+                    raw_budget_payload = json.loads(raw_budget)
+                except json.JSONDecodeError as exc:
+                    raise ProviderRuntimeContractError(
+                        "AUTO_GENERATE_ACCEPTANCE_BUDGET_JSON is not valid JSON"
+                    ) from exc
+                if (
+                    not isinstance(raw_budget_payload, Mapping)
+                    or provider_aggregate_budget_from_mapping(raw_budget_payload)
+                    != active_acceptance_context.provider_budget
+                ):
+                    raise ProviderRuntimeContractError(
+                        "inherited acceptance budget conflicts with the active typed entry"
+                    )
+        if (
+            not active_acceptance_context.owner_authorized
+            or not active_acceptance_context.provider_budget_state_started
+            or active_acceptance_context.absolute_deadline_epoch <= time.time()
+            or not active_acceptance_controller.state_started
+            or active_acceptance_controller.state_path
+            != Path(active_acceptance_context.provider_budget_state_path)
+            .expanduser()
+            .resolve()
+        ):
+            raise ProviderRuntimeContractError(
+                "accepted runtime entry is not owner-authorized, started, and current"
+            )
+        active_acceptance_controller.assert_state_integrity(
+            acceptance_run_id=active_acceptance_context.acceptance_run_id,
+            state_started=True,
+        )
+        if not isinstance(active_acceptance_controller.budget, ProviderAggregateBudgetV2):
+            raise ProviderRuntimeContractError(
+                "legacy V1 acceptance budget cannot authorize a new runtime job; "
+                "its durable ledger is preserved"
+            )
+        return active_acceptance_controller
+
+    # Do this before consulting the compatibility factory: its historical
+    # behavior may initialize a missing V1 state file, which is inappropriate
+    # when rejecting a new public run.
+    if raw_context:
+        raise ProviderRuntimeContractError(
+            "serialized acceptance context is inherited and lacks an in-process "
+            "accepted-run scope proof"
+        )
+    if raw_budget:
         try:
-            payload = json.loads(raw)
+            payload = json.loads(raw_budget)
         except json.JSONDecodeError as exc:
             raise ProviderRuntimeContractError(
                 "AUTO_GENERATE_ACCEPTANCE_BUDGET_JSON is not valid JSON"
@@ -1825,30 +3221,728 @@ def provider_budget_controller_from_environment() -> ProviderBudgetController | 
             raise ProviderRuntimeContractError(
                 "AUTO_GENERATE_ACCEPTANCE_BUDGET_JSON must be a JSON object"
             )
-        controller = ProviderBudgetController(
-            provider_aggregate_budget_from_mapping(payload)
-        )
-        if serialized_context is not None and controller.budget != serialized_context.provider_budget:
+        budget = provider_aggregate_budget_from_mapping(payload)
+        if not isinstance(budget, ProviderAggregateBudgetV2):
             raise ProviderRuntimeContractError(
-                "acceptance execution context budget does not match its environment bridge"
+                "legacy V1 environment budget cannot authorize a new runtime job; "
+                "its durable ledger is preserved"
             )
-        if state_path:
-            controller.bind_state_path(
-                state_path,
-                acceptance_run_id=(
-                    serialized_context.acceptance_run_id
-                    if serialized_context is not None
-                    else str(os.getenv("AUTO_GENERATE_ACCEPTANCE_RUN_ID", "")).strip()
-                ),
-                state_started=(
-                    serialized_context.provider_budget_state_started
-                    if serialized_context is not None
-                    else None
-                ),
+        raise ProviderRuntimeContractError(
+            "acceptance budget environment variables are not ordinary run authority; "
+            "bind the typed acceptance entry or provide metadata.provider_budget"
+        )
+    elif raw_state_path or raw_run_id:
+        raise ProviderRuntimeContractError(
+            "unpaired acceptance budget state identity cannot authorize a new runtime job"
+        )
+
+    if active_run_controller is not None:
+        if not isinstance(active_run_controller.budget, ProviderAggregateBudgetV2):
+            raise ProviderRuntimeContractError(
+                "ordinary runtime run binding must use strict finite budget V2"
             )
-        _ENV_BUDGET_RAW = cache_key
-        _ENV_BUDGET_CONTROLLER = controller
-        return controller
+        if active_run_controller.state_path is None or not active_run_controller.state_started:
+            raise ProviderRuntimeContractError(
+                "ordinary runtime run budget must be durably bound"
+            )
+        if (
+            explicit_budget is not None
+            and explicit_budget != active_run_controller.budget
+        ):
+            from runtime.downstream_continuation import validate_current_continuation_controller
+
+            if not validate_current_continuation_controller(
+                active_run_controller, runtime_spec_budget=explicit_budget,
+            ):
+                raise ProviderRuntimeContractError(
+                    "runtime-spec budget conflicts with the active ordinary run budget"
+                )
+        return active_run_controller
+    return None
+
+
+def validate_started_acceptance_execution_context(
+    context: AcceptanceExecutionContextV1,
+    controller: ProviderBudgetController,
+    *,
+    current_executable_sha: str,
+    now_epoch: float | None = None,
+) -> None:
+    """Validate acceptance authority before binding it to a runtime run.
+
+    This is the budget/context portion of ControlPlane's started-acceptance
+    check. Callers remain responsible for their operation-specific host policy
+    and for verifying any Registry scope proof.
+    """
+
+    if not isinstance(context, AcceptanceExecutionContextV1):
+        raise ProviderRuntimeContractError("accepted runtime context is not typed")
+    if not isinstance(controller, ProviderBudgetController):
+        raise ProviderRuntimeContractError("accepted runtime controller is not typed")
+    if not context.owner_authorized or not context.provider_budget_state_started:
+        raise ProviderRuntimeContractError(
+            "acceptance context is not owner-authorized and started"
+        )
+    current_time = time.time() if now_epoch is None else float(now_epoch)
+    if (
+        isinstance(current_time, bool)
+        or not math.isfinite(current_time)
+        or current_time < 0
+        or context.absolute_deadline_epoch <= current_time
+    ):
+        raise ProviderRuntimeContractError("acceptance context deadline has expired")
+    expected_sha = str(current_executable_sha or "").strip().lower()
+    if expected_sha != context.final_executable_sha:
+        raise ProviderRuntimeContractError(
+            "acceptance context executable SHA differs from the current runtime"
+        )
+    if controller.budget != context.provider_budget:
+        raise ProviderRuntimeContractError(
+            "acceptance context budget differs from its controller"
+        )
+    if (
+        not controller.state_started
+        or controller.state_path
+        != Path(context.provider_budget_state_path).expanduser().resolve()
+    ):
+        raise ProviderRuntimeContractError(
+            "acceptance context does not match a started durable budget controller"
+        )
+    if (
+        controller.budget.max_provider_calls_total <= 0
+        or controller.budget.max_output_tokens_total <= 0
+        or controller.budget.max_wall_seconds <= 0
+    ):
+        raise ProviderRuntimeContractError(
+            "acceptance context provider budget is not finitely bounded"
+        )
+    controller.assert_state_integrity(
+        acceptance_run_id=context.acceptance_run_id,
+        state_started=True,
+    )
+
+
+def provider_run_plan_binding_from_verified_acceptance_plan(
+    context: AcceptanceExecutionContextV1,
+    controller: ProviderBudgetController,
+    *,
+    current_executable_sha: str,
+    acceptance_plan_sha256: str,
+    acceptance_spec_file_sha256: str,
+    scenario_id: str,
+    job_id: str,
+    runtime_spec_sha256: str,
+    runtime_spec_file_sha256: str,
+    scope_hashes: Mapping[str, str],
+    input_identity_sha256: str,
+    workspace_identity_sha256: str,
+    now_epoch: float | None = None,
+) -> ProviderRunPlanBindingV1:
+    """Bind one child after ControlPlane has verified its acceptance plan.
+
+    The caller must parse and hash the current acceptance plan, confirm the
+    scenario's exact RuntimeJobSpec/job/workspace/input binding, and verify
+    the acceptance-run state before calling this factory. The factory checks
+    that its result is coupled to a current, started, finite V2 controller.
+    """
+
+    validate_started_acceptance_execution_context(
+        context,
+        controller,
+        current_executable_sha=current_executable_sha,
+        now_epoch=now_epoch,
+    )
+    if not isinstance(controller.budget, ProviderAggregateBudgetV2):
+        raise ProviderRuntimeContractError(
+            "legacy V1 acceptance budgets cannot bind a new accepted runtime scope"
+        )
+    return ProviderRunPlanBindingV1(
+        acceptance_run_id=context.acceptance_run_id,
+        acceptance_plan_sha256=acceptance_plan_sha256,
+        acceptance_spec_file_sha256=acceptance_spec_file_sha256,
+        scenario_id=scenario_id,
+        job_id=job_id,
+        runtime_spec_sha256=runtime_spec_sha256,
+        runtime_spec_file_sha256=runtime_spec_file_sha256,
+        scope_hashes=scope_hashes,
+        input_identity_sha256=input_identity_sha256,
+        workspace_identity_sha256=workspace_identity_sha256,
+        provider_budget_sha256=hash_json(controller.budget.to_dict()),
+        final_executable_sha=context.final_executable_sha,
+        _verification_token=_PROVIDER_RUN_PLAN_BINDING_TOKEN,
+    )
+
+
+@contextmanager
+def bind_provider_run_plan_binding(binding: ProviderRunPlanBindingV1):
+    """Bind one ControlPlane-verified child plan for its runtime execution."""
+
+    if not isinstance(binding, ProviderRunPlanBindingV1):
+        raise ProviderRuntimeContractError(
+            "provider run plan binding must be a typed verified binding"
+        )
+    context = _ACTIVE_ACCEPTANCE_CONTEXT.get()
+    if context is None or binding.acceptance_run_id != context.acceptance_run_id:
+        raise ProviderRuntimeContractError(
+            "provider run plan binding does not match the active accepted entry"
+        )
+    if (
+        binding._verification_token is not _PROVIDER_RUN_PLAN_BINDING_TOKEN
+        or binding.final_executable_sha != context.final_executable_sha
+    ):
+        raise ProviderRuntimeContractError(
+            "provider run plan binding verification or executable identity is invalid"
+        )
+    token = _ACTIVE_PROVIDER_RUN_PLAN_BINDING.set(binding)
+    try:
+        yield binding
+    finally:
+        _ACTIVE_PROVIDER_RUN_PLAN_BINDING.reset(token)
+
+
+def validate_provider_run_plan_binding(
+    controller: ProviderBudgetController,
+    *,
+    job_id: str,
+    runtime_spec_sha256: str,
+    scope_hashes: Mapping[str, str],
+    workspace_identity_sha256: str = "",
+    current_executable_sha: str,
+    now_epoch: float | None = None,
+) -> ProviderRunPlanBindingV1:
+    """Require the active verified plan to match this normalized runtime spec."""
+
+    context = _ACTIVE_ACCEPTANCE_CONTEXT.get()
+    if context is None or _ACTIVE_ACCEPTANCE_CONTROLLER.get() is not controller:
+        raise ProviderRuntimeContractError(
+            "accepted runtime scope lacks an active in-process plan owner"
+        )
+    validate_started_acceptance_execution_context(
+        context,
+        controller,
+        current_executable_sha=current_executable_sha,
+        now_epoch=now_epoch,
+    )
+    binding = _ACTIVE_PROVIDER_RUN_PLAN_BINDING.get()
+    if not isinstance(binding, ProviderRunPlanBindingV1):
+        raise ProviderRuntimeContractError(
+            "accepted runtime scope lacks a ControlPlane-verified child plan binding"
+        )
+    if (
+        binding._verification_token is not _PROVIDER_RUN_PLAN_BINDING_TOKEN
+        or binding.acceptance_run_id != context.acceptance_run_id
+        or binding.final_executable_sha != context.final_executable_sha
+        or binding.provider_budget_sha256 != hash_json(controller.budget.to_dict())
+        or binding.job_id != str(job_id or "")
+        or binding.runtime_spec_sha256 != str(runtime_spec_sha256 or "")
+        or dict(binding.scope_hashes) != dict(scope_hashes)
+        or (
+            workspace_identity_sha256
+            and binding.workspace_identity_sha256 != str(workspace_identity_sha256)
+        )
+    ):
+        raise ProviderRuntimeContractError(
+            "accepted child plan does not match this job, budget, executable, or normalized RuntimeJobSpec"
+        )
+    return binding
+
+
+def provider_run_scope_payload_from_plan_binding(
+    controller: ProviderBudgetController,
+    *,
+    job_id: str,
+    scope_hashes: Mapping[str, str],
+    workspace_identity_sha256: str,
+    current_executable_sha: str,
+    now_epoch: float | None = None,
+) -> dict[str, Any]:
+    """Materialize the exact actual scope under a verified accepted child plan."""
+
+    binding = validate_provider_run_plan_binding(
+        controller,
+        job_id=job_id,
+        runtime_spec_sha256=str(scope_hashes.get("runtime_spec_sha256") or ""),
+        scope_hashes=scope_hashes,
+        workspace_identity_sha256=workspace_identity_sha256,
+        current_executable_sha=current_executable_sha,
+        now_epoch=now_epoch,
+    )
+    if not isinstance(controller.budget, ProviderAggregateBudgetV2):
+        raise ProviderRuntimeContractError(
+            "accepted run scope artifact requires strict finite budget V2"
+        )
+    if set(scope_hashes) != _PROVIDER_RUN_SCOPE_HASH_FIELDS:
+        raise ProviderRuntimeContractError(
+            "accepted run scope does not contain the complete six-hash contract"
+        )
+    normalized_scope: dict[str, str] = {}
+    for name in sorted(_PROVIDER_RUN_SCOPE_HASH_FIELDS):
+        value = str(scope_hashes.get(name) or "")
+        if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ProviderRuntimeContractError(
+                f"accepted run scope hash is invalid: {name}"
+            )
+        normalized_scope[name] = value
+    return {
+        "schema_version": "accepted-provider-run-scope/v1",
+        "job_id": binding.job_id,
+        "run_id": binding.acceptance_run_id,
+        "provider_budget": controller.budget.to_dict(),
+        "scope_hashes": normalized_scope,
+        "acceptance_plan_sha256": binding.acceptance_plan_sha256,
+        "acceptance_spec_file_sha256": binding.acceptance_spec_file_sha256,
+        "scenario_id": binding.scenario_id,
+        "runtime_spec_sha256": binding.runtime_spec_sha256,
+        "runtime_spec_file_sha256": binding.runtime_spec_file_sha256,
+        "input_identity_sha256": binding.input_identity_sha256,
+        "workspace_identity_sha256": binding.workspace_identity_sha256,
+        "final_executable_sha": binding.final_executable_sha,
+    }
+
+
+def provider_run_scope_authorization_from_verified_artifact(
+    payload: Mapping[str, Any],
+    *,
+    artifact_id: str,
+    artifact_type: str,
+    artifact_version: str,
+    artifact_role: str,
+    artifact_status: str,
+    artifact_sha256: str,
+) -> ProviderRunScopeAuthorizationV1:
+    """Decode a ready accepted-plan scope artifact after Registry closure verification."""
+
+    if (
+        artifact_type != "accepted_runtime_run_scope"
+        or artifact_version != "v1"
+        or artifact_role != "accepted_runtime_run_scope"
+        or artifact_status != "ready"
+        or not str(artifact_id or "").strip()
+    ):
+        raise ProviderRuntimeContractError(
+            "accepted run scope must come from a ready accepted_runtime_run_scope/v1 artifact"
+        )
+    if not isinstance(payload, Mapping) or payload.get("schema_version") != "accepted-provider-run-scope/v1":
+        raise ProviderRuntimeContractError(
+            "accepted runtime scope payload schema is invalid"
+        )
+    raw_budget = payload.get("provider_budget")
+    if not isinstance(raw_budget, Mapping):
+        raise ProviderRuntimeContractError(
+            "accepted runtime scope payload lacks its finite provider budget"
+        )
+    budget = ProviderAggregateBudgetV2.from_mapping(raw_budget)
+    scope_hashes = payload.get("scope_hashes")
+    if not isinstance(scope_hashes, Mapping):
+        raise ProviderRuntimeContractError(
+            "accepted runtime scope payload hashes are invalid"
+        )
+    runtime_spec_sha256 = str(scope_hashes.get("runtime_spec_sha256") or "")
+    if runtime_spec_sha256 != str(payload.get("runtime_spec_sha256") or ""):
+        raise ProviderRuntimeContractError(
+            "accepted runtime scope payload RuntimeJobSpec hash is inconsistent"
+        )
+    return ProviderRunScopeAuthorizationV1(
+        job_id=str(payload.get("job_id") or ""),
+        run_id=str(payload.get("run_id") or ""),
+        provider_budget_sha256=hash_json(budget.to_dict()),
+        scope_hashes={str(key): str(value) for key, value in scope_hashes.items()},
+        artifact_id=artifact_id,
+        artifact_sha256=artifact_sha256,
+        acceptance_plan_sha256=str(payload.get("acceptance_plan_sha256") or ""),
+        acceptance_spec_file_sha256=str(
+            payload.get("acceptance_spec_file_sha256") or ""
+        ),
+        scenario_id=str(payload.get("scenario_id") or ""),
+        runtime_spec_file_sha256=str(payload.get("runtime_spec_file_sha256") or ""),
+        input_identity_sha256=str(payload.get("input_identity_sha256") or ""),
+        workspace_identity_sha256=str(payload.get("workspace_identity_sha256") or ""),
+        final_executable_sha=str(payload.get("final_executable_sha") or ""),
+        _verification_token=_PROVIDER_RUN_SCOPE_AUTHORIZATION_TOKEN,
+    )
+
+
+@contextmanager
+def bind_provider_run_scope_authorization(
+    authorization: ProviderRunScopeAuthorizationV1,
+):
+    """Bind a ControlPlane-verified exact scope for an accepted run entry."""
+
+    if not isinstance(authorization, ProviderRunScopeAuthorizationV1):
+        raise ProviderRuntimeContractError(
+            "accepted provider run scope authorization must be a typed artifact binding"
+        )
+    context = _ACTIVE_ACCEPTANCE_CONTEXT.get()
+    if context is None:
+        raise ProviderRuntimeContractError(
+            "accepted provider run scope authorization requires an active typed acceptance entry"
+        )
+    if (
+        authorization._verification_token is not _PROVIDER_RUN_SCOPE_AUTHORIZATION_TOKEN
+        or authorization.run_id != context.acceptance_run_id
+    ):
+        raise ProviderRuntimeContractError(
+            "accepted provider run scope authorization does not match the active accepted entry"
+        )
+    token = _ACTIVE_PROVIDER_RUN_SCOPE_AUTHORIZATION.set(authorization)
+    try:
+        yield authorization
+    finally:
+        _ACTIVE_PROVIDER_RUN_SCOPE_AUTHORIZATION.reset(token)
+
+
+def validate_provider_run_scope_authorization(
+    controller: ProviderBudgetController,
+    *,
+    job_id: str,
+    scope_hashes: Mapping[str, str],
+    workspace_identity_sha256: str,
+    current_executable_sha: str,
+    authorization: ProviderRunScopeAuthorizationV1 | None = None,
+    now_epoch: float | None = None,
+) -> None:
+    """Check that a trusted ControlPlane entry authorized this exact scope."""
+
+    context = _ACTIVE_ACCEPTANCE_CONTEXT.get()
+    active_controller = _ACTIVE_ACCEPTANCE_CONTROLLER.get()
+    bound_authorization = authorization or _ACTIVE_PROVIDER_RUN_SCOPE_AUTHORIZATION.get()
+    if context is None or active_controller is not controller:
+        raise ProviderRuntimeContractError(
+            "accepted runtime scope lacks an active in-process acceptance entry"
+        )
+    validate_started_acceptance_execution_context(
+        context,
+        controller,
+        current_executable_sha=current_executable_sha,
+        now_epoch=now_epoch,
+    )
+    if not isinstance(controller.budget, ProviderAggregateBudgetV2):
+        raise ProviderRuntimeContractError(
+            "legacy V1 acceptance budget cannot authorize a new runtime scope"
+        )
+    plan_binding = validate_provider_run_plan_binding(
+        controller,
+        job_id=job_id,
+        runtime_spec_sha256=str(scope_hashes.get("runtime_spec_sha256") or ""),
+        scope_hashes=scope_hashes,
+        workspace_identity_sha256=workspace_identity_sha256,
+        current_executable_sha=current_executable_sha,
+        now_epoch=now_epoch,
+    )
+    if not isinstance(bound_authorization, ProviderRunScopeAuthorizationV1):
+        raise ProviderRuntimeContractError(
+            "accepted runtime entry lacks a verified accepted-plan scope artifact"
+        )
+    if (
+        bound_authorization._verification_token is not _PROVIDER_RUN_SCOPE_AUTHORIZATION_TOKEN
+        or bound_authorization.run_id != context.acceptance_run_id
+        or bound_authorization.job_id != str(job_id or "")
+        or bound_authorization.provider_budget_sha256 != hash_json(controller.budget.to_dict())
+        or dict(bound_authorization.scope_hashes) != dict(scope_hashes)
+        or bound_authorization.acceptance_plan_sha256 != plan_binding.acceptance_plan_sha256
+        or bound_authorization.acceptance_spec_file_sha256
+        != plan_binding.acceptance_spec_file_sha256
+        or bound_authorization.scenario_id != plan_binding.scenario_id
+        or bound_authorization.runtime_spec_file_sha256
+        != plan_binding.runtime_spec_file_sha256
+        or bound_authorization.input_identity_sha256 != plan_binding.input_identity_sha256
+        or bound_authorization.workspace_identity_sha256
+        != plan_binding.workspace_identity_sha256
+        or bound_authorization.final_executable_sha != plan_binding.final_executable_sha
+    ):
+        raise ProviderRuntimeContractError(
+            "accepted-plan scope authorization does not match this job, budget, or source/goal/route scope"
+        )
+
+
+def provider_run_scope_proof_from_verified_artifact(
+    envelope_payload: Mapping[str, Any],
+    *,
+    artifact_id: str,
+    artifact_role: str,
+    artifact_status: str,
+    artifact_sha256: str,
+) -> ProviderRunScopeProofV1:
+    """Create an accepted-run proof from a Registry-verified ready envelope.
+
+    The caller must first run ``ArtifactRegistry.verify_ready_artifact_closure``
+    on the artifact. This function revalidates the envelope payload itself and
+    records the Registry artifact identity/hash; it never accepts a serialized
+    environment flag as proof.
+    """
+
+    if artifact_id != "provider_run_envelope" or artifact_role != "provider_run_envelope":
+        raise ProviderRuntimeContractError(
+            "accepted runtime scope must come from the provider run envelope artifact"
+        )
+    if artifact_status != "ready":
+        raise ProviderRuntimeContractError(
+            "accepted runtime scope proof artifact is not ready"
+        )
+    from runtime.provider_run_envelope import ProviderRunEnvelopeV1
+
+    try:
+        envelope = ProviderRunEnvelopeV1.from_dict(envelope_payload)
+    except (TypeError, ValueError) as exc:
+        raise ProviderRuntimeContractError(
+            f"accepted runtime scope envelope is invalid: {exc}"
+        ) from exc
+    if envelope.admission_status != "ready_with_jit":
+        raise ProviderRuntimeContractError(
+            "accepted runtime scope envelope is not admitted"
+        )
+    return ProviderRunScopeProofV1(
+        job_id=envelope.job_id,
+        run_id=envelope.run_id,
+        provider_budget_sha256=hash_json(envelope.provider_budget.to_dict()),
+        scope_hashes=dict(envelope.scope_hashes),
+        artifact_id=artifact_id,
+        artifact_sha256=artifact_sha256,
+        _verification_token=_PROVIDER_RUN_SCOPE_PROOF_TOKEN,
+    )
+
+
+@contextmanager
+def bind_provider_run_scope_proof(proof: ProviderRunScopeProofV1):
+    """Bind a Registry-verified scope proof for one accepted continuation."""
+
+    if not isinstance(proof, ProviderRunScopeProofV1):
+        raise ProviderRuntimeContractError(
+            "accepted provider run scope proof must be a typed verified proof"
+        )
+    active_context = _ACTIVE_ACCEPTANCE_CONTEXT.get()
+    if active_context is None:
+        raise ProviderRuntimeContractError(
+            "accepted provider run scope proof requires an active validated acceptance entry"
+        )
+    if (
+        proof._verification_token is not _PROVIDER_RUN_SCOPE_PROOF_TOKEN
+        or proof.run_id != active_context.acceptance_run_id
+    ):
+        raise ProviderRuntimeContractError(
+            "accepted provider run scope proof is not bound to the active accepted entry"
+        )
+    token = _ACTIVE_PROVIDER_RUN_SCOPE_PROOF.set(proof)
+    try:
+        yield proof
+    finally:
+        _ACTIVE_PROVIDER_RUN_SCOPE_PROOF.reset(token)
+
+
+def validate_provider_run_scope_authority(
+    controller: ProviderBudgetController,
+    *,
+    job_id: str,
+    scope_hashes: Mapping[str, str],
+    workspace_identity_sha256: str,
+    current_executable_sha: str,
+    authorization: ProviderRunScopeAuthorizationV1 | None = None,
+    proof: ProviderRunScopeProofV1 | None = None,
+    now_epoch: float | None = None,
+) -> None:
+    """Require a same-job, same-budget accepted continuation proof."""
+
+    validate_provider_run_scope_authorization(
+        controller,
+        job_id=job_id,
+        scope_hashes=scope_hashes,
+        workspace_identity_sha256=workspace_identity_sha256,
+        current_executable_sha=current_executable_sha,
+        authorization=authorization,
+        now_epoch=now_epoch,
+    )
+    bound_proof = proof or _ACTIVE_PROVIDER_RUN_SCOPE_PROOF.get()
+    if not isinstance(bound_proof, ProviderRunScopeProofV1):
+        raise ProviderRuntimeContractError(
+            "accepted runtime continuation lacks a verified run-scope envelope"
+        )
+    accepted_context = _ACTIVE_ACCEPTANCE_CONTEXT.get()
+    if accepted_context is None:
+        raise ProviderRuntimeContractError(
+            "accepted runtime continuation lost its active acceptance context"
+        )
+    if (
+        bound_proof._verification_token is not _PROVIDER_RUN_SCOPE_PROOF_TOKEN
+        or bound_proof.run_id != accepted_context.acceptance_run_id
+        or bound_proof.job_id != str(job_id or "")
+        or bound_proof.provider_budget_sha256
+        != hash_json(controller.budget.to_dict())
+        or dict(bound_proof.scope_hashes) != dict(scope_hashes)
+    ):
+        raise ProviderRuntimeContractError(
+            "accepted run-scope proof does not match this job, budget, or source/goal/route scope"
+        )
+
+
+def project_shared_retry_attempts_v1(
+    logical_calls: int | None,
+    per_call_retry_ceilings: Iterable[int | None],
+    *,
+    aggregate_controller: ProviderBudgetController | None = None,
+) -> SharedRetryProjectionV1:
+    """Project physical attempts using per-call ceilings and a shared pool.
+
+    This is a diagnostic upper bound only; aggregate admission remains atomic
+    in ``ProviderBudgetController.admit``. V2 zero is a real exhausted shared
+    retry pool. V1 zero retains its historical unbounded-pool meaning and thus
+    falls back to the per-call ceilings when those are known.
+    """
+
+    if logical_calls is not None and (
+        isinstance(logical_calls, bool)
+        or not isinstance(logical_calls, int)
+        or logical_calls < 0
+    ):
+        raise ProviderRuntimeContractError(
+            "logical_calls must be a non-negative integer or None"
+        )
+    ceilings: list[int | None] = []
+    for value in per_call_retry_ceilings:
+        if value is None:
+            ceilings.append(None)
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ProviderRuntimeContractError(
+                "per-call retry ceilings must be non-negative integers or None"
+            )
+        ceilings.append(value)
+    if logical_calls is not None and len(ceilings) != logical_calls:
+        raise ProviderRuntimeContractError(
+            "per-call retry ceilings must contain one row per logical call"
+        )
+
+    configured_slots = (
+        None if any(value is None for value in ceilings)
+        else sum(int(value or 0) for value in ceilings)
+    )
+    return project_shared_retry_slots_v1(
+        logical_calls,
+        configured_retry_slots_upper_bound=configured_slots,
+        aggregate_controller=aggregate_controller,
+    )
+
+
+def project_shared_retry_slots_v1(
+    logical_calls: int | None,
+    *,
+    configured_retry_slots_upper_bound: int | None,
+    aggregate_controller: ProviderBudgetController | None = None,
+) -> SharedRetryProjectionV1:
+    """Apply a run retry pool to an already-summed per-call ceiling.
+
+    ``configured_retry_slots_upper_bound`` is the sum of the request-specific
+    retry ceilings; it remains separate from aggregate pool availability. This
+    form is useful to callers whose call plan already stores those ceilings as
+    per-call physical-attempt bounds.
+    """
+
+    if logical_calls is not None and (
+        isinstance(logical_calls, bool)
+        or not isinstance(logical_calls, int)
+        or logical_calls < 0
+    ):
+        raise ProviderRuntimeContractError(
+            "logical_calls must be a non-negative integer or None"
+        )
+    if configured_retry_slots_upper_bound is not None and (
+        isinstance(configured_retry_slots_upper_bound, bool)
+        or not isinstance(configured_retry_slots_upper_bound, int)
+        or configured_retry_slots_upper_bound < 0
+    ):
+        raise ProviderRuntimeContractError(
+            "configured retry slot upper bound must be a non-negative integer or None"
+        )
+
+    shared_remaining: int | None = None
+    if aggregate_controller is not None:
+        budget = aggregate_controller.budget
+        if (
+            isinstance(budget, ProviderAggregateBudgetV2)
+            or budget.max_retry_attempts_total > 0
+        ):
+            snapshot = aggregate_controller.snapshot()
+            shared_remaining = max(
+                0,
+                int(budget.max_retry_attempts_total)
+                - int(snapshot["retry_attempts_used"])
+                - int(snapshot["retry_attempts_reserved"]),
+            )
+
+    configured_slots = configured_retry_slots_upper_bound
+    if shared_remaining is None:
+        retry_upper = configured_slots
+        retry_source = "per_call" if configured_slots is not None else "unknown"
+    elif configured_slots is None:
+        retry_upper = shared_remaining
+        retry_source = "shared_pool"
+    else:
+        retry_upper = min(configured_slots, shared_remaining)
+        retry_source = (
+            "per_call_and_shared_pool"
+            if configured_slots <= shared_remaining
+            else "shared_pool"
+        )
+    physical_upper = (
+        None
+        if logical_calls is None or retry_upper is None
+        else logical_calls + retry_upper
+    )
+    return SharedRetryProjectionV1(
+        logical_calls=logical_calls,
+        configured_retry_slots_upper_bound=configured_slots,
+        aggregate_retry_pool_remaining=shared_remaining,
+        retry_attempts_upper_bound=retry_upper,
+        physical_attempts_upper_bound=physical_upper,
+        retry_bound_source=retry_source,
+    )
+
+
+def build_provider_run_scope_hashes_v1(
+    *,
+    normalized_runtime_spec: Mapping[str, Any],
+    effective_config_sha256: str,
+    source_snapshot_sha256: str,
+    review_goal: Mapping[str, Any],
+    route_plan: Any,
+    stage_work_contract: Mapping[str, Any],
+) -> dict[str, str]:
+    """Build the canonical six run-scope hashes from the actual run inputs."""
+
+    route_payload = route_plan.to_dict() if callable(getattr(route_plan, "to_dict", None)) else route_plan
+    if not isinstance(normalized_runtime_spec, Mapping):
+        raise ProviderRuntimeContractError("normalized RuntimeJobSpec payload must be a mapping")
+    if not isinstance(review_goal, Mapping) or not isinstance(stage_work_contract, Mapping):
+        raise ProviderRuntimeContractError("run goal and stage work contract must be mappings")
+    if not isinstance(route_payload, Mapping):
+        raise ProviderRuntimeContractError("reachable provider route plan must be a mapping")
+    for name, value in (
+        ("effective_config_sha256", effective_config_sha256),
+        ("source_snapshot_sha256", source_snapshot_sha256),
+    ):
+        if re.fullmatch(r"[0-9a-f]{64}", str(value or "")) is None:
+            raise ProviderRuntimeContractError(f"{name} must be a lowercase SHA-256 digest")
+    return {
+        "runtime_spec_sha256": hash_json(dict(normalized_runtime_spec)),
+        "effective_config_sha256": str(effective_config_sha256),
+        "source_snapshot_sha256": str(source_snapshot_sha256),
+        "review_goal_sha256": hash_json(dict(review_goal)),
+        "route_plan_sha256": hash_json(dict(route_payload)),
+        "stage_work_contract_sha256": hash_json(dict(stage_work_contract)),
+    }
+
+
+def provider_run_workspace_identity_sha256(
+    workspace_path: str | Path,
+    *,
+    job_id: str,
+) -> str:
+    """Return a stable workspace/job binding that survives Registry growth."""
+
+    target = Path(workspace_path).expanduser().resolve()
+    normalized_job_id = str(job_id or "").strip()
+    if not normalized_job_id:
+        raise ProviderRuntimeContractError("provider run workspace identity requires job_id")
+    return hash_json({"workspace": str(target), "job_id": normalized_job_id})
 
 
 def _ledger_lock(path: Path) -> threading.RLock:
@@ -2077,7 +4171,11 @@ def _redact_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
     for raw_key, raw_value in value.items():
         key = str(raw_key)
         folded = key.casefold().replace("-", "_")
-        if folded in _NON_SECRET_TOKEN_KEYS:
+        if folded == "requested_output_tokens_per_attempt" and type(raw_value) is int and raw_value >= 0:
+            # This is an accounting count, never a credential string. Keep
+            # legacy redacted values and nonnumeric values redacted below.
+            result[key] = raw_value
+        elif folded in _NON_SECRET_TOKEN_KEYS:
             if isinstance(raw_value, Mapping):
                 result[key] = _redact_mapping(raw_value)
             elif isinstance(raw_value, (list, tuple)):
@@ -2792,6 +4890,14 @@ class ProviderRuntimeLedger:
                 return migrated_count
 
 
+class ProviderResponseSnapshotSink(Protocol):
+    """Optional successor storage boundary, separate from receipt authority."""
+
+    def capture(self, receipt: ProviderCallReceiptV1, content: Any) -> Any: ...
+
+    def require(self, receipt: ProviderCallReceiptV1) -> Any: ...
+
+
 class ProviderRuntime:
     """Admission controller and receipt producer for one job/attempt/stage."""
 
@@ -2815,6 +4921,8 @@ class ProviderRuntime:
         prompt_id: str = "",
         prompt_version: str = "",
         prompt_sha256: str = "",
+        primary_repair_response_journal: PrimaryRepairResponseJournal | None = None,
+        response_snapshot_sink: ProviderResponseSnapshotSink | None = None,
     ) -> None:
         if not test_only:
             missing = [
@@ -2873,11 +4981,64 @@ class ProviderRuntime:
         self._consumed_tokens = 0
         self._unknown_exposure_tokens = 0
         self._aggregate_reservations: dict[int, ProviderAggregateReservationV1] = {}
+        self.primary_repair_response_journal = primary_repair_response_journal
+        self.response_snapshot_sink = response_snapshot_sink
+        self._primary_repair_scopes: dict[int, PrimaryRepairScopeV1] = {}
+        self._primary_repair_receipt_bindings: dict[int, dict[str, Any]] = {}
         self._receipts: list[ProviderCallReceiptV1] = []
         self._completion_lock = threading.RLock()
         self._completed_receipts: dict[int, ProviderCallReceiptV1] = {}
         self._accounted_sequences: set[int] = set()
         self._restore_local_budget_from_ledger()
+
+    @staticmethod
+    def _snapshot_eligible(receipt: ProviderCallReceiptV1) -> bool:
+        return (receipt.status == "success" and receipt.error_kind is None
+                and not receipt.incomplete_reason and not receipt.timeout_kind
+                and receipt.finish_reason.strip().casefold() not in {
+                    "length", "max_tokens", "max_output_tokens", "incomplete",
+                }
+                and (receipt.http_status is None or 200 <= receipt.http_status < 300))
+
+    def _require_response_snapshot(self, receipt: ProviderCallReceiptV1) -> None:
+        if self.response_snapshot_sink is None or not self._snapshot_eligible(receipt):
+            return
+        try:
+            self.response_snapshot_sink.require(receipt)
+        except Exception as exc:
+            raise ProviderRuntimeContractError(
+                f"provider response snapshot is unavailable for {receipt.receipt_id}; "
+                "local reconciliation is required before reuse"
+            ) from exc
+
+    def _capture_response_snapshot(self, receipt: ProviderCallReceiptV1, content: Any) -> None:
+        if self.response_snapshot_sink is None or not self._snapshot_eligible(receipt):
+            return
+        try:
+            self.response_snapshot_sink.capture(receipt, content)
+        except Exception as exc:
+            raise ProviderRuntimeContractError(
+                f"provider response snapshot capture is incomplete for {receipt.receipt_id}; "
+                "the original receipt and consumption are retained"
+            ) from exc
+
+    def _snapshot_receipt_metadata(
+        self, metadata: Mapping[str, Any] | None, api_config: Mapping[str, Any],
+        endpoint_type: str,
+    ) -> dict[str, Any]:
+        result = dict(metadata or {})
+        if self.response_snapshot_sink is not None and "transport_config" not in result:
+            # Some production stages own an uninstrumented transport and append
+            # the authoritative receipt here. Capture must see its admitted
+            # route identity before that receipt is made durable. Keep old
+            # receipts and richer instrumented transport metadata unchanged.
+            result["transport_config"] = {
+                "provider_family": str(api_config.get("provider_family") or api_config.get("provider") or "generic"),
+                "endpoint_type": endpoint_type,
+                "api_base": str(api_config.get("api_base") or ""),
+                "model": str(api_config.get("model") or ""),
+            }
+        return result
 
     @staticmethod
     def _reported_total_tokens(receipt: ProviderCallReceiptV1) -> int | None:
@@ -2944,7 +5105,7 @@ class ProviderRuntime:
             for receipt in self._receipts
             if receipt.sequence == admission.sequence
             and belongs_to_runtime(receipt)
-            and is_pending_accounting(receipt)
+            and (is_pending_accounting(receipt) or self.response_snapshot_sink is not None)
         ]
         if not candidates and self.ledger is not None:
             candidates = [
@@ -2952,10 +5113,14 @@ class ProviderRuntime:
                 for receipt in self.ledger.list_receipts()
                 if receipt.sequence == admission.sequence
                 and belongs_to_runtime(receipt)
-                and is_pending_accounting(receipt)
+                and (is_pending_accounting(receipt) or self.response_snapshot_sink is not None)
             ]
         if not candidates:
             return None
+        if self.response_snapshot_sink is not None and len({row.receipt_id for row in candidates}) != 1:
+            raise ProviderRuntimeContractError(
+                f"response snapshot completion has ambiguous receipt authority for sequence {admission.sequence}"
+            )
         receipt = candidates[0]
         if receipt.prompt_hash != hash_text(prompt) or receipt.input_hash != hash_json(input_payload):
             raise ProviderReceiptConflict(
@@ -3014,7 +5179,7 @@ class ProviderRuntime:
                         f"CANCEL_STATE_INVALID: cancellation token cannot be read: {type(exc).__name__}"
                     ) from exc
                 if cancelled:
-                    raise ProviderBudgetExceeded(
+                    raise ProviderCancellationRequested(
                         "CANCEL_REQUESTED: provider admission is blocked by the queue cancellation token"
                     )
             try:
@@ -3024,7 +5189,7 @@ class ProviderRuntime:
                     f"CONTROL_STATE_INVALID: cancellation authority cannot be verified: {exc}"
                 ) from exc
             if cancellation is not None and cancellation.active:
-                raise ProviderBudgetExceeded(
+                raise ProviderCancellationRequested(
                     "CANCEL_REQUESTED: provider admission is blocked by the durable cancellation request"
                 )
 
@@ -3110,6 +5275,12 @@ class ProviderRuntime:
         return self._calls
 
     @property
+    def aggregate_wall_deadline_epoch(self) -> float | None:
+        if self.aggregate_budget is None:
+            return None
+        return self.aggregate_budget.durable_deadline_epoch
+
+    @property
     def reserved_tokens(self) -> int:
         return self._reserved_tokens
 
@@ -3172,11 +5343,31 @@ class ProviderRuntime:
         estimated_tokens: int = 0,
         requested_output_tokens: int = 0,
         requested_retry_attempts: int = 0,
+        primary_repair_scope: PrimaryRepairScopeV1 | Mapping[str, Any] | None = None,
+        request_hash: str = "",
     ) -> ProviderCallAdmissionV1:
         self._assert_pause_state_before_admission()
         estimated = max(0, int(estimated_tokens))
         output = max(0, int(requested_output_tokens))
         retries = max(0, int(requested_retry_attempts))
+        scope = ProviderBudgetController._coerce_primary_repair_scope(primary_repair_scope)
+        if scope is not None:
+            if self.aggregate_budget is None or self.aggregate_budget.state_path is None:
+                raise ProviderRuntimeContractError(
+                    "PRIMARY repair admission requires the durable run aggregate budget"
+                )
+            if self.primary_repair_response_journal is None:
+                raise ProviderRuntimeContractError(
+                    "PRIMARY repair admission requires a durable response journal"
+                )
+            if scope.job_id != self.job_id or scope.logical_attempt_identity != self.logical_attempt_identity:
+                raise ProviderRuntimeContractError(
+                    "PRIMARY repair scope does not match the bound runtime attempt"
+                )
+            if not str(request_hash or "") or str(request_hash) != scope.request_hash:
+                raise ProviderRuntimeContractError(
+                    "PRIMARY repair request hash does not match its materialized scope"
+                )
         with self._lock:
             elapsed = time.monotonic() - self.started_monotonic
             if self.budget.max_elapsed_seconds and elapsed >= self.budget.max_elapsed_seconds:
@@ -3195,22 +5386,31 @@ class ProviderRuntime:
                 raise ProviderBudgetExceeded("provider runtime token budget exhausted")
             aggregate_reservation = None
             if self.aggregate_budget is not None:
+                reservation_context = {
+                    "job_id": self.job_id,
+                    "attempt_id": self.attempt_id,
+                    "stage_name": self.stage_name,
+                    "node_id": self.node_id,
+                    "call_id": self.call_id,
+                    "ledger_path": str(self.ledger.path) if self.ledger is not None else "",
+                }
+                if scope is not None:
+                    assert self.primary_repair_response_journal is not None
+                    reservation_context["primary_repair_response_journal_root"] = str(
+                        self.primary_repair_response_journal.root
+                    )
                 aggregate_reservation = self.aggregate_budget.admit(
                     requested_output_tokens=output,
                     requested_retry_attempts=retries,
-                    context={
-                        "job_id": self.job_id,
-                        "attempt_id": self.attempt_id,
-                        "stage_name": self.stage_name,
-                        "node_id": self.node_id,
-                        "call_id": self.call_id,
-                        "ledger_path": str(self.ledger.path) if self.ledger is not None else "",
-                    },
+                    context=reservation_context,
+                    primary_repair_scope=scope,
                 )
             self._calls += 1
             self._reserved_tokens += estimated + output
             if aggregate_reservation is not None:
                 self._aggregate_reservations[self._calls] = aggregate_reservation
+            if scope is not None:
+                self._primary_repair_scopes[self._calls] = scope
             return ProviderCallAdmissionV1(
                 sequence=self._calls,
                 estimated_tokens=estimated,
@@ -3247,6 +5447,7 @@ class ProviderRuntime:
         with self._completion_lock:
             cached = self._completed_receipts.get(admission.sequence)
             if cached is not None:
+                self._require_response_snapshot(cached)
                 return cached
             receipt = self._complete_once(
                 admission=admission,
@@ -3261,6 +5462,262 @@ class ProviderRuntime:
             self._completed_receipts[admission.sequence] = receipt
             return receipt
 
+    def _primary_repair_receipt_binding(
+        self,
+        *,
+        admission: ProviderCallAdmissionV1,
+        prompt: str,
+        input_payload: Any,
+        api_config: Mapping[str, Any],
+        schema_hash: str | None,
+        metadata: Mapping[str, Any] | None,
+        route: str | None,
+        result: Mapping[str, Any],
+        response_format: str = "",
+    ) -> dict[str, Any]:
+        provider = str(api_config.get("provider_family") or api_config.get("provider") or "generic")
+        return {
+            "schema_version": "provider-primary-repair-receipt-binding/v1",
+            "job_id": self.job_id,
+            "attempt_id": self.attempt_id,
+            "stage_name": self.stage_name,
+            "route": str(route or self.route or provider),
+            "provider": provider,
+            "model": str(api_config.get("model") or ""),
+            "endpoint": str(api_config.get("api_base") or ""),
+            "prompt_hash": hash_text(prompt),
+            "input_hash": hash_json(input_payload),
+            "config_hash": hash_json(_redact_mapping(api_config)),
+            "schema_hash": schema_hash or self.schema_hash,
+            "node_id": self.node_id,
+            "call_id": str((metadata or {}).get("call_id") or self.call_id),
+            "closure_epoch_id": self.closure_epoch_id,
+            "logical_attempt_identity": self.logical_attempt_identity,
+            "endpoint_type": str(result.get("endpoint_type") or self.endpoint_type),
+            "response_format": str(response_format or "text"),
+            "admission": asdict(admission),
+            "budget": self.budget.to_dict(),
+            "receipt_metadata": _redact_mapping(self._snapshot_receipt_metadata(
+                metadata, api_config, str(result.get("endpoint_type") or self.endpoint_type),
+            )),
+            "test_only": self.test_only,
+            "prompt_id": self.prompt_id,
+            "prompt_version": self.prompt_version,
+            "prompt_sha256": self.prompt_sha256,
+        }
+
+    def primary_repair_raw_response_callback(
+        self,
+        admission: ProviderCallAdmissionV1,
+        scope: PrimaryRepairScopeV1 | Mapping[str, Any],
+        *,
+        prompt: str,
+        input_payload: Any,
+        api_config: Mapping[str, Any],
+        response_format: str,
+        metadata: Mapping[str, Any] | None = None,
+        route: str | None = None,
+    ) -> Callable[[str, str, int, int | None, str, str, bool, int], None]:
+        """Prepare the fsynced-spool callback for a PRIMARY call already admitted."""
+
+        normalized_scope = ProviderBudgetController._coerce_primary_repair_scope(scope)
+        assert normalized_scope is not None
+        response_journal = self.primary_repair_response_journal
+        aggregate_budget = self.aggregate_budget
+        if (
+            aggregate_budget is None
+            or response_journal is None
+            or admission.aggregate_reservation_id is None
+        ):
+            raise ProviderRuntimeContractError(
+                "PRIMARY raw response retention requires its durable reservation and journal"
+            )
+        if hash_json(input_payload) != normalized_scope.request_hash:
+            raise ProviderRuntimeContractError(
+                "PRIMARY raw response request differs from its reserved scope"
+            )
+        with self._lock:
+            registered_scope = self._primary_repair_scopes.get(admission.sequence)
+            reservation = self._aggregate_reservations.get(admission.sequence)
+        if (
+            registered_scope is None
+            or registered_scope.fingerprint_sha256 != normalized_scope.fingerprint_sha256
+            or reservation is None
+            or reservation.reservation_id != admission.aggregate_reservation_id
+        ):
+            raise ProviderRuntimeContractError(
+                "PRIMARY raw response callback does not match the live admission"
+            )
+        receipt_binding = self._primary_repair_receipt_binding(
+            admission=admission,
+            prompt=prompt,
+            input_payload=input_payload,
+            api_config=api_config,
+            schema_hash=self.schema_hash,
+            metadata=metadata,
+            route=route,
+            result={"endpoint_type": self.endpoint_type},
+            response_format=response_format,
+        )
+        if receipt_binding["schema_hash"] != normalized_scope.schema_hash:
+            raise ProviderRuntimeContractError(
+                "PRIMARY raw response schema differs from its reserved scope"
+            )
+        self._primary_repair_receipt_bindings[admission.sequence] = receipt_binding
+
+        def persist_primary_raw_response(
+            path: str,
+            sha256: str,
+            byte_count: int,
+            http_status: int | None,
+            content_type: str,
+            response_protocol: str,
+            complete: bool,
+            attempt_number: int,
+        ) -> PrimaryRepairResponseRefV1:
+            return response_journal.persist_raw_response(
+                normalized_scope,
+                reservation.reservation_id,
+                spool_path=path,
+                sha256=sha256,
+                byte_count=byte_count,
+                http_status=http_status,
+                content_type=content_type,
+                response_protocol=response_protocol,
+                complete=complete,
+                receipt_binding=receipt_binding,
+                attempt_number=attempt_number,
+            )
+
+        def finalize_primary_raw_response(
+            path: str,
+            sha256: str,
+            byte_count: int,
+            http_status: int | None,
+            content_type: str,
+            response_protocol: str,
+            complete: bool,
+            attempt_number: int,
+        ) -> None:
+            # This fsynced per-scope record is committed before the adapter's
+            # later retention callback updates aggregate scope state. On kill
+            # in between, reservation reconciliation can recover locally.
+            persist_primary_raw_response(
+                path,
+                sha256,
+                byte_count,
+                http_status,
+                content_type,
+                response_protocol,
+                complete,
+                attempt_number,
+            )
+
+        def retain_primary_raw_response(
+            path: str,
+            sha256: str,
+            byte_count: int,
+            http_status: int | None,
+            content_type: str,
+            response_protocol: str,
+            complete: bool,
+            attempt_number: int,
+        ) -> None:
+            response_ref = persist_primary_raw_response(
+                path,
+                sha256,
+                byte_count,
+                http_status,
+                content_type,
+                response_protocol,
+                complete,
+                attempt_number,
+            )
+            aggregate_budget.retain_primary_repair_raw_response(
+                reservation,
+                normalized_scope,
+                response_ref,
+                journal=response_journal,
+            )
+
+        setattr(
+            retain_primary_raw_response,
+            "finalize_transport_spool",
+            finalize_primary_raw_response,
+        )
+        return retain_primary_raw_response
+
+    def _reparse_primary_repair_raw_response(
+        self,
+        entry: PrimaryRepairResponseEntryV1,
+    ) -> dict[str, Any]:
+        """Locally parse one complete, retained PRIMARY HTTP 200 response."""
+
+        raw_spool = entry.raw_spool
+        semantic_only = (
+            entry.entry_kind == "semantic_raw_response"
+            and raw_spool is not None
+            and not raw_spool.complete
+            and raw_spool.http_status == 200
+            and raw_spool.completion_proof == "semantic_complete_only"
+        )
+        if (
+            entry.entry_kind not in {"raw_response", "semantic_raw_response"}
+            or raw_spool is None
+            or (not raw_spool.complete and not semantic_only)
+            or raw_spool.http_status != 200
+        ):
+            raise ProviderRuntimeContractError(
+                "PRIMARY raw response has no verified successful content"
+            )
+        receipt_binding = entry.receipt_binding
+        if receipt_binding.get("schema_version") != "provider-primary-repair-receipt-binding/v1":
+            raise ProviderRuntimeContractError(
+                "PRIMARY raw response has no supported receipt binding"
+            )
+        try:
+            from ai_interface import reparse_provider_response_spool
+
+            response = reparse_provider_response_spool(
+                raw_spool.path,
+                raw_spool.sha256,
+                raw_spool.byte_count,
+                raw_spool.content_type,
+                raw_spool.response_protocol,
+                str(receipt_binding.get("endpoint_type") or ""),
+                str(receipt_binding.get("model") or ""),
+                str(receipt_binding.get("response_format") or ""),
+                int(raw_spool.http_status),
+                True,
+            )
+        except Exception as exc:
+            raise ProviderRuntimeContractError(
+                "retained PRIMARY raw response failed local protocol reparse"
+            ) from exc
+        response["endpoint_type"] = str(
+            receipt_binding.get("endpoint_type") or self.endpoint_type
+        )
+        response["attempts"] = raw_spool.attempt_number
+        if semantic_only:
+            # Parsed content is usable, but HTTP EOF and provider usage remain
+            # unknown. Preserve that distinction and charge the full output
+            # reservation.
+            response["response_body_complete"] = False
+            response["transport_completion_proof"] = "semantic_complete_only"
+        if semantic_only or raw_spool.attempt_number > 1:
+            # Earlier non-200 attempts may have incurred unreported usage.
+            # Keep the full pre-reserved output ceiling charged.
+            for token_field in (
+                "input_tokens",
+                "output_tokens",
+                "total_tokens",
+                "cached_input_tokens",
+                "reasoning_tokens",
+            ):
+                response.pop(token_field, None)
+            response["usage_status"] = "unknown"
+        return response
+
     def _complete_once(
         self,
         *,
@@ -3273,6 +5730,7 @@ class ProviderRuntime:
         metadata: Mapping[str, Any] | None = None,
         route: str | None = None,
     ) -> ProviderCallReceiptV1:
+        result = dict(result)
         provider = str(api_config.get("provider_family") or api_config.get("provider") or "generic")
         model = str(api_config.get("model") or "")
         endpoint = str(api_config.get("api_base") or "")
@@ -3282,18 +5740,111 @@ class ProviderRuntime:
             prompt=prompt,
             input_payload=input_payload,
         )
-        if existing is not None:
+        with self._lock:
+            primary_scope = self._primary_repair_scopes.get(admission.sequence)
+            aggregate_reservation = self._aggregate_reservations.get(admission.sequence)
+        prepost_failure = (
+            result.get("provider_http_attempt_started") is False
+            and int(result.get("provider_http_attempts_started") or 0) == 0
+        )
+        if (
+            prepost_failure
+            and primary_scope is not None
+            and aggregate_reservation is not None
+            and self.aggregate_budget is not None
+            and self.release_unstarted(admission)
+        ):
+            raise ProviderBudgetExceeded(
+                "PRIMARY provider attempt was blocked before its first POST; "
+                "the unstarted run-budget reservation was released"
+            )
+        if (
+            primary_scope is not None
+            and result.get("primary_raw_response_retention_callback_failed") is True
+        ):
+            if self.primary_repair_response_journal is None or self.aggregate_budget is None:
+                raise ProviderRuntimeContractError(
+                    "PRIMARY response retention failed without a recoverable journal"
+                )
+            entry = self.primary_repair_response_journal.load_entry_for_scope(
+                primary_scope,
+                reservation_id=(
+                    aggregate_reservation.reservation_id
+                    if aggregate_reservation is not None
+                    else None
+                ),
+            )
             with self._lock:
-                aggregate_reservation = self._aggregate_reservations.get(admission.sequence)
+                expected_binding = self._primary_repair_receipt_bindings.get(
+                    admission.sequence
+                )
+            state = self.aggregate_budget.lookup_primary_repair_scope(primary_scope)
+            if (
+                entry is not None
+                and expected_binding is not None
+                and dict(entry.receipt_binding) == expected_binding
+                and entry.raw_spool is not None
+                and state is not None
+                and entry.raw_spool.attempt_number
+                == int(state.get("physical_attempts_started") or 0)
+            ):
+                result = self._reparse_primary_repair_raw_response(entry)
+        if primary_scope is not None:
+            try:
+                physical_attempts = max(1, int(result.get("attempts") or 1))
+            except (TypeError, ValueError):
+                physical_attempts = admission.reserved_call_attempts
+            if physical_attempts > 1:
+                # A successful final response does not report usage consumed
+                # by earlier retry responses. Charge the reserved output
+                # ceiling instead of crediting only the last response's usage.
+                for token_field in (
+                    "input_tokens",
+                    "output_tokens",
+                    "total_tokens",
+                    "cached_input_tokens",
+                    "reasoning_tokens",
+                ):
+                    result.pop(token_field, None)
+                result["usage_status"] = "unknown"
+        if existing is not None:
             if self.aggregate_budget is not None and aggregate_reservation is not None:
-                self.aggregate_budget.complete(aggregate_reservation, result)
+                existing_metadata = (
+                    existing.metadata if isinstance(existing.metadata, Mapping) else {}
+                )
+                existing_response_ref = existing_metadata.get("primary_repair_response_ref")
+                if primary_scope is not None and existing_response_ref is None:
+                    if self.primary_repair_response_journal is None:
+                        raise ProviderRuntimeContractError(
+                            "PRIMARY repair receipt has no response journal binding"
+                        )
+                    recovered = self.primary_repair_response_journal.load_for_scope(
+                        primary_scope,
+                        reservation_id=aggregate_reservation.reservation_id,
+                    )
+                    if recovered is None:
+                        raise ProviderRuntimeContractError(
+                            "PRIMARY repair receipt has no recoverable response"
+                        )
+                    existing_response_ref = recovered[0].to_dict()
+                if existing_response_ref is None:
+                    self.aggregate_budget.complete(aggregate_reservation, result)
+                else:
+                    self.aggregate_budget.complete(
+                        aggregate_reservation,
+                        result,
+                        primary_repair_response_ref=existing_response_ref,
+                    )
                 with self._lock:
                     self._aggregate_reservations.pop(admission.sequence, None)
+                    self._primary_repair_scopes.pop(admission.sequence, None)
                     self._account_existing_receipt(existing, admission)
+            self._require_response_snapshot(existing)
             return existing
         aggregate_reservation = None
         aggregate_snapshot: dict[str, Any] | None = None
         aggregate_error: BaseException | None = None
+        response_ref: PrimaryRepairResponseRefV1 | None = None
         reservation_tokens = admission.estimated_tokens + admission.estimated_output_tokens
         result_total_tokens = _optional_nonnegative_int(result.get("total_tokens"))
         if result_total_tokens is None:
@@ -3303,9 +5854,76 @@ class ProviderRuntime:
                 result_total_tokens = input_tokens + output_tokens
         with self._lock:
             aggregate_reservation = self._aggregate_reservations.get(admission.sequence)
+            primary_scope = self._primary_repair_scopes.get(admission.sequence)
+        if primary_scope is not None:
+            if aggregate_reservation is None or self.aggregate_budget is None:
+                raise ProviderRuntimeContractError(
+                    "PRIMARY repair response has no durable aggregate reservation"
+                )
+            if self.primary_repair_response_journal is None:
+                raise ProviderRuntimeContractError(
+                    "PRIMARY repair response journal disappeared after admission"
+                )
+            with self._lock:
+                receipt_binding = self._primary_repair_receipt_bindings.get(
+                    admission.sequence
+                )
+            if receipt_binding is None:
+                response_format = (
+                    "json"
+                    if isinstance(result.get("content"), Mapping)
+                    else "text"
+                )
+                receipt_binding = self._primary_repair_receipt_binding(
+                    admission=admission,
+                    prompt=prompt,
+                    input_payload=input_payload,
+                    api_config=api_config,
+                    schema_hash=schema_hash,
+                    metadata=metadata,
+                    route=route,
+                    result=result,
+                    response_format=response_format,
+                )
+            else:
+                binding_check = self._primary_repair_receipt_binding(
+                    admission=admission,
+                    prompt=prompt,
+                    input_payload=input_payload,
+                    api_config=api_config,
+                    schema_hash=schema_hash,
+                    metadata=metadata,
+                    route=route,
+                    result=result,
+                    response_format=str(receipt_binding.get("response_format") or ""),
+                )
+                if binding_check != receipt_binding:
+                    raise ProviderRuntimeContractError(
+                        "PRIMARY raw response binding changed before normalization"
+                    )
+            if receipt_binding["input_hash"] != primary_scope.request_hash:
+                raise ProviderRuntimeContractError(
+                    "PRIMARY repair receipt input differs from its reserved request hash"
+                )
+            response_ref = self.primary_repair_response_journal.persist_response(
+                primary_scope,
+                aggregate_reservation.reservation_id,
+                result,
+                receipt_binding=receipt_binding,
+            )
         if self.aggregate_budget is not None and aggregate_reservation is not None:
             try:
-                aggregate_snapshot = self.aggregate_budget.complete(aggregate_reservation, result)
+                if response_ref is None:
+                    aggregate_snapshot = self.aggregate_budget.complete(
+                        aggregate_reservation,
+                        result,
+                    )
+                else:
+                    aggregate_snapshot = self.aggregate_budget.complete(
+                        aggregate_reservation,
+                        result,
+                        primary_repair_response_ref=response_ref,
+                    )
             except BaseException as exc:
                 # The provider response must still become durable.  Keep the
                 # reservation live so a later resume can retry accounting
@@ -3314,7 +5932,9 @@ class ProviderRuntime:
             else:
                 with self._lock:
                     self._aggregate_reservations.pop(admission.sequence, None)
-        receipt_metadata = dict(metadata or {})
+        receipt_metadata = self._snapshot_receipt_metadata(
+            metadata, api_config, str(result.get("endpoint_type") or self.endpoint_type),
+        )
         receipt_metadata["local_budget_reservation_tokens"] = reservation_tokens
         receipt_metadata["local_budget_usage_status"] = (
             "reported" if result_total_tokens is not None else "unknown"
@@ -3332,6 +5952,13 @@ class ProviderRuntime:
             receipt_metadata["aggregate_budget"] = aggregate_snapshot
         if aggregate_reservation is not None:
             receipt_metadata["aggregate_reservation_id"] = aggregate_reservation.reservation_id
+        if primary_scope is not None:
+            receipt_metadata["primary_repair_scope_id"] = primary_scope.scope_id
+            receipt_metadata["primary_repair_scope_fingerprint_sha256"] = (
+                primary_scope.fingerprint_sha256
+            )
+            if response_ref is not None:
+                receipt_metadata["primary_repair_response_ref"] = response_ref.to_dict()
         receipt = ProviderCallReceiptV1.from_result(
             admission=admission,
             job_id=self.job_id,
@@ -3376,6 +6003,16 @@ class ProviderRuntime:
             self._receipts.append(receipt)
             if aggregate_error is None:
                 self._accounted_sequences.add(admission.sequence)
+                self._primary_repair_scopes.pop(admission.sequence, None)
+        # Capture after the receipt is durably appended and local accounting is
+        # recorded, but outside the runtime accounting lock. A failed capture
+        # never turns that known call into a new admission or refunds it.
+        try:
+            self._capture_response_snapshot(receipt, result.get("content"))
+        except ProviderRuntimeContractError as exc:
+            if aggregate_error is not None:
+                raise aggregate_error from exc
+            raise
         if aggregate_error is not None:
             raise aggregate_error
         return receipt
@@ -3383,16 +6020,469 @@ class ProviderRuntime:
     def mark_transport_started(self, admission: ProviderCallAdmissionV1) -> None:
         """Durably mark the boundary immediately before a transport call."""
 
-        self._assert_pause_state_before_admission()
+        try:
+            self._assert_pause_state_before_admission()
+        except ProviderCancellationRequested:
+            self.release_unstarted(admission)
+            raise
         if self.aggregate_budget is None or admission.aggregate_reservation_id is None:
             return
         with self._lock:
             reservation = self._aggregate_reservations.get(admission.sequence)
+            primary_scope = self._primary_repair_scopes.get(admission.sequence)
         if reservation is None:
             raise ProviderRuntimeContractError(
                 f"aggregate reservation is missing for admission sequence {admission.sequence}"
             )
+        if primary_scope is not None:
+            # PRIMARY's physical POST marker is recorded by the adapter's
+            # attempt-start callback after local request preparation. The
+            # executor's earlier call marks the transport phase only.
+            return
         self.aggregate_budget.mark_transport_started(reservation)
+
+    def primary_provider_attempt_started_callback(
+        self,
+        admission: ProviderCallAdmissionV1,
+        scope: PrimaryRepairScopeV1 | Mapping[str, Any],
+    ) -> Callable[[int], str]:
+        """Bind each pre-POST PRIMARY physical attempt to its reservation."""
+
+        normalized_scope = ProviderBudgetController._coerce_primary_repair_scope(scope)
+        assert normalized_scope is not None
+        response_journal = self.primary_repair_response_journal
+        aggregate_budget = self.aggregate_budget
+        if (
+            aggregate_budget is None
+            or response_journal is None
+            or admission.aggregate_reservation_id is None
+        ):
+            raise ProviderRuntimeContractError(
+                "PRIMARY physical attempt tracking requires its aggregate reservation"
+            )
+        with self._lock:
+            registered_scope = self._primary_repair_scopes.get(admission.sequence)
+            reservation = self._aggregate_reservations.get(admission.sequence)
+        if (
+            registered_scope is None
+            or registered_scope.fingerprint_sha256 != normalized_scope.fingerprint_sha256
+            or reservation is None
+            or reservation.reservation_id != admission.aggregate_reservation_id
+        ):
+            raise ProviderRuntimeContractError(
+                "PRIMARY physical attempt callback does not match the live admission"
+            )
+
+        def mark_attempt_started(attempt_number: int) -> str:
+            with self._lock:
+                receipt_binding = self._primary_repair_receipt_bindings.get(
+                    admission.sequence
+                )
+            if receipt_binding is None:
+                raise ProviderRuntimeContractError(
+                    "PRIMARY physical attempt has no prebound receipt identity"
+                )
+            spool_path = response_journal.persist_attempt_intent(
+                normalized_scope,
+                reservation.reservation_id,
+                attempt_number,
+                receipt_binding=receipt_binding,
+            )
+            aggregate_budget.mark_primary_repair_attempt_started(
+                reservation,
+                normalized_scope,
+                attempt_number,
+            )
+            return spool_path
+
+        def bind_response_headers(
+            attempt_number: int,
+            http_status: int | None,
+            content_type: str,
+            content_length: int | None,
+            content_encoding: str,
+            transfer_encoding: str,
+        ) -> None:
+            response_journal.bind_attempt_response_headers(
+                normalized_scope,
+                reservation.reservation_id,
+                attempt_number,
+                http_status=http_status,
+                content_type=content_type,
+                content_length=content_length,
+                content_encoding=content_encoding,
+                transfer_encoding=transfer_encoding,
+            )
+
+        setattr(mark_attempt_started, "response_headers", bind_response_headers)
+        return mark_attempt_started
+
+    def release_unstarted(self, admission: ProviderCallAdmissionV1) -> bool:
+        """Release a reservation when transport is proven not to have started."""
+
+        if self.aggregate_budget is None or admission.aggregate_reservation_id is None:
+            return False
+        with self._lock:
+            reservation = self._aggregate_reservations.get(admission.sequence)
+        if reservation is None:
+            return False
+        released = self.aggregate_budget.release_unstarted(reservation)
+        if released:
+            with self._lock:
+                self._aggregate_reservations.pop(admission.sequence, None)
+                self._primary_repair_scopes.pop(admission.sequence, None)
+                self._reserved_tokens = max(
+                    0,
+                    self._reserved_tokens
+                    - admission.estimated_tokens
+                    - admission.estimated_output_tokens,
+                )
+        return released
+
+    def recover_primary_repair_response(
+        self,
+        scope: PrimaryRepairScopeV1 | Mapping[str, Any],
+        *,
+        prompt: str,
+        input_payload: Any,
+        api_config: Mapping[str, Any],
+    ) -> tuple[PrimaryRepairResponseRefV1, dict[str, Any]] | None:
+        """Recover a journaled PRIMARY response and append its durable receipt.
+
+        A missing journal leaves the scope untouched so the caller can report
+        the original ambiguity. A retained response never becomes a new
+        provider admission. The receipt is reconstructed from the receipt
+        binding written beside the response before aggregate accounting.
+        """
+
+        normalized_scope = ProviderBudgetController._coerce_primary_repair_scope(scope)
+        assert normalized_scope is not None
+        if self.aggregate_budget is None or self.primary_repair_response_journal is None:
+            raise ProviderRuntimeContractError(
+                "PRIMARY repair recovery requires its aggregate budget and response journal"
+            )
+        state = self.aggregate_budget.lookup_primary_repair_scope(normalized_scope)
+        if state is None:
+            return None
+        reservation_id = str(state.get("reservation_id") or "")
+        stored_journal_root = str(state.get("response_journal_root") or "").strip()
+        if not stored_journal_root and isinstance(state.get("response_ref"), Mapping):
+            stored_journal_root = str(
+                Path(str(state["response_ref"].get("path") or "")).expanduser().resolve().parent
+            )
+        if (
+            stored_journal_root
+            and Path(stored_journal_root).expanduser().resolve()
+            != self.primary_repair_response_journal.root.resolve()
+        ):
+            raise ProviderRuntimeContractError(
+                "PRIMARY repair response journal differs from its durable reservation binding"
+            )
+        entry = self.primary_repair_response_journal.load_entry_for_scope(
+            normalized_scope,
+            reservation_id=reservation_id,
+        )
+        if entry is None:
+            return None
+        response_ref = entry.reference
+        response = dict(entry.response)
+        receipt_binding = dict(entry.receipt_binding)
+        if receipt_binding.get("schema_version") != "provider-primary-repair-receipt-binding/v1":
+            raise ProviderRuntimeContractError(
+                "PRIMARY repair response journal has no supported receipt binding"
+            )
+        expected_binding = {
+            "job_id": self.job_id,
+            "attempt_id": self.attempt_id,
+            "stage_name": self.stage_name,
+            "route": self.route,
+            "node_id": self.node_id,
+            "call_id": self.call_id,
+            "closure_epoch_id": self.closure_epoch_id,
+            "logical_attempt_identity": self.logical_attempt_identity,
+            "schema_hash": self.schema_hash,
+            "endpoint_type": self.endpoint_type,
+            "test_only": self.test_only,
+            "prompt_id": self.prompt_id,
+            "prompt_version": self.prompt_version,
+            "prompt_sha256": self.prompt_sha256,
+        }
+        if any(receipt_binding.get(key) != value for key, value in expected_binding.items()):
+            raise ProviderRuntimeContractError(
+                "PRIMARY repair receipt binding differs from the current runtime identity"
+            )
+        input_hash = hash_json(input_payload)
+        prompt_hash = hash_text(prompt)
+        config_hash = hash_json(_redact_mapping(api_config))
+        if (
+            input_hash != normalized_scope.request_hash
+            or receipt_binding.get("input_hash") != input_hash
+            or receipt_binding.get("prompt_hash") != prompt_hash
+            or receipt_binding.get("config_hash") != config_hash
+            or receipt_binding.get("schema_hash") != normalized_scope.schema_hash
+        ):
+            raise ProviderRuntimeContractError(
+                "PRIMARY repair response receipt binding does not match the current request"
+            )
+        if entry.entry_kind == "ambiguous_raw_response":
+            raise ProviderRuntimeContractError(
+                "incomplete or non-200 PRIMARY raw response remains outcome-unknown"
+            )
+        if entry.entry_kind in {"raw_response", "semantic_raw_response"}:
+            raw_spool = entry.raw_spool
+            if raw_spool is None:
+                raise ProviderRuntimeContractError(
+                    "PRIMARY raw response journal entry lost its spool"
+                )
+            physical_attempts_started = int(
+                state.get("physical_attempts_started") or raw_spool.attempt_number
+            )
+            expected_scope_status = (
+                "raw_semantically_complete"
+                if entry.entry_kind == "semantic_raw_response"
+                else "raw_retained"
+            )
+            if (
+                str(state.get("status") or "") != expected_scope_status
+                or raw_spool.attempt_number != physical_attempts_started
+            ):
+                raise ProviderRuntimeContractError(
+                    "PRIMARY raw response is stale relative to the latest physical attempt"
+                )
+            response = self._reparse_primary_repair_raw_response(entry)
+            response_ref = self.primary_repair_response_journal.persist_response(
+                normalized_scope,
+                reservation_id,
+                response,
+                receipt_binding=receipt_binding,
+            )
+            response = self.primary_repair_response_journal.load(
+                response_ref,
+                scope=normalized_scope,
+                reservation_id=reservation_id,
+            )
+        elif entry.entry_kind != "normalized_response":
+            raise ProviderRuntimeContractError(
+                "PRIMARY repair response journal entry kind cannot be recovered"
+            )
+        try:
+            admission_payload = receipt_binding.get("admission")
+            if not isinstance(admission_payload, Mapping):
+                raise TypeError("admission is missing")
+            remaining_calls_value = admission_payload.get("remaining_calls")
+            remaining_tokens_value = admission_payload.get("remaining_tokens")
+            admission = ProviderCallAdmissionV1(
+                sequence=int(admission_payload.get("sequence") or 0),
+                estimated_tokens=int(admission_payload.get("estimated_tokens") or 0),
+                admitted_at=str(admission_payload.get("admitted_at") or ""),
+                remaining_calls=(
+                    None
+                    if remaining_calls_value is None
+                    else int(remaining_calls_value)
+                ),
+                remaining_tokens=(
+                    None
+                    if remaining_tokens_value is None
+                    else int(remaining_tokens_value)
+                ),
+                estimated_output_tokens=int(
+                    admission_payload.get("estimated_output_tokens") or 0
+                ),
+                reserved_call_attempts=int(
+                    admission_payload.get("reserved_call_attempts") or 0
+                ),
+                reserved_retry_attempts=int(
+                    admission_payload.get("reserved_retry_attempts") or 0
+                ),
+                aggregate_reservation_id=str(
+                    admission_payload.get("aggregate_reservation_id") or ""
+                ),
+            )
+            receipt_budget = ProviderBudgetV1.from_mapping(receipt_binding.get("budget"))
+        except (TypeError, ValueError, ProviderRuntimeContractError) as exc:
+            raise ProviderRuntimeContractError(
+                "PRIMARY repair receipt admission binding is invalid"
+            ) from exc
+        if (
+            admission.sequence < 1
+            or not admission.admitted_at
+            or admission.aggregate_reservation_id != response_ref.reservation_id
+            or receipt_binding.get("budget") != self.budget.to_dict()
+            or receipt_binding.get("provider")
+            != str(api_config.get("provider_family") or api_config.get("provider") or "generic")
+            or receipt_binding.get("model") != str(api_config.get("model") or "")
+            or receipt_binding.get("endpoint") != str(api_config.get("api_base") or "")
+        ):
+            raise ProviderRuntimeContractError(
+                "PRIMARY repair receipt admission identity is inconsistent"
+            )
+        status = str(state.get("status") or "")
+        if status in {
+            "transport_started",
+            "raw_retained",
+            "raw_semantically_complete",
+            "response_retained",
+        }:
+            if status == "response_retained" and state.get("response_ref") != response_ref.to_dict():
+                raise ProviderRuntimeContractError(
+                    "response-retained PRIMARY scope has a different journal reference"
+                )
+            self.aggregate_budget.recover_primary_repair_response(
+                normalized_scope,
+                response_ref,
+                response,
+                journal=self.primary_repair_response_journal,
+            )
+        elif status == "completed":
+            if state.get("response_ref") != response_ref.to_dict():
+                raise ProviderRuntimeContractError(
+                    "completed PRIMARY repair scope has a different response reference"
+                )
+        elif status == "reserved":
+            raise ProviderRuntimeContractError(
+                "PRIMARY repair response exists before its transport-started reservation"
+            )
+        else:
+            raise ProviderRuntimeContractError(
+                "PRIMARY repair response scope is ambiguous and requires operator reconciliation"
+            )
+        if self.ledger is None:
+            raise ProviderRuntimeContractError(
+                "PRIMARY repair recovery requires the bound provider receipt ledger"
+            )
+        existing_by_call = [
+            item
+            for item in self.ledger.list_receipts()
+            if item.job_id == self.job_id
+            and item.call_id == self.call_id
+            and item.logical_attempt_identity == self.logical_attempt_identity
+        ]
+        matching_receipts = []
+        for item in existing_by_call:
+            item_metadata = item.metadata if isinstance(item.metadata, Mapping) else {}
+            if (
+                item_metadata.get("primary_repair_scope_id") == normalized_scope.scope_id
+                and item_metadata.get("primary_repair_scope_fingerprint_sha256")
+                == normalized_scope.fingerprint_sha256
+                and item_metadata.get("primary_repair_response_ref") == response_ref.to_dict()
+                and item.prompt_hash == prompt_hash
+                and item.input_hash == input_hash
+                and item.config_hash == config_hash
+            ):
+                matching_receipts.append(item)
+        if len(matching_receipts) > 1:
+            raise ProviderRuntimeContractError(
+                "PRIMARY repair response has duplicate durable receipts"
+            )
+        if existing_by_call and not matching_receipts:
+            raise ProviderRuntimeContractError(
+                "PRIMARY repair call already has a receipt with a different response binding"
+            )
+        if matching_receipts:
+            receipt = matching_receipts[0]
+            expected_response_hash = (
+                hash_json(response.get("content"))
+                if receipt.status == "success" and response.get("content") is not None
+                else None
+            )
+            if receipt.response_hash != expected_response_hash:
+                raise ProviderRuntimeContractError(
+                    "PRIMARY repair receipt response differs from its journal"
+                )
+        else:
+            base_metadata = receipt_binding.get("receipt_metadata")
+            if not isinstance(base_metadata, Mapping):
+                raise ProviderRuntimeContractError(
+                    "PRIMARY repair receipt metadata binding is invalid"
+                )
+            receipt_metadata = dict(base_metadata)
+            result_total_tokens = _optional_nonnegative_int(response.get("total_tokens"))
+            if result_total_tokens is None:
+                input_tokens = _optional_nonnegative_int(response.get("input_tokens"))
+                output_tokens = _optional_nonnegative_int(response.get("output_tokens"))
+                if input_tokens is not None and output_tokens is not None:
+                    result_total_tokens = input_tokens + output_tokens
+            receipt_metadata.update(
+                {
+                    "accounting_status": "committed",
+                    "accounting_recovered_from_response_journal": True,
+                    "local_budget_reservation_tokens": (
+                        admission.estimated_tokens + admission.estimated_output_tokens
+                    ),
+                    "local_budget_usage_status": (
+                        "reported" if result_total_tokens is not None else "unknown"
+                    ),
+                    "aggregate_reservation_id": response_ref.reservation_id,
+                    "primary_repair_scope_id": normalized_scope.scope_id,
+                    "primary_repair_scope_fingerprint_sha256": (
+                        normalized_scope.fingerprint_sha256
+                    ),
+                    "primary_repair_response_ref": response_ref.to_dict(),
+                }
+            )
+            if (
+                entry.raw_spool is not None
+                and entry.raw_spool.completion_proof == "semantic_complete_only"
+            ):
+                receipt_metadata.update(
+                    {
+                        "provider_http_body_complete": False,
+                        "provider_content_semantically_complete": True,
+                        "provider_http_completion_proof": "semantic_complete_only",
+                        "local_budget_usage_status": "unknown",
+                    }
+                )
+            receipt = ProviderCallReceiptV1.from_result(
+                admission=admission,
+                job_id=str(receipt_binding.get("job_id") or ""),
+                attempt_id=str(receipt_binding.get("attempt_id") or ""),
+                stage_name=str(receipt_binding.get("stage_name") or ""),
+                route=str(receipt_binding.get("route") or ""),
+                provider=str(receipt_binding.get("provider") or ""),
+                model=str(receipt_binding.get("model") or ""),
+                endpoint=str(receipt_binding.get("endpoint") or ""),
+                prompt_hash=str(receipt_binding.get("prompt_hash") or ""),
+                input_hash=str(receipt_binding.get("input_hash") or ""),
+                config_hash=str(receipt_binding.get("config_hash") or ""),
+                schema_hash=str(receipt_binding.get("schema_hash") or ""),
+                result=response,
+                budget=receipt_budget,
+                started_at=admission.admitted_at,
+                finished_at=entry.created_at,
+                metadata=receipt_metadata,
+                node_id=str(receipt_binding.get("node_id") or ""),
+                call_id=str(receipt_binding.get("call_id") or ""),
+                closure_epoch_id=str(receipt_binding.get("closure_epoch_id") or ""),
+                logical_attempt_identity=str(
+                    receipt_binding.get("logical_attempt_identity") or ""
+                ),
+                endpoint_type=str(receipt_binding.get("endpoint_type") or ""),
+                test_only=bool(receipt_binding.get("test_only")),
+                prompt_id=str(receipt_binding.get("prompt_id") or ""),
+                prompt_version=str(receipt_binding.get("prompt_version") or ""),
+                prompt_sha256=str(receipt_binding.get("prompt_sha256") or ""),
+            )
+            stable_receipt_id = "provider-receipt-" + uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                "|".join(
+                    (
+                        normalized_scope.scope_id,
+                        response_ref.reservation_id,
+                        response_ref.record_sha256,
+                    )
+                ),
+            ).hex
+            receipt = replace(receipt, receipt_id=stable_receipt_id)
+            receipt = self.ledger.append(receipt)
+        with self._lock:
+            if all(item.receipt_id != receipt.receipt_id for item in self._receipts):
+                self._receipts.append(receipt)
+            self._calls = max(self._calls, admission.sequence)
+            self._account_existing_receipt(receipt, admission)
+        # This content comes from the verified PRIMARY response journal, after
+        # stable receipt-ID assignment, not from an expanded output artifact.
+        self._capture_response_snapshot(receipt, response.get("content"))
+        return response_ref, response
 
     def blocked_receipt(
         self,
@@ -3440,7 +6530,9 @@ __all__ = [
     "AcceptanceExecutionContextV1",
     "acceptance_context_environment",
     "acceptance_execution_context_from_environment",
+    "build_provider_run_scope_hashes_v1",
     "ProviderBudgetExceeded",
+    "ProviderCancellationRequested",
     "ProviderAggregateBudgetV1",
     "ProviderAggregateBudgetV2",
     "ProviderAggregateReservationV1",
@@ -3453,10 +6545,18 @@ __all__ = [
     "ProviderRuntime",
     "ProviderRuntimeContractError",
     "ProviderRuntimeLedger",
+    "ProviderRunPlanBindingV1",
+    "ProviderRunScopeAuthorizationV1",
+    "ProviderRunScopeProofV1",
+    "SharedRetryProjectionV1",
     "ProcessIdentityV1",
     "ProcessLiveness",
     "canonical_provider_request_payload",
     "bind_acceptance_execution_context",
+    "bind_provider_run_scope_authorization",
+    "bind_provider_run_scope_proof",
+    "bind_provider_run_budget",
+    "bind_provider_run_plan_binding",
     "compute_closure_epoch_id",
     "current_acceptance_execution_context",
     "hash_json",
@@ -3466,6 +6566,18 @@ __all__ = [
     "process_liveness",
     "provider_budget_controller_from_environment",
     "provider_aggregate_budget_from_mapping",
+    "provider_run_budget_controller_from_environment",
+    "provider_run_plan_binding_from_verified_acceptance_plan",
+    "provider_run_scope_payload_from_plan_binding",
+    "provider_run_scope_authorization_from_verified_artifact",
+    "provider_run_scope_proof_from_verified_artifact",
+    "provider_run_workspace_identity_sha256",
+    "project_shared_retry_attempts_v1",
+    "project_shared_retry_slots_v1",
     "provider_request_input_hash",
     "stable_provider_hash",
+    "validate_provider_run_scope_authority",
+    "validate_provider_run_scope_authorization",
+    "validate_provider_run_plan_binding",
+    "validate_started_acceptance_execution_context",
 ]

@@ -50,6 +50,7 @@ class BootstrappedRuntimeContext:
     required_stages: tuple[str, ...]
     job_outcome_path: str
     publication_context: Any
+    stage1_work_item_basis: Mapping[str, Any] | None = None
     attempt_number: int = 1
     resumed_from_attempt: int | None = None
 
@@ -215,6 +216,7 @@ def bootstrap_job_runtime(
     source_inventory: SourceInventoryV1 | Mapping[str, Any] | None = None,
     source_canonical_ready: bool | None = None,
     source_degradation_reasons: Sequence[str] = (),
+    stage1_work_item_basis: Mapping[str, Any] | None = None,
     claim_latest_pointer: bool = True,
     resume_requested: bool = False,
     resume_preflight: ResumePreflight | None = None,
@@ -432,6 +434,11 @@ def bootstrap_job_runtime(
         required_stages=required_stages,
         job_outcome_path=job_outcome_path,
         publication_context=active_publication_context,
+        stage1_work_item_basis=(
+            dict(stage1_work_item_basis)
+            if isinstance(stage1_work_item_basis, Mapping)
+            else None
+        ),
     )
     if publish_running_state:
         publish_running_job_runtime(

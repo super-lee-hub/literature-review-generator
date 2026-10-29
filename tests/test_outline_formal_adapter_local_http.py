@@ -102,9 +102,9 @@ class _FormalLoopbackProvider:
     ("paper_count", "source_cap", "target_tokens", "call_cap", "transport_retries"),
     [
         (3, None, 1500, 24, 0), (3, None, 1500, 24, 2),
-        (6, None, 1500, 24, 2),
+        (6, None, 1500, 14, 2),
         (3, 1000, 1500, 24, 2), (3, 1000, 0, 24, 2),
-        (3, None, 1500, 14, 2),
+        (3, None, 1500, 10, 2),
     ],
     ids=["admitted", "physical_retry_budget", "over_call_budget", "over_shard_input_cap", "over_flat_input_cap", "candidate_shard_call_cap"],
 )
@@ -200,20 +200,22 @@ def test_formal_outline_adapter_uses_loopback_socket_and_real_audit(
         preflight_path = next(tmp_path.rglob("stability_preflight_*.json"))
         preflight = json.loads(preflight_path.read_text(encoding="utf-8"))
         assert preflight["rejection_reason"] == "max_provider_calls_exceeded"
-        assert preflight["estimated_provider_calls"] > preflight["max_provider_calls"] == 24
+        assert preflight["estimated_provider_calls"] > preflight["max_provider_calls"] == 14
+        assert preflight["estimated_provider_physical_attempts_upper_bound"] > 14
         assert preflight["hierarchical_relation_shard_calls"] > 0
         return
-    if call_cap == 14:
+    if call_cap == 10:
         assert result.status == "blocked"
         assert provider.requests == []
         preflight_path = next(tmp_path.rglob("stability_preflight_*.json"))
         preflight = json.loads(preflight_path.read_text(encoding="utf-8"))
         assert preflight["rejection_reason"] == "max_provider_calls_exceeded"
+        assert preflight["estimated_provider_calls"] > preflight["max_provider_calls"] == call_cap
+        assert preflight["estimated_provider_physical_attempts_upper_bound"] > call_cap
         assert preflight["hierarchical_candidate_shard_calls"] > 0
         assert len([row for row in preflight["provider_call_plans"] if row["transport_expected"]]) <= call_cap
         assert preflight["hierarchical_relation_shard_calls"] > 0
         assert preflight["hierarchical_candidate_shard_calls"] > 0
-        assert call_cap < preflight["estimated_provider_calls"]
         return
     if source_cap is not None:
         assert result.status == "blocked"
@@ -250,10 +252,28 @@ def test_formal_outline_adapter_uses_loopback_socket_and_real_audit(
         "digest_type" not in view
         for request in cross_requests for view in request["evidence_views"]
     )
-    assert any(
-        "The treatment improved the outcome." in json.dumps(request, ensure_ascii=False)
-        for request in cross_requests
-    )
+    expected_relation_papers = {"paper-b", "paper-c"}
+    for request in cross_requests:
+        candidates = request["relation_candidates"]
+        bundles = request["relation_evidence_bundles"]
+        candidates_by_id = {str(item["relation_id"]): item for item in candidates}
+        bundles_by_id = {str(item["relation_id"]): item for item in bundles}
+        assert len(candidates_by_id) == len(candidates)
+        assert len(bundles_by_id) == len(bundles)
+        assert set(candidates_by_id) == set(bundles_by_id)
+        for relation_id, candidate in candidates_by_id.items():
+            assert set(candidate["paper_keys"]) == expected_relation_papers
+            bundle = bundles_by_id[relation_id]
+            assert set(bundle["paper_ids"]) == expected_relation_papers
+            bundle_findings = json.dumps(
+                {
+                    "findings_left": bundle.get("findings_left") or [],
+                    "findings_right": bundle.get("findings_right") or [],
+                },
+                ensure_ascii=False,
+            )
+            assert "The effect held under a different context." in bundle_findings
+            assert "A boundary condition limits the effect." in bundle_findings
     preflight_path = next(tmp_path.rglob("stability_preflight_*.json"))
     preflight = json.loads(preflight_path.read_text(encoding="utf-8"))
     assert len(provider.requests) <= preflight["estimated_provider_calls"]

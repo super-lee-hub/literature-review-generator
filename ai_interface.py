@@ -2,12 +2,15 @@ import base64
 import copy
 import hashlib
 import json
+import math
 import mimetypes
 import os
+from dataclasses import dataclass
 from pathlib import Path
 import tempfile
 import time
 import re
+import socket
 import requests  # type: ignore
 from typing import Dict, Optional, Any, List, Tuple, Callable, Set, Mapping, Iterable, cast
 from urllib.parse import urlparse
@@ -99,12 +102,14 @@ class ProviderResponseReadError(RuntimeError):
         content_type: str,
         cause: BaseException,
         spool_path: str = "",
+        timeout_phase: str = "",
     ) -> None:
         super().__init__(str(cause) or "provider response body read failed")
         self.partial_body = partial_body
         self.content_type = content_type
         self.cause = cause
         self.spool_path = spool_path
+        self.timeout_phase = timeout_phase
 
 
 class ProviderResponseLimitError(ValueError):
@@ -114,6 +119,40 @@ class ProviderResponseLimitError(ValueError):
         super().__init__(message)
         self.partial_body = partial_body
         self.spool_path = spool_path
+
+
+PrimaryRawResponseRetentionCallback = Callable[
+    [str, str, int, Optional[int], str, str, bool, int], None
+]
+PrimaryProviderAttemptStartedCallback = Callable[[int], Optional[str]]
+
+
+class PrimaryRawResponseRetentionError(RuntimeError):
+    """A local durable-retention callback failed after the provider POST."""
+
+    def __init__(
+        self,
+        *,
+        path: str,
+        sha256: str,
+        byte_count: int,
+        http_status: Optional[int],
+        content_type: str,
+        response_protocol: str,
+        complete: bool,
+        attempt_number: int,
+        cause: BaseException,
+    ) -> None:
+        super().__init__("primary raw-response retention callback failed")
+        self.path = path
+        self.sha256 = sha256
+        self.byte_count = byte_count
+        self.http_status = http_status
+        self.content_type = content_type
+        self.response_protocol = response_protocol
+        self.complete = complete
+        self.attempt_number = attempt_number
+        self.cause_type = type(cause).__name__
 
 
 def _load_stage1_system_prompt(logger: Any = None) -> str:
@@ -164,7 +203,10 @@ def _redact_provider_text(value: Any, secret: str = "") -> str:
     return text[:2000]
 
 
-def _extract_provider_error(response: Any, *, secret: str = "") -> Dict[str, Any]:
+def _extract_provider_error(
+    response: Any, *, secret: str = "", body: bytes | None = None,
+    read_response_body: bool = True,
+) -> Dict[str, Any]:
     status_code = getattr(response, "status_code", None)
     provider_code = None
     message = ""
@@ -179,7 +221,10 @@ def _extract_provider_error(response: Any, *, secret: str = "") -> Dict[str, Any
         }
 
     try:
-        payload = response.json()
+        payload = (
+            json.loads(body.decode("utf-8", errors="replace")) if body is not None
+            else response.json() if read_response_body else None
+        )
     except Exception:
         payload = None
 
@@ -196,7 +241,11 @@ def _extract_provider_error(response: Any, *, secret: str = "") -> Dict[str, Any
             message = _redact_provider_text(error_payload, secret)
         raw_text = _redact_provider_text(payload, secret)
     else:
-        raw_text = _redact_provider_text(getattr(response, "text", "") or "", secret)
+        raw_text = _redact_provider_text(
+            body.decode("utf-8", errors="replace") if body is not None
+            else (getattr(response, "text", "") or "") if read_response_body else "",
+            secret,
+        )
         message = raw_text
 
     return {
@@ -212,8 +261,11 @@ def _looks_like_quota_error(*parts: Any) -> bool:
     return any(marker.casefold() in text for marker in _QUOTA_ERROR_MARKERS)
 
 
-def _classify_http_error(response: Any, *, secret: str = "") -> Tuple[str, Optional[int], Optional[str], str]:
-    details = _extract_provider_error(response, secret=secret)
+def _classify_http_error(
+    response: Any, *, secret: str = "", body: bytes | None = None,
+    read_response_body: bool = True,
+) -> Tuple[str, Optional[int], Optional[str], str]:
+    details = _extract_provider_error(response, secret=secret, body=body, read_response_body=read_response_body)
     status_code = details.get("http_status")
     provider_code = str(details.get("provider_code") or "")
     message = str(details.get("message") or details.get("raw_text") or "")
@@ -1251,6 +1303,39 @@ def _close_provider_response(response: Any) -> None:
             session_close()
 
 
+def _provider_response_socket(response: Any) -> socket.socket | None:
+    """Return the live socket for a streamed Requests response when exposed."""
+
+    raw_response = getattr(response, "raw", None)
+    connection = getattr(raw_response, "_connection", None)
+    original_response = getattr(raw_response, "_original_response", None)
+    candidates = (
+        getattr(connection, "sock", None),
+        getattr(
+            getattr(
+                getattr(getattr(raw_response, "_fp", None), "fp", None),
+                "raw",
+                None,
+            ),
+            "_sock",
+            None,
+        ),
+        getattr(
+            getattr(
+                getattr(getattr(original_response, "fp", None), "fp", None),
+                "raw",
+                None,
+            ),
+            "_sock",
+            None,
+        ),
+    )
+    return next(
+        (candidate for candidate in candidates if isinstance(candidate, socket.socket)),
+        None,
+    )
+
+
 def _read_bounded_response(
     response: Any,
     *,
@@ -1258,14 +1343,19 @@ def _read_bounded_response(
     spool_path: str = "",
     total_deadline: float | None = None,
     cancelled: Callable[[], bool] | None = None,
+    first_body_timeout_seconds: float | None = None,
+    first_body_timeout_is_explicit: bool = False,
+    stream_idle_timeout_seconds: float | None = None,
 ) -> Tuple[bytes, str]:
-    """Read one body with bounded chunks, durable attempt spooling and deadlines."""
+    """Read one body with bounded chunks, durable spooling and phase deadlines."""
 
     chunks: List[bytes] = []
     total = 0
     content_type = _response_header(response, "content-type")
     spool_handle = None
     normalized_spool_path = str(spool_path or "").strip()
+    response_socket = _provider_response_socket(response)
+    active_timeout_phase = ""
     try:
         if normalized_spool_path:
             spool_target = Path(normalized_spool_path).expanduser().resolve()
@@ -1273,10 +1363,43 @@ def _read_bounded_response(
             spool_handle = spool_target.open("wb")
 
         def check_deadline() -> None:
+            nonlocal active_timeout_phase
             if cancelled is not None and cancelled():
+                active_timeout_phase = "cancelled"
                 raise TimeoutError("provider response read cancelled")
             if total_deadline is not None and time.monotonic() >= total_deadline:
+                active_timeout_phase = "total_deadline"
                 raise TimeoutError("provider response total deadline exceeded")
+
+        def set_read_timeout(timeout_seconds: float | None, phase: str) -> bool:
+            """Clamp the live socket timeout for the next blocking body read."""
+
+            nonlocal active_timeout_phase
+            check_deadline()
+            timeout_value = (
+                float(timeout_seconds) if timeout_seconds is not None else None
+            )
+            if total_deadline is not None:
+                remaining = total_deadline - time.monotonic()
+                if remaining <= 0:
+                    active_timeout_phase = "total_deadline"
+                    raise TimeoutError("provider response total deadline exceeded")
+                if timeout_value is None or remaining <= timeout_value:
+                    timeout_value = remaining
+                    active_timeout_phase = "total_deadline"
+                else:
+                    active_timeout_phase = phase
+            else:
+                active_timeout_phase = phase
+            if timeout_value is None:
+                return response_socket is not None
+            if response_socket is None:
+                return False
+            try:
+                response_socket.settimeout(max(0.001, timeout_value))
+            except (OSError, ValueError):
+                return False
+            return True
 
         def record_chunk(chunk: bytes) -> None:
             nonlocal total
@@ -1303,21 +1426,85 @@ def _read_bounded_response(
                 spool_handle.flush()
                 os.fsync(spool_handle.fileno())
 
-        iterator = None
         iter_content = getattr(response, "iter_content", None)
+        iterator = None
         if callable(iter_content):
             try:
                 iterator = iter(cast(Iterable[Any], iter_content(chunk_size=8192)))
             except (AttributeError, TypeError):
                 iterator = None
         if iterator is not None:
-            for raw_chunk in iterator:
+            output_started = False
+            if first_body_timeout_is_explicit and response_socket is None:
+                raise ProviderResponseReadError(
+                    partial_body=b"".join(chunks),
+                    content_type=content_type,
+                    cause=RuntimeError(
+                        "first_body_timeout_seconds cannot be enforced "
+                        "by this response transport"
+                    ),
+                    spool_path=normalized_spool_path,
+                    timeout_phase="unsupported",
+                )
+            while True:
+                timeout_phase = "stream_idle" if output_started else "first_body"
+                timeout_seconds = (
+                    stream_idle_timeout_seconds
+                    if output_started
+                    else first_body_timeout_seconds
+                )
+                if timeout_seconds is not None:
+                    timeout_enforced = set_read_timeout(timeout_seconds, timeout_phase)
+                    if first_body_timeout_is_explicit and not timeout_enforced:
+                        raise ProviderResponseReadError(
+                            partial_body=b"".join(chunks),
+                            content_type=content_type,
+                            cause=RuntimeError(
+                                "first_body_timeout_seconds cannot be enforced "
+                                "by this response socket"
+                            ),
+                            spool_path=normalized_spool_path,
+                            timeout_phase="unsupported",
+                        )
+                try:
+                    raw_chunk = next(iterator)
+                except StopIteration:
+                    break
                 check_deadline()
                 if not raw_chunk:
                     continue
                 chunk = raw_chunk.encode("utf-8") if isinstance(raw_chunk, str) else bytes(raw_chunk)
                 record_chunk(chunk)
+                output_started = True
+            if total == 0:
+                # Minimal response doubles often expose a callable but empty
+                # iter_content mock while providing their body through json().
+                # Preserve that supported fallback without masking partial
+                # network reads, which have already raised above.
+                check_deadline()
+                raw_body = getattr(response, "content", b"")
+                if not isinstance(raw_body, (bytes, bytearray)) or not raw_body:
+                    try:
+                        raw_body = json.dumps(
+                            response.json(), ensure_ascii=False
+                        ).encode("utf-8")
+                    except Exception:
+                        raw_body = str(
+                            getattr(response, "text", "") or ""
+                        ).encode("utf-8")
+                record_chunk(bytes(raw_body))
         else:
+            if first_body_timeout_is_explicit:
+                raise ProviderResponseReadError(
+                    partial_body=b"".join(chunks),
+                    content_type=content_type,
+                    cause=RuntimeError(
+                        "first_body_timeout_seconds requires a streamed "
+                        "response body reader"
+                    ),
+                    spool_path=normalized_spool_path,
+                    timeout_phase="unsupported",
+                )
             check_deadline()
             raw_body = getattr(response, "content", b"")
             if not isinstance(raw_body, (bytes, bytearray)) or not raw_body:
@@ -1329,12 +1516,20 @@ def _read_bounded_response(
         return b"".join(chunks), content_type
     except ProviderResponseLimitError:
         raise
+    except ProviderResponseReadError:
+        raise
     except Exception as exc:
+        timeout_phase = ""
+        if isinstance(exc, (TimeoutError, requests.exceptions.Timeout)) or any(
+            marker in str(exc).casefold() for marker in ("timed out", "timeout")
+        ):
+            timeout_phase = active_timeout_phase
         raise ProviderResponseReadError(
             partial_body=b"".join(chunks),
             content_type=content_type,
             cause=exc,
             spool_path=normalized_spool_path,
+            timeout_phase=timeout_phase,
         ) from exc
     finally:
         if spool_handle is not None:
@@ -1379,6 +1574,269 @@ def _persist_raw_response(body: bytes, *, api_config: Mapping[str, Any]) -> str:
     finally:
         temporary.unlink(missing_ok=True)
     return str(target)
+
+
+def _response_protocol_from_body(body: bytes, content_type: str) -> str:
+    if "text/event-stream" in str(content_type or "").casefold():
+        return "sse"
+    if any(
+        line.lstrip().startswith("data:")
+        for line in body.decode("utf-8", errors="replace").splitlines()
+    ):
+        return "sse"
+    return "json"
+
+
+def _hash_fsynced_spool(path: str, expected_body: bytes) -> tuple[str, int]:
+    """Re-fsync and verify a closed response spool before handing it off."""
+
+    spool_path = Path(path).expanduser().resolve()
+    if not spool_path.is_file():
+        raise OSError("response spool is not available for durable retention")
+    digest = hashlib.sha256()
+    byte_count = 0
+    with spool_path.open("r+b") as handle:
+        os.fsync(handle.fileno())
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+            byte_count += len(chunk)
+    sha256 = digest.hexdigest()
+    if byte_count != len(expected_body) or sha256 != hashlib.sha256(expected_body).hexdigest():
+        raise OSError("response spool does not match the bytes read from the provider")
+    return sha256, byte_count
+
+
+def _invoke_primary_raw_response_retention(
+    callback: PrimaryRawResponseRetentionCallback | None,
+    *,
+    path: str,
+    body: bytes,
+    http_status: Optional[int],
+    content_type: str,
+    response_protocol: str,
+    complete: bool,
+    attempt_number: int,
+) -> None:
+    """Synchronously bind a hash-verified spool without exposing credentials."""
+
+    if callback is None:
+        return
+    normalized_path = ""
+    sha256 = hashlib.sha256(body).hexdigest()
+    byte_count = len(body)
+    try:
+        if not path:
+            raise OSError("response spool path is unavailable")
+        normalized_path = str(Path(path).expanduser().resolve())
+        sha256, byte_count = _hash_fsynced_spool(path, body)
+        callback(
+            normalized_path,
+            sha256,
+            byte_count,
+            http_status,
+            str(content_type or ""),
+            response_protocol,
+            bool(complete),
+            int(attempt_number),
+        )
+    except PrimaryRawResponseRetentionError:
+        raise
+    except Exception as exc:
+        raise PrimaryRawResponseRetentionError(
+            path=normalized_path,
+            sha256=sha256,
+            byte_count=byte_count,
+            http_status=http_status,
+            content_type=str(content_type or ""),
+            response_protocol=response_protocol,
+            complete=bool(complete),
+            attempt_number=int(attempt_number),
+            cause=exc,
+        ) from exc
+
+
+def _invoke_primary_raw_response_finalizer(
+    callback: PrimaryRawResponseRetentionCallback | None,
+    **kwargs: Any,
+) -> None:
+    """Commit scope-bound spool metadata before the ordinary retention callback."""
+
+    if callback is None:
+        return
+    finalizer = getattr(callback, "finalize_transport_spool", None)
+    if not callable(finalizer):
+        return
+    _invoke_primary_raw_response_retention(
+        cast(PrimaryRawResponseRetentionCallback, finalizer), **kwargs
+    )
+
+
+def _retain_primary_raw_response(
+    callback: PrimaryRawResponseRetentionCallback | None,
+    *,
+    path: str,
+    body: bytes,
+    http_status: Optional[int],
+    content_type: str,
+    response_protocol: str,
+    complete: bool,
+    attempt_number: int,
+) -> bool:
+    """Run the typed pre-parse finalizer and ordinary spool retainer once."""
+
+    if callback is None:
+        return False
+    metadata = {
+        "path": path,
+        "body": body,
+        "http_status": http_status,
+        "content_type": content_type,
+        "response_protocol": response_protocol,
+        "complete": complete,
+        "attempt_number": attempt_number,
+    }
+    _invoke_primary_raw_response_finalizer(callback, **metadata)
+    _invoke_primary_raw_response_retention(callback, **metadata)
+    return True
+
+
+def _retention_failure_result(
+    failure: PrimaryRawResponseRetentionError,
+) -> Dict[str, Any]:
+    result = _api_result(
+        status="failed",
+        error_kind="outcome_unknown",
+        http_status=failure.http_status,
+        message=(
+            "provider response was received but local raw-response retention failed; "
+            "provider outcome remains unknown and will not be retried automatically"
+        ),
+    )
+    result.update(
+        {
+            "primary_raw_response_retention_callback_failed": True,
+            "primary_raw_response_retention_callback_error_type": failure.cause_type,
+            "raw_response_sha256": failure.sha256,
+            "response_bytes": failure.byte_count,
+            "response_protocol": failure.response_protocol,
+            "response_body_complete": failure.complete,
+            "response_attempt_number": failure.attempt_number,
+            "raw_response_spool_path": failure.path,
+        }
+    )
+    return result
+
+
+def reparse_provider_response_spool(
+    path: str | Path,
+    expected_sha256: str,
+    expected_bytes: int,
+    content_type: str,
+    response_protocol: str,
+    endpoint_type: str,
+    model: str,
+    response_format: str,
+    http_status: int,
+    complete: bool,
+) -> Dict[str, Any]:
+    """Parse a retained complete HTTP 200 response locally, without network IO."""
+
+    spool_path = Path(path).expanduser().resolve()
+    if not complete:
+        raise ValueError("incomplete provider response spools are not parse candidates")
+    if http_status != 200:
+        raise ValueError("only complete HTTP 200 response spools are parse candidates")
+    if isinstance(expected_bytes, bool) or not isinstance(expected_bytes, int) or expected_bytes < 0:
+        raise ValueError("expected response byte count must be a non-negative integer")
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", str(expected_sha256 or "")):
+        raise ValueError("expected response SHA-256 must be 64 hexadecimal characters")
+    protocol = str(response_protocol or "").strip().casefold()
+    if protocol not in {"json", "sse"}:
+        raise ValueError("response protocol must be json or sse")
+    if endpoint_type not in {"anthropic", "responses", "chat_completions"}:
+        raise ValueError("unsupported provider endpoint type")
+    if expected_bytes > _MAX_PROVIDER_RESPONSE_BYTES:
+        raise ValueError("retained provider response exceeds the configured parser limit")
+
+    digest = hashlib.sha256()
+    raw_body_parts: List[bytes] = []
+    byte_count = 0
+    with spool_path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+            raw_body_parts.append(chunk)
+            byte_count += len(chunk)
+            if byte_count > _MAX_PROVIDER_RESPONSE_BYTES:
+                raise ValueError("retained provider response exceeds the configured parser limit")
+    actual_sha256 = digest.hexdigest()
+    if byte_count != expected_bytes:
+        raise ValueError("retained provider response byte count does not match its binding")
+    if actual_sha256.casefold() != expected_sha256.casefold():
+        raise ValueError("retained provider response SHA-256 does not match its binding")
+    raw_body = b"".join(raw_body_parts)
+    inferred_protocol = _response_protocol_from_body(raw_body, content_type)
+    if inferred_protocol != protocol:
+        raise ValueError("retained provider response protocol does not match its content")
+
+    payload, semantic_complete = _decode_sse_response(
+        raw_body,
+        content_type=content_type,
+        endpoint_type=endpoint_type,
+        model=model,
+    )
+    parser = {
+        "anthropic": parse_anthropic_messages_response,
+        "responses": parse_responses_response,
+        "chat_completions": parse_chat_completions_response,
+    }[endpoint_type]
+    content, finish_reason = parser(payload)
+
+    class _RetainedResponse:
+        status_code = 200
+
+    result = _format_success_result(
+        content,
+        response_format,
+        _RetainedResponse(),
+        finish_reason,
+    )
+    result.update(
+        {
+            "response_complete": bool(semantic_complete),
+            "response_body_complete": True,
+            "response_protocol": protocol,
+            "response_bytes": byte_count,
+            "raw_response_sha256": actual_sha256,
+            "raw_response_path": str(spool_path),
+            "raw_response_spool_path": str(spool_path),
+        }
+    )
+    if isinstance(payload, dict):
+        result["provider_response_model"] = str(payload.get("model") or "").strip()
+        usage = payload.get("usage")
+        result["provider_usage_present"] = isinstance(usage, dict)
+        result["usage_status"] = "unknown"
+        if isinstance(usage, dict):
+            usage_keys = {
+                "input_tokens": ("prompt_tokens", "input_tokens"),
+                "output_tokens": ("completion_tokens", "output_tokens"),
+                "total_tokens": ("total_tokens",),
+            }
+            for result_key, candidates in usage_keys.items():
+                for usage_key in candidates:
+                    raw_value = usage.get(usage_key)
+                    if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float, str)):
+                        continue
+                    try:
+                        parsed_value = int(raw_value)
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    if parsed_value >= 0:
+                        result[result_key] = parsed_value
+                        break
+            if any(key in result for key in usage_keys):
+                result["usage_status"] = "reported"
+    return result
 
 
 def _decode_sse_response(
@@ -2376,6 +2834,349 @@ def _admit_local_images_to_budget(
     ]
 
 
+def _mutation_label(value: Any) -> str:
+    if isinstance(value, tuple) and tuple(str(item) for item in value) == ("reasoning", "display"):
+        return "removed_reasoning_display"
+    text = str(value or "").strip()
+    if text == "reasoning_effort:max_to_high":
+        return "reasoning_effort:max->high"
+    if text.startswith("removed_"):
+        return text
+    return f"removed_{text}" if text else ""
+
+
+def _finish_detailed_api_result(
+    result: Dict[str, Any],
+    *,
+    attempts_used: int,
+    durable_run_deadline_enforced: bool,
+    run_deadline_epoch: float,
+    first_token_timeout_setting: Any,
+    first_body_timeout_setting: Any,
+    first_body_timeout_seconds: int | None,
+    first_body_timeout_enforced: bool,
+    removed_compat_params: Set[Any],
+) -> Dict[str, Any]:
+    """Attach transport accounting and timeout semantics to one result."""
+
+    enriched = dict(result)
+    enriched["attempts"] = max(1, attempts_used)
+    enriched.setdefault("provider_http_attempts_started", attempts_used)
+    enriched.setdefault("provider_http_attempt_started", attempts_used > 0)
+    enriched["provider_aggregate_wall_deadline_enforced"] = (
+        durable_run_deadline_enforced
+    )
+    if run_deadline_epoch > 0:
+        enriched["provider_aggregate_wall_deadline_epoch"] = run_deadline_epoch
+    enriched["first_token_timeout_enforced"] = False
+    enriched["first_token_timeout_status"] = (
+        "unsupported_semantic_content_detection"
+    )
+    enriched["first_token_timeout_configured"] = (
+        first_token_timeout_setting not in (None, "")
+    )
+    enriched["semantic_first_content_timeout_enforced"] = False
+    enriched["semantic_first_content_timeout_status"] = (
+        "unsupported_buffered_response_parser"
+    )
+    if first_token_timeout_setting not in (None, ""):
+        enriched["first_token_timeout_seconds_requested"] = str(
+            first_token_timeout_setting
+        )
+    enriched["first_body_timeout_seconds"] = first_body_timeout_seconds
+    enriched["first_body_timeout_source"] = (
+        "first_body_timeout_seconds"
+        if first_body_timeout_setting not in (None, "")
+        else "read_timeout_seconds"
+    )
+    enriched["first_body_timeout_enforced"] = bool(
+        first_body_timeout_enforced
+        and enriched.get("timeout_phase") != "unsupported"
+    )
+    enriched["first_body_timeout_semantics"] = (
+        "deadline for the first response-body chunk read after headers; "
+        "not a semantic model-content token deadline"
+    )
+    enriched["fallback_or_payload_mutations"] = sorted(
+        label
+        for label in (_mutation_label(item) for item in removed_compat_params)
+        if label
+    )
+    return enriched
+
+
+@dataclass
+class _ProviderResponseBodyResult:
+    formatted: Dict[str, Any]
+    response_data: Any
+    response_body_complete: bool
+    response_retryable: bool
+    retention_callback_failed: bool
+    first_body_timeout_enforced: bool
+
+
+def _read_and_parse_provider_response(
+    response: Any,
+    *,
+    api_config: APIConfig,
+    response_spool_path: str,
+    total_deadline: float,
+    first_body_timeout_seconds: int,
+    first_body_timeout_is_explicit: bool,
+    read_timeout_seconds: int,
+    endpoint_type: str,
+    model_name: str,
+    response_format: str,
+    response_parser: Callable[[Dict[str, Any]], Tuple[str, str]],
+    logger: Any,
+    retention_callback: PrimaryRawResponseRetentionCallback | None,
+    attempt_number: int,
+    provider_request_id: str,
+) -> _ProviderResponseBodyResult:
+    raw_response_body = b""
+    response_protocol = "json"
+    response_body_complete = False
+    response_complete = False
+    raw_response_path = ""
+    response_retryable = True
+    retention_callback_called = False
+    retention_callback_failed = False
+    first_body_timeout_enforced = _provider_response_socket(response) is not None
+    response_data: Any = None
+    content_type = _response_header(response, "content-type")
+    formatted = _api_result(
+        status="failed",
+        error_kind="invalid_response",
+        message="provider response body was not parsed",
+    )
+
+    try:
+        max_response_bytes = _coerce_positive_int(
+            api_config.get("max_response_bytes"),
+            _MAX_PROVIDER_RESPONSE_BYTES,
+        )
+        raw_response_body, content_type = _read_bounded_response(
+            response,
+            max_bytes=max_response_bytes,
+            spool_path=response_spool_path,
+            total_deadline=total_deadline,
+            first_body_timeout_seconds=first_body_timeout_seconds,
+            first_body_timeout_is_explicit=first_body_timeout_is_explicit,
+            stream_idle_timeout_seconds=float(read_timeout_seconds),
+        )
+        response_body_complete = True
+        response_protocol = _response_protocol_from_body(
+            raw_response_body,
+            content_type,
+        )
+        retention_callback_called = _retain_primary_raw_response(
+            retention_callback,
+            path=response_spool_path,
+            body=raw_response_body,
+            http_status=getattr(response, "status_code", None),
+            content_type=content_type,
+            response_protocol=response_protocol,
+            complete=True,
+            attempt_number=attempt_number,
+        )
+        raw_response_path = _persist_raw_response(raw_response_body, api_config=api_config)
+        if response_spool_path:
+            Path(response_spool_path).unlink(missing_ok=True)
+            response_spool_path = ""
+        response_data, response_complete = _decode_sse_response(
+            raw_response_body,
+            content_type=content_type,
+            endpoint_type=endpoint_type,
+            model=model_name,
+        )
+        content, finish_reason = response_parser(response_data)
+    except PrimaryRawResponseRetentionError as exc:
+        retention_callback_failed = True
+        response_retryable = False
+        response_spool_path = exc.path or response_spool_path
+        response_protocol = exc.response_protocol
+        response_body_complete = exc.complete
+        formatted = _retention_failure_result(exc)
+    except ProviderResponseReadError as exc:
+        raw_response_body = exc.partial_body
+        response_spool_path = exc.spool_path or response_spool_path
+        response_protocol = _response_protocol_from_body(
+            raw_response_body,
+            exc.content_type,
+        )
+        response_retryable = False
+        try:
+            retention_callback_called = _retain_primary_raw_response(
+                retention_callback,
+                path=response_spool_path,
+                body=raw_response_body,
+                http_status=getattr(response, "status_code", None),
+                content_type=exc.content_type,
+                response_protocol=response_protocol,
+                complete=False,
+                attempt_number=attempt_number,
+            )
+        except PrimaryRawResponseRetentionError as retention_error:
+            retention_callback_failed = True
+            response_spool_path = retention_error.path or response_spool_path
+            response_protocol = retention_error.response_protocol
+            formatted = _retention_failure_result(retention_error)
+        if not retention_callback_failed:
+            raw_response_path = _persist_raw_response(
+                raw_response_body,
+                api_config=api_config,
+            )
+            timeout_detail = {
+                "first_body": (
+                    "the first response-body chunk exceeded "
+                    "first_body_timeout_seconds; "
+                ),
+                "stream_idle": (
+                    "the response body stalled beyond read_timeout_seconds; "
+                ),
+                "total_deadline": (
+                    "the response body exceeded total_timeout_seconds; "
+                ),
+                "unsupported": (
+                    "first_body_timeout_seconds could not be enforced "
+                    "for this transport; "
+                ),
+            }.get(exc.timeout_phase, "")
+            formatted = _api_result(
+                status="failed",
+                error_kind="outcome_unknown",
+                http_status=getattr(response, "status_code", None),
+                message=(
+                    "provider response body was incomplete after response headers; "
+                    + timeout_detail
+                    + "partial bytes were retained and the outcome is unknown"
+                    + (f": {exc}" if str(exc) else "")
+                ),
+            )
+            if exc.timeout_phase:
+                formatted["timeout_phase"] = exc.timeout_phase
+    except ProviderResponseLimitError as exc:
+        raw_response_body = exc.partial_body
+        response_spool_path = exc.spool_path or response_spool_path
+        content_type = _response_header(response, "content-type")
+        response_protocol = _response_protocol_from_body(
+            raw_response_body,
+            content_type,
+        )
+        response_retryable = False
+        try:
+            retention_callback_called = _retain_primary_raw_response(
+                retention_callback,
+                path=response_spool_path,
+                body=raw_response_body,
+                http_status=getattr(response, "status_code", None),
+                content_type=content_type,
+                response_protocol=response_protocol,
+                complete=False,
+                attempt_number=attempt_number,
+            )
+        except PrimaryRawResponseRetentionError as retention_error:
+            retention_callback_failed = True
+            response_spool_path = retention_error.path or response_spool_path
+            formatted = _retention_failure_result(retention_error)
+        if not retention_callback_failed:
+            raw_response_path = _persist_raw_response(
+                raw_response_body,
+                api_config=api_config,
+            )
+            formatted = _api_result(
+                status="failed",
+                error_kind="invalid_response",
+                http_status=getattr(response, "status_code", None),
+                message=str(exc),
+            )
+    except Exception as exc:
+        message = f"Malformed API response: {exc}"
+        if logger:
+            logger.error(message)
+        formatted = _api_result(
+            status="failed",
+            error_kind="invalid_response",
+            http_status=getattr(response, "status_code", None),
+            message=message,
+        )
+    else:
+        formatted = _format_success_result(
+            content,
+            response_format,
+            response,
+            finish_reason,
+            logger=logger,
+        )
+
+    formatted["provider_request_id"] = provider_request_id
+    formatted["raw_response_sha256"] = (
+        hashlib.sha256(raw_response_body).hexdigest() if raw_response_body else ""
+    )
+    formatted["response_bytes"] = len(raw_response_body)
+    formatted["response_protocol"] = response_protocol
+    formatted["response_complete"] = bool(response_complete)
+    formatted["raw_response_path"] = raw_response_path
+    formatted["raw_response_spool_path"] = response_spool_path
+    if retention_callback is not None:
+        formatted["primary_raw_response_retention_callback_called"] = (
+            retention_callback_called
+        )
+        formatted["response_body_complete"] = response_body_complete
+        formatted["response_attempt_number"] = attempt_number
+
+    return _ProviderResponseBodyResult(
+        formatted=formatted,
+        response_data=response_data,
+        response_body_complete=response_body_complete,
+        response_retryable=response_retryable,
+        retention_callback_failed=retention_callback_failed,
+        first_body_timeout_enforced=first_body_timeout_enforced,
+    )
+
+
+def _record_provider_response_usage(
+    formatted: Dict[str, Any],
+    response_data: Any,
+    usage_totals: Dict[str, int],
+) -> bool:
+    if not isinstance(response_data, dict):
+        return False
+    provider_model = str(response_data.get("model") or "").strip()
+    usage = response_data.get("usage")
+    formatted["provider_response_model"] = provider_model
+    formatted["provider_usage_present"] = isinstance(usage, dict)
+    if not isinstance(usage, dict):
+        return False
+    usage_keys = {
+        "input_tokens": ("prompt_tokens", "input_tokens"),
+        "output_tokens": ("completion_tokens", "output_tokens"),
+        "total_tokens": ("total_tokens",),
+    }
+    attempt_usage: Dict[str, int] = {}
+    for result_key, candidates in usage_keys.items():
+        for usage_key in candidates:
+            raw_value = usage.get(usage_key)
+            if isinstance(raw_value, bool) or not isinstance(
+                raw_value, (int, float, str)
+            ):
+                continue
+            try:
+                parsed_value = int(raw_value)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if parsed_value >= 0:
+                attempt_usage[result_key] = parsed_value
+                break
+    if not attempt_usage:
+        return False
+    for result_key, parsed_value in attempt_usage.items():
+        usage_totals[result_key] = usage_totals.get(result_key, 0) + parsed_value
+    formatted.update(usage_totals)
+    formatted["usage_status"] = "reported"
+    return True
+
+
 def _call_ai_api_detailed_uninstrumented(
     prompt: str,
     api_config: APIConfig,
@@ -2391,32 +3192,33 @@ def _call_ai_api_detailed_uninstrumented(
     attempt_limit: Optional[int] = None,
     max_single_image_bytes: Optional[int] = None,
     max_request_image_bytes: Optional[int] = None,
+    primary_raw_response_retention_callback: PrimaryRawResponseRetentionCallback | None = None,
+    primary_provider_attempt_started_callback: PrimaryProviderAttemptStartedCallback | None = None,
 ) -> Dict[str, Any]:
     """Call a configured AI API transport and retain failure details."""
     attempts_used = 0
     usage_totals: Dict[str, int] = {}
     usage_reported = False
     removed_compat_params: Set[Any] = set()
-
-    def mutation_label(value: Any) -> str:
-        if isinstance(value, tuple) and tuple(str(item) for item in value) == ("reasoning", "display"):
-            return "removed_reasoning_display"
-        text = str(value or "").strip()
-        if text == "reasoning_effort:max_to_high":
-            return "reasoning_effort:max->high"
-        if text.startswith("removed_"):
-            return text
-        return f"removed_{text}" if text else ""
+    run_deadline_epoch = 0.0
+    durable_run_deadline_enforced = False
+    first_token_timeout_setting = api_config.get("first_token_timeout_seconds")
+    first_body_timeout_setting = api_config.get("first_body_timeout_seconds")
+    first_body_timeout_seconds: int | None = None
+    first_body_timeout_enforced = False
 
     def finish(result: Dict[str, Any]) -> Dict[str, Any]:
-        enriched = dict(result)
-        enriched["attempts"] = max(1, attempts_used)
-        enriched["fallback_or_payload_mutations"] = sorted(
-            label
-            for label in (mutation_label(item) for item in removed_compat_params)
-            if label
+        return _finish_detailed_api_result(
+            result,
+            attempts_used=attempts_used,
+            durable_run_deadline_enforced=durable_run_deadline_enforced,
+            run_deadline_epoch=run_deadline_epoch,
+            first_token_timeout_setting=first_token_timeout_setting,
+            first_body_timeout_setting=first_body_timeout_setting,
+            first_body_timeout_seconds=first_body_timeout_seconds,
+            first_body_timeout_enforced=first_body_timeout_enforced,
+            removed_compat_params=removed_compat_params,
         )
-        return enriched
 
     try:
         api_key = api_config.get('api_key') or ''
@@ -2445,11 +3247,101 @@ def _call_ai_api_detailed_uninstrumented(
             api_config.get("read_timeout_seconds"),
             request_timeout_seconds,
         )
+        first_body_timeout_is_explicit = first_body_timeout_setting not in (None, "")
+        first_body_timeout_seconds = _coerce_positive_int(
+            first_body_timeout_setting,
+            read_timeout_seconds,
+        )
         total_timeout_seconds = _coerce_positive_int(
             api_config.get("total_timeout_seconds"),
             request_timeout_seconds,
         )
-        total_deadline = time.monotonic() + total_timeout_seconds
+        if primary_raw_response_retention_callback is not None:
+            raw_root = str(
+                api_config.get("raw_response_dir")
+                or api_config.get("provider_raw_response_dir")
+                or ""
+            ).strip()
+            if not raw_root:
+                return finish(
+                    _api_result(
+                        status="failed",
+                        error_kind="fatal_config_or_auth",
+                        message=(
+                            "primary raw-response retention requires a configured "
+                            "raw_response_dir before transport"
+                        ),
+                    )
+                )
+            try:
+                spool_root = Path(raw_root).expanduser().resolve()
+                spool_root.mkdir(parents=True, exist_ok=True)
+                probe_fd, probe_path = tempfile.mkstemp(
+                    prefix=".primary-retention-probe-",
+                    suffix=".tmp",
+                    dir=str(spool_root),
+                )
+                try:
+                    os.fsync(probe_fd)
+                finally:
+                    os.close(probe_fd)
+                    Path(probe_path).unlink(missing_ok=True)
+            except OSError as exc:
+                return finish(
+                    _api_result(
+                        status="failed",
+                        error_kind="fatal_config_or_auth",
+                        message=(
+                            "primary raw-response retention directory is unavailable "
+                            f"before transport ({type(exc).__name__})"
+                        ),
+                    )
+                )
+        monotonic_now = time.monotonic()
+        total_deadline = monotonic_now + total_timeout_seconds
+        raw_run_deadline = str(
+            api_config.get("provider_aggregate_wall_deadline_epoch") or ""
+        ).strip()
+        if raw_run_deadline:
+            try:
+                run_deadline_epoch = float(raw_run_deadline)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "provider aggregate wall deadline must be a finite epoch"
+                ) from exc
+            if not math.isfinite(run_deadline_epoch) or run_deadline_epoch <= 0:
+                raise ValueError(
+                    "provider aggregate wall deadline must be a finite positive epoch"
+                )
+            remaining_run_wall = run_deadline_epoch - time.time()
+            if remaining_run_wall <= 0:
+                expired = finish(
+                    _api_result(
+                        status="failed",
+                        error_kind="budget_exhausted",
+                        message=(
+                            "durable provider run wall deadline expired before "
+                            "the HTTP POST boundary"
+                        ),
+                    )
+                )
+                expired.update(
+                    {
+                        "attempts": 0,
+                        "provider_http_attempts_started": 0,
+                        "provider_http_attempt_started": False,
+                        "provider_aggregate_wall_deadline_exhausted": True,
+                        "provider_aggregate_wall_deadline_epoch": run_deadline_epoch,
+                    }
+                )
+                return expired
+            total_deadline = min(
+                total_deadline,
+                monotonic_now + remaining_run_wall,
+            )
+            durable_run_deadline_enforced = True
+        else:
+            durable_run_deadline_enforced = False
         max_retries = (
             _coerce_nonnegative_int(retry_attempts, configured_retries)
             if retry_attempts is not None
@@ -2565,6 +3457,26 @@ def _call_ai_api_detailed_uninstrumented(
 
         while can_start_attempt():
             if total_deadline <= time.monotonic():
+                if attempts_used == 0 and durable_run_deadline_enforced:
+                    expired = finish(
+                        _api_result(
+                            status="failed",
+                            error_kind="budget_exhausted",
+                            message=(
+                                "durable provider run wall deadline expired before "
+                                "the HTTP POST boundary"
+                            ),
+                        )
+                    )
+                    expired.update(
+                        {
+                            "attempts": 0,
+                            "provider_http_attempts_started": 0,
+                            "provider_http_attempt_started": False,
+                            "provider_aggregate_wall_deadline_exhausted": True,
+                        }
+                    )
+                    return expired
                 return finish(
                     _api_result(
                         status="failed",
@@ -2573,17 +3485,62 @@ def _call_ai_api_detailed_uninstrumented(
                     )
                 )
             attempt += 1
-            attempts_used += 1
             # Do not let a previous 429/503 leak into a new transport error.
             response = None
             transport_attempt_started = False
             provider_request_id = ""
             response_spool_path = ""
+            prebound_response_spool_path = ""
             try:
                 final_payload = copy.deepcopy(payload)
                 if 'aihubmix.com' in api_base.lower() and logger:
                     logger.info(f"调用AIHubMix API，模型: {final_payload['model']}")
 
+                if primary_provider_attempt_started_callback is not None:
+                    try:
+                        attempt_spool_path = primary_provider_attempt_started_callback(
+                            attempt
+                        )
+                        if attempt_spool_path is not None:
+                            prebound_response_spool_path = str(
+                                Path(attempt_spool_path).expanduser().resolve()
+                            )
+                            raw_root = str(
+                                api_config.get("raw_response_dir")
+                                or api_config.get("provider_raw_response_dir")
+                                or ""
+                            ).strip()
+                            if (
+                                not raw_root
+                                or Path(prebound_response_spool_path).parent
+                                != Path(raw_root).expanduser().resolve()
+                            ):
+                                raise ValueError(
+                                    "prebound PRIMARY spool path is outside its raw-response root"
+                                )
+                            response_spool_path = prebound_response_spool_path
+                    except Exception as exc:
+                        started_failure = _api_result(
+                            status="failed",
+                            error_kind="outcome_unknown",
+                            http_status=None,
+                            message=(
+                                "provider-attempt start could not be durably recorded; "
+                                "the next POST was not issued"
+                            ),
+                        )
+                        started_failure.update(
+                            {
+                                "primary_provider_attempt_start_callback_failed": True,
+                                "primary_provider_attempt_start_callback_error_type": (
+                                    type(exc).__name__
+                                ),
+                                "provider_attempt_number": attempt,
+                                "provider_http_attempt_started": False,
+                            }
+                        )
+                        return finish(started_failure)
+                attempts_used += 1
                 # Once the POST hand-off begins, a disconnect/timeout cannot
                 # prove that the provider did not process the request.  Keep
                 # this boundary separate from retry configuration so an
@@ -2604,6 +3561,54 @@ def _call_ai_api_detailed_uninstrumented(
                 # raise for an HTTP error or a truncated body.
                 provider_request_id = _response_header(response, "x-aihubmix-request-id")
                 response_status = getattr(response, "status_code", None)
+                if primary_provider_attempt_started_callback is not None:
+                    headers_callback = getattr(
+                        primary_provider_attempt_started_callback,
+                        "response_headers",
+                        None,
+                    )
+                    if callable(headers_callback):
+                        raw_content_length = _response_header(
+                            response, "content-length"
+                        )
+                        try:
+                            content_length = (
+                                int(raw_content_length)
+                                if raw_content_length
+                                else None
+                            )
+                        except (TypeError, ValueError):
+                            content_length = None
+                        try:
+                            headers_callback(
+                                attempt,
+                                response_status,
+                                _response_header(response, "content-type"),
+                                content_length,
+                                _response_header(response, "content-encoding"),
+                                _response_header(response, "transfer-encoding"),
+                            )
+                        except Exception as exc:
+                            _close_provider_response(response)
+                            headers_failure = _api_result(
+                                status="failed",
+                                error_kind="outcome_unknown",
+                                http_status=response_status,
+                                message=(
+                                    "provider response headers could not be durably bound; "
+                                    "the response body will not be retried automatically"
+                                ),
+                            )
+                            headers_failure.update(
+                                {
+                                    "primary_provider_response_headers_binding_failed": True,
+                                    "primary_provider_response_headers_error_type": (
+                                        type(exc).__name__
+                                    ),
+                                    "provider_http_attempt_started": True,
+                                }
+                            )
+                            return finish(headers_failure)
                 if isinstance(response_status, int) and 300 <= response_status < 400:
                     _close_provider_response(response)
                     blocked = _api_result(
@@ -2624,139 +3629,44 @@ def _call_ai_api_detailed_uninstrumented(
                 if raw_root:
                     spool_root = Path(raw_root).expanduser().resolve()
                     spool_root.mkdir(parents=True, exist_ok=True)
-                    response_spool_path = str(
-                        spool_root
-                        / f"attempt-{attempt}-{request_fingerprint()[:16]}.spool"
-                    )
+                    if not response_spool_path:
+                        response_spool_path = str(
+                            spool_root
+                            / f"attempt-{attempt}-{request_fingerprint()[:16]}.spool"
+                        )
 
-                response_data: Any = None
-                raw_response_body = b""
-                response_protocol = "json"
-                response_complete = False
-                raw_response_path = ""
-                response_retryable = True
-                try:
-                    max_response_bytes = _coerce_positive_int(
-                        api_config.get("max_response_bytes"),
-                        _MAX_PROVIDER_RESPONSE_BYTES,
-                    )
-                    raw_response_body, content_type = _read_bounded_response(
-                        response,
-                        max_bytes=max_response_bytes,
-                        spool_path=response_spool_path,
-                        total_deadline=total_deadline,
-                    )
-                    raw_response_path = _persist_raw_response(raw_response_body, api_config=api_config)
-                    if response_spool_path:
-                        Path(response_spool_path).unlink(missing_ok=True)
-                        response_spool_path = ""
-                    response_data, response_complete = _decode_sse_response(
-                        raw_response_body,
-                        content_type=content_type,
-                        endpoint_type=capability.endpoint_type,
-                        model=str(model_name),
-                    )
-                    response_protocol = (
-                        "sse"
-                        if "text/event-stream" in content_type.casefold()
-                        or any(line.lstrip().startswith("data:") for line in raw_response_body.decode("utf-8", errors="replace").splitlines())
-                        else "json"
-                    )
-                    content, finish_reason = response_parser(response_data)
-                except ProviderResponseReadError as exc:
-                    raw_response_body = exc.partial_body
-                    raw_response_path = _persist_raw_response(
-                        raw_response_body,
-                        api_config=api_config,
-                    )
-                    response_spool_path = exc.spool_path or response_spool_path
-                    response_protocol = (
-                        "sse" if "text/event-stream" in exc.content_type.casefold() else "json"
-                    )
-                    response_retryable = False
-                    formatted = _api_result(
-                        status="failed",
-                        error_kind="outcome_unknown",
-                        http_status=getattr(response, "status_code", None),
-                        message=(
-                            "provider response body was incomplete after response headers; "
-                            "partial bytes were retained and the outcome is unknown"
-                            + (f": {exc}" if str(exc) else "")
-                        ),
-                    )
-                except ProviderResponseLimitError as exc:
-                    raw_response_body = exc.partial_body
-                    raw_response_path = _persist_raw_response(
-                        raw_response_body,
-                        api_config=api_config,
-                    )
-                    response_spool_path = exc.spool_path or response_spool_path
-                    response_retryable = False
-                    formatted = _api_result(
-                        status="failed",
-                        error_kind="invalid_response",
-                        http_status=getattr(response, "status_code", None),
-                        message=str(exc),
-                    )
-                except Exception as exc:
-                    message = f"Malformed API response: {exc}"
-                    if logger:
-                        logger.error(message)
-                    formatted = _api_result(
-                        status="failed",
-                        error_kind="invalid_response",
-                        http_status=getattr(response, "status_code", None),
-                        message=message,
-                    )
-                else:
-                    formatted = _format_success_result(content, response_format, response, finish_reason, logger=logger)
-
-                formatted["provider_request_id"] = provider_request_id
-                formatted["raw_response_sha256"] = (
-                    hashlib.sha256(raw_response_body).hexdigest()
-                    if raw_response_body
-                    else ""
+                body_result = _read_and_parse_provider_response(
+                    response,
+                    api_config=api_config,
+                    response_spool_path=response_spool_path,
+                    total_deadline=total_deadline,
+                    first_body_timeout_seconds=first_body_timeout_seconds,
+                    first_body_timeout_is_explicit=first_body_timeout_is_explicit,
+                    read_timeout_seconds=read_timeout_seconds,
+                    endpoint_type=capability.endpoint_type,
+                    model_name=str(model_name),
+                    response_format=response_format,
+                    response_parser=response_parser,
+                    logger=logger,
+                    retention_callback=primary_raw_response_retention_callback,
+                    attempt_number=attempt,
+                    provider_request_id=provider_request_id,
                 )
-                formatted["response_bytes"] = len(raw_response_body)
-                formatted["response_protocol"] = response_protocol
-                formatted["response_complete"] = bool(response_complete)
-                formatted["raw_response_path"] = raw_response_path
-                formatted["raw_response_spool_path"] = response_spool_path
-
-                if isinstance(response_data, dict):
-                    provider_model = str(response_data.get("model") or "").strip()
-                    usage = response_data.get("usage")
-                    formatted["provider_response_model"] = provider_model
-                    formatted["provider_usage_present"] = isinstance(usage, dict)
-                    if isinstance(usage, dict):
-                        usage_keys = {
-                            "input_tokens": ("prompt_tokens", "input_tokens"),
-                            "output_tokens": ("completion_tokens", "output_tokens"),
-                            "total_tokens": ("total_tokens",),
-                        }
-                        attempt_usage = {}
-                        for result_key, candidates in usage_keys.items():
-                            for usage_key in candidates:
-                                raw_value = usage.get(usage_key)
-                                if isinstance(raw_value, bool) or not isinstance(
-                                    raw_value, (int, float, str)
-                                ):
-                                    continue
-                                try:
-                                    parsed_value = int(raw_value)
-                                except (TypeError, ValueError, OverflowError):
-                                    continue
-                                if parsed_value >= 0:
-                                    attempt_usage[result_key] = parsed_value
-                                    break
-                        if attempt_usage:
-                            usage_reported = True
-                            for result_key, parsed_value in attempt_usage.items():
-                                usage_totals[result_key] = usage_totals.get(result_key, 0) + parsed_value
-                            formatted.update(usage_totals)
-                            formatted["usage_status"] = "reported"
+                formatted = body_result.formatted
+                response_data = body_result.response_data
+                response_body_complete = body_result.response_body_complete
+                response_retryable = body_result.response_retryable
+                retention_callback_failed = body_result.retention_callback_failed
+                first_body_timeout_enforced = body_result.first_body_timeout_enforced
+                usage_reported = (
+                    _record_provider_response_usage(formatted, response_data, usage_totals)
+                    or usage_reported
+                )
                 if usage_reported:
                     formatted.update(usage_totals)
+                if retention_callback_failed:
+                    return finish(formatted)
+
                 if (
                     formatted.get("status") == "failed"
                     and formatted.get("error_kind") == "invalid_response"
@@ -2773,7 +3683,13 @@ def _call_ai_api_detailed_uninstrumented(
                     last_failure = formatted
                     continue
 
-                if formatted.get("error_kind") == "outcome_unknown":
+                if (
+                    formatted.get("error_kind") == "outcome_unknown"
+                    and not (
+                        primary_raw_response_retention_callback is not None
+                        and not response_body_complete
+                    )
+                ):
                     recovered = recover_final_transient_failure(formatted)
                     return finish(recovered or formatted)
 
@@ -2781,14 +3697,18 @@ def _call_ai_api_detailed_uninstrumented(
 
             except requests.exceptions.HTTPError as exc:
                 current_response = getattr(exc, "response", None) or response
-                error_kind, http_status, provider_code, message = _classify_http_error(
-                    current_response,
-                    secret=api_key,
-                )
+                # Reading .json()/.text here would drain a streamed error
+                # response before its body/deadline and retention guards.
+                http_status = getattr(current_response, "status_code", None)
                 error_body = b""
                 error_content_type = _response_header(current_response, "content-type")
                 error_response_path = ""
                 error_response_spool_path = ""
+                error_body_complete = False
+                error_protocol = "json"
+                error_retention_callback_called = False
+                error_retention_callback_failure: PrimaryRawResponseRetentionError | None = None
+                error_timeout_phase = ""
                 try:
                     error_root = str(
                         api_config.get("raw_response_dir")
@@ -2798,9 +3718,12 @@ def _call_ai_api_detailed_uninstrumented(
                     if error_root:
                         error_spool_root = Path(error_root).expanduser().resolve()
                         error_spool_root.mkdir(parents=True, exist_ok=True)
-                        error_response_spool_path = str(
-                            error_spool_root
-                            / f"attempt-{attempt}-{request_fingerprint()[:16]}.error.spool"
+                        error_response_spool_path = (
+                            prebound_response_spool_path
+                            or str(
+                                error_spool_root
+                                / f"attempt-{attempt}-{request_fingerprint()[:16]}.error.spool"
+                            )
                         )
                     error_body, error_content_type = _read_bounded_response(
                         current_response,
@@ -2810,6 +3733,24 @@ def _call_ai_api_detailed_uninstrumented(
                         ),
                         spool_path=error_response_spool_path,
                         total_deadline=total_deadline,
+                        stream_idle_timeout_seconds=float(read_timeout_seconds),
+                        first_body_timeout_seconds=float(first_body_timeout_seconds),
+                        first_body_timeout_is_explicit=first_body_timeout_is_explicit,
+                    )
+                    error_body_complete = True
+                    error_protocol = _response_protocol_from_body(
+                        error_body,
+                        error_content_type,
+                    )
+                    error_retention_callback_called = _retain_primary_raw_response(
+                        primary_raw_response_retention_callback,
+                        path=error_response_spool_path,
+                        body=error_body,
+                        http_status=http_status,
+                        content_type=error_content_type,
+                        response_protocol=error_protocol,
+                        complete=True,
+                        attempt_number=attempt,
                     )
                     error_response_path = _persist_raw_response(
                         error_body,
@@ -2818,9 +3759,37 @@ def _call_ai_api_detailed_uninstrumented(
                     if error_response_spool_path:
                         Path(error_response_spool_path).unlink(missing_ok=True)
                         error_response_spool_path = ""
+                except PrimaryRawResponseRetentionError as retention_error:
+                    error_body_complete = retention_error.complete
+                    error_content_type = retention_error.content_type
+                    error_protocol = retention_error.response_protocol
+                    error_response_spool_path = retention_error.path or error_response_spool_path
+                    error_retention_callback_failure = retention_error
                 except ProviderResponseReadError as read_error:
                     error_body = read_error.partial_body
+                    error_timeout_phase = str(read_error.timeout_phase or "")
+                    error_content_type = read_error.content_type
+                    error_protocol = _response_protocol_from_body(
+                        error_body,
+                        error_content_type,
+                    )
                     error_response_spool_path = read_error.spool_path or error_response_spool_path
+                    try:
+                        error_retention_callback_called = _retain_primary_raw_response(
+                            primary_raw_response_retention_callback,
+                            path=error_response_spool_path,
+                            body=error_body,
+                            http_status=http_status,
+                            content_type=error_content_type,
+                            response_protocol=error_protocol,
+                            complete=False,
+                            attempt_number=attempt,
+                        )
+                    except PrimaryRawResponseRetentionError as retention_error:
+                        error_retention_callback_failure = retention_error
+                        error_response_spool_path = (
+                            retention_error.path or error_response_spool_path
+                        )
                     try:
                         error_response_path = _persist_raw_response(
                             error_body,
@@ -2831,6 +3800,26 @@ def _call_ai_api_detailed_uninstrumented(
                 except ProviderResponseLimitError as limit_error:
                     error_body = limit_error.partial_body
                     error_response_spool_path = limit_error.spool_path or error_response_spool_path
+                    error_protocol = _response_protocol_from_body(
+                        error_body,
+                        error_content_type,
+                    )
+                    try:
+                        error_retention_callback_called = _retain_primary_raw_response(
+                            primary_raw_response_retention_callback,
+                            path=error_response_spool_path,
+                            body=error_body,
+                            http_status=http_status,
+                            content_type=error_content_type,
+                            response_protocol=error_protocol,
+                            complete=False,
+                            attempt_number=attempt,
+                        )
+                    except PrimaryRawResponseRetentionError as retention_error:
+                        error_retention_callback_failure = retention_error
+                        error_response_spool_path = (
+                            retention_error.path or error_response_spool_path
+                        )
                     try:
                         error_response_path = _persist_raw_response(
                             error_body,
@@ -2852,12 +3841,15 @@ def _call_ai_api_detailed_uninstrumented(
                     )
                     if trace_match:
                         error_trace_id = trace_match.group(1).decode("utf-8", errors="replace")
+                error_kind, http_status, provider_code, message = _classify_http_error(
+                    current_response, secret=api_key, body=error_body, read_response_body=False,
+                )
                 last_failure = _api_result(
                     status="failed",
                     error_kind=error_kind,
                     http_status=http_status,
                     provider_code=provider_code,
-                    message=message or _response_error_details(current_response, limit=500, secret=api_key),
+                    message=message or f"HTTP error {http_status}",
                 )
                 last_failure["provider_request_id"] = (
                     provider_request_id
@@ -2870,10 +3862,32 @@ def _call_ai_api_detailed_uninstrumented(
                 last_failure["error_response_bytes"] = len(error_body)
                 last_failure["error_response_path"] = error_response_path
                 last_failure["error_response_spool_path"] = error_response_spool_path
-                last_failure["error_response_protocol"] = (
-                    "sse" if "text/event-stream" in error_content_type.casefold() else "json"
-                )
+                last_failure["error_response_protocol"] = error_protocol
+                if error_timeout_phase:
+                    last_failure["timeout_phase"] = error_timeout_phase
+                    last_failure["response_body_complete"] = False
+                if primary_raw_response_retention_callback is not None:
+                    last_failure["primary_raw_response_retention_callback_called"] = (
+                        error_retention_callback_called
+                    )
+                    last_failure["response_body_complete"] = error_body_complete
                 _close_provider_response(current_response)
+                if error_retention_callback_failure is not None:
+                    retention_failure = _retention_failure_result(
+                        error_retention_callback_failure
+                    )
+                    retention_failure.update(
+                        {
+                            "provider_request_id": last_failure.get("provider_request_id", ""),
+                            "provider_error_trace_id": error_trace_id,
+                            "error_response_sha256": last_failure.get("error_response_sha256", ""),
+                            "error_response_bytes": last_failure.get("error_response_bytes", 0),
+                            "error_response_path": error_response_path,
+                            "error_response_spool_path": error_response_spool_path,
+                            "error_response_protocol": error_protocol,
+                        }
+                    )
+                    return finish(retention_failure)
                 if (
                     capability.reasoning_param_style == "chat_reasoning"
                     and ("reasoning", "display") not in removed_compat_params
@@ -2945,7 +3959,7 @@ def _call_ai_api_detailed_uninstrumented(
                     wait_time = 2 * (2 ** (attempt - 1))
                     if logger:
                         logger.warning(
-                            f"{_response_error_details(current_response, limit=200, secret=api_key)}，"
+                            f"{last_failure['message']}，"
                             f"{wait_time:.1f}秒后重试..."
                         )
                     sleep_before_retry(wait_time)
@@ -2963,6 +3977,7 @@ def _call_ai_api_detailed_uninstrumented(
                     error_kind, http_status, provider_code, message = _classify_http_error(
                         current_response,
                         secret=api_key,
+                        read_response_body=False,
                     )
                 else:
                     error_kind, message = _classify_exception(exc)
@@ -3036,6 +4051,8 @@ def _call_ai_api_detailed(
     provider_route: Optional[str] = None,
     max_single_image_bytes: Optional[int] = None,
     max_request_image_bytes: Optional[int] = None,
+    primary_raw_response_retention_callback: PrimaryRawResponseRetentionCallback | None = None,
+    primary_provider_attempt_started_callback: PrimaryProviderAttemptStartedCallback | None = None,
 ) -> Dict[str, Any]:
     """Call the transport only after bound-runtime and complete-budget admission."""
 
@@ -3143,6 +4160,11 @@ def _call_ai_api_detailed(
     # transport so resume can release only the former case.
     provider_runtime.mark_transport_started(admission)
     transport_api_config: dict[str, Any] = dict(api_config)
+    run_wall_deadline = provider_runtime.aggregate_wall_deadline_epoch
+    if run_wall_deadline is not None:
+        transport_api_config["provider_aggregate_wall_deadline_epoch"] = str(
+            run_wall_deadline
+        )
     if not str(transport_api_config.get("operation_id") or "").strip():
         transport_api_config["operation_id"] = (
             f"{getattr(provider_runtime, 'job_id', '')}:{getattr(provider_runtime, 'call_id', '')}"
@@ -3181,6 +4203,8 @@ def _call_ai_api_detailed(
         attempt_limit=effective_attempts,
         max_single_image_bytes=max_single_image_bytes,
         max_request_image_bytes=max_request_image_bytes,
+        primary_raw_response_retention_callback=primary_raw_response_retention_callback,
+        primary_provider_attempt_started_callback=primary_provider_attempt_started_callback,
     )
     _normalized_content, transport_report = _normalize_user_message_content_with_report(
         prompt,
@@ -3254,11 +4278,27 @@ def _call_ai_api_detailed(
                     "response_complete",
                     "raw_response_path",
                     "raw_response_spool_path",
+                    "timeout_phase",
+                    "semantic_first_content_timeout_enforced",
+                    "semantic_first_content_timeout_status",
+                    "first_body_timeout_seconds",
+                    "first_body_timeout_source",
+                    "first_body_timeout_enforced",
+                    "first_body_timeout_semantics",
                     "provider_error_trace_id",
                     "error_response_sha256",
                     "error_response_bytes",
                     "error_response_path",
                     "error_response_spool_path",
+                    "primary_raw_response_retention_callback_called",
+                    "primary_raw_response_retention_callback_failed",
+                    "primary_raw_response_retention_callback_error_type",
+                    "response_body_complete",
+                    "response_attempt_number",
+                    "primary_provider_attempt_start_callback_failed",
+                    "primary_provider_attempt_start_callback_error_type",
+                    "provider_attempt_number",
+                    "provider_http_attempt_started",
                 )
                 if key in result
             },
@@ -3315,6 +4355,12 @@ def _call_ai_api_detailed(
             api_config.get("total_timeout_seconds"),
             effective_timeout,
         ),
+        "semantic_first_content_timeout_enforced": False,
+        "semantic_first_content_timeout_status": "unsupported_buffered_response_parser",
+        "first_body_timeout_seconds": result.get("first_body_timeout_seconds"),
+        "first_body_timeout_source": result.get("first_body_timeout_source"),
+        "first_body_timeout_enforced": result.get("first_body_timeout_enforced", False),
+        "first_body_timeout_semantics": result.get("first_body_timeout_semantics"),
         "provider_stream": _config_bool(api_config.get("provider_stream")),
         "max_response_bytes": _coerce_positive_int(
             api_config.get("max_response_bytes"),

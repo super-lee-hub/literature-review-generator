@@ -39,7 +39,6 @@ from runtime.outline_v3_replay import ModelCallReplayStore
 from runtime.orchestrator import AgentRuntimeBridge, InternalStageExecutorRegistry
 from runtime.runner import AgentRuntimeRunner, RuntimeExecutionResult, RuntimeRunnerError
 from runtime.provider_runtime import (
-    DEFAULT_PROVIDER_CALL_BUDGET,
     AcceptanceExecutionContextV1,
     ProviderAggregateBudgetV1,
     ProviderBudgetController,
@@ -62,7 +61,10 @@ from services.stage1_reuse import (
 )
 from runtime.reconcile import load_summary_source_manifest
 from runtime.provider_routes import build_reachable_provider_route_plan
-from runtime.source_intake import build_source_bundle_for_request
+from runtime.source_intake import (
+    build_source_bundle_for_request,
+    stage1_paper_work_item_basis,
+)
 from runtime.stage_planning import (
     ProviderStageRequestInventoryV1,
     UnplannedProviderExposureV1,
@@ -127,11 +129,6 @@ _FULL_STAGE_BUILDER_EXPOSURE = {
         "arbitration_builder_requires_materialized_candidate_and_critique_outputs",
         "eligible_candidate_and_critique_outputs_materialized",
     ),
-}
-_FULL_STAGE_LOGICAL_CALL_UPPER_BOUNDS = {
-    # The canonical Outline path invokes arbitration once after candidate and
-    # critique closure; absence of eligible candidates fails before transport.
-    ("outline", "arbitration"): 1,
 }
 FORBIDDEN_ACTIONS = (
     "edit_registry",
@@ -532,7 +529,9 @@ class ReviewControlPlane:
     ) -> dict[str, Any]:
         candidates: list[Path] = []
         for record in records:
-            if "receipt" in record.artifact_type.lower() or "receipt" in record.artifact_role.lower():
+            # Only ledger artifacts contain line-delimited ProviderCallReceiptV1 rows.
+            # Closure and snapshot artifacts are JSON documents, not receipt ledgers.
+            if record.artifact_type == "provider_receipt_ledger":
                 candidates.append(Path(record.path))
         artifacts_dir = Path(workspace.paths.artifacts_dir)
         if artifacts_dir.is_dir():
@@ -653,7 +652,12 @@ class ReviewControlPlane:
         }
 
     def _full_stage_request_plan_for_spec(
-        self, spec: RuntimeJobSpec
+        self,
+        spec: RuntimeJobSpec,
+        *,
+        aggregate_budget_override: Any | None = None,
+        stage1_work_item_basis: Mapping[str, Any] | None = None,
+        derive_stage1_work_item_basis: bool = True,
     ) -> dict[str, Any]:
         """Expose reachable work before admission without inventing requests."""
 
@@ -663,7 +667,12 @@ class ReviewControlPlane:
             or spec.free_mode_idea
             or spec.metadata.get("free_mode_input")
         )
-        config = load_config(
+        explicit_scope = None
+        if spec.metadata.get("stage1_summary_input_mode") == "explicit_typed_import":
+            from runtime.explicit_stage1_scope import load_explicit_stage1_scope
+
+            explicit_scope = load_explicit_stage1_scope(spec)
+        config = explicit_scope.config if explicit_scope is not None else load_config(
             spec.config,
             action=spec.action,
             requested_stages=requested,
@@ -682,6 +691,53 @@ class ReviewControlPlane:
             ),
         )
         stage1_reuse_projection = self._verified_typed_reuse_only_stage1_input(spec)
+        explicit_stage1_plan = None
+        explicit_stage1_source_count = 0
+        if explicit_scope is not None:
+            full_bundle = explicit_scope.full_bundle
+            explicit_stage1_source_count = len(full_bundle.paper_work_items)
+            explicit_stage1_plan = explicit_scope.import_plan
+            pending_keys = set(explicit_stage1_plan.pending_keys)
+            # This is a pending-work estimate only. Execution still freezes
+            # and validates the complete, unchanged source bundle.
+            stage1_work_item_basis = stage1_paper_work_item_basis(replace(
+                full_bundle,
+                paper_work_items=[item for item in full_bundle.paper_work_items
+                                  if item.canonical_paper_key in pending_keys],
+            ))
+        if (
+            stage1_work_item_basis is None
+            and derive_stage1_work_item_basis
+            and stage1_reuse_projection is None
+            and "analyze" in stage_plan.requested_stages
+            and spec.action in {"analyze", "run_all", "retry_failed"}
+            and spec.source.mode == "direct"
+            and not (
+                spec.summary_file
+                or spec.summary_sources
+                or spec.reuse_summary_files
+            )
+            and not spec.metadata.get("f1_corpus_binding")
+            and not spec.metadata.get("allow_partial_source_quarantine")
+        ):
+            source_bundle = build_source_bundle_for_request(
+                spec.to_job_request(),
+                project_name=spec.project_name,
+            )
+            if source_bundle.paper_work_items:
+                stage1_work_item_basis = stage1_paper_work_item_basis(source_bundle)
+        if stage1_work_item_basis is not None:
+            basis_count = stage1_work_item_basis.get("paper_work_item_count")
+            basis_hash = str(stage1_work_item_basis.get("paper_work_items_sha256") or "")
+            if (
+                stage1_work_item_basis.get("schema_version") != "stage1-paper-work-items/v1"
+                or isinstance(basis_count, bool)
+                or not isinstance(basis_count, int)
+                or basis_count < 0
+                or len(basis_hash) != 64
+                or any(character not in "0123456789abcdef" for character in basis_hash)
+            ):
+                raise ControlPlaneError("Stage 1 work-item basis is invalid")
         route_plan = build_reachable_provider_route_plan(
             config,
             action=spec.action,
@@ -689,16 +745,24 @@ class ReviewControlPlane:
             free_mode_enabled=free_mode_enabled,
             stage_plan=stage_plan,
         )
-        from outline.v3_executor import MAX_SEMANTIC_REDUCER_CALLS_PER_STAGE
+        raw_route_plan = route_plan
+        if explicit_scope is not None:
+            route_plan = explicit_scope.provider_route_plan
         suppressed_provider_routes: list[dict[str, str]] = []
-        if stage1_reuse_projection is not None:
+        if stage1_reuse_projection is not None or (
+            explicit_stage1_plan is not None and not explicit_stage1_plan.pending_keys
+        ):
             suppressed_provider_routes = [
                 {
                     "stage": route.stage,
                     "semantic_role": route.semantic_role,
-                    "reason": "verified typed reuse-only source has no Stage 1 paper work items",
+                    "reason": (
+                        "verified explicit typed inputs cover every current PDF work item"
+                        if explicit_stage1_plan is not None
+                        else "verified typed reuse-only source has no Stage 1 paper work items"
+                    ),
                 }
-                for route in route_plan.routes
+                for route in raw_route_plan.routes
                 if route.stage == "analyze"
             ]
             route_plan = replace(
@@ -729,21 +793,58 @@ class ReviewControlPlane:
             conditional_on: str = "",
             logical_calls_upper_bound: int | None = None,
             output_tokens_upper_bound: int | None = None,
+            logical_calls_known_lower_bound: int = 0,
+            known_lower_bound_basis: Mapping[str, Any] | None = None,
         ) -> UnplannedProviderExposureV1:
             """Bound each reachable request while keeping its call count unknown."""
 
-            api_config = get_api_config_for_section(config, route.section_name)
+            api_config = get_api_config_for_section(dict(config), route.section_name)
             model = str(api_config.get("model") or route.model or "").strip()
             profile: ProviderContextProfile | None = None
+            output_tokens_per_call_upper_bound: int | None = None
             if model:
                 capability = resolve_model_capability(api_config)
-                output_tokens = max(1, int(api_config.get("max_output_tokens") or 4_096))
-                if semantic_role == "evidence_critique":
-                    output_tokens = min(output_tokens, 2_048)
-                elif semantic_role in {"structure_critique", "coverage_critique"}:
-                    output_tokens = min(output_tokens, 2_048)
+                profile_output_tokens = max(
+                    1, int(api_config.get("max_output_tokens") or 4_096)
+                )
+                output_tokens_per_call_upper_bound = profile_output_tokens
+                if stage_name == "analyze" and semantic_role in {
+                    "primary_reader",
+                    "backup_reader",
+                }:
+                    stage1_input_settings = settings.section("Stage1_Input")
+                    stage1_budget_stages = (
+                        ("visual_scan", "synthesis")
+                        if semantic_role == "primary_reader"
+                        else ("synthesis",)
+                    )
+                    output_tokens_per_call_upper_bound = max(
+                        stage1_output_budget_sequence(
+                            stage,
+                            stage1_input_settings,
+                            provider_config=api_config,
+                        )[-1]
+                        for stage in stage1_budget_stages
+                    )
                 if output_tokens_upper_bound is not None:
-                    output_tokens = min(output_tokens, max(1, int(output_tokens_upper_bound)))
+                    bounded_output_tokens = max(1, int(output_tokens_upper_bound))
+                    profile_output_tokens = min(
+                        profile_output_tokens, bounded_output_tokens
+                    )
+                    output_tokens_per_call_upper_bound = min(
+                        output_tokens_per_call_upper_bound,
+                        bounded_output_tokens,
+                    )
+                if semantic_role == "evidence_critique":
+                    profile_output_tokens = min(profile_output_tokens, 2_048)
+                    output_tokens_per_call_upper_bound = min(
+                        output_tokens_per_call_upper_bound, 2_048
+                    )
+                elif semantic_role in {"structure_critique", "coverage_critique"}:
+                    profile_output_tokens = min(profile_output_tokens, 2_048)
+                    output_tokens_per_call_upper_bound = min(
+                        output_tokens_per_call_upper_bound, 2_048
+                    )
                 profile = ProviderContextProfile.conservative(
                     provider=capability.provider_family,
                     model=model,
@@ -751,7 +852,7 @@ class ReviewControlPlane:
                     model_context_limit=max(
                         1, int(api_config.get("max_context_tokens") or 128_000),
                     ),
-                    max_output_tokens=output_tokens,
+                    max_output_tokens=profile_output_tokens,
                     reasoning_reserve=max(
                         0, int(api_config.get("reasoning_reserve_tokens") or 2_048),
                     ),
@@ -762,9 +863,12 @@ class ReviewControlPlane:
                 if stage_name == "review" and semantic_role == "writer":
                     from runtime.provider_context import writer_output_token_limit
 
-                    output_tokens = writer_output_token_limit(api_config)
+                    profile_output_tokens = writer_output_token_limit(api_config)
+                    output_tokens_per_call_upper_bound = profile_output_tokens
                     profile = ProviderContextProfile.from_api_config(
-                        api_config, max_output_tokens=output_tokens, default_model="writer",
+                        api_config,
+                        max_output_tokens=profile_output_tokens,
+                        default_model="writer",
                     )
             input_tokens_upper_bound = (
                 int(profile.input_budget) if profile is not None else None
@@ -788,10 +892,10 @@ class ReviewControlPlane:
                 route_identity=tuple(route.identity),
                 conditional_on=conditional_on,
                 logical_calls_upper_bound=logical_calls_upper_bound,
+                logical_calls_known_lower_bound=logical_calls_known_lower_bound,
+                known_lower_bound_basis=known_lower_bound_basis,
                 input_tokens_per_call_upper_bound=input_tokens_upper_bound,
-                output_tokens_per_call_upper_bound=(
-                    int(profile.max_output_tokens) if profile is not None else None
-                ),
+                output_tokens_per_call_upper_bound=output_tokens_per_call_upper_bound,
                 reasoning_tokens_per_call_upper_bound=(
                     int(profile.reasoning_reserve) if profile is not None else None
                 ),
@@ -799,22 +903,29 @@ class ReviewControlPlane:
             )
 
         acceptance = current_acceptance_execution_context()
-        aggregate_budget = (
+        aggregate_budget = aggregate_budget_override or (
             acceptance.provider_budget
             if acceptance is not None
             else ProviderAggregateBudgetV1(
                 max_provider_calls_total=authorized_provider_call_limit()
             )
         )
+        if acceptance is None and aggregate_budget_override is None:
+            from runtime.run_budget_binding import resolve_run_provider_budget
+
+            aggregate_budget, _budget_authority = resolve_run_provider_budget(spec.metadata, config)
         inventories: list[ProviderStageRequestInventoryV1] = []
         if "analyze" in stage_plan.requested_stages:
-            if stage1_reuse_projection is not None:
+            if stage1_reuse_projection is not None or (
+                explicit_stage1_plan is not None and not explicit_stage1_plan.pending_keys
+            ):
                 inventories.append(
                     ProviderStageRequestInventoryV1(
                         stage_name="analyze",
                         source_builder=(
                             "runtime.orchestrator.AgentRuntimeBridge._execute_analyze "
-                            "verified typed reuse-only path"
+                            + ("verified explicit typed input path" if explicit_stage1_plan is not None
+                               else "verified typed reuse-only path")
                         ),
                     )
                 )
@@ -829,6 +940,11 @@ class ReviewControlPlane:
                     ):
                         continue
                     if route.semantic_role == "primary_reader":
+                        reader_work_item_count = (
+                            stage1_work_item_basis["paper_work_item_count"]
+                            if isinstance(stage1_work_item_basis, Mapping)
+                            else 0
+                        )
                         analyze_exposures.extend((
                             unplanned_exposure(
                                 stage_name="analyze",
@@ -836,6 +952,12 @@ class ReviewControlPlane:
                                 route=route,
                                 reason="primary_reader_requests_require_source_pages_or_verified_typed_reuse",
                                 request_builder_id="services.stage1_analysis_service.Stage1AnalysisService._call_reader",
+                                logical_calls_known_lower_bound=reader_work_item_count,
+                                known_lower_bound_basis=(
+                                    stage1_work_item_basis
+                                    if reader_work_item_count
+                                    else None
+                                ),
                             ),
                             unplanned_exposure(
                                 stage_name="analyze",
@@ -866,9 +988,9 @@ class ReviewControlPlane:
                         )
                     )
         if "outline" in stage_plan.requested_stages:
-            semantic_reducer_call_upper_bound = (
-                MAX_SEMANTIC_REDUCER_CALLS_PER_STAGE + 1
-            )
+            # Reducer and arbitration counts depend on their materialized
+            # source-bound trees. A fallback guard or one final node cannot
+            # bound the full future hierarchy before those inputs exist.
             semantic_builder_by_phase = {
                 "candidate_generation": "outline.v3_executor.OutlineV3Executor._run_hierarchical_candidate_generation",
                 "topic": "outline.v3_executor.OutlineV3Executor._build_topic_provider_request",
@@ -909,11 +1031,6 @@ class ReviewControlPlane:
                                     "global": "cross_group_completed",
                                     "stability": "outline_stability_mode_enabled",
                                 }.get(phase, ""),
-                                logical_calls_upper_bound=(
-                                    semantic_reducer_call_upper_bound
-                                    if phase in {"cross_group", "global"}
-                                    else None
-                                ),
                                 output_tokens_upper_bound=(
                                     4_096
                                     if phase in {"candidate_generation", "stability"}
@@ -961,9 +1078,6 @@ class ReviewControlPlane:
                             ("outline", role), ""
                         ),
                         conditional_on=conditional_on,
-                        logical_calls_upper_bound=_FULL_STAGE_LOGICAL_CALL_UPPER_BOUNDS.get(
-                            ("outline", role)
-                        ),
                     )
                 )
             if outline_exposures:
@@ -1058,9 +1172,23 @@ class ReviewControlPlane:
         projection["config_sha256"] = file_sha256(spec.config)
         projection["aggregate_budget_source"] = (
             "bound_acceptance_run" if acceptance is not None
-            else "application_call_cap_projection_without_bound_acceptance_run"
+            else "explicit_runtime_spec" if spec.metadata.get("provider_budget") is not None
+            else "documented_finite_run_default"
         )
-        projection["unbound_aggregate_limits_are_unknown"] = acceptance is None
+        from runtime.provider_runtime import ProviderAggregateBudgetV2
+
+        projection["unbound_aggregate_limits_are_unknown"] = not isinstance(
+            aggregate_budget, ProviderAggregateBudgetV2
+        ) and acceptance is None
+        projection["run_resource_limits_finite"] = isinstance(
+            aggregate_budget, ProviderAggregateBudgetV2
+        )
+        projection["run_start_contract"] = (
+            "finite_run_resources_with_jit_request_materialization"
+            if isinstance(aggregate_budget, ProviderAggregateBudgetV2)
+            else "legacy_acceptance_authority"
+        )
+        projection["jit_request_admission_required"] = True
         projection["stage1_reuse_authority_status"] = (
             "verified_typed_manifest_summary_only_input"
             if stage1_reuse_projection is not None
@@ -1071,6 +1199,16 @@ class ReviewControlPlane:
         if stage1_reuse_projection is not None:
             projection["stage1_reuse_authority"] = stage1_reuse_projection
             projection["suppressed_provider_routes"] = suppressed_provider_routes
+        if explicit_stage1_plan is not None:
+            projection["explicit_stage1_inputs"] = {
+                "full_source_count": explicit_stage1_source_count,
+                "imported_count": len(explicit_stage1_plan.imports),
+                "pending_count": len(explicit_stage1_plan.pending_keys),
+            }
+            projection["explicit_stage1_authority_set_hash"] = explicit_stage1_plan.authority_set_hash
+            projection["stage1_work_item_basis"] = dict(stage1_work_item_basis or {})
+            projection["suppressed_provider_routes"] = suppressed_provider_routes
+            projection["stage1_reuse_authority_status"] = "verified_explicit_typed_inputs_with_current_pdf_joins"
         projection["provider_calls"] = "not executed"
         return projection
 
@@ -1155,6 +1293,55 @@ class ReviewControlPlane:
             "current_binding_comparison": "not_run_no_stage1_paper_work_items",
         }
 
+    def source_revision_plan(
+        self, spec_path: str | Path, *, parent_workspace: str | Path,
+        output_path: str | Path,
+    ) -> dict[str, Any]:
+        """Save a source-bound child plan without creating a run or provider scope."""
+        from runtime.source_revision import (
+            PROVIDER_SEMANTIC_CONTRACT_V2, SourceRevisionPlanRefV1,
+            child_core_spec_hash,
+        )
+        from runtime.source_revision_admission import (
+            build_source_revision_plan_v1, verify_source_revision_plan_v1,
+        )
+
+        spec = _load_spec_path(spec_path)
+        if not spec.job_id or "source_revision_plan" in spec.metadata:
+            raise ControlPlaneError("a new explicit child job_id and a spec without a plan reference are required")
+        if spec.metadata.get("provider_semantic_contract_version") != PROVIDER_SEMANTIC_CONTRACT_V2:
+            raise ControlPlaneError("source revision requires the explicit successor semantic contract")
+        normalized = AgentRuntimeRunner(spec)._normalized_spec(resume=False)
+        core_hash = child_core_spec_hash(normalized.to_dict())
+        plan = build_source_revision_plan_v1(normalized, Path(parent_workspace).expanduser().resolve())
+        target = Path(output_path).expanduser().resolve()
+        if (not target.parent.is_dir() or target.exists()
+                or target.is_relative_to(Path(parent_workspace).expanduser().resolve())
+                or target.is_relative_to(Path(plan["child_workspace_path"]).resolve())):
+            raise ControlPlaneError("plan output must be a fresh file outside parent and child workspaces")
+        content = (json.dumps(plan, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False) + "\n").encode("utf-8")
+        reference = SourceRevisionPlanRefV1(
+            schema_version="source-revision-plan-ref/v1", path=str(target),
+            file_sha256=hashlib.sha256(content).hexdigest(), content_hash=hash_json(plan),
+        )
+        bound = replace(normalized, metadata={**normalized.metadata, "source_revision_plan": reference.to_dict()})
+        rebound = AgentRuntimeRunner(bound)._normalized_spec(resume=False)
+        if rebound.to_dict() != bound.to_dict() or child_core_spec_hash(rebound.to_dict()) != core_hash:
+            raise ControlPlaneError("child normalization changed after binding its plan reference")
+        with target.open("xb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        verify_source_revision_plan_v1(rebound)
+        return {
+            "control_plane_version": CONTROL_PLANE_VERSION, "status": "source_revision_planned",
+            "source_revision_plan": reference.to_dict(), "normalized_child_spec": rebound.to_dict(),
+            "child_core_spec_hash": core_hash, "child_spec_hash": hash_json(rebound.to_dict()),
+            "provider_posts_emitted": 0, "workspace_created": False,
+            "provider_budget_or_envelope_created": False, "parent_state_changed": False,
+            "read_only": False, "writes": [str(target)],
+        }
+
     def plan(self, spec_path: str | Path) -> dict[str, Any]:
         spec = _load_spec_path(spec_path)
         requested = AgentRuntimeRunner._requested_stages(spec)
@@ -1205,9 +1392,16 @@ class ReviewControlPlane:
         physical_call_limit: int | None = None,
         output_path: str | Path | None = None,
         config_path: str | Path | None = None,
+        review_intent: Mapping[str, Any] | None = None,
+        prospective_provider_budget: Mapping[str, Any] | None = None,
+        provider_semantic_contract_version: str | None = None,
     ) -> dict[str, Any]:
         """Build navigation and route-bound semantic request plans without provider calls."""
 
+        from runtime.source_revision import PROVIDER_SEMANTIC_CONTRACT_V2
+
+        if provider_semantic_contract_version not in (None, PROVIDER_SEMANTIC_CONTRACT_V2):
+            raise ControlPlaneError("chunk-plan provider semantic contract is unsupported")
         if not summary_files:
             raise ControlPlaneError("chunk-plan requires at least one --summary-file")
         output_resolved = (
@@ -1369,18 +1563,37 @@ class ReviewControlPlane:
             if configured_settings is not None
             else 3
         )
-        configured_call_limit = (
-            configured_settings.outline_stability.max_provider_calls
-            if configured_settings is not None
-            else DEFAULT_PROVIDER_CALL_BUDGET
-        )
+        from runtime.provider_runtime import ProviderAggregateBudgetV2
+        from runtime.run_budget_binding import resolve_run_provider_budget
+
+        budget_metadata: dict[str, Any] = {}
+        if prospective_provider_budget is not None:
+            if not isinstance(prospective_provider_budget, Mapping):
+                raise ControlPlaneError(
+                    "prospective_provider_budget must be a strict V2 budget object"
+                )
+            budget_metadata["provider_budget"] = dict(prospective_provider_budget)
+        try:
+            prospective_budget, prospective_budget_source = resolve_run_provider_budget(
+                budget_metadata,
+                loaded_config or {},
+            )
+        except (TypeError, ValueError) as exc:
+            raise ControlPlaneError(
+                f"chunk-plan prospective provider budget is invalid: {exc}"
+            ) from exc
+        if not isinstance(prospective_budget, ProviderAggregateBudgetV2):
+            raise ControlPlaneError(
+                "chunk-plan prospective provider budget must use strict V2 limits"
+            )
+        configured_call_limit = prospective_budget.max_provider_calls_total
         requested_call_limit = (
             int(physical_call_limit)
             if physical_call_limit is not None
-            else int(configured_call_limit)
+            else configured_call_limit
         )
         effective_call_limit = authorized_provider_call_limit(
-            min(requested_call_limit, int(configured_call_limit))
+            min(requested_call_limit, configured_call_limit)
         )
         if loaded_config is not None:
             effective_candidate_count = int(
@@ -1388,13 +1601,6 @@ class ReviewControlPlane:
                 if candidate_count is not None
                 else loaded_config.get("Outline", {}).get("candidate_count") or 3
             )
-            if physical_call_limit is None:
-                effective_call_limit = authorized_provider_call_limit(
-                    int(
-                        loaded_config.get("OutlineStability", {}).get("max_provider_calls")
-                        or DEFAULT_PROVIDER_CALL_BUDGET
-                    )
-                )
         semantic_request_plan: list[dict[str, Any]] = []
         topic_request_plan_identity_hash = ""
         semantic_preflight_status = "NOT_PLANNED"
@@ -1408,73 +1614,92 @@ class ReviewControlPlane:
         summaries: list[dict[str, Any]] = []
         source_paths: list[str] = []
         typed_manifest_authorities: list[dict[str, str]] = []
-        for raw_path in summary_files:
-            path = Path(raw_path).expanduser().resolve()
-            if not path.is_file():
-                raise ControlPlaneError(f"summary file does not exist: {path}")
-            if output_resolved is not None and path == output_resolved:
-                raise ControlPlaneError(
-                    "chunk-plan output must differ from every read-only summary input"
-                )
-            try:
-                root_payload = json.loads(path.read_text(encoding="utf-8"))
-                if (
-                    isinstance(root_payload, Mapping)
-                    and root_payload.get("artifact_type") == "summary_source_manifest"
-                ):
-                    _manifest, materialized_path, _raw_rows = load_summary_source_manifest(path)
-                    if output_resolved is not None and materialized_path == output_resolved:
+        from services.stage1_reuse import _TypedManifestVerificationScope
+
+        try:
+            with _TypedManifestVerificationScope() as verification_scope:
+                for raw_path in summary_files:
+                    path = Path(raw_path).expanduser().resolve()
+                    if not path.is_file():
+                        raise ControlPlaneError(f"summary file does not exist: {path}")
+                    if output_resolved is not None and path == output_resolved:
                         raise ControlPlaneError(
-                            "chunk-plan output must differ from the manifest materialized summary"
+                            "chunk-plan output must differ from every read-only summary input"
                         )
-                    rows = InternalStageExecutorRegistry._summary_payloads_from_file(
-                        materialized_path
-                    )
-                    source_paths.append(str(materialized_path))
-                else:
-                    rows = InternalStageExecutorRegistry._summary_payloads_from_file(path)
-            except ControlPlaneError:
-                raise
-            except (OSError, UnicodeError, json.JSONDecodeError, RuntimeError, TypeError, ValueError) as exc:
-                raise ControlPlaneError(f"cannot load canonical summary source {path}: {exc}") from exc
-            for row in rows:
-                reuse = row.get("stage1_reuse")
-                if not isinstance(reuse, Mapping) or str(reuse.get("authority_kind") or "") != "typed_manifest":
-                    continue
-                binding_payload = reuse.get("binding")
-                if not isinstance(binding_payload, Mapping) or not binding_payload:
-                    raise ControlPlaneError(
-                        f"typed Stage1 summary at {path} has no verified reuse binding"
-                    )
-                try:
-                    binding = Stage1ReusableSummaryBindingV1.from_mapping(binding_payload)
-                    authority, reason = verify_stage1_typed_manifest_authority(row, binding)
-                except (OSError, UnicodeError, TypeError, ValueError, RuntimeError) as exc:
-                    raise ControlPlaneError(
-                        f"typed Stage1 authority verification failed for {path}: {exc}"
-                    ) from exc
-                if authority is None:
-                    raise ControlPlaneError(
-                        f"typed Stage1 authority verification failed for {path}: {reason}"
-                    )
-                typed_manifest_authorities.append(
-                    {
-                        "manifest_file_hash": authority.manifest_file_hash,
-                        "source_summary_artifact_hash": authority.manifest.source_summary_artifact_hash,
-                    }
-                )
-            summaries.extend(dict(item) for item in rows)
-            if str(path) not in source_paths:
-                source_paths.append(str(path))
+                    try:
+                        root_payload = json.loads(path.read_text(encoding="utf-8"))
+                        if (
+                            isinstance(root_payload, Mapping)
+                            and root_payload.get("artifact_type") == "summary_source_manifest"
+                        ):
+                            _manifest, materialized_path, _raw_rows = load_summary_source_manifest(path)
+                            if output_resolved is not None and materialized_path == output_resolved:
+                                raise ControlPlaneError(
+                                    "chunk-plan output must differ from the manifest materialized summary"
+                                )
+                            rows = InternalStageExecutorRegistry._summary_payloads_from_file(
+                                materialized_path
+                            )
+                            source_paths.append(str(materialized_path))
+                        else:
+                            rows = InternalStageExecutorRegistry._summary_payloads_from_file(path)
+                    except ControlPlaneError:
+                        raise
+                    except (OSError, UnicodeError, json.JSONDecodeError, RuntimeError, TypeError, ValueError) as exc:
+                        raise ControlPlaneError(f"cannot load canonical summary source {path}: {exc}") from exc
+                    for row in rows:
+                        reuse = row.get("stage1_reuse")
+                        if not isinstance(reuse, Mapping) or str(reuse.get("authority_kind") or "") != "typed_manifest":
+                            continue
+                        binding_payload = reuse.get("binding")
+                        if not isinstance(binding_payload, Mapping) or not binding_payload:
+                            raise ControlPlaneError(
+                                f"typed Stage1 summary at {path} has no verified reuse binding"
+                            )
+                        try:
+                            binding = Stage1ReusableSummaryBindingV1.from_mapping(binding_payload)
+                            authority, reason = verify_stage1_typed_manifest_authority(
+                                row, binding, _verification_scope=verification_scope,
+                            )
+                        except (OSError, UnicodeError, TypeError, ValueError, RuntimeError) as exc:
+                            raise ControlPlaneError(
+                                f"typed Stage1 authority verification failed for {path}: {exc}"
+                            ) from exc
+                        if authority is None:
+                            raise ControlPlaneError(
+                                f"typed Stage1 authority verification failed for {path}: {reason}"
+                            )
+                        typed_manifest_authorities.append(
+                            {
+                                "manifest_file_hash": authority.manifest_file_hash,
+                                "source_summary_artifact_hash": authority.manifest.source_summary_artifact_hash,
+                            }
+                        )
+                    summaries.extend(dict(item) for item in rows)
+                    if str(path) not in source_paths:
+                        source_paths.append(str(path))
+        except ControlPlaneError:
+            raise
+        except (OSError, RuntimeError) as exc:
+            raise ControlPlaneError(
+                f"chunk-plan typed Stage1 authority scope failed: {exc}"
+            ) from exc
+
         evidence = build_outline_evidence_views(summaries, str(job_id))
         ledger = build_global_corpus_ledger(evidence)
         matrix = build_multi_view_matrix(evidence)
-        relation_map = build_global_relation_map(evidence, matrix, ledger)
+        from outline.v3_evidence import build_review_intent
+
+        intent_model = build_review_intent(review_intent or {})
+        relation_map = build_global_relation_map(
+            evidence, matrix, ledger, required_comparisons=intent_model.required_comparisons,
+        )
         content_layers = build_paper_content_layers(summaries, evidence, job_id=str(job_id))
+        content_layers_hash = content_layers.content_hash
         reuse_inventory = [
             ReuseInventoryItem(
                 source_path=path,
-                content_hash=content_layers.content_hash,
+                content_hash=content_layers_hash,
                 source_node="stage1_canonical_summaries",
                 content_status="read_only_input",
                 evidence_completeness="complete" if not content_layers.blocking_diagnostics else "partial",
@@ -1836,6 +2061,7 @@ class ReviewControlPlane:
                         workspace=workspace,
                         artifact_registry=registry,
                         provider_profile=route_profile,
+                        review_intent=dict(review_intent or {}),
                         provider_router=role_router,
                         enabled_semantic_roles=reachable_outline_roles,
                         reachable_provider_route_plan=reachable_outline.to_dict(),
@@ -1864,7 +2090,10 @@ class ReviewControlPlane:
                             if configured_settings is not None else 4_096
                         ),
                         semantic_transport_retries=route_transport_retries,
+                        prospective_provider_budget=prospective_budget,
+                        prospective_provider_budget_source=prospective_budget_source,
                         technical_shard_target_tokens=technical_target,
+                        provider_semantic_contract_version=provider_semantic_contract_version,
                     )
                     if executor.semantic_provider_synthesis_enabled:
                         preflight_error = ""
@@ -1927,8 +2156,38 @@ class ReviewControlPlane:
                             "estimated_provider_calls": executor.stability_preflight.get(
                                 "estimated_provider_calls"
                             ),
+                            "known_provider_calls_lower_bound": executor.stability_preflight.get(
+                                "known_provider_calls_lower_bound"
+                            ),
                             "estimated_provider_physical_attempts_upper_bound": executor.stability_preflight.get(
                                 "estimated_provider_physical_attempts_upper_bound"
+                            ),
+                            "retry_projection_scope": executor.stability_preflight.get(
+                                "retry_projection_scope"
+                            ),
+                            "retry_projection_budget_source": executor.stability_preflight.get(
+                                "retry_projection_budget_source"
+                            ),
+                            "retry_projection_bound_source": executor.stability_preflight.get(
+                                "retry_projection_bound_source"
+                            ),
+                            "configured_retry_slots_upper_bound": executor.stability_preflight.get(
+                                "configured_retry_slots_upper_bound"
+                            ),
+                            "aggregate_retry_pool_remaining": executor.stability_preflight.get(
+                                "aggregate_retry_pool_remaining"
+                            ),
+                            "retry_attempts_upper_bound": executor.stability_preflight.get(
+                                "retry_attempts_upper_bound"
+                            ),
+                            "aggregate_retry_pool_applied_to": executor.stability_preflight.get(
+                                "aggregate_retry_pool_applied_to"
+                            ),
+                            "token_retry_reserve_scope": executor.stability_preflight.get(
+                                "token_retry_reserve_scope"
+                            ),
+                            "cost_retry_reserve_scope": executor.stability_preflight.get(
+                                "cost_retry_reserve_scope"
                             ),
                             "semantic_cross_group_runtime_fragment_count": executor.stability_preflight.get(
                                 "semantic_cross_group_runtime_fragment_count"
@@ -1983,6 +2242,27 @@ class ReviewControlPlane:
                             ),
                             "estimated_total_tokens": executor.stability_preflight.get(
                                 "estimated_total_tokens"
+                            ),
+                            "known_estimated_input_tokens_lower_bound": executor.stability_preflight.get(
+                                "known_estimated_input_tokens_lower_bound"
+                            ),
+                            "known_estimated_output_tokens_lower_bound": executor.stability_preflight.get(
+                                "known_estimated_output_tokens_lower_bound"
+                            ),
+                            "known_estimated_reasoning_tokens_lower_bound": executor.stability_preflight.get(
+                                "known_estimated_reasoning_tokens_lower_bound"
+                            ),
+                            "known_estimated_total_tokens_lower_bound": executor.stability_preflight.get(
+                                "known_estimated_total_tokens_lower_bound"
+                            ),
+                            "known_token_reserve_floor_basis": executor.stability_preflight.get(
+                                "known_token_reserve_floor_basis"
+                            ),
+                            "known_estimated_cost_lower_bound": executor.stability_preflight.get(
+                                "known_estimated_cost_lower_bound"
+                            ),
+                            "semantic_output_dependent_request_count": executor.stability_preflight.get(
+                                "semantic_output_dependent_request_count"
                             ),
                             "estimated_cost": executor.stability_preflight.get("estimated_cost"),
                             "physical_attempt_estimate_status": executor.stability_preflight.get(
@@ -2308,6 +2588,8 @@ class ReviewControlPlane:
             ),
             "read_only": True,
         }
+        if provider_semantic_contract_version is not None:
+            payload["provider_semantic_contract_version"] = provider_semantic_contract_version
         if output_path:
             target = Path(output_path).expanduser().resolve()
             if target in {Path(item).expanduser().resolve() for item in source_paths}:
@@ -2331,17 +2613,211 @@ class ReviewControlPlane:
             from dataclasses import replace
 
             spec = replace(spec, job_id=job_id)
-        external_host_admission = self._admit_runtime_spec_external_hosts(spec)
-        runner = AgentRuntimeRunner(spec)
-        result = runner.resume() if resume else runner.run()
-        payload = self._status_payload(result)
-        if result.job_status != "completed" or result.completion_status != "complete":
-            payload["formal_runner_transport_diff"] = self._formal_runner_transport_diff(
-                spec,
-                result,
+
+        def execute_bound_spec() -> dict[str, Any]:
+            external_host_admission = self._admit_runtime_spec_external_hosts(spec)
+            runner = AgentRuntimeRunner(spec)
+            result = runner.resume() if resume else runner.run()
+            payload = self._status_payload(result)
+            if result.job_status != "completed" or result.completion_status != "complete":
+                payload["formal_runner_transport_diff"] = self._formal_runner_transport_diff(
+                    spec,
+                    result,
+                )
+            payload["external_host_admission"] = external_host_admission
+            return payload
+
+        from runtime.provider_runtime import (
+            acceptance_execution_context_from_environment,
+            bind_acceptance_execution_context,
+            bind_provider_run_plan_binding,
+            current_acceptance_execution_context,
+        )
+
+        if current_acceptance_execution_context() is not None:
+            # Same-process acceptance execution must already carry the exact
+            # child binding installed by _acceptance_run_plan.
+            return execute_bound_spec()
+        inherited_context = acceptance_execution_context_from_environment()
+        if inherited_context is None:
+            return execute_bound_spec()
+        controller, plan_binding = self._revalidated_serialized_acceptance_child_scope(
+            inherited_context,
+            runtime_spec=spec,
+            resume=resume,
+        )
+        with bind_acceptance_execution_context(inherited_context, controller):
+            with bind_provider_run_plan_binding(plan_binding):
+                return execute_bound_spec()
+
+    def _revalidated_serialized_acceptance_child_scope(
+        self,
+        context: AcceptanceExecutionContextV1,
+        *,
+        runtime_spec: RuntimeJobSpec,
+        resume: bool,
+    ) -> tuple[ProviderBudgetController, Any]:
+        """Reconstruct trusted child scope from the durable accepted plan.
+
+        A child process never treats inherited environment JSON or a live flag
+        as sufficient authority. It reopens the parent acceptance state and
+        plan, verifies the child RuntimeJobSpec/workspace/input binding, then
+        creates an in-process typed scope binding.
+        """
+
+        from runtime.provider_runtime import (
+            ProviderAggregateBudgetV2,
+            provider_budget_controller_from_environment,
+            validate_started_acceptance_execution_context,
+        )
+        from runtime.release_acceptance import AcceptanceRunStateV1, ReleaseAcceptanceSpec
+
+        if not context.owner_authorized or not context.provider_budget_state_started:
+            raise ControlPlaneError(
+                "inherited acceptance context is not owner-authorized and started"
             )
-        payload["external_host_admission"] = external_host_admission
-        return payload
+        if not isinstance(context.provider_budget, ProviderAggregateBudgetV2):
+            raise ControlPlaneError(
+                "legacy V1 acceptance budget cannot authorize a new runtime scope"
+            )
+        controller = provider_budget_controller_from_environment()
+        if (
+            controller is None
+            or controller.budget != context.provider_budget
+            or not isinstance(controller.budget, ProviderAggregateBudgetV2)
+        ):
+            raise ControlPlaneError(
+                "inherited acceptance controller does not match a strict V2 context"
+            )
+        current_sha = self._acceptance_checkout_sha(self.repo_root, require_clean=True)
+        validate_started_acceptance_execution_context(
+            context,
+            controller,
+            current_executable_sha=current_sha,
+        )
+
+        state_path = Path(context.scenario_state_path).expanduser().resolve()
+        if not state_path.is_file() or state_path.is_symlink():
+            raise ControlPlaneError("inherited acceptance run state is missing or unsafe")
+        try:
+            state = AcceptanceRunStateV1.from_mapping(
+                json.loads(state_path.read_text(encoding="utf-8"))
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise ControlPlaneError("inherited acceptance run state is invalid") from exc
+        if (
+            state.run_id != context.acceptance_run_id
+            or state.final_sha != current_sha
+            or Path(state.provider_budget_state_path).expanduser().resolve()
+            != Path(context.provider_budget_state_path).expanduser().resolve()
+            or not state.acceptance_spec_path
+        ):
+            raise ControlPlaneError(
+                "inherited acceptance run state does not match its context"
+            )
+        acceptance_spec_path = Path(state.acceptance_spec_path).expanduser().resolve()
+        try:
+            acceptance_payload = json.loads(
+                acceptance_spec_path.read_text(encoding="utf-8")
+            )
+            accepted_spec = ReleaseAcceptanceSpec.from_mapping(
+                acceptance_payload,
+                origin_dir=acceptance_spec_path.parent,
+                allow_missing_live_budget=True,
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise ControlPlaneError("inherited acceptance plan cannot be revalidated") from exc
+        plan = accepted_spec.plan
+        if plan is None:
+            if (
+                state.plan_sha256
+                or not state.runtime_spec_path
+                or Path(state.runtime_spec_path).expanduser().resolve()
+                != Path(accepted_spec.runtime_spec).expanduser().resolve()
+                or not accepted_spec.runtime_spec
+            ):
+                raise ControlPlaneError(
+                    "inherited single-runtime acceptance state does not bind its RuntimeJobSpec"
+                )
+            gates = tuple(accepted_spec.gates or ())
+            if len(gates) != 1:
+                raise ControlPlaneError(
+                    "inherited plan-less acceptance requires exactly one runtime gate"
+                )
+            return controller, self._verified_acceptance_single_runtime_binding(
+                acceptance_context=context,
+                budget_controller=controller,
+                acceptance_spec_path=acceptance_spec_path,
+                acceptance_spec=accepted_spec,
+                runtime_spec=runtime_spec,
+                scenario_id=str(gates[0]),
+                current_executable_sha=current_sha,
+                resume=resume,
+            )
+        if (
+            plan is None
+            or plan.plan_sha256() != state.plan_sha256
+            or plan.budget.to_provider_budget() != controller.budget
+            or plan.final_executable_sha != current_sha
+        ):
+            raise ControlPlaneError(
+                "inherited acceptance plan/budget differs from the durable run state"
+            )
+
+        normalized_spec = AgentRuntimeRunner(runtime_spec)._normalized_spec(
+            resume=resume
+        )
+        normalized_spec_hash = hash_json(normalized_spec.to_dict())
+        matches: list[tuple[str, Any, RuntimeJobSpec]] = []
+        for scenario_id, child in plan.scenarios.items():
+            if not child.runtime_spec:
+                continue
+            try:
+                accepted_child_spec = load_runtime_job_spec(child.runtime_spec)
+                accepted_normalized_spec = AgentRuntimeRunner(accepted_child_spec)._normalized_spec(
+                    resume=resume
+                )
+                accepted_child_hash = hash_json(accepted_normalized_spec.to_dict())
+            except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, RuntimeError):
+                continue
+            if (
+                accepted_normalized_spec.job_id == normalized_spec.job_id
+                and accepted_normalized_spec.workspace_path
+                and Path(accepted_normalized_spec.workspace_path).expanduser().resolve()
+                == Path(normalized_spec.workspace_path).expanduser().resolve()
+                and accepted_child_hash == normalized_spec_hash
+            ):
+                matches.append((str(scenario_id), child, accepted_normalized_spec))
+        if len(matches) != 1:
+            raise ControlPlaneError(
+                "inherited acceptance plan does not bind exactly one matching RuntimeJobSpec/job/workspace"
+            )
+        scenario_id, child, accepted_child_spec = matches[0]
+        _accepted_workspace, accepted_job_id = self._acceptance_runtime_child_binding(
+            child,
+            accepted_child_spec,
+        )
+        if accepted_job_id != normalized_spec.job_id:
+            raise ControlPlaneError("accepted child job_id differs from the requested runtime job")
+        runtime_spec_file_sha256 = self._acceptance_file_hash(child.runtime_spec)
+        input_identity_sha256 = self._acceptance_input_identity(
+            child,
+            runtime_spec_hash=runtime_spec_file_sha256,
+        )
+        return controller, self._verified_acceptance_child_plan_binding(
+            acceptance_context=context,
+            budget_controller=controller,
+            acceptance_spec_path=acceptance_spec_path,
+            plan=plan,
+            plan_sha256=state.plan_sha256,
+            scenario_id=scenario_id,
+            child=child,
+            runtime_spec=accepted_child_spec,
+            runtime_spec_file_sha256=runtime_spec_file_sha256,
+            input_identity_sha256=input_identity_sha256,
+            current_executable_sha=current_sha,
+            resume=resume,
+        )
 
     def _admit_runtime_spec_external_hosts(
         self,
@@ -2359,7 +2835,14 @@ class ReviewControlPlane:
             from services.credential_provenance import is_template_credential
 
             test_dependencies = current_runtime_test_dependencies()
-            normalized = load_config(
+            explicit_scope = None
+            if spec.metadata.get("stage1_summary_input_mode") == "explicit_typed_import":
+                from runtime.explicit_stage1_scope import load_explicit_stage1_scope
+
+                explicit_scope = load_explicit_stage1_scope(
+                    spec, allow_template_credentials=bool(test_dependencies and test_dependencies.allow_template_credentials),
+                )
+            normalized = explicit_scope.config if explicit_scope is not None else load_config(
                 str(spec.config),
                 action=spec.action,
                 requested_stages=spec.metadata.get("requested_stages"),
@@ -2393,10 +2876,12 @@ class ReviewControlPlane:
                 requested_stages=spec.metadata.get("requested_stages"),
                 free_mode_enabled=free_mode_enabled,
             )
+            if explicit_scope is not None:
+                route_plan = explicit_scope.provider_route_plan
             policy = build_runtime_external_host_policy(
                 normalized,
                 route_plan,
-                requested_stages=spec.metadata.get("requested_stages"),
+                requested_stages=(route_plan.stage_plan.requested_stages if explicit_scope is not None else spec.metadata.get("requested_stages")),
                 outline_pilot=spec.metadata.get("outline_pilot"),
             )
             admission = validate_external_host_acknowledgement(
@@ -2490,10 +2975,15 @@ class ReviewControlPlane:
             current_acceptance_execution_context()
             or acceptance_execution_context_from_environment()
         )
+        if acceptance is None:
+            # Ordinary strict V2 runs restore their controller from the
+            # persisted run envelope and workspace budget ledger after the
+            # direct command has bootstrapped the exact resume session.  Do
+            # not turn a runtime-spec/default budget into fresh authority here.
+            return policy.route_fingerprint, acknowledgement
         controller = provider_budget_controller_from_environment()
         if (
-            acceptance is None
-            or not acceptance.owner_authorized
+            not acceptance.owner_authorized
             or not acceptance.provider_budget_state_started
             or controller is None
             or controller.budget != acceptance.provider_budget
@@ -2517,6 +3007,334 @@ class ReviewControlPlane:
         )
         controller.snapshot()
         return policy.route_fingerprint, acknowledgement
+
+    def _direct_validator_provider_context(
+        self,
+        spec: RuntimeJobSpec,
+        session: Any,
+        *,
+        operation: str,
+        validator_route_fingerprint: str,
+    ):
+        """Bind direct Validator work to its accepted run or exact ordinary V2 run.
+
+        The ordinary branch first reads and validates the persisted RunStart
+        envelope and strict budget ledger without writing either.  Only after
+        the current Runner scope verifier accepts that exact session does it
+        perform the normal durable controller bind and allow JIT admission.
+        """
+
+        from contextlib import contextmanager
+
+        @contextmanager
+        def bind():
+            if not validator_route_fingerprint:
+                yield None
+                return
+
+            # Keep existing explicit acceptance behavior unchanged.  The
+            # caller already ran its owner, SHA, started-ledger, deadline, and
+            # external-host checks in _admit_direct_validator_execution.
+            acceptance = (
+                current_acceptance_execution_context()
+                or acceptance_execution_context_from_environment()
+            )
+            if acceptance is not None:
+                yield None
+                return
+
+            from runtime.provider_run_envelope import ProviderRunEnvelopeV1
+            from runtime.provider_runtime import (
+                ProviderAggregateBudgetV2,
+                ProviderBudgetController,
+                ProviderRuntimeContractError,
+                RuntimeControlIdentityV1,
+                bind_provider_run_budget,
+                bind_runtime_control_context,
+                current_runtime_control_context,
+                provider_run_budget_controller_from_environment,
+            )
+            from runtime.runner import AgentRuntimeRunner
+            from services.durable_io import interprocess_file_lock
+
+            workspace = session.context.workspace
+            registry = session.context.registry
+            job_id = str(workspace.job_id or "").strip()
+            run_id = f"run:{job_id}"
+            workspace_path = Path(workspace.root_dir).expanduser().resolve()
+            if (
+                not job_id
+                or job_id != str(spec.job_id or "").strip()
+                or str(registry.job_id or "").strip() != job_id
+            ):
+                raise ControlPlaneError(
+                    f"{operation} workspace, Registry, and RuntimeJobSpec identities differ"
+                )
+            if "validate" not in {
+                str(item).strip()
+                for item in (session.context.required_stages or ())
+                if str(item).strip()
+            }:
+                raise ControlPlaneError(
+                    f"{operation} Validator route is outside the persisted run-stage contract"
+                )
+
+            envelope_record = registry.get("provider_run_envelope")
+            if (
+                envelope_record is None
+                or envelope_record.status != "ready"
+                or envelope_record.job_id != job_id
+                or envelope_record.artifact_type != "provider_run_envelope"
+                or envelope_record.artifact_version != "v1"
+                or envelope_record.artifact_role != "provider_run_envelope"
+            ):
+                raise ControlPlaneError(
+                    f"{operation} requires this job's existing ready provider run envelope"
+                )
+            try:
+                envelope_record = registry.verify_ready_artifact_closure(envelope_record)
+                raw_envelope = json.loads(Path(envelope_record.path).read_text(encoding="utf-8"))
+                for _ in range(3):
+                    if not isinstance(raw_envelope, Mapping) or not isinstance(
+                        raw_envelope.get("payload"), Mapping
+                    ):
+                        break
+                    raw_envelope = raw_envelope["payload"]
+                envelope = ProviderRunEnvelopeV1.from_dict(raw_envelope)
+            except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, RegistryError) as exc:
+                raise ControlPlaneError(
+                    f"{operation} provider run envelope is invalid: {exc}"
+                ) from exc
+            if (
+                envelope.job_id != job_id
+                or envelope.run_id != run_id
+                or envelope.budget_authority == "bound_acceptance_context"
+                or envelope.admission_status != "ready_with_jit"
+                or not isinstance(envelope.provider_budget, ProviderAggregateBudgetV2)
+                or envelope.provider_budget.max_provider_calls_total <= 0
+                or envelope.provider_budget.max_output_tokens_total <= 0
+                or envelope.provider_budget.max_wall_seconds <= 0
+            ):
+                raise ControlPlaneError(
+                    f"{operation} provider run envelope is not a started ordinary strict V2 run"
+                )
+
+            explicit_budget = spec.metadata.get("provider_budget")
+            if explicit_budget is not None:
+                if not isinstance(explicit_budget, Mapping):
+                    raise ControlPlaneError(
+                        f"{operation} RuntimeJobSpec provider budget is invalid"
+                    )
+                try:
+                    decoded_budget = ProviderAggregateBudgetV2.from_mapping(explicit_budget)
+                except ProviderRuntimeContractError as exc:
+                    raise ControlPlaneError(
+                        f"{operation} RuntimeJobSpec provider budget is invalid: {exc}"
+                    ) from exc
+                if decoded_budget != envelope.provider_budget:
+                    raise ControlPlaneError(
+                        f"{operation} RuntimeJobSpec and persisted run envelope budgets differ"
+                    )
+
+            # Require the exact verified RuntimeJobSpec and source inventory
+            # that Runner captured in the envelope's dependency closure.
+            for artifact_id in ("runtime_job_spec", "source_inventory"):
+                current_record = registry.get(artifact_id)
+                dependency = next(
+                    (
+                        item
+                        for item in envelope_record.depends_on
+                        if item.artifact_id == artifact_id
+                    ),
+                    None,
+                )
+                if (
+                    current_record is None
+                    or current_record.status != "ready"
+                    or dependency is None
+                    or dependency.job_id != current_record.job_id
+                    or dependency.content_hash != current_record.content_hash
+                    or dependency.path != current_record.path
+                ):
+                    raise ControlPlaneError(
+                        f"{operation} provider run envelope is not bound to the current {artifact_id}"
+                    )
+            try:
+                registry.verify_ready_artifact_closure(registry.get("runtime_job_spec"))
+                registry.verify_ready_artifact_closure(registry.get("source_inventory"))
+                current_spec_payload = json.loads(
+                    Path(registry.get("runtime_job_spec").path).read_text(encoding="utf-8")
+                )
+            except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, RegistryError) as exc:
+                raise ControlPlaneError(
+                    f"{operation} current RuntimeJobSpec/source closure is invalid: {exc}"
+                ) from exc
+            if current_spec_payload != spec.to_dict():
+                raise ControlPlaneError(
+                    f"{operation} in-memory RuntimeJobSpec differs from its durable Registry artifact"
+                )
+
+            state_path = Path(workspace.log_path("acceptance_budget_state_v1.json")).expanduser().resolve()
+            identity_path = state_path.with_name(state_path.name + ".identity.json")
+            file_lock_path = state_path.with_name(state_path.name + ".lock")
+            if (
+                not state_path.is_file()
+                or not identity_path.is_file()
+                or not file_lock_path.is_file()
+                or file_lock_path.stat().st_size < 1
+            ):
+                raise ControlPlaneError(
+                    f"{operation} ordinary run budget state/identity is missing or unstarted"
+                )
+
+            active_controller = provider_run_budget_controller_from_environment(
+                runtime_spec_budget=explicit_budget,
+            )
+            needs_durable_bind = active_controller is None
+            controller = active_controller or ProviderBudgetController(envelope.provider_budget)
+            if (
+                controller.budget != envelope.provider_budget
+                or controller.state_path not in (None, state_path)
+                or controller.acceptance_run_id not in ("", run_id)
+                or (not needs_durable_bind and not controller.state_started)
+            ):
+                raise ControlPlaneError(
+                    f"{operation} active provider controller does not match the persisted ordinary run"
+                )
+
+            # Re-open the strict ledger with the controller's parser in
+            # read-only mode.  Do not call bind_state_path until envelope and
+            # scope verification has succeeded: that method reconciles and
+            # persists durable state.
+            controller._state_path = state_path
+            controller._identity_path = identity_path
+            controller._acceptance_run_id = run_id
+            controller._state_started = True
+            try:
+                with interprocess_file_lock(state_path):
+                    controller._load_state_unlocked()
+                    snapshot = controller._snapshot_unlocked()
+            except (
+                OSError,
+                RegistryError,
+                ProviderBudgetExceeded,
+                ProviderRuntimeContractError,
+                ValueError,
+                TypeError,
+            ) as exc:
+                raise ControlPlaneError(
+                    f"{operation} ordinary run budget state is invalid: {exc}"
+                ) from exc
+            if (
+                controller.acceptance_run_id != run_id
+                or controller.state_path != state_path
+                or not controller.state_started
+                or controller.durable_deadline_epoch is None
+                or controller.durable_deadline_epoch <= time.time()
+            ):
+                raise ControlPlaneError(
+                    f"{operation} ordinary run budget identity/deadline is invalid or expired"
+                )
+            if any(
+                int(snapshot.get(field) or 0) < 0
+                for field in (
+                    "calls_used",
+                    "output_tokens_used",
+                    "retry_attempts_used",
+                    "calls_reserved",
+                    "output_tokens_reserved",
+                    "retry_attempts_reserved",
+                )
+            ):
+                raise ControlPlaneError(f"{operation} ordinary run budget counters are invalid")
+            if controller._ambiguous_reservation_ids:
+                raise ControlPlaneError(
+                    f"{operation} ordinary run budget has unresolved provider exposure"
+                )
+            if not any(int(snapshot.get(field) or 0) for field in (
+                "calls_used",
+                "output_tokens_used",
+                "retry_attempts_used",
+                "calls_reserved",
+                "output_tokens_reserved",
+                "retry_attempts_reserved",
+            )) and not controller._reservations and not controller._primary_repair_scopes:
+                raise ControlPlaneError(
+                    f"{operation} ordinary run budget ledger is pristine"
+                )
+
+            current_runtime_identity = current_runtime_control_context()
+            if current_runtime_identity is not None and (
+                current_runtime_identity.identity.job_id != job_id
+                or current_runtime_identity.identity.workspace_path != str(workspace_path)
+                or current_runtime_identity.identity.acceptance_run_id not in {"", run_id}
+            ):
+                raise ControlPlaneError(
+                    f"{operation} active runtime control identity belongs to another run"
+                )
+            identity = RuntimeControlIdentityV1(
+                job_id=job_id,
+                workspace_path=str(workspace_path),
+                acceptance_run_id=run_id,
+                lease_id=(
+                    current_runtime_identity.identity.lease_id
+                    if current_runtime_identity is not None
+                    and current_runtime_identity.identity.job_id == job_id
+                    else ""
+                ),
+                lease_generation=(
+                    current_runtime_identity.identity.lease_generation
+                    if current_runtime_identity is not None
+                    and current_runtime_identity.identity.job_id == job_id
+                    else 0
+                ),
+                provider_budget_started=True,
+            )
+            with bind_provider_run_budget(controller), bind_runtime_control_context(
+                identity,
+                workspace=workspace,
+                registry=registry,
+                lease_validator=(
+                    current_runtime_identity.lease_validator
+                    if current_runtime_identity is not None
+                    and current_runtime_identity.identity.job_id == job_id
+                    else None
+                ),
+                cancel_token=(
+                    current_runtime_identity.cancel_token
+                    if current_runtime_identity is not None
+                    and current_runtime_identity.identity.job_id == job_id
+                    else None
+                ),
+            ):
+                # Reuse Runner's exact current-spec/source/config/route/stage
+                # scope verifier. It sees the existing envelope and cannot
+                # mint a replacement because the persisted record was required
+                # above.
+                try:
+                    AgentRuntimeRunner(spec)._admit_run_provider_envelope(session, spec)
+                except (OSError, RegistryError, RuntimeRunnerError, ValueError, TypeError) as exc:
+                    raise ControlPlaneError(
+                        f"{operation} persisted ordinary run envelope scope is invalid: {exc}"
+                    ) from exc
+                if needs_durable_bind:
+                    try:
+                        controller.bind_state_path(
+                            state_path,
+                            acceptance_run_id=run_id,
+                            state_started=True,
+                        )
+                        controller.assert_state_integrity(
+                            acceptance_run_id=run_id,
+                            state_started=True,
+                        )
+                    except (OSError, RegistryError, ProviderRuntimeContractError, ValueError, TypeError) as exc:
+                        raise ControlPlaneError(
+                            f"{operation} could not resume the existing ordinary run ledger: {exc}"
+                        ) from exc
+                yield controller
+
+        return bind()
 
     def acceptance_run(
         self,
@@ -2720,6 +3538,7 @@ class ReviewControlPlane:
                     config_path = Path(runtime_job_spec.config).expanduser().resolve()
                     preflight = self.provider_preflight(
                         config_path=config_path,
+                        runtime_spec=runtime_job_spec,
                         action=runtime_job_spec.action,
                         requested_stages=runtime_job_spec.metadata.get("requested_stages"),
                         outline_pilot=runtime_job_spec.metadata.get("outline_pilot"),
@@ -2752,12 +3571,35 @@ class ReviewControlPlane:
                                 job_id=state.job_id if state else "",
                             )
                         )
-                        runtime_result = self.resume(
-                            workspace=prior_workspace,
-                            job_id=state.job_id if state else "",
-                        )
+                        resume_existing = True
                     else:
-                        runtime_result = self.run(runtime_spec)
+                        resume_existing = False
+                    if runtime_job_spec is None:
+                        raise ControlPlaneError(
+                            "accepted single-runtime scope has no valid RuntimeJobSpec"
+                        )
+                    scenario_id = str((acceptance_spec.gates or ("",))[0])
+                    plan_binding = self._verified_acceptance_single_runtime_binding(
+                        acceptance_context=execution_context,
+                        budget_controller=budget_controller,
+                        acceptance_spec_path=spec_path,
+                        acceptance_spec=acceptance_spec,
+                        runtime_spec=runtime_job_spec,
+                        scenario_id=scenario_id,
+                        current_executable_sha=current_sha,
+                        resume=resume_existing,
+                    )
+                    from runtime.provider_runtime import bind_provider_run_plan_binding
+
+                    with bind_provider_run_plan_binding(plan_binding):
+                        runtime_result = (
+                            self.resume(
+                                workspace=prior_workspace,
+                                job_id=state.job_id if state else "",
+                            )
+                            if resume_existing
+                            else self.run(runtime_spec)
+                        )
                 except ProviderBudgetExceeded as exc:
                     runtime_result = {
                         "status": "BLOCKED_AMBIGUOUS_PROVIDER_CALL",
@@ -3123,6 +3965,264 @@ class ReviewControlPlane:
             )
         return child_workspace, runtime_job_id
 
+    def _provider_run_scope_hashes_for_spec(
+        self,
+        runtime_spec: RuntimeJobSpec,
+        *,
+        resume: bool = False,
+    ) -> dict[str, str]:
+        """Compute the exact six hashes with the same preparation path as Runner.
+
+        This performs only local config and source inventory work. It deliberately
+        reuses ``AgentRuntimeBridge``, ``JobRunner._prepare_source_inventory``,
+        lifecycle fingerprinting, readiness policy, route planning, and the
+        normalized RuntimeJobSpec helper used by the actual Runner.
+        """
+
+        from services.job_fingerprint import (
+            FingerprintInputs,
+            build_fingerprint_bundle,
+            sanitize_config_for_fingerprint,
+        )
+        from services.job_runner import JobRunner
+        from services.queue_service import CancelToken
+        from runtime.lifecycle import _readiness_policy_for_request
+        from runtime.orchestrator import AgentRuntimeBridge, _RuntimeStageHost
+        from runtime.provider_runtime import build_provider_run_scope_hashes_v1
+        from runtime.runner import AgentRuntimeRunner
+        from runtime.stage_planning import StagePlan
+
+        normalized_spec = AgentRuntimeRunner(runtime_spec)._normalized_spec(
+            resume=resume
+        )
+        bridge = AgentRuntimeBridge(normalized_spec)
+        request = bridge.build_job_request()
+        job_runner = JobRunner()
+        project_name = job_runner._resolve_project_name(request)
+        stage_host = _RuntimeStageHost(request, project_name, CancelToken())
+        output_base_dir = stage_host.config.get("Paths", {}).get(
+            "output_path", "./output"
+        )
+        if normalized_spec.workspace_path:
+            planned_workspace = Path(normalized_spec.workspace_path).expanduser().resolve()
+            output_base_dir = str(planned_workspace.parent)
+            configured_paths = dict(stage_host.config.get("Paths", {}))
+            configured_paths["output_path"] = output_base_dir
+            stage_host.config["Paths"] = configured_paths
+        project_name = job_runner._resolve_project_name_from_existing_workspaces(
+            base_output_dir=output_base_dir,
+            requested_project_name=project_name,
+            action=request.action,
+        )
+        if project_name != stage_host.project_name:
+            stage_host.project_name = project_name
+
+        prepared_sources = job_runner._prepare_source_inventory(
+            generator=stage_host,
+            request=request,
+            project_name=project_name,
+        )
+        request_snapshot = bridge._freeze_free_mode_snapshot(
+            job_runner._request_snapshot(request)
+        )
+        source_fingerprint_snapshot = {
+            "source_inventory_hash": prepared_sources.inventory.fingerprint(),
+            "source_inventory": prepared_sources.inventory.fingerprint_payload(),
+        }
+        fingerprint_bundle = build_fingerprint_bundle(
+            FingerprintInputs(
+                config_snapshot=sanitize_config_for_fingerprint(stage_host.config),
+                source_snapshot=source_fingerprint_snapshot,
+                request_snapshot=request_snapshot,
+            )
+        )
+        readiness_policy = _readiness_policy_for_request(
+            request,
+            validation_enabled=stage_host.settings.review_validation_enabled(),
+        )
+        stage_policy = dict(readiness_policy["stage_plan"])
+        stage_plan = StagePlan(
+            **{
+                **stage_policy,
+                "requested_stages": tuple(stage_policy["requested_stages"]),
+                "required_stages": tuple(stage_policy["required_stages"]),
+            }
+        )
+        free_mode_enabled = bool(
+            normalized_spec.free_mode_profile
+            or normalized_spec.free_mode_idea
+            or normalized_spec.metadata.get("free_mode_input")
+        )
+        route_plan = build_reachable_provider_route_plan(
+            stage_host.config,
+            action=normalized_spec.action,
+            requested_stages=stage_plan.requested_stages,
+            free_mode_enabled=free_mode_enabled,
+            stage_plan=stage_plan,
+        )
+        if normalized_spec.metadata.get("stage1_summary_input_mode") == "explicit_typed_import":
+            from runtime.explicit_stage1_scope import resolve_explicit_stage1_scope
+
+            route_plan = resolve_explicit_stage1_scope(
+                normalized_spec, stage_host.config, stage_plan,
+            ).provider_route_plan
+        return build_provider_run_scope_hashes_v1(
+            normalized_runtime_spec=normalized_spec.to_dict(),
+            effective_config_sha256=fingerprint_bundle.config_hash,
+            source_snapshot_sha256=fingerprint_bundle.source_hash,
+            review_goal=normalized_spec.metadata.get("review_intent") or {},
+            route_plan=route_plan,
+            stage_work_contract=readiness_policy["stage_plan"],
+        )
+
+    def _verified_acceptance_child_plan_binding(
+        self,
+        *,
+        acceptance_context: AcceptanceExecutionContextV1,
+        budget_controller: ProviderBudgetController,
+        acceptance_spec_path: str | Path,
+        plan: Any,
+        plan_sha256: str,
+        scenario_id: str,
+        child: Any,
+        runtime_spec: RuntimeJobSpec,
+        runtime_spec_file_sha256: str,
+        input_identity_sha256: str,
+        current_executable_sha: str,
+        resume: bool = False,
+    ) -> Any:
+        """Verify a plan child, then bind the actual Runner-computed six hashes."""
+
+        from runtime.provider_runtime import (
+            provider_run_plan_binding_from_verified_acceptance_plan,
+            provider_run_workspace_identity_sha256,
+        )
+        from runtime.runner import AgentRuntimeRunner
+
+        normalized = AgentRuntimeRunner(runtime_spec)._normalized_spec(resume=resume)
+        expected_runtime_spec_path = Path(str(child.runtime_spec or "")).expanduser().resolve()
+        if not expected_runtime_spec_path.is_file():
+            raise ControlPlaneError("accepted child RuntimeJobSpec disappeared before run binding")
+        if self._acceptance_file_hash(expected_runtime_spec_path) != runtime_spec_file_sha256:
+            raise ControlPlaneError("accepted child RuntimeJobSpec changed after plan verification")
+        declared_workspace, declared_job_id = self._acceptance_runtime_child_binding(
+            child,
+            normalized,
+        )
+        if (
+            declared_job_id != normalized.job_id
+            or declared_job_id != str(child.job_id or normalized.job_id)
+            or plan.plan_sha256() != plan_sha256
+            or plan.final_executable_sha != current_executable_sha
+        ):
+            raise ControlPlaneError(
+                "accepted child plan no longer binds this RuntimeJobSpec, job, or executable"
+            )
+        if acceptance_context.provider_budget != budget_controller.budget:
+            raise ControlPlaneError("accepted child plan budget differs from the active controller")
+        if plan.budget.to_provider_budget() != budget_controller.budget:
+            raise ControlPlaneError("accepted child plan budget differs from its verified plan")
+        if str(child.budget_domain or "live") != "live":
+            raise ControlPlaneError("ordinary runtime scope cannot consume the offline-k budget domain")
+        accepted_scope_hashes = self._provider_run_scope_hashes_for_spec(
+            normalized,
+            resume=resume,
+        )
+        return provider_run_plan_binding_from_verified_acceptance_plan(
+            acceptance_context,
+            budget_controller,
+            current_executable_sha=current_executable_sha,
+            acceptance_plan_sha256=plan_sha256,
+            acceptance_spec_file_sha256=self._acceptance_file_hash(acceptance_spec_path),
+            scenario_id=scenario_id,
+            job_id=declared_job_id,
+            runtime_spec_sha256=accepted_scope_hashes["runtime_spec_sha256"],
+            runtime_spec_file_sha256=runtime_spec_file_sha256,
+            scope_hashes=accepted_scope_hashes,
+            input_identity_sha256=input_identity_sha256,
+            workspace_identity_sha256=provider_run_workspace_identity_sha256(
+                declared_workspace,
+                job_id=declared_job_id,
+            ),
+        )
+
+    def _verified_acceptance_single_runtime_binding(
+        self,
+        *,
+        acceptance_context: AcceptanceExecutionContextV1,
+        budget_controller: ProviderBudgetController,
+        acceptance_spec_path: str | Path,
+        acceptance_spec: Any,
+        runtime_spec: RuntimeJobSpec,
+        scenario_id: str,
+        current_executable_sha: str,
+        resume: bool,
+    ) -> Any:
+        """Bind the plan-less legacy single-runtime spec to an exact scope.
+
+        This path is kept for one-scenario ReleaseAcceptanceSpec files. A
+        multi-child run must use ReleaseAcceptancePlanV2 so every child has its
+        own independent plan binding.
+        """
+
+        from runtime.provider_runtime import (
+            provider_run_plan_binding_from_verified_acceptance_plan,
+            provider_run_workspace_identity_sha256,
+        )
+        from runtime.runner import AgentRuntimeRunner
+        from types import SimpleNamespace
+
+        if acceptance_spec.plan is not None:
+            raise ControlPlaneError("single-runtime acceptance binding received a multi-child plan")
+        gates = tuple(acceptance_spec.gates or ())
+        if len(gates) != 1 or str(gates[0]) != str(scenario_id):
+            raise ControlPlaneError("single-runtime acceptance scope must bind exactly one gate")
+        if acceptance_spec.budget.to_provider_budget() != budget_controller.budget:
+            raise ControlPlaneError("single-runtime acceptance budget differs from its controller")
+        accepted_path = Path(acceptance_spec.runtime_spec).expanduser().resolve()
+        if not accepted_path.is_file():
+            raise ControlPlaneError("single-runtime accepted RuntimeJobSpec is missing")
+        runtime_spec_file_sha256 = self._acceptance_file_hash(accepted_path)
+        accepted_spec = load_runtime_job_spec(accepted_path)
+        normalized_accepted_spec = AgentRuntimeRunner(accepted_spec)._normalized_spec(
+            resume=resume
+        )
+        normalized_runtime_spec = AgentRuntimeRunner(runtime_spec)._normalized_spec(
+            resume=resume
+        )
+        if normalized_accepted_spec.to_dict() != normalized_runtime_spec.to_dict():
+            raise ControlPlaneError("single-runtime accepted RuntimeJobSpec changed")
+        job_id = str(normalized_runtime_spec.job_id or "")
+        workspace = str(normalized_runtime_spec.workspace_path or "")
+        if not job_id or not workspace:
+            raise ControlPlaneError("single-runtime accepted spec lacks job/workspace identity")
+        input_identity_sha256 = self._acceptance_input_identity(
+            SimpleNamespace(input_manifest="", scenario_id=scenario_id, gate=scenario_id),
+            runtime_spec_hash=runtime_spec_file_sha256,
+        )
+        scope_hashes = self._provider_run_scope_hashes_for_spec(
+            normalized_runtime_spec,
+            resume=resume,
+        )
+        acceptance_spec_file_sha256 = self._acceptance_file_hash(acceptance_spec_path)
+        return provider_run_plan_binding_from_verified_acceptance_plan(
+            acceptance_context,
+            budget_controller,
+            current_executable_sha=current_executable_sha,
+            acceptance_plan_sha256=acceptance_spec_file_sha256,
+            acceptance_spec_file_sha256=acceptance_spec_file_sha256,
+            scenario_id=scenario_id,
+            job_id=job_id,
+            runtime_spec_sha256=scope_hashes["runtime_spec_sha256"],
+            runtime_spec_file_sha256=runtime_spec_file_sha256,
+            scope_hashes=scope_hashes,
+            input_identity_sha256=input_identity_sha256,
+            workspace_identity_sha256=provider_run_workspace_identity_sha256(
+                workspace,
+                job_id=job_id,
+            ),
+        )
+
     @staticmethod
     def _require_live_runtime_deadline(runtime_spec: RuntimeJobSpec) -> None:
         """Reject live acceptance jobs with the ordinary unlimited deadline."""
@@ -3132,7 +4232,12 @@ class ReviewControlPlane:
             or runtime_spec.free_mode_idea
             or runtime_spec.metadata.get("free_mode_input")
         )
-        normalized = load_config(
+        explicit_scope = None
+        if runtime_spec.metadata.get("stage1_summary_input_mode") == "explicit_typed_import":
+            from runtime.explicit_stage1_scope import load_explicit_stage1_scope
+
+            explicit_scope = load_explicit_stage1_scope(runtime_spec)
+        normalized = explicit_scope.config if explicit_scope is not None else load_config(
             runtime_spec.config,
             action=runtime_spec.action,
             requested_stages=runtime_spec.metadata.get("requested_stages"),
@@ -4501,6 +5606,7 @@ class ReviewControlPlane:
                         self._require_live_runtime_deadline(runtime_job_spec)
                     child_preflight = self.provider_preflight(
                         config_path=runtime_job_spec.config,
+                        runtime_spec=runtime_job_spec,
                         action=runtime_job_spec.action,
                         requested_stages=runtime_job_spec.metadata.get("requested_stages"),
                         outline_pilot=runtime_job_spec.metadata.get("outline_pilot"),
@@ -4657,6 +5763,7 @@ class ReviewControlPlane:
                         )
                         child_preflight = child_preflight or self.provider_preflight(
                             config_path=runtime_job_spec.config,
+                            runtime_spec=runtime_job_spec,
                             action=runtime_job_spec.action,
                             requested_stages=runtime_job_spec.metadata.get("requested_stages"),
                             outline_pilot=runtime_job_spec.metadata.get("outline_pilot"),
@@ -4715,15 +5822,32 @@ class ReviewControlPlane:
                                 declared_workspace.rmdir()
                                 workspace_exists = False
                         resume_existing = workspace_exists and resume_marker
+                        from runtime.provider_runtime import bind_provider_run_plan_binding
+
+                        accepted_plan_binding = self._verified_acceptance_child_plan_binding(
+                            acceptance_context=execution_context,
+                            budget_controller=budget_controller,
+                            acceptance_spec_path=spec_path,
+                            plan=plan,
+                            plan_sha256=plan_sha,
+                            scenario_id=gate,
+                            child=child,
+                            runtime_spec=runtime_job_spec,
+                            runtime_spec_file_sha256=child_runtime_hash,
+                            input_identity_sha256=input_identity,
+                            current_executable_sha=current_sha,
+                            resume=resume_existing,
+                        )
                         with bind_acceptance_execution_context(execution_context, budget_controller):
-                            runtime_result = (
-                                self.resume(
-                                    workspace=declared_workspace,
-                                    job_id=declared_job_id,
+                            with bind_provider_run_plan_binding(accepted_plan_binding):
+                                runtime_result = (
+                                    self.resume(
+                                        workspace=declared_workspace,
+                                        job_id=declared_job_id,
+                                    )
+                                    if resume_existing
+                                    else self.run(child.runtime_spec)
                                 )
-                                if resume_existing
-                                else self.run(child.runtime_spec)
-                            )
                         job_value = str(runtime_result.get("job_id") or declared_job_id)
                         if job_value != declared_job_id:
                             raise ControlPlaneError(
@@ -5876,6 +7000,7 @@ class ReviewControlPlane:
         try:
             preflight = ReviewControlPlane(repo_root=Path(spec.config).expanduser().resolve().parent).provider_preflight(
                 config_path=spec.config,
+                runtime_spec=spec,
                 action=spec.action,
                 requested_stages=spec.metadata.get("requested_stages"),
                 free_mode_enabled=bool(
@@ -5957,6 +7082,47 @@ class ReviewControlPlane:
     ) -> dict[str, Any]:
         return self._run_spec(spec_path, job_id=job_id)
 
+    def authorize_downstream(
+        self,
+        *,
+        budget: Mapping[str, Any],
+        actor: str,
+        reason: str,
+        authorization_reference: str,
+        job_id: str | None = None,
+        workspace: str | Path | None = None,
+    ) -> dict[str, Any]:
+        """Authorize finite local Writer/Validator work after an expired run.
+
+        This prepares an append-only grant. The ordinary resume entry still
+        owns all source, adoption, stage, validation and completion gates.
+        """
+        from runtime.downstream_continuation import prepare_downstream_continuation
+
+        resolved = self.resolve_workspace(job_id=job_id, workspace=workspace)
+        workspace_obj, registry = AgentRuntimeRunner._open_workspace(resolved)
+        spec = _load_spec_path(_persisted_runtime_spec_path(resolved, registry))
+        normalized = AgentRuntimeRunner(spec)._normalized_spec(resume=True)
+        AgentRuntimeRunner._validate_persisted_spec(workspace_obj, normalized.to_dict(), registry)
+        grant = prepare_downstream_continuation(
+            workspace_obj, registry, budget=budget, actor=actor, reason=reason,
+            authorization_reference=authorization_reference, spec_payload=normalized.to_dict(),
+        )
+        return {
+            "status": "authorized",
+            "job_id": workspace_obj.job_id,
+            "workspace_path": resolved,
+            "grant_artifact_id": grant.artifact_record.artifact_id,
+            "grant_sha256": grant.artifact_record.content_hash,
+            "run_id": grant.run_id,
+            "provider_budget": grant.budget.to_dict(),
+            "provider_budget_state_path": str(grant.state_path),
+            "carried_usage": dict(grant.carried_usage),
+            "absolute_deadline_epoch": grant.absolute_deadline_epoch,
+            "allowed_provider_stages": list(grant.allow_provider_stages),
+            "next_action": "resume",
+        }
+
     def resume(
         self,
         *,
@@ -5968,6 +7134,11 @@ class ReviewControlPlane:
         spec_path = _persisted_runtime_spec_path(resolved, registry)
         if not spec_path.is_file():
             raise ControlPlaneError(f"persisted runtime spec is missing: {spec_path}")
+        cancel_store = CancellationRequestStore(workspace_obj, registry)
+        try:
+            captured_cancel, captured_cancel_hash = cancel_store.read_snapshot()
+        except (OSError, RegistryError, ValueError, TypeError) as exc:
+            raise ControlPlaneError(f"resume cancellation state is invalid: {exc}") from exc
         # Validate the persisted runtime identity before mutating any resume
         # state. A malformed/stale spec or fingerprint must leave the DAG,
         # cancellation request, and pause marker untouched.
@@ -5986,6 +7157,9 @@ class ReviewControlPlane:
                 normalized_resume_spec.to_dict(),
                 registry,
             )
+            from runtime.downstream_continuation import load_current_continuation
+
+            load_current_continuation(workspace_obj, registry, normalized_resume_spec.to_dict())
         except (OSError, RegistryError, ValueError, TypeError, RuntimeError) as exc:
             raise ControlPlaneError(f"resume identity preflight is invalid: {exc}") from exc
         outline_resume_plan: dict[str, Any] | None = None
@@ -5998,9 +7172,11 @@ class ReviewControlPlane:
         except (OSError, ValueError, TypeError, RegistryError) as exc:
             raise ControlPlaneError(f"Outline v3 resume planning is blocked: {exc}") from exc
         try:
-            cancel_store = CancellationRequestStore(workspace_obj, registry)
-            if cancel_store.is_requested():
-                cancel_store.clear(cleared_by="reviewctl", reason="resume_requested")
+            if captured_cancel is not None and captured_cancel.active:
+                cancel_store.clear(
+                    cleared_by="reviewctl", reason="resume_requested",
+                    expected_hash=captured_cancel_hash,
+                )
         except (OSError, RegistryError, ValueError, TypeError) as exc:
             raise ControlPlaneError(f"resume cancellation state is invalid: {exc}") from exc
         try:
@@ -6560,17 +7736,23 @@ class ReviewControlPlane:
             revalidation_dir = workspace_obj.artifact_path(
                 f"repair_revalidation/{source_record.content_hash[:16]}"
             )
-            validation_service = bridge.build_validation_service(
+            with self._direct_validator_provider_context(
+                spec,
                 session,
-                attempt_id=f"repair-revalidation:{source_record.content_hash[:16]}:{time.time_ns()}",
-            )
-            revalidation = validation_service.revalidate_review_artifacts(
-                review_draft_record=validated_draft,
-                citation_manifest_record=validated_manifest,
-                output_dir=revalidation_dir,
-                result_artifact_id=revalidation_id,
-                repair_transaction_record=source_record,
-            )
+                operation="external repair revalidation",
+                validator_route_fingerprint=admitted_validator_route,
+            ):
+                validation_service = bridge.build_validation_service(
+                    session,
+                    attempt_id=f"repair-revalidation:{source_record.content_hash[:16]}:{time.time_ns()}",
+                )
+                revalidation = validation_service.revalidate_review_artifacts(
+                    review_draft_record=validated_draft,
+                    citation_manifest_record=validated_manifest,
+                    output_dir=revalidation_dir,
+                    result_artifact_id=revalidation_id,
+                    repair_transaction_record=source_record,
+                )
             session.context.registry.reload()
             revalidation_record = session.context.registry.get(revalidation_id)
             if revalidation_record is None:
@@ -6670,7 +7852,13 @@ class ReviewControlPlane:
                 publish_running_state=False,
             )
             bridge.verify_direct_validation_route(session.stage_host.config)
-            stage_result = bridge.run_validation(session, attempt_id=attempt_id)
+            with self._direct_validator_provider_context(
+                spec,
+                session,
+                operation="external validation",
+                validator_route_fingerprint=admitted_validator_route,
+            ):
+                stage_result = bridge.run_validation(session, attempt_id=attempt_id)
             session.context.registry.reload()
             closure = ValidationClosureService(
                 session.context.workspace,
@@ -6806,7 +7994,10 @@ class ReviewControlPlane:
             }
         workspace_obj, registry = AgentRuntimeRunner._open_workspace(inspection["workspace_path"])
         try:
-            result = OutlineAdoptionTransaction(workspace_obj, registry).adopt(
+            result = OutlineAdoptionTransaction(
+                workspace_obj, registry,
+                external_registry_resolver=AgentRuntimeRunner._external_registry_resolver(workspace_obj),
+            ).adopt(
                 source_artifact_id=artifact_id,
                 actor=actor,
                 reason=reason,
@@ -7222,19 +8413,33 @@ class ReviewControlPlane:
         outline_pilot: Mapping[str, Any] | None = None,
         section: str | None = None,
         free_mode_enabled: bool = False,
+        runtime_spec: RuntimeJobSpec | None = None,
     ) -> dict[str, Any]:
         """Exercise the formal config/route/payload construction without HTTP."""
 
         target_config = Path(config_path or self.repo_root / "config.ini").expanduser().resolve()
         try:
-            normalized = load_config(
+            explicit_scope = None
+            if runtime_spec is not None and runtime_spec.metadata.get("stage1_summary_input_mode") == "explicit_typed_import":
+                from runtime.explicit_stage1_scope import load_explicit_stage1_scope
+
+                explicit_scope = load_explicit_stage1_scope(runtime_spec)
+                target_config = Path(runtime_spec.config).expanduser().resolve()
+                action = runtime_spec.action
+                requested_stages = explicit_scope.stage_plan.requested_stages
+                outline_pilot = runtime_spec.metadata.get("outline_pilot")
+                free_mode_enabled = bool(
+                    runtime_spec.free_mode_profile or runtime_spec.free_mode_idea
+                    or runtime_spec.metadata.get("free_mode_input")
+                )
+            normalized = explicit_scope.config if explicit_scope is not None else load_config(
                 str(target_config),
                 action=action,
                 requested_stages=requested_stages,
                 free_mode_enabled=free_mode_enabled,
                 allow_template_credentials=False,
             )
-            route_plan = build_reachable_provider_route_plan(
+            route_plan = explicit_scope.provider_route_plan if explicit_scope is not None else build_reachable_provider_route_plan(
                 normalized,
                 action=action,
                 requested_stages=requested_stages,
@@ -7281,7 +8486,12 @@ class ReviewControlPlane:
                 )
                 details["section"] = role
                 providers.append(details)
-            mineru_admission = self._mineru_remote_admission(normalized)
+            mineru_admission = (
+                {"status": "not_required", "remote_requested": False,
+                 "network_probe": False, "reason": "verified_explicit_inputs_cover_current_sources"}
+                if explicit_scope is not None and not explicit_scope.remote_preprocess_required
+                else self._mineru_remote_admission(normalized)
+            )
             admission_status = str(mineru_admission["status"])
             return {
                 "control_plane_version": CONTROL_PLANE_VERSION,

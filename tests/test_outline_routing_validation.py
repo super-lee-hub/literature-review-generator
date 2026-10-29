@@ -1,9 +1,5 @@
 """Regression tests for Outline role-route validation (item G)."""
 
-from copy import deepcopy
-
-import pytest
-
 from services.configuration_service import default_config_sections
 from services.settings import ApplicationSettings
 

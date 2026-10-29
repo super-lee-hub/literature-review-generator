@@ -140,7 +140,7 @@ def test_candidate_plans_share_global_inputs_but_use_distinct_axes_and_provider_
     assert all("organizing_axes" in candidate.required_node_ids for candidate in plans.candidates)
 
 
-def test_relation_pair_cap_limits_actual_pairs_not_input_paper_count():
+def test_shared_label_cohort_preserves_members_without_pair_cap_or_false_comparisons():
     summaries = [
         _relation_summary(f"10.1000/{letter}", letter, "online retail", "survey", "supports")
         for letter in ("a", "b", "c", "d")
@@ -155,11 +155,20 @@ def test_relation_pair_cap_limits_actual_pairs_not_input_paper_count():
         max_pairs_per_label=2,
     )
 
-    capped = [
-        item for item in relation_map.blocking_diagnostics
-        if item.get("code") == "relation_label_pair_cap"
-    ]
-    assert capped
-    assert all(item["generated_pair_count"] == 2 for item in capped)
-    assert all(item["possible_pair_count"] == 6 for item in capped)
-    assert all(item["omitted_pair_count"] == 4 for item in capped)
+    # The former implementation reported six possible pairs, emitted the
+    # first two by paper-key order, and blocked adoption. Shared membership is
+    # now represented by a complete cohort; absent a source-backed contrast,
+    # pairwise work remains explicitly deferred rather than implied complete.
+    cohort = next(
+        item for item in relation_map.cohorts
+        if item["dimension"] == "construct" and item["label"] == "consumer trust"
+    )
+    assert cohort["member_keys"] == relation_map.paper_keys
+    assert cohort["disposition"] == "deferred"
+    assert cohort["reason_codes"] == ["shared_label_only_no_source_contrast_signal"]
+    assert relation_map.comparison_coverage["selected_pair_count"] == 0
+    assert relation_map.comparison_coverage["all_pairwise_comparisons_completed"] is False
+    assert not any(
+        item.get("code") == "relation_label_pair_cap"
+        for item in relation_map.blocking_diagnostics
+    )

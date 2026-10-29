@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field, replace
 import json
-from pathlib import Path
-from typing import Any, Callable, Mapping
+from dataclasses import asdict, dataclass, field, replace
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from types import TracebackType
+from typing import Any, Callable, Mapping, Self
 
-from services.artifact_registry import ArtifactRecord, ArtifactRegistry, file_sha256
+from runtime.provider_runtime import hash_json
+from services.artifact_registry import (
+    ArtifactRecord,
+    ArtifactRegistry,
+    RegistryError,
+    file_sha256,
+)
 from services.prompt_registry import PromptRegistry
 from services.stage1_visual_contract import (
     SELECTIVE_VISUAL_CONTRACT_VERSION,
@@ -24,8 +31,6 @@ from services.stage1_visual_scan import (
     VISUAL_SCAN_PROMPT_ID,
 )
 from services.stage1_visual_schema import VISUAL_EVIDENCE_KINDS
-from runtime.provider_runtime import hash_json
-
 
 STAGE1_REUSE_BINDING_VERSION = "v1"
 STAGE1_REUSE_POLICY = "exact_summary_reuse_v1"
@@ -121,6 +126,50 @@ _OPTIONAL_COMPARISON_FIELDS = frozenset({"provider", "model", "endpoint_type"})
 
 def _text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _prompt_path_equivalence(
+    original: "Stage1ReusableSummaryBindingV1", current: "Stage1ReusableSummaryBindingV1",
+) -> dict[str, str] | None:
+    """Prove one supported Stage 1 root move without changing either identity."""
+    fields = {"prompt_id", "prompt_version", "status", "owner", "path", "prompt_sha256"}
+
+    def captured(binding: "Stage1ReusableSummaryBindingV1") -> tuple[dict[str, Any], str] | None:
+        raw = _mapping(binding.extra).get("prompt_authority")
+        if not isinstance(raw, Mapping) or set(raw) != {"system", "user"}:
+            return None
+        identities: dict[str, Any] = {}
+        roots: list[PureWindowsPath | PurePosixPath] = []
+        for role in ("system", "user"):
+            if not isinstance(raw[role], Mapping):
+                return None
+            identity = dict(raw[role])
+            if set(identity) != fields or any(type(v) is not str or not v or v != v.strip() for v in identity.values()):
+                return None
+            if identity["prompt_id"] != f"stage1.analysis.{role}.v3" or identity["status"] != "ACTIVE" or not _is_sha256(identity["prompt_sha256"]):
+                return None
+            location = identity["path"]
+            path = PureWindowsPath(location) if PureWindowsPath(location).is_absolute() else PurePosixPath(location)
+            if "\x00" in location or not path.is_absolute() or path.parts[-4:] != ("prompts", "active", "stage1", f"{role}_analysis_v3.txt"):
+                return None
+            roots.append(path.parents[3])
+            identities[role] = identity
+        if roots[0] != roots[1] or type(binding.prompt_template_hash) is not str or hash_json(identities) != binding.prompt_template_hash:
+            return None
+        user = identities["user"]
+        if (binding.prompt_id, binding.prompt_version, binding.prompt_sha256) != (user["prompt_id"], user["prompt_version"], user["prompt_sha256"]):
+            return None
+        return identities, str(roots[0])
+
+    left, right = captured(original), captured(current)
+    if left is None or right is None:
+        return None
+    def semantics(identities: Mapping[str, Mapping[str, str]]) -> dict[str, dict[str, str]]:
+        return {role: {k: v for k, v in entry.items() if k != "path"} for role, entry in identities.items()}
+    if semantics(left[0]) != semantics(right[0]):
+        return None
+    return {"policy": "stage1-prompt-authority-root-equivalence/v1", "original_root": left[1], "current_root": right[1],
+            "original_template_hash": original.prompt_template_hash, "current_template_hash": current.prompt_template_hash}
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:
@@ -334,7 +383,9 @@ class Stage1VisualEvidenceQualificationV1:
         if self.artifact_version == "v1" and self.required_nonblank_page_count != len(self.required_page_ids):
             issues.append("required_page_ids_incomplete")
         if self.artifact_version == SELECTIVE_VISUAL_CONTRACT_VERSION:
-            from services.stage1_visual_contract import validate_selective_visual_semantics
+            from services.stage1_visual_contract import (
+                validate_selective_visual_semantics,
+            )
 
             issues.extend(validate_selective_visual_semantics(self.to_dict()))
             if self.selection_contract_version != "stage1_visual_selection/v1":
@@ -682,6 +733,7 @@ class Stage1ReusableSummaryBindingV1:
     def compare(self, current: "Stage1ReusableSummaryBindingV1") -> dict[str, Any]:
         mismatches: dict[str, dict[str, str]] = {}
         missing: list[str] = []
+        prompt_equivalence: dict[str, str] | None = None
         comparison_fields = self._comparison_fields(current)
         for field_name in comparison_fields:
             original = _text(getattr(self, field_name))
@@ -703,8 +755,12 @@ class Stage1ReusableSummaryBindingV1:
             if not original or not actual:
                 missing.append(field_name)
             elif original != actual:
+                if field_name == "prompt_template_hash":
+                    prompt_equivalence = _prompt_path_equivalence(self, current)
+                    if prompt_equivalence is not None:
+                        continue
                 mismatches[field_name] = {"original": original, "current": actual}
-        return {
+        result = {
             "equal": not mismatches and not missing,
             "compared_fields": list(comparison_fields),
             "missing_fields": missing,
@@ -712,6 +768,9 @@ class Stage1ReusableSummaryBindingV1:
             "original": self.comparison_projection(current),
             "current": current.comparison_projection(self),
         }
+        if prompt_equivalence is not None:
+            result["verified_prompt_path_equivalence"] = prompt_equivalence
+        return result
 
 
 @dataclass(frozen=True)
@@ -1705,11 +1764,116 @@ def _verify_visual_evidence_qualification(
     )
 
 
+class _TypedManifestVerificationScope:
+    """Share identical V1 receipt proofs for one operation, then recheck bytes."""
+
+    def __init__(self) -> None:
+        self._proofs: set[tuple[str, ...]] = set()
+        self._files: dict[str, str] = {}
+        self._active = False
+        self._finished = False
+
+    def __enter__(self) -> Self:
+        if self._active or self._finished:
+            raise RuntimeError("typed manifest verification scope cannot be reused")
+        self._active = True
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        _exc_value: BaseException | None,
+        _traceback: TracebackType | None,
+    ) -> None:
+        try:
+            if exc_type is None:
+                for path, expected_hash in self._files.items():
+                    if _hash_file(path) != expected_hash:
+                        raise RegistryError(
+                            "typed manifest shared provider authority changed during verification: "
+                            + path
+                        )
+        finally:
+            self._active = False
+            self._finished = True
+            self._proofs.clear()
+            self._files.clear()
+
+    def _remember_file(self, path: str | Path, expected_hash: str) -> None:
+        # Keep the caller's path, including a symlink, so the final read also
+        # detects a retargeted provider-output locator.
+        tracked_path = str(Path(path).expanduser().absolute())
+        prior_hash = self._files.get(tracked_path)
+        if prior_hash is not None and prior_hash != expected_hash:
+            raise RegistryError("typed manifest shared provider file identity changed: " + tracked_path)
+        self._files[tracked_path] = expected_hash
+
+    def verify_provider_closure(
+        self,
+        *,
+        closure_path: Path,
+        closure_hash: str,
+        ledger_path: Path,
+        ledger_hash: str,
+        job_id: str,
+        stage_name: str,
+        expected_calls: list[Any],
+        declared_closure: Mapping[str, Any],
+    ) -> bool:
+        if not self._active:
+            raise RuntimeError("typed manifest verification scope is not active")
+        from runtime.provider_receipt_closure import (
+            ExpectedProviderCall,
+            ProviderReceiptClosure,
+        )
+        from runtime.provider_runtime import ProviderRuntimeLedger
+
+        if _hash_file(str(closure_path)) != closure_hash or _hash_file(str(ledger_path)) != ledger_hash:
+            raise RegistryError("typed manifest shared provider proof bytes changed")
+        key = (
+            closure_hash, ledger_hash,
+            job_id, stage_name, hash_json(expected_calls), hash_json(declared_closure),
+        )
+        if key in self._proofs:
+            # Identical portable copies share the computation, but every
+            # locator remains bound to its own bytes through scope exit.
+            self._remember_file(closure_path, closure_hash)
+            self._remember_file(ledger_path, ledger_hash)
+            return True
+        receipts = ProviderRuntimeLedger(str(ledger_path)).list_receipts()
+        recomputed = ProviderReceiptClosure.evaluate(expected_calls, receipts)
+        if not recomputed.complete or recomputed.to_dict() != dict(declared_closure):
+            return False
+        calls = [ExpectedProviderCall.from_mapping(item) for item in expected_calls]
+        epochs = {call.closure_epoch_id for call in calls if call.closure_epoch_id}
+        current_receipts = [
+            receipt for receipt in receipts
+            if not epochs or receipt.closure_epoch_id in epochs
+        ]
+        for call in calls:
+            path = call.artifact_path
+            if not path:
+                candidates = [receipt for receipt in current_receipts if receipt.call_id == call.call_id]
+                if candidates:
+                    current = max(
+                        candidates,
+                        key=lambda receipt: (receipt.finished_at, receipt.sequence, receipt.attempts),
+                    )
+                    path = str(current.metadata.get("registry_file_path") or "")
+            if path and call.registry_file_hash:
+                self._remember_file(path, call.registry_file_hash)
+        self._remember_file(closure_path, closure_hash)
+        self._remember_file(ledger_path, ledger_hash)
+        self._proofs.add(key)
+        return True
+
+
 def verify_stage1_typed_manifest_authority(
     previous_summary: Mapping[str, Any],
     binding: Stage1ReusableSummaryBindingV1,
     *,
     external_registry_resolver: Callable[[str], ArtifactRegistry | None] | None = None,
+    _verification_scope: _TypedManifestVerificationScope | None = None,
 ) -> tuple[Stage1TypedManifestAuthorityV1 | Stage1TypedManifestAuthorityV2 | None, str]:
     """Verify a portable manifest and every authority byte it binds."""
 
@@ -1829,16 +1993,35 @@ def verify_stage1_typed_manifest_authority(
             from runtime.provider_receipt_closure import ProviderReceiptClosure
             from runtime.provider_runtime import ProviderRuntimeLedger
 
-            receipts = ProviderRuntimeLedger(str(ledger_path)).list_receipts()
-            recomputed = ProviderReceiptClosure.evaluate(expected_calls, receipts)
+            declared_closure = _mapping(closure_payload.get("payload"))
+            if _verification_scope is None:
+                receipts = ProviderRuntimeLedger(str(ledger_path)).list_receipts()
+                recomputed = ProviderReceiptClosure.evaluate(expected_calls, receipts)
+                verified = recomputed.complete and recomputed.to_dict() == dict(declared_closure)
+            else:
+                assert closure_path is not None
+                verified = _verification_scope.verify_provider_closure(
+                    closure_path=closure_path,
+                    closure_hash=manifest.provider_receipt_closure_hash,
+                    ledger_path=ledger_path,
+                    ledger_hash=manifest.provider_receipt_ledger_hash,
+                    job_id=manifest.job_id,
+                    stage_name=manifest.stage_name,
+                    expected_calls=expected_calls,
+                    declared_closure=declared_closure,
+                )
         except (OSError, UnicodeError, TypeError, ValueError, RuntimeError) as exc:
             return None, f"typed_manifest_provider_ledger_invalid:{exc}"
-        declared_closure = _mapping(closure_payload.get("payload"))
-        if not recomputed.complete or recomputed.to_dict() != dict(declared_closure):
+        if not verified:
             return None, "typed_manifest_provider_closure_recompute_mismatch"
     elif provider_generated:
         return None, "typed_manifest_provider_expected_calls_missing"
 
+    if _verification_scope is not None:
+        _verification_scope._remember_file(manifest_path, manifest_file_hash)
+        _verification_scope._remember_file(
+            source_summary_path, manifest.source_summary_artifact_hash
+        )
     return (
         Stage1TypedManifestAuthorityV1(
             manifest=manifest,
@@ -1954,6 +2137,7 @@ def _registered_source_is_verifiable(
     *,
     registry: ArtifactRegistry | None,
     external_registry_resolver: Callable[[str], ArtifactRegistry | None] | None = None,
+    _verification_scope: _TypedManifestVerificationScope | None = None,
 ) -> tuple[bool, str]:
     manifest_path, _manifest_id, _manifest_hash = _typed_manifest_metadata(
         previous_summary
@@ -1963,6 +2147,7 @@ def _registered_source_is_verifiable(
             previous_summary,
             binding,
             external_registry_resolver=external_registry_resolver,
+            _verification_scope=_verification_scope,
         )
         return authority is not None, reason
 
@@ -2251,6 +2436,7 @@ def evaluate_stage1_reuse(
     *,
     registry: ArtifactRegistry | None = None,
     external_registry_resolver: Callable[[str], ArtifactRegistry | None] | None = None,
+    _verification_scope: _TypedManifestVerificationScope | None = None,
 ) -> Stage1ReuseEligibilityV1:
     """Evaluate a prior summary without creating a current-run authority."""
 
@@ -2316,6 +2502,7 @@ def evaluate_stage1_reuse(
         previous_summary,
         registry=registry,
         external_registry_resolver=external_registry_resolver,
+        _verification_scope=_verification_scope,
     )
     if not verified:
         return Stage1ReuseEligibilityV1(
@@ -2342,6 +2529,106 @@ def build_binding_hash(payload: Mapping[str, Any]) -> str:
     return _binding_content_hash(payload)
 
 
+def verified_typed_reuse_registry_paths(registry: ArtifactRegistry) -> tuple[str, ...]:
+    """Locate source Registries from the current summary's verified typed bindings.
+
+    Reading the local bytes first avoids a circular external-closure lookup.
+    The paths locate owners only; downstream dependency verification still
+    checks each referenced artifact and its complete Registry closure.
+    """
+    registry.reload()
+    record = registry.get("summary_file")
+    if record is None or record.status != "ready":
+        return ()
+    ArtifactRegistry._verify_ready_artifact(record)
+    payload = json.loads(Path(record.path).read_text(encoding="utf-8"))
+    rows = payload.get("summaries") if isinstance(payload, Mapping) else payload
+    if not isinstance(rows, list):
+        raise RegistryError("typed source Registry bootstrap requires a summary array")
+    typed_rows = [row for row in rows if isinstance(row, Mapping)
+                  and _mapping(row.get("stage1_reuse")).get("authority_kind") == "typed_manifest"]
+    if not typed_rows:
+        return ()
+    if record.job_id != registry.job_id or record.artifact_type != "summary_file":
+        raise RegistryError("typed source Registry bootstrap has a foreign summary owner")
+    if any(name in record.metadata for name in ("pointer_role", "current_version_artifact_id", "summary_set_hash")):
+        versioned = registry.get(_text(record.metadata.get("current_version_artifact_id")))
+        summary_hash = hash_json(rows)
+        if (record.metadata.get("pointer_role") != "current"
+                or versioned is None or versioned.status != "ready"
+                or versioned.job_id != registry.job_id
+                or versioned.artifact_type != record.artifact_type
+                or versioned.artifact_version != record.artifact_version
+                or versioned.metadata.get("immutable") is not True
+                or versioned.content_hash != record.content_hash
+                or Path(versioned.path).resolve() != Path(record.path).resolve()
+                or record.metadata.get("summary_set_hash") != summary_hash
+                or versioned.metadata.get("summary_set_hash") != summary_hash):
+            raise RegistryError("typed source Registry bootstrap has a stale current summary pointer")
+        ArtifactRegistry._verify_ready_artifact(versioned)
+
+    paths: dict[str, Path] = {}
+    bindings: list[tuple[Mapping[str, Any], Stage1ReusableSummaryBindingV1]] = []
+
+    def add_locator(job_id: str, value: str) -> None:
+        if not job_id or not value:
+            raise RegistryError("typed source Registry locator is incomplete")
+        path = Path(value).expanduser().resolve()
+        if job_id in paths and paths[job_id] != path:
+            raise RegistryError(f"typed source Registry locators conflict for {job_id}")
+        paths[job_id] = path
+
+    # V2 owner-correction verification needs both origin and correction
+    # locators. These provisional locators stay internal until every typed
+    # authority below verifies; a locator never grants artifact authority.
+    for row in typed_rows:
+        binding = Stage1ReusableSummaryBindingV1.from_mapping(
+            _mapping(_mapping(row.get("stage1_reuse")).get("binding"))
+        )
+        manifest_path, _manifest_id, manifest_hash = _typed_manifest_metadata(row)
+        if not manifest_path or not _is_sha256(manifest_hash) or file_sha256(manifest_path) != manifest_hash:
+            raise RegistryError("typed source Registry bootstrap manifest hash mismatch")
+        raw = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+        manifest, reason = _validate_manifest_self_binding(raw, binding=binding, previous_summary=row)
+        if manifest is None:
+            raise RegistryError(f"typed source Registry bootstrap rejected: {reason}")
+        if (binding.source_authority_job_id != manifest.job_id
+                or binding.source_authority_registry_id != f"artifact-registry:{manifest.job_id}"):
+            raise RegistryError("typed source Registry bootstrap owner identity mismatch")
+        add_locator(binding.source_authority_job_id, binding.source_authority_registry_path)
+        if isinstance(manifest, Stage1ReusableSummaryManifestV2):
+            for name in ("origin_registry", "correction_registry"):
+                locator = _mapping(manifest.owner_correction_authority.get(name))
+                add_locator(_text(locator.get("job_id")), _text(locator.get("registry_path")))
+        bindings.append((row, binding))
+
+    owners: dict[str, ArtifactRegistry] = {}
+    for job_id, path in paths.items():
+        if not path.is_file():
+            raise RegistryError(f"typed source Registry is unavailable: {job_id}")
+        owner = ArtifactRegistry(path, job_id)
+        if owner.job_id != job_id:
+            raise RegistryError(f"typed source Registry owner mismatch: {job_id}")
+        owners[job_id] = owner
+    with _TypedManifestVerificationScope() as verification_scope:
+        for row, binding in bindings:
+            authority, reason = verify_stage1_typed_manifest_authority(
+                row, binding, external_registry_resolver=owners.get,
+                _verification_scope=verification_scope,
+            )
+            if authority is None:
+                raise RegistryError(f"typed source Registry bootstrap authority rejected: {reason}")
+            owner = owners[binding.source_authority_job_id]
+            source = owner.get(binding.source_authority_artifact_id)
+            if (source is None or source.status != "ready"
+                    or source.content_hash != binding.source_authority_artifact_hash
+                    or Path(source.path).resolve() != Path(authority.source_summary_path).resolve()):
+                raise RegistryError("typed source Registry bootstrap source identity mismatch")
+            ArtifactRegistry._verify_ready_artifact(source)
+        ArtifactRegistry._verify_ready_artifact(record)
+    return tuple(str(paths[job_id]) for job_id in sorted(paths) if job_id != registry.job_id)
+
+
 __all__ = [
     "STAGE1_REUSE_BINDING_VERSION",
     "STAGE1_REUSE_POLICY",
@@ -2359,4 +2646,5 @@ __all__ = [
     "build_owner_corrected_stage1_binding",
     "evaluate_stage1_reuse",
     "verify_stage1_typed_manifest_authority",
+    "verified_typed_reuse_registry_paths",
 ]

@@ -17,15 +17,16 @@ from outline.v3_executor import OutlineV3Executor
 from config_loader import load_config
 from outline.evidence_projection import build_pack
 from runtime.control_plane import ReviewControlPlane
-from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec, save_runtime_job_spec
+from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec, load_runtime_job_spec, save_runtime_job_spec
 from runtime.orchestrator import AgentRuntimeBridge, InternalStageExecutorRegistry
 from runtime.provider_receipt_closure import ProviderReceiptClosure
 from runtime.provider_context import ProviderContextProfile
 from runtime.provider_runtime import (
     AcceptanceExecutionContextV1,
-    ProviderAggregateBudgetV1,
+    ProviderAggregateBudgetV2,
     ProviderBudgetController,
     bind_acceptance_execution_context,
+    bind_provider_run_plan_binding,
     hash_json,
 )
 from services.artifact_registry import ArtifactRegistry, file_sha256
@@ -39,14 +40,21 @@ class _PilotRequestHashCaptureStop(Exception):
     """Stop the provider-free fixture probe after the approved plan is built."""
 
 
+# Fixed local component-test authority identity. Executed-code provenance and
+# real clean/dirty checkout admission are verified separately.
+_FIXTURE_CHECKOUT_SHA = "4b0ffe73726d7a32ec46122be22965576e0edd50"
+
+
 @pytest.fixture(autouse=True)
 def _fixture_checkout_identity(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The fixture uses an external-shaped route with a local callable while
-    # exercising uncommitted code. Source identity itself has separate tests
-    # against clean/dirty temporary Git checkouts.
+    # Source identity's clean/dirty admission behavior has separate tests.
     monkeypatch.setattr(
         "outline.v3_executor.read_checkout_sha",
-        lambda _root, *, require_clean: "c1ad0da869bc68869a521f60bbda07342fb16058",
+        lambda _root, *, require_clean: _FIXTURE_CHECKOUT_SHA,
+    )
+    monkeypatch.setattr(
+        "runtime.checkout_identity.read_checkout_sha",
+        lambda _root, *, require_clean=False: _FIXTURE_CHECKOUT_SHA,
     )
 
 
@@ -327,7 +335,7 @@ def _acceptance_binding(
     max_retry_attempts_total: int = 0,
     max_wall_seconds: float = 60,
 ) -> tuple[AcceptanceExecutionContextV1, ProviderBudgetController]:
-    budget = ProviderAggregateBudgetV1(
+    budget = ProviderAggregateBudgetV2(
         max_provider_calls_total=max_provider_calls_total,
         max_output_tokens_total=max_output_tokens_total,
         max_retry_attempts_total=max_retry_attempts_total,
@@ -335,7 +343,7 @@ def _acceptance_binding(
     )
     context = AcceptanceExecutionContextV1(
         acceptance_run_id=acceptance_run_id,
-        final_executable_sha="c1ad0da869bc68869a521f60bbda07342fb16058",
+        final_executable_sha=_FIXTURE_CHECKOUT_SHA,
         absolute_deadline_epoch=(datetime.now(timezone.utc) + timedelta(seconds=max_wall_seconds)).timestamp(),
         provider_budget=budget,
         provider_budget_state_path=str(tmp_path / "provider_budget_state_v1.json"),
@@ -345,8 +353,52 @@ def _acceptance_binding(
         owner_authorized=True,
         provider_budget_state_started=False,
     )
-    return context, ProviderBudgetController(budget)
+    controller = ProviderBudgetController(budget)
+    controller.bind_state_path(
+        context.provider_budget_state_path,
+        acceptance_run_id=context.acceptance_run_id,
+        state_started=False,
+    )
+    return replace(context, provider_budget_state_started=True), controller
 
+
+def _run_with_verified_local_acceptance_binding(
+    control: ReviewControlPlane,
+    spec_path: Path,
+    context: AcceptanceExecutionContextV1,
+    controller: ProviderBudgetController,
+) -> dict[str, Any]:
+    from runtime.release_acceptance import ReleaseAcceptanceSpec
+
+    acceptance_path = spec_path.with_name(f"{spec_path.stem}-acceptance.json")
+    budget_payload = dict(controller.budget.to_dict())
+    budget_payload["max_wall_seconds"] = int(controller.budget.max_wall_seconds)
+    acceptance_payload = {
+        "runtime_spec": str(spec_path.resolve()),
+        "state_path": str(acceptance_path.with_suffix(".state.json")),
+        "gates": ["C"],
+        "budget": budget_payload,
+    }
+    acceptance_path.write_text(json.dumps(acceptance_payload), encoding="utf-8")
+    acceptance_spec = ReleaseAcceptanceSpec.from_mapping(
+        acceptance_payload,
+        origin_dir=acceptance_path.parent,
+        allow_missing_live_budget=True,
+    )
+    runtime_spec = load_runtime_job_spec(spec_path)
+    plan_binding = control._verified_acceptance_single_runtime_binding(
+        acceptance_context=context,
+        budget_controller=controller,
+        acceptance_spec_path=acceptance_path,
+        acceptance_spec=acceptance_spec,
+        runtime_spec=runtime_spec,
+        scenario_id="C",
+        current_executable_sha=_FIXTURE_CHECKOUT_SHA,
+        resume=False,
+    )
+    with bind_acceptance_execution_context(context, controller):
+        with bind_provider_run_plan_binding(plan_binding):
+            return control.run(spec_path)
 
 def _safe_closure_debug(executor: OutlineV3Executor) -> dict[str, Any]:
     selected = set(executor._pilot_allowed_node_ids)
@@ -455,9 +507,23 @@ def _runner_pilot_spec(
     parser = configparser.ConfigParser(interpolation=None)
     parser.read(config_path, encoding="utf-8")
     parser["Paths"]["output_path"] = str(tmp_path / "output")
+    parser["Preprocess"]["enabled"] = "true"
+    parser["Preprocess"]["cache_dir"] = str(tmp_path / "preprocess-cache")
+    parser["Preprocess"]["parser_mode"] = "local"
+    parser["Preprocess"]["primary_parser"] = "local"
+    parser["Preprocess"]["fallback_parser"] = "local"
     for section_name in parser.sections():
         if section_name.endswith("_API") and "api_base" in parser[section_name]:
             parser[section_name]["api_base"] = "http://127.0.0.1:1/v1"
+    for section_name in (
+        "Primary_Reader_API",
+        "Backup_Reader_API",
+        "Outline_API",
+        "Free_Mode_API",
+        "Writer_API",
+        "Validator_API",
+    ):
+        parser[section_name]["api_key"] = f"{section_name.lower()}-test"
     parser["Outline_API"]["provider_family"] = "deepseek"
     parser["Outline_API"]["model"] = "pilot-test-model"
     parser["Outline_API"]["endpoint_type"] = "chat_completions"
@@ -476,6 +542,7 @@ def _runner_pilot_spec(
         project_name="topic-pilot-runtime",
         source=RuntimeSourceSpec(mode="direct", pdf_folder=str(pdf_dir)),
         job_id=job_id,
+        workspace_path=str(tmp_path / "output" / "topic-pilot-runtime__topic-pilot-runtime-job"),
         config=str(config_path),
         action="generate_outline",
         summary_file=str(summary_file),
@@ -552,6 +619,9 @@ def _runner_pilot_spec(
     probe_spec = replace(
         base_spec,
         config=str(probe_config_path),
+        workspace_path=str(
+            probe_root / "output" / "topic-pilot-runtime__topic-pilot-runtime-job"
+        ),
         queue_file=str(probe_root / "queue.json"),
         metadata={**metadata, "outline_pilot": probe_pilot},
     )
@@ -623,14 +693,16 @@ def _runner_pilot_spec(
             probe_root,
             str(pilot["acceptance_run_id"]),
         )
-        with bind_acceptance_execution_context(probe_context, probe_controller):
-            ReviewControlPlane(
-                repo_root=Path(__file__).resolve().parents[1]
-            ).run(probe_spec_path)
+        probe_result = _run_with_verified_local_acceptance_binding(
+            ReviewControlPlane(repo_root=Path(__file__).resolve().parents[1]),
+            probe_spec_path,
+            probe_context,
+            probe_controller,
+        )
     if set(captured_hashes) != set(pilot["selected_topic_batch_ids"]):
         raise AssertionError(
             "runner provider-free hash probe did not materialize every selected batch: "
-            f"captured={sorted(captured_hashes)}"
+            f"captured={sorted(captured_hashes)}; result={probe_result!r}"
         )
     pilot["selected_request_hashes"] = dict(captured_hashes)
     spec = replace(base_spec, metadata={**metadata, "outline_pilot": pilot})
@@ -642,24 +714,29 @@ def _install_runner_fake_router(
     monkeypatch: pytest.MonkeyPatch,
     transport: _LocalTopicRouter,
 ) -> None:
-    import runtime.orchestrator as orchestrator_module
+    import ai_interface
 
-    original_builder = orchestrator_module.build_outline_provider_router
+    def local_provider_edge(
+        prompt: str,
+        _api_config: Mapping[str, Any],
+        _system_prompt: str,
+        **_kwargs: Any,
+    ) -> Mapping[str, Any]:
+        envelope = json.loads(prompt)
+        if not isinstance(envelope, Mapping):
+            raise AssertionError("runtime Outline transport must send a JSON request envelope")
+        node_id = str(envelope.get("node_id") or "")
+        request = envelope.get("request")
+        if not isinstance(request, Mapping):
+            raise AssertionError("runtime Outline transport request must remain a mapping")
+        return transport(node_id, request)
 
-    def fake_router_builder(**kwargs: Any) -> OutlineProviderRouter:
-        router = original_builder(**kwargs)
-        return OutlineProviderRouter(
-            routes={
-                role: replace(route, transport=transport)
-                for role, route in router.routes.items()
-            },
-            diagnostics=router.diagnostics,
-        )
-
+    # Keep the runtime-owned transport adapter and its exact bound api_config.
+    # Replace only the socket edge with the local fixture response.
     monkeypatch.setattr(
-        orchestrator_module,
-        "build_outline_provider_router",
-        fake_router_builder,
+        ai_interface,
+        "_call_ai_api_detailed_uninstrumented",
+        local_provider_edge,
     )
 
 
@@ -1134,12 +1211,14 @@ def test_runner_records_pilot_substage_as_needs_review_without_canonical_ready(
         tmp_path,
         str(pilot["acceptance_run_id"]),
     )
-    with bind_acceptance_execution_context(context, controller):
-        result = ReviewControlPlane(
-            repo_root=Path(__file__).resolve().parents[1]
-        ).run(spec_path)
+    result = _run_with_verified_local_acceptance_binding(
+        ReviewControlPlane(repo_root=Path(__file__).resolve().parents[1]),
+        spec_path,
+        context,
+        controller,
+    )
 
-    assert result["job_status"] == "completed"
+    assert result["job_status"] == "completed", f"runner result: {result!r}"
     assert result["job_disposition"] == "needs_review"
     assert result["canonical_ready"] is False
     assert tuple(result["completed_stages"]) == ("source_intake", "outline_topic_pilot")
@@ -1149,6 +1228,11 @@ def test_runner_records_pilot_substage_as_needs_review_without_canonical_ready(
         Path(result["workspace_path"]) / "artifact_registry.json",
         spec.job_id,
     )
+    runtime_scope = registry.get("accepted_runtime_run_scope")
+    assert runtime_scope is not None and runtime_scope.status == "ready"
+    runtime_scope_payload = json.loads(Path(runtime_scope.path).read_text(encoding="utf-8"))
+    assert runtime_scope_payload["final_executable_sha"] == _FIXTURE_CHECKOUT_SHA
+
     scope_hash = hash_json(pilot)
     checkpoint_id = f"outline-v3:topic-pilot-checkpoint:{scope_hash[:24]}"
     closure_id = f"outline-v3:topic-pilot-closure:{scope_hash[:24]}"

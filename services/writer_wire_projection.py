@@ -14,6 +14,10 @@ from typing import Any
 
 from outline.v3_models import compute_v3_hash
 from services.writer_source_inventory import SOURCE_INVENTORY_ARTIFACT_ID
+from services.writer_task_scope import (
+    WRITER_SELECTED_SOURCE_CONTRACT, WriterTaskScopeError, _CONTEXT_SOURCE_FIELDS,
+    verify_writer_selected_source_scope_v2,
+)
 
 
 WRITER_WIRE_SCOPE_VERSION = "writer_task_scope_wire/v1"
@@ -65,10 +69,15 @@ def _store_entity(store: dict[str, dict[str, Any]], kind: str, value: Any) -> st
     return key
 
 
-def project_writer_scope_for_provider_v1(scope: Mapping[str, Any]) -> dict[str, Any]:
+def project_writer_scope_for_provider_v1(scope: Mapping[str, Any], *,
+                                        provider_semantic_contract_version: str | None = None) -> dict[str, Any]:
     """Project a fully verified paragraph scope without duplicating source prose."""
     if not isinstance(scope, Mapping):
         raise WriterWireProjectionError("Writer task scope must be an object")
+    try:
+        verify_writer_selected_source_scope_v2(scope, provider_semantic_contract_version=provider_semantic_contract_version)
+    except WriterTaskScopeError as exc:
+        raise WriterWireProjectionError(str(exc)) from exc
     basis = str(scope.get("writer_task_basis_hash") or "")
     binding = scope.get("source_inventory_binding")
     output_contract = scope.get("output_contract")
@@ -153,13 +162,30 @@ def project_writer_scope_for_provider_v1(scope: Mapping[str, Any]) -> dict[str, 
         projected["schema_version"] = "writer_task_scope_wire/v2"
         projected["table_layouts"] = scope["table_layouts"]
         projected["table_layout_binding"] = scope["table_layout_binding"]
+    if provider_semantic_contract_version is not None:
+        projected.pop("source_inventory_binding")
+        projected["provider_semantic_contract_version"] = provider_semantic_contract_version
+        projected["selected_source_binding"] = dict(scope["selected_source_binding"])
+        projected["selected_context_sources"] = scope["selected_context_sources"]
     return projected
 
 
-def expand_writer_source_bundles_for_test_v1(projection: Mapping[str, Any]) -> dict[str, list[dict[str, Any]]]:
+def expand_writer_source_bundles_for_test_v1(projection: Mapping[str, Any], *,
+                                           provider_semantic_contract_version: str | None = None) -> dict[str, list[dict[str, Any]]]:
     """Validate content-addressed references and reconstruct exact source bundles."""
-    if not isinstance(projection, Mapping) or projection.get("schema_version") != WRITER_WIRE_SCOPE_VERSION:
+    versions = {WRITER_WIRE_SCOPE_VERSION}
+    if provider_semantic_contract_version == WRITER_SELECTED_SOURCE_CONTRACT:
+        versions.add("writer_task_scope_wire/v2")
+    if not isinstance(projection, Mapping) or projection.get("schema_version") not in versions:
         raise WriterWireProjectionError("Writer wire projection schema is invalid")
+    marker = projection.get("provider_semantic_contract_version")
+    if provider_semantic_contract_version is None:
+        if any(name in projection for name in ("provider_semantic_contract_version", "selected_source_binding", "selected_context_sources")):
+            raise WriterWireProjectionError("selected Writer wire requires its explicit semantic contract")
+    elif provider_semantic_contract_version != WRITER_SELECTED_SOURCE_CONTRACT or marker != provider_semantic_contract_version:
+        raise WriterWireProjectionError("Writer wire semantic contract or marker is unsupported")
+    elif "source_inventory_binding" in projection:
+        raise WriterWireProjectionError("selected Writer wire contains a global source authority binding")
     store = projection.get("evidence_store")
     tasks = projection.get("tasks")
     if not isinstance(store, Mapping) or not isinstance(tasks, list):
@@ -212,4 +238,21 @@ def expand_writer_source_bundles_for_test_v1(projection: Mapping[str, Any]) -> d
         result[task_id] = restored
     if used != set(store):
         raise WriterWireProjectionError("Writer evidence_store contains unreferenced source rows")
+    if provider_semantic_contract_version is not None:
+        binding = projection.get("selected_source_binding")
+        context_sources = projection.get("selected_context_sources")
+        expected_sources = [{"writer_task_id": task["writer_task_id"],
+                             "canonical_source_bundle": result[task["writer_task_id"]]} for task in tasks]
+        if (not isinstance(binding, Mapping) or set(binding) != {
+                "schema_version", "paper_keys", "source_projection_hash", "selected_catalog_hash"}
+                or binding.get("schema_version") != "writer-selected-source-binding/v2"
+                or not isinstance(context_sources, list)
+                or any(not isinstance(row, Mapping) or set(row) != _CONTEXT_SOURCE_FIELDS
+                       or not isinstance(row.get("paper_key"), str) for row in context_sources)
+                or binding.get("source_projection_hash") != compute_v3_hash({"task_sources": expected_sources, "context_sources": context_sources})
+                or not isinstance(binding.get("selected_catalog_hash"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", binding["selected_catalog_hash"]) is None
+                or binding.get("paper_keys") != sorted({row["paper_key"] for row in context_sources})
+                or not {row["paper_key"] for bundle in result.values() for row in bundle}.issubset(set(binding["paper_keys"]))):
+            raise WriterWireProjectionError("selected Writer wire source binding differs from its complete source bundles")
     return result

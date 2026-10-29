@@ -18,6 +18,7 @@ These tests close that gap:
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Mapping
@@ -33,13 +34,11 @@ from outline.provider_router import (
 from outline.v3_executor import OutlineV3Executor
 from outline.v3_models import OutlineQualityGate
 from runtime.provider_context import ProviderContextProfile
+from runtime.provider_runtime import ProviderRuntimeLedger, hash_json
 from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry, RegistryError
 from services.job_workspace import JobWorkspace
 
-from test_outline_v3_semantic_execution import (
-    _configured_test_provider,
-    _summary,
-)
+from test_outline_v3_semantic_execution import _executor as _fixture_executor, _summary
 
 CLAUDE = ("anthropic", "claude-opus-5", "anthropic")
 GPT = ("openai_responses", "gpt-5.6-sol", "responses")
@@ -101,9 +100,13 @@ class SentinelTransport:
 
     def __call__(self, node_id: str, request: Mapping[str, Any]) -> Any:
         self.invocations.append(str(node_id))
-        # Delegate to the project's configured fixture provider so the response
-        # is valid for the node; only the invocation is being asserted here.
-        response = dict(_configured_test_provider(node_id, request))
+        # Use the same source-complete local fixture as the production-path
+        # HTTP tests. The older generic fixture emitted a cross-group claim
+        # without source_claim_ids, so candidate-scope validation stopped the
+        # DAG before the routed critique transports could run.
+        from tests.test_current_runtime_full_e2e import _outline_provider_response
+
+        response = dict(_outline_provider_response(node_id, request))
         # Routed provider receipts require usage evidence for non-fixture
         # endpoint types. The sentinel represents a successful transport, so
         # provide deterministic usage metadata rather than testing an unrelated
@@ -255,7 +258,9 @@ def test_routed_node_without_transport_fails_closed(tmp_path: Path) -> None:
 
 def _noop_transport():
     def _call(node_id: str, request: Mapping[str, Any]) -> Any:
-        return _configured_test_provider(node_id, request)
+        from tests.test_current_runtime_full_e2e import _outline_provider_response
+
+        return _outline_provider_response(node_id, request)
 
     return _call
 
@@ -380,6 +385,235 @@ def _selective_replay_quality_gate() -> OutlineQualityGate:
     )
 
 
+def _local_source_scope_executor(
+    tmp_path: Path,
+    calls: list[str],
+    *,
+    workspace: JobWorkspace | None = None,
+    logical_attempt_identity: str | None = None,
+    quality_gate: OutlineQualityGate | None = None,
+) -> OutlineV3Executor:
+    """Use the existing internal-profile semantic fixture and local responder."""
+
+    from tests.test_current_runtime_full_e2e import _outline_provider_response
+
+    def provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        calls.append(node_id)
+        return _outline_provider_response(node_id, request)
+
+    summaries = [
+        _summary("paper-a", "Study A", "The treatment improved the outcome."),
+        _summary("paper-b", "Study B", "The effect held under a different context."),
+        _summary("paper-c", "Study C", "A boundary condition limits the effect."),
+        _summary("paper-d", "Study D", "The result depends on the measured moderator."),
+        _summary("paper-e", "Study E", "The effect weakens in a different sample."),
+        _summary("paper-f", "Study F", "A second boundary condition limits the effect."),
+    ]
+    if workspace is None:
+        executor = _fixture_executor(
+            tmp_path,
+            provider=provider,
+            stability_mode="off",
+            technical_shard_target_tokens=32_000,
+            summaries=summaries,
+        )
+    else:
+        executor = OutlineV3Executor(
+            job_id=workspace.job_id,
+            summaries=summaries,
+            workspace=workspace,
+            artifact_registry=ArtifactRegistry(workspace.paths.registry_path, workspace.job_id),
+            provider=provider,
+            candidate_count=2,
+            stability_mode="off",
+            technical_shard_target_tokens=32_000,
+            logical_attempt_identity=logical_attempt_identity,
+            quality_gate=quality_gate,
+            pricing_source="tests:explicit-rates-v1",
+            input_cost_per_1k_tokens=0.0,
+            output_cost_per_1k_tokens=0.001,
+            reasoning_cost_per_1k_tokens=0.001,
+            cache_read_cost_per_1k_tokens=0.0,
+            cache_write_cost_per_1k_tokens=0.0,
+        )
+    # This is the existing explicit offline semantic-source-scope mode. The
+    # responder is local and source-bound; no transport or provider API is used.
+    executor.semantic_provider_synthesis_enabled = True
+    return executor
+
+
+def _assert_local_projection_result_or_quality_fixture_block(
+    result: Any, executor: OutlineV3Executor
+) -> None:
+    if result.ok:
+        return
+    health_record = executor.registry.get("outline-v3:stage_health")
+    assert health_record is not None and health_record.status == "ready"
+    health = json.loads(Path(health_record.path).read_text(encoding="utf-8"))["payload"]
+    checks = health["quality_decision"]["enforced_checks"]
+    assert checks["max_duplicate_assignments"] is False
+    assert all(value for key, value in checks.items() if key != "max_duplicate_assignments")
+    assert health["provider_receipt_closure"]["complete"] is True
+
+
+def _assert_local_candidate_projection_closure(
+    closure_payload: Mapping[str, Any], registry: ArtifactRegistry,
+    *, closure_epoch_id: str, source_closure_epoch_id: str,
+) -> None:
+    expected = {str(value) for value in closure_payload["expected_call_ids"]}
+    observed = {str(value) for value in closure_payload["observed_call_ids"]}
+    reused = {str(value) for value in closure_payload["verified_reuse_call_ids"]}
+    local_children = {
+        call_id for call_id in expected if "_provider_generation:local:" in call_id
+    }
+    assert local_children
+    assert {call_id for call_id in local_children if ":candidate_1_provider_generation:local:" in call_id}
+    assert {call_id for call_id in local_children if ":candidate_2_provider_generation:local:" in call_id}
+    assert observed == set()
+    assert expected == reused
+    assert local_children <= reused
+
+    scope_record = registry.get("outline-v3:candidate_output_scope")
+    assert scope_record is not None and scope_record.status == "ready"
+    registry.verify_ready_artifact_closure(scope_record)
+    scope_envelope = json.loads(Path(scope_record.path).read_text(encoding="utf-8"))
+    scope_payload = scope_envelope.get("payload")
+    if not isinstance(scope_payload, Mapping):
+        scope_payload = scope_envelope
+    assert isinstance(scope_payload, Mapping)
+    expected_group_ids = {
+        str(row["claim_group_id"])
+        for row in scope_payload.get("claim_groups") or ()
+        if isinstance(row, Mapping) and str(row.get("claim_group_id") or "")
+    }
+    assert expected_group_ids
+
+    projections = closure_payload["logical_candidate_reuse_projections"]
+    assert len(projections) == 2, projections
+    assert {str(row["call_id"]) for row in projections} == {
+        "outline:candidate_1_provider_generation",
+        "outline:candidate_2_provider_generation",
+    }
+    assert all(row["status"] == "verified" for row in projections)
+    assert all(row["schema_version"] == "logical-candidate-reuse-projection/v1" for row in projections)
+    for projection in projections:
+        child_call_ids = {str(value) for value in projection["child_call_ids"]}
+        assert child_call_ids
+        assert child_call_ids <= local_children
+        assert child_call_ids <= reused
+        assignment = dict(projection["group_assignment"])
+        deferred = {str(value) for value in projection["deferred_group_ids"]}
+        assert assignment
+        assert not set(assignment).intersection(deferred)
+        assert set(assignment) | deferred == expected_group_ids
+        assert {f"outline:{node_id}" for node_id in assignment.values()} == child_call_ids
+        assert projection["assignment_coverage_hash"] == hash_json(assignment)
+
+        merged_record = registry.get(str(projection["merged_artifact_id"]))
+        assert merged_record is not None and merged_record.status == "ready"
+        assert merged_record.content_hash == projection["merged_artifact_hash"]
+        registry.verify_ready_artifact_closure(merged_record)
+        merged_envelope = json.loads(Path(merged_record.path).read_text(encoding="utf-8"))
+        merged_payload = merged_envelope.get("payload")
+        assert isinstance(merged_payload, Mapping)
+        assert merged_payload["shard_plan"]["group_assignment"] == assignment
+        assert merged_payload["shard_plan"]["assignment_coverage_hash"] == projection["assignment_coverage_hash"]
+
+        evidence_by_call = dict(projection["verified_reuse_evidence_artifact_ids"])
+        assert set(evidence_by_call) == child_call_ids
+        for child_call_id, evidence_id in evidence_by_call.items():
+            evidence_record = registry.get(str(evidence_id))
+            assert evidence_record is not None and evidence_record.status == "ready"
+            registry.verify_ready_artifact_closure(evidence_record)
+            evidence = json.loads(Path(evidence_record.path).read_text(encoding="utf-8"))
+            assert evidence["call_id"] == child_call_id
+            assert evidence["current_closure_epoch_id"] == closure_epoch_id
+            binding = evidence["current_binding"]
+            assert binding["call_id"] == child_call_id
+            for field in ("prompt_hash", "input_hash", "config_hash", "schema_hash"):
+                value = str(binding[field])
+                assert len(value) == 64 and all(char in "0123456789abcdef" for char in value)
+            authority = evidence["source_authority"]
+            assert authority["source_closure_epoch_id"] == source_closure_epoch_id
+            source_ledger_id = str(authority["source_receipt_ledger_artifact_id"])
+            source_ledger = registry.get(source_ledger_id)
+            assert source_ledger is not None and source_ledger.status == "ready"
+            registry.verify_ready_artifact_closure(source_ledger)
+            assert source_ledger.content_hash == authority["source_receipt_ledger_content_hash"]
+            receipt_id = str(authority["source_receipt_id"])
+            receipts = [
+                receipt
+                for receipt in ProviderRuntimeLedger(source_ledger.path).list_receipts()
+                if receipt.receipt_id == receipt_id
+            ]
+            assert len(receipts) == 1
+            source_receipt = receipts[0]
+            assert source_receipt.call_id == child_call_id
+            assert source_receipt.closure_epoch_id == source_closure_epoch_id
+            assert source_receipt.status == "success"
+            assert hash_json(source_receipt.to_dict()) == authority["source_receipt_record_hash"]
+            for field in ("source_receipt_ledger_content_hash", "source_receipt_record_hash"):
+                value = str(authority[field])
+                assert len(value) == 64 and all(char in "0123456789abcdef" for char in value)
+            reused_output = evidence["reused_output"]
+            source_output = registry.get(str(reused_output["registered_artifact_id"]))
+            assert source_output is not None and source_output.status == "ready"
+            evidence_dependency_ids = {dependency.artifact_id for dependency in evidence_record.depends_on}
+            assert source_ledger.artifact_id in evidence_dependency_ids
+            assert source_output.artifact_id in evidence_dependency_ids
+            registry.verify_ready_artifact_closure(source_output)
+            source_output_envelope = json.loads(Path(source_output.path).read_text(encoding="utf-8"))
+            assert source_output.content_hash == reused_output["registered_artifact_file_hash"]
+            assert source_output_envelope["content_hash"] == reused_output["registered_artifact_content_hash"]
+            assert hashlib.sha256(Path(source_output.path).read_bytes()).hexdigest() == source_output.content_hash
+
+
+def _assert_fragment_bank_call_closure(
+    closure_payload: Mapping[str, Any], *, observed_call_ids: set[str]
+) -> None:
+    """Assert the exact provider-call partition for this external-route fixture.
+
+    All routes from ``_build_router`` use real provider endpoint types, so this
+    fixture takes the candidate fragment-bank/organization path. It does not
+    create local hierarchical shard children or logical shard projections.
+    """
+
+    assert closure_payload["complete"] is True, closure_payload
+    expected = {str(value) for value in closure_payload["expected_call_ids"]}
+    observed = {str(value) for value in closure_payload["observed_call_ids"]}
+    reused = {str(value) for value in closure_payload["verified_reuse_call_ids"]}
+    assert expected == observed | reused, closure_payload
+    assert observed.isdisjoint(reused), closure_payload
+    assert observed == observed_call_ids, closure_payload
+    assert reused == expected - observed, closure_payload
+
+    candidate_calls = {call_id for call_id in expected if call_id.startswith("outline:candidate_")}
+    fragment_calls = {
+        call_id for call_id in candidate_calls
+        if call_id.startswith("outline:candidate_comparison_fragments_provider:")
+    }
+    organization_calls = {
+        call_id for call_id in candidate_calls
+        if call_id.startswith("outline:candidate_organization_provider:")
+    }
+    assert len(fragment_calls) == 1, candidate_calls
+    assert organization_calls == {
+        "outline:candidate_organization_provider:candidate_1",
+        "outline:candidate_organization_provider:candidate_2",
+    }, candidate_calls
+    assert expected == {
+        "outline:arbitration",
+        "outline:coverage_critique",
+        "outline:evidence_critique",
+        "outline:relation_adjudication",
+        "outline:structure_critique",
+        *fragment_calls,
+        *organization_calls,
+    }, expected
+    assert not any("_provider_generation:local:" in call_id for call_id in expected)
+    assert closure_payload["logical_candidate_reuse_projections"] == []
+
+
 def test_route_only_change_reuses_unchanged_nodes_and_closes_current_epoch(
     tmp_path: Path,
 ) -> None:
@@ -417,19 +651,17 @@ def test_route_only_change_reuses_unchanged_nodes_and_closes_current_epoch(
     closure_record = second.registry.get("outline-v3:provider_receipt_closure")
     assert closure_record is not None
     closure_payload = json.loads(Path(closure_record.path).read_text(encoding="utf-8"))["payload"]
-    assert closure_payload["complete"] is True, closure_payload
-    assert set(closure_payload["verified_reuse_call_ids"]) >= {
-        "outline:relation_adjudication",
-        "outline:candidate_1_provider_generation",
-        "outline:candidate_2_provider_generation",
-        "outline:structure_critique",
-        "outline:coverage_critique",
-    }
-    assert len(second._receipt_ledger.list_receipts()) == 2
-    assert all(
-        receipt.closure_epoch_id == second.closure_epoch_id
-        for receipt in second._receipt_ledger.list_receipts()
+    _assert_fragment_bank_call_closure(
+        closure_payload,
+        observed_call_ids={"outline:arbitration", "outline:evidence_critique"},
     )
+    current_receipts = list(second._receipt_ledger.list_receipts())
+    assert len(current_receipts) == 2
+    assert {receipt.call_id for receipt in current_receipts} == {
+        "outline:arbitration",
+        "outline:evidence_critique",
+    }
+    assert all(receipt.closure_epoch_id == second.closure_epoch_id for receipt in current_receipts)
     reuse_records = [
         record
         for record in second.registry.list_records()
@@ -521,14 +753,39 @@ def test_all_prior_epoch_reuse_closes_without_current_provider_receipts(
     assert closure_record is not None
     closure_payload = json.loads(Path(closure_record.path).read_text(encoding="utf-8"))["payload"]
     assert closure_payload["complete"] is True, closure_payload
-    assert len(closure_payload["verified_reuse_call_ids"]) == len(ROLE_MODEL) + 1
-    assert closure_payload["observed_call_ids"] == []
+    _assert_fragment_bank_call_closure(closure_payload, observed_call_ids=set())
 
 
-def test_transitive_dependency_tamper_rejects_reuse_and_reruns_descendants(
+@pytest.mark.parametrize(
+    ("tamper_node_id", "expected_observed_call_ids", "expected_transport_invocations"),
+    [
+        pytest.param(
+            "candidate_1_provider_generation",
+            set(),
+            [],
+            id="local-aggregate-rebuilt-from-clean-physical-children",
+        ),
+        pytest.param(
+            "candidate_organization_provider:candidate_1",
+            {"outline:candidate_organization_provider:candidate_1"},
+            ["candidate_organization_provider:candidate_1"],
+            id="tampered-physical-provider-child-is-rerun-on-its-own-route",
+        ),
+    ],
+)
+def test_transitive_dependency_tamper_rejects_reuse_and_rebuilds_or_reruns_child(
     tmp_path: Path,
+    tamper_node_id: str,
+    expected_observed_call_ids: set[str],
+    expected_transport_invocations: list[str],
 ) -> None:
-    """A deep registered dependency blocks reuse on the real provider path."""
+    """Reject a deep dependency tamper without forcing an unrelated POST.
+
+    The aggregate-control case is locally reconstructed from clean, verified
+    fragment/organization outputs. The physical-output case must rerun exactly
+    its affected organization provider call and keep the sibling/other calls
+    covered by the current verified reuse closure.
+    """
 
     first_router, _first_transports = _build_router()
     first = _executor(
@@ -561,19 +818,31 @@ def test_transitive_dependency_tamper_rejects_reuse_and_reruns_descendants(
         producer="tests",
         depends_on=[ArtifactDependencyRefV2.from_record(leaf)],
     )
-    candidate_record = first.registry.get("outline-v3:candidate_1_provider_generation")
-    assert candidate_record is not None
-    first.registry.update_record(
-        candidate_record.artifact_id,
-        depends_on=[*candidate_record.depends_on, ArtifactDependencyRefV2.from_record(middle)],
+    tampered_record = next(
+        (
+            record for record in first.registry.list_records()
+            if str(record.metadata.get("node_id") or "") == tamper_node_id
+        ),
+        None,
     )
-    # Leave the candidate output bytes unchanged; only a two-level registered
-    # dependency beneath its Registry record is now invalid.
+    assert tampered_record is not None and tampered_record.status == "ready"
+    expected_artifact_type = (
+        "outline_candidate"
+        if tamper_node_id == "candidate_1_provider_generation"
+        else "candidate_organization_map_result"
+    )
+    assert tampered_record.artifact_type == expected_artifact_type
+    first.registry.update_record(
+        tampered_record.artifact_id,
+        depends_on=[*tampered_record.depends_on, ArtifactDependencyRefV2.from_record(middle)],
+    )
+    # Keep the selected output bytes unchanged; corrupt only its two-level
+    # registered dependency chain so the next run must prove closure handling.
     leaf_path.write_bytes(leaf_path.read_bytes() + b"\n")
-    tampered_candidate_record = first.registry.get(candidate_record.artifact_id)
-    assert tampered_candidate_record is not None
+    invalid_record = first.registry.get(tampered_record.artifact_id)
+    assert invalid_record is not None
     with pytest.raises(RegistryError):
-        first.registry.verify_ready_artifact_closure(tampered_candidate_record)
+        first.registry.verify_ready_artifact_closure(invalid_record)
 
     second_router, second_transports = _build_router()
     second = _executor(
@@ -581,38 +850,96 @@ def test_transitive_dependency_tamper_rejects_reuse_and_reruns_descendants(
         router=second_router,
         poison=ExplodingProvider(),
         stability_mode="off",
-        logical_attempt_identity=f"{first.logical_attempt_identity}:transitive-tamper",
+        logical_attempt_identity=f"{first.logical_attempt_identity}:transitive-tamper:{tamper_node_id}",
         quality_gate=_selective_replay_quality_gate(),
     )
     result = second.run()
-
     assert result.ok is True, result
-    assert len(second_transports["candidate_provider_generation"].invocations) == 1
+    assert second_transports["candidate_provider_generation"].invocations == expected_transport_invocations
     assert all(
         not transport.invocations
         for role, transport in second_transports.items()
         if role != "candidate_provider_generation"
     )
-    current_receipts = second._receipt_ledger.list_receipts()
-    assert len(current_receipts) == 1
-    assert current_receipts[0].attempt_id == "outline:candidate_1_provider_generation"
-    stability = json.loads(Path(result.artifacts["stability_audit"]).read_text(encoding="utf-8"))["payload"]
-    candidate_replay = next(
-        item for item in stability["replay_evidence"]
-        if item.get("node_id") == "candidate_1_provider_generation"
-    )
-    assert candidate_replay["lookup_status"] == "miss"
-    assert candidate_replay["provider_invoked"] is True
-    assert candidate_replay["reused_receipt_ids"] == []
+
+    current_receipts = list(second._receipt_ledger.list_receipts())
+    assert len(current_receipts) == len(expected_observed_call_ids)
+    if expected_observed_call_ids:
+        assert len(current_receipts) == 1
+        expected_call_id = next(iter(expected_observed_call_ids))
+        assert current_receipts[0].call_id == expected_call_id
+        assert current_receipts[0].attempt_id.startswith(expected_call_id)
+        provider, model, endpoint_type = ROLE_MODEL["candidate_provider_generation"]
+        assert current_receipts[0].provider == provider
+        assert current_receipts[0].model == model
+        assert current_receipts[0].endpoint_type == endpoint_type
+    assert all(receipt.closure_epoch_id == second.closure_epoch_id for receipt in current_receipts)
 
     closure_record = second.registry.get("outline-v3:provider_receipt_closure")
     assert closure_record is not None
     closure_payload = json.loads(Path(closure_record.path).read_text(encoding="utf-8"))["payload"]
-    assert closure_payload["complete"] is True, closure_payload
-    assert "outline:candidate_1_provider_generation" not in closure_payload["verified_reuse_call_ids"]
-    assert not [
-        record
-        for record in second.registry.list_records()
-        if record.artifact_type == "provider_verified_reuse"
-        and record.metadata.get("call_id") == "outline:candidate_1_provider_generation"
+    _assert_fragment_bank_call_closure(
+        closure_payload,
+        observed_call_ids=expected_observed_call_ids,
+    )
+
+    # Regardless of whether the aggregate itself or a physical child was
+    # tampered, the adopted local aggregate must close only over clean current
+    # fragment and organization artifacts after this run.
+    rebuilt_candidate = second.registry.get("outline-v3:candidate_1_provider_generation")
+    assert rebuilt_candidate is not None and rebuilt_candidate.status == "ready"
+    second.registry.verify_ready_artifact_closure(rebuilt_candidate)
+    assert all(
+        dependency.artifact_id not in {"tamper:leaf", "tamper:middle"}
+        for dependency in rebuilt_candidate.depends_on
+    )
+    organization_refs = [
+        dependency for dependency in rebuilt_candidate.depends_on
+        if dependency.artifact_id.startswith("outline-v3:organization-map:")
     ]
+    assert len(organization_refs) == 1
+    organization_record = second.registry.get(organization_refs[0].artifact_id)
+    assert organization_record is not None and organization_record.status == "ready"
+    assert organization_record.metadata.get("node_id") == "candidate_organization_provider:candidate_1"
+    second.registry.verify_ready_artifact_closure(organization_record)
+    assert all(
+        dependency.artifact_id not in {"tamper:leaf", "tamper:middle"}
+        for dependency in organization_record.depends_on
+    )
+
+
+def test_local_candidate_shard_replay_closes_projection_and_reuse_evidence(
+    tmp_path: Path,
+) -> None:
+    """Exercise actual local shard replay and its sealed projection evidence."""
+
+    case_path = tmp_path / "local-shard-projection"
+    first_calls: list[str] = []
+    first = _local_source_scope_executor(case_path, first_calls)
+    first_result = first.run()
+    _assert_local_projection_result_or_quality_fixture_block(first_result, first)
+    assert any("candidate_1_provider_generation:local:" in node_id for node_id in first_calls)
+    assert any("candidate_2_provider_generation:local:" in node_id for node_id in first_calls)
+
+    second_calls: list[str] = []
+    second = _local_source_scope_executor(
+        case_path,
+        second_calls,
+        workspace=first.workspace,
+        logical_attempt_identity=f"{first.logical_attempt_identity}:projection-replay",
+        quality_gate=first.quality_gate,
+    )
+    second_result = second.run()
+    _assert_local_projection_result_or_quality_fixture_block(second_result, second)
+    assert second_calls == []
+
+    closure_record = second.registry.get("outline-v3:provider_receipt_closure")
+    assert closure_record is not None
+    closure_payload = json.loads(Path(closure_record.path).read_text(encoding="utf-8"))["payload"]
+    assert closure_payload["complete"] is True
+    _assert_local_candidate_projection_closure(
+        closure_payload,
+        second.registry,
+        closure_epoch_id=second.closure_epoch_id,
+        source_closure_epoch_id=first.closure_epoch_id,
+    )

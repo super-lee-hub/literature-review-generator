@@ -18,11 +18,15 @@ from runtime.provider_receipt_closure import (
     ProviderReceiptClosure,
 )
 from runtime.provider_routes import build_reachable_provider_route_plan
+from runtime.source_revision import PROVIDER_SEMANTIC_CONTRACT_V2
 from runtime.provider_runtime import (
     ProviderAggregateBudgetV2,
     ProviderBudgetExceeded,
     ProviderBudgetV1,
+    ProviderCallReceiptV1,
+    ProviderResponseSnapshotSink,
     ProviderRuntime,
+    ProviderRuntimeContractError,
     ProviderRuntimeLedger,
     _redact_mapping,
     canonical_provider_request_payload,
@@ -40,6 +44,7 @@ from runtime.stage_planning import (
 )
 from services.artifact_registry import (
     ArtifactDependencyRefV2,
+    ArtifactRecord,
     ArtifactRegistry,
     file_sha256,
 )
@@ -101,11 +106,23 @@ class ReviewGenerationService:
         cancellation_checker: Callable[[], None] | None = None,
         logger: logging.Logger | None = None,
         publication_context: Any | None = None,
+        response_snapshot_sink: ProviderResponseSnapshotSink | None = None,
+        source_revision_replay_context: Any | None = None,
+        provider_semantic_contract_version: str | None = None,
     ) -> None:
         self.job_id = str(job_id)
         self.attempt_id = str(attempt_id or "review")
         self.workspace = workspace
         self.registry = artifact_registry
+        self.response_snapshot_sink = response_snapshot_sink
+        self.source_revision_replay_context = source_revision_replay_context
+        self._source_revision_sections: dict[str, dict[str, Any]] = {}
+        self._source_revision_proofs: dict[str, tuple[Any, Any, Any]] = {}
+        self._source_revision_catalog: Mapping[str, Any] = {}
+        if provider_semantic_contract_version not in (None, PROVIDER_SEMANTIC_CONTRACT_V2):
+            raise ValueError("unsupported Writer provider semantic contract")
+        self.provider_semantic_contract_version = provider_semantic_contract_version
+        self._writer_source_inventory_authority: tuple[str, str, str] | None = None
         self.publication_context = (
             publication_context
             or getattr(artifact_registry, "publication_context", None)
@@ -129,6 +146,8 @@ class ReviewGenerationService:
         self.receipt_ledger_path = ""
         self._expected_provider_calls: dict[str, ExpectedProviderCall] = {}
         self._verified_reuse_proofs: dict[str, dict[str, str]] = {}
+        self._verified_reuse_receipts: dict[str, ProviderCallReceiptV1] = {}
+        self._receipt_snapshot_records: dict[str, Any] = {}
         self.expected_call_graph_hash = ""
         self.closure_epoch_id = ""
         self.provider_request_inventory: ProviderStageRequestInventoryV1 | None = None
@@ -141,13 +160,31 @@ class ReviewGenerationService:
         free_mode_context: Mapping[str, Any] | None = None,
     ) -> ReviewGenerationResult:
         self.free_mode_context = dict(free_mode_context or {})
+        if self.provider_semantic_contract_version == PROVIDER_SEMANTIC_CONTRACT_V2 and self.free_mode_context:
+            raise RuntimeError("source-closed Writer Free Mode context projection is not supported yet")
         self._expected_provider_calls = {}
         self._verified_reuse_proofs = {}
+        self._verified_reuse_receipts = {}
+        self._receipt_snapshot_records = {}
+        self._source_revision_sections = {}
+        self._source_revision_proofs = {}
         self.provider_request_inventory = None
         from services.writer_source_inventory import load_writer_source_inventory_v1
 
         source_inventory = load_writer_source_inventory_v1(self.registry)
+        if self.provider_semantic_contract_version == PROVIDER_SEMANTIC_CONTRACT_V2:
+            if source_inventory is None or not source_inventory.is_verified:
+                raise RuntimeError("source-closed Writer requires the full verified current source inventory")
+            self._writer_source_inventory_authority = (
+                source_inventory.artifact_id, source_inventory.artifact_hash, source_inventory.registry_job_id,
+            )
+        candidate_output_scope = self._verified_writer_candidate_scope(
+            outline_payload=outline_payload,
+            evidence_packets=evidence_packets,
+            source_inventory=source_inventory,
+        )
         catalog, catalog_path = self._build_and_persist_catalog()
+        self._source_revision_catalog = catalog
         packet_by_section = {
             str(packet.get("section_id") or "").strip(): dict(packet)
             for packet in evidence_packets
@@ -213,7 +250,13 @@ class ReviewGenerationService:
             if source_inventory is not None:
                 from services.writer_task_scope import build_writer_task_scope_v1
 
-                task_scope = build_writer_task_scope_v1(packet, catalog, source_inventory=source_inventory)
+                task_scope = build_writer_task_scope_v1(
+                    packet,
+                    catalog,
+                    source_inventory=source_inventory,
+                    candidate_output_scope=candidate_output_scope,
+                    provider_semantic_contract_version=self.provider_semantic_contract_version,
+                )
                 if task_scope.get("usable_for_provider_admission") is not True:
                     reasons = sorted({reason for task in task_scope["tasks"] for reason in task["reason_codes"]})
                     raise RuntimeError(f"Writer source task scope for {section_id} requires review: {', '.join(reasons)}")
@@ -308,6 +351,10 @@ class ReviewGenerationService:
             prompt = prepared.prompt
             request_payload = prepared.request_payload
             binding = prepared.binding
+            reused_section = self._source_revision_sections.get(f"review:{section_id}")
+            if reused_section is not None:
+                sections.append(reused_section)
+                continue
             if prepared.persisted is not None:
                 sections.append(prepared.persisted)
                 continue
@@ -340,7 +387,10 @@ class ReviewGenerationService:
                     content = json.loads(content)
                 if not isinstance(content, Mapping):
                     raise RuntimeError("Writer section content must be an object")
-                scoped_output = validate_writer_task_output_v1(prepared.writer_task_scope, content)
+                scoped_output = validate_writer_task_output_v1(
+                    prepared.writer_task_scope, content,
+                    provider_semantic_contract_version=self.provider_semantic_contract_version,
+                )
                 if scoped_output["scope_status"] != "ready":
                     self._persist_writer_review_disposition(prepared, scoped_output, provider_result)
                     raise RuntimeError(f"Writer section {section_id} requires source review; disposition saved")
@@ -366,6 +416,18 @@ class ReviewGenerationService:
                     content = json.loads(content)
                 section_payload["writer_task_scope"] = prepared.writer_task_scope
                 section_payload["writer_task_dispositions"] = content["task_dispositions"]
+                if self.provider_semantic_contract_version == PROVIDER_SEMANTIC_CONTRACT_V2:
+                    section_payload["provider_semantic_contract_version"] = PROVIDER_SEMANTIC_CONTRACT_V2
+            receipt = runtime.receipts[-1] if runtime.receipts else None
+            receipt_snapshot = (
+                self._persist_receipt_snapshot(
+                    section_id=section_id,
+                    binding=binding,
+                    receipt=receipt,
+                )
+                if receipt is not None
+                else None
+            )
             section_record = self._persist_section(
                 section_id,
                 section_payload,
@@ -375,8 +437,7 @@ class ReviewGenerationService:
                 binding=binding,
             )
             sections.append(section_payload)
-            if runtime.receipts:
-                receipt = runtime.receipts[-1]
+            if receipt is not None:
                 logical_hash = hash_json(section_payload)
                 self._expected_provider_calls[f"review:{section_id}"] = replace(
                     self._expected_provider_calls[f"review:{section_id}"],
@@ -390,13 +451,16 @@ class ReviewGenerationService:
                     registered_artifact_hash=logical_hash,
                     node_output_hash=logical_hash,
                 )
+                if receipt_snapshot is None:
+                    raise RuntimeError("Writer receipt snapshot was not persisted for a completed section")
+                self._receipt_snapshot_records[f"review:{section_id}"] = receipt_snapshot
                 self._persist_review_replay(
                     section_id=section_id,
                     binding=binding,
                     section_record=section_record,
                     section_hash=logical_hash,
-                    receipt_id=receipt.receipt_id,
-                    normalized_output_hash=receipt.response_hash or "",
+                    receipt=receipt,
+                    receipt_snapshot=receipt_snapshot,
                 )
 
         if not sections:
@@ -512,6 +576,234 @@ class ReviewGenerationService:
             "final_outline_hash": final.content_hash if final is not None and final.status == "ready" else "",
         }
 
+    def _verified_writer_candidate_scope(
+        self,
+        *,
+        outline_payload: Mapping[str, Any],
+        evidence_packets: Sequence[Mapping[str, Any]],
+        source_inventory: Any,
+    ) -> Any | None:
+        """Resolve candidate scope only from the exact adopted Registry lineage.
+
+        The paper-level Study wording exception is narrow and optional. This
+        method returns no authority unless the current adopted outline, packet
+        set, candidate scope and verified Stage 1 inventory all match exactly.
+        """
+        try:
+            from outline.adoption_transaction import current_adoption_record
+            from outline.candidate_output_scope import (
+                CandidateOutputClaimGroupV1,
+                CandidateOutputScopeV1,
+                CandidateOutputSupportSlotV1,
+                validate_candidate_output_scope_intrinsic_v1,
+            )
+            from services.writer_source_inventory import VerifiedWriterSourceInventoryV1
+            from services.writer_task_scope import _verified_candidate_output_scope
+
+            if (
+                type(source_inventory) is not VerifiedWriterSourceInventoryV1
+                or not source_inventory.is_verified
+                or source_inventory.registry_job_id != self.job_id
+            ):
+                return None
+            registry_job_id = getattr(self.registry, "job_id", "")
+            scope_record = self.registry.get("outline-v3:candidate_output_scope")
+            packet_record = self.registry.get("outline-v3:section_evidence_packets")
+            final_record = self.registry.get("outline-v3:final_outline")
+            adoption_record = current_adoption_record(self.registry)
+            if (
+                not registry_job_id
+                or registry_job_id != self.job_id
+                or scope_record is None
+                or packet_record is None
+                or final_record is None
+                or adoption_record is None
+                or any(
+                    record.status != "ready" or record.job_id != self.job_id
+                    for record in (scope_record, packet_record, final_record, adoption_record)
+                )
+                or (
+                    scope_record.artifact_type,
+                    scope_record.artifact_version,
+                    scope_record.artifact_role,
+                ) != ("outline_candidate_output_scope", "v1", "outline_candidate_output_scope")
+                or (
+                    packet_record.artifact_type,
+                    packet_record.artifact_version,
+                    packet_record.artifact_role,
+                ) != ("section_evidence_packet_set", "v3", "outline_v3_node_output")
+                or (
+                    final_record.artifact_type,
+                    final_record.artifact_version,
+                    final_record.artifact_role,
+                ) != ("final_outline", "v3", "outline_v3_node_output")
+                or (
+                    adoption_record.artifact_type,
+                    adoption_record.artifact_version,
+                ) != ("adopted_outline", "v3")
+            ):
+                return None
+
+            verified = {
+                record.artifact_id: self.registry.verify_ready_artifact_closure(record)
+                for record in (scope_record, packet_record, final_record, adoption_record)
+            }
+            scope_record = verified[scope_record.artifact_id]
+            packet_record = verified[packet_record.artifact_id]
+            final_record = verified[final_record.artifact_id]
+            adoption_record = verified[adoption_record.artifact_id]
+
+            def read_json(record: Any) -> dict[str, Any]:
+                raw = Path(record.path).read_bytes()
+                if hashlib.sha256(raw).hexdigest() != record.content_hash:
+                    raise ValueError("Registry artifact bytes changed")
+                decoded = json.loads(raw.decode("utf-8"))
+                if not isinstance(decoded, Mapping):
+                    raise TypeError("Registry artifact must be an object")
+                return dict(decoded)
+
+            def read_outline_payload(record: Any, expected_type: str) -> dict[str, Any]:
+                from outline.v3_artifacts import AdoptedOutline, FinalOutline, SectionEvidencePacketSet
+
+                envelope = read_json(record)
+                if (
+                    set(envelope) != {
+                        "artifact_type", "artifact_version", "job_id", "dependency_hashes",
+                        "payload", "blocking_diagnostics", "status", "content_hash",
+                    }
+                    or envelope.get("artifact_type") != expected_type
+                    or envelope.get("artifact_version") != "v3"
+                    or envelope.get("job_id") != self.job_id
+                    or envelope.get("status") != "ready"
+                    or envelope.get("blocking_diagnostics") != []
+                    or (
+                        (expected_type != "adopted_outline" or "content_hash" in record.metadata)
+                        and envelope.get("content_hash") != record.metadata.get("content_hash")
+                    )
+                ):
+                    raise ValueError("Outline envelope does not match its Registry record")
+                artifact_class = {
+                    "final_outline": FinalOutline,
+                    "adopted_outline": AdoptedOutline,
+                    "section_evidence_packet_set": SectionEvidencePacketSet,
+                }[expected_type]
+                artifact = artifact_class.from_dict(envelope)
+                if artifact.content_hash != envelope.get("content_hash"):
+                    raise ValueError("Outline payload hash is invalid")
+                payload = envelope.get("payload")
+                if not isinstance(payload, Mapping):
+                    raise TypeError("Outline payload is missing")
+                return dict(payload)
+
+            def has_ancestor(root: Any, target: Any) -> bool:
+                pending = [root]
+                visited: set[str] = set()
+                while pending:
+                    current = pending.pop()
+                    if current.artifact_id in visited:
+                        continue
+                    visited.add(current.artifact_id)
+                    for dependency in current.depends_on:
+                        if (
+                            dependency.job_id == target.job_id
+                            and dependency.artifact_id == target.artifact_id
+                            and dependency.content_hash == target.content_hash
+                        ):
+                            return True
+                        if dependency.dependency_kind != "local_job":
+                            continue
+                        child = self.registry.get(dependency.artifact_id)
+                        if (
+                            child is not None
+                            and child.status == "ready"
+                            and child.job_id == dependency.job_id
+                            and child.content_hash == dependency.content_hash
+                        ):
+                            pending.append(child)
+                return False
+
+            inventory_record = self.registry.get(source_inventory.artifact_id)
+            if (
+                inventory_record is None
+                or inventory_record.status != "ready"
+                or inventory_record.job_id != source_inventory.registry_job_id
+                or inventory_record.content_hash != source_inventory.artifact_hash
+                or not any(
+                    dependency.job_id == inventory_record.job_id
+                    and dependency.artifact_id == inventory_record.artifact_id
+                    and dependency.content_hash == inventory_record.content_hash
+                    for dependency in scope_record.depends_on
+                )
+                or not has_ancestor(packet_record, scope_record)
+                or not has_ancestor(final_record, packet_record)
+                or not has_ancestor(adoption_record, final_record)
+            ):
+                return None
+
+            scope_payload = read_json(scope_record)
+            validate_candidate_output_scope_intrinsic_v1(scope_payload)
+            binding = scope_payload["source_inventory_binding"]
+            if binding != {
+                "registry_job_id": source_inventory.registry_job_id,
+                "artifact_id": source_inventory.artifact_id,
+                "artifact_hash": source_inventory.artifact_hash,
+                "content_hash": source_inventory.content_hash,
+            }:
+                return None
+            scope = CandidateOutputScopeV1(
+                registry_job_id=binding["registry_job_id"],
+                source_inventory_artifact_id=binding["artifact_id"],
+                source_inventory_artifact_hash=binding["artifact_hash"],
+                source_inventory_content_hash=binding["content_hash"],
+                task_ids=tuple(scope_payload["task_ids"]),
+                selected_relation_ids=tuple(scope_payload["selected_relation_ids"]),
+                claim_groups=tuple(
+                    CandidateOutputClaimGroupV1(
+                        **{
+                            **group,
+                            "paper_keys": tuple(group["paper_keys"]),
+                            "support_slot_ids": tuple(group["support_slot_ids"]),
+                            "relation_ids": tuple(group["relation_ids"]),
+                            "task_contract": tuple(group.get("task_contract", {}).items()),
+                        }
+                    )
+                    for group in scope_payload["claim_groups"]
+                ),
+                claim_slots=tuple(
+                    CandidateOutputSupportSlotV1(
+                        **{
+                            **slot,
+                            "source_claim_ids": tuple(slot["source_claim_ids"]),
+                            "evidence_ids": tuple(slot["evidence_ids"]),
+                            "source_field_ids": tuple(slot["source_field_ids"]),
+                            "relation_ids": tuple(slot["relation_ids"]),
+                        }
+                    )
+                    for slot in scope_payload["claim_slots"]
+                ),
+            )
+            if scope.to_dict() != scope_payload:
+                return None
+            final_payload = read_outline_payload(final_record, "final_outline")
+            adoption_payload = read_outline_payload(adoption_record, "adopted_outline")
+            if (
+                dict(outline_payload) != final_payload
+                or adoption_payload.get("final_outline_hash") != final_record.content_hash
+                or adoption_payload.get("final_outline") != final_payload
+            ):
+                return None
+            packet_payload = read_outline_payload(packet_record, "section_evidence_packet_set")
+            packets = packet_payload.get("packets")
+            if (
+                not isinstance(packets, list)
+                or [dict(packet) for packet in evidence_packets] != packets
+            ):
+                return None
+            scope.validate(final_payload)
+            return _verified_candidate_output_scope(scope)
+        except (ImportError, OSError, UnicodeError, ValueError, TypeError, RuntimeError, KeyError, AttributeError):
+            return None
+
     def _section_binding(
         self,
         *,
@@ -526,7 +818,7 @@ class ReviewGenerationService:
         profile = self._provider_context_profile(writer_config)
         adoption = self._current_adoption_binding()
         free_mode = self.free_mode_context
-        return {
+        binding = {
             "binding_version": "review-section-binding-v1",
             "stage_name": runtime.stage_name,
             "section_id": section_id,
@@ -572,29 +864,145 @@ class ReviewGenerationService:
             ),
             "application_schema_version": str(self.settings.config_schema),
         }
+        if self.provider_semantic_contract_version == PROVIDER_SEMANTIC_CONTRACT_V2:
+            binding["provider_semantic_contract_version"] = PROVIDER_SEMANTIC_CONTRACT_V2
+            binding["source_inventory_authority"] = ArtifactDependencyRefV2.from_record(
+                self._current_writer_inventory_record_v2(),
+            ).to_dict()
+        return binding
+
+    def _current_writer_inventory_record_v2(self) -> ArtifactRecord:
+        authority = self._writer_source_inventory_authority
+        if authority is None:
+            raise RuntimeError("source-closed Writer inventory authority has not been verified")
+        artifact_id, expected_hash, owner = authority
+        record = self.registry.get(artifact_id)
+        if (record is None or record.status != "ready" or record.content_hash != expected_hash
+                or record.job_id != owner or owner != self.job_id):
+            raise RuntimeError("source-closed Writer current inventory authority changed")
+        self.registry.verify_ready_artifact_closure(record)
+        return record
 
     def _load_review_replay(self, *, section_id: str, binding: Mapping[str, Any]) -> Mapping[str, Any] | None:
         current = self.registry.get("review_replay")
-        path = Path(current.path) if current is not None and current.status == "ready" else self._review_replay_path()
-        if not path.is_file():
+        if current is None:
             return None
-        binding_hash = hash_json(binding)
-        found: Mapping[str, Any] | None = None
+        if (
+            current.status != "ready"
+            or current.job_id != self.job_id
+            or current.artifact_role != "review_replay"
+            or current.artifact_type != "review_replay_ledger"
+            or current.artifact_version != "v1"
+        ):
+            raise RuntimeError("Review v3 saved replay Registry authority is not ready and local")
+        path = Path(current.path)
         try:
-            for line in path.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
+            if not path.is_file() or current.content_hash != file_sha256(path):
+                raise RuntimeError("Review v3 saved replay Registry hash does not match its bytes")
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError) as exc:
+            raise RuntimeError("Review v3 saved replay Registry bytes are unreadable") from exc
+        binding_hash = hash_json(binding)
+        matches: list[Mapping[str, Any]] = []
+        for line_number, line in enumerate(lines, start=1):
+            if not line.strip():
+                continue
+            try:
                 payload = json.loads(line)
-                if not isinstance(payload, Mapping):
-                    continue
-                if (
-                    str(payload.get("section_id") or "") == section_id
-                    and str(payload.get("binding_hash") or "") == binding_hash
-                ):
-                    found = dict(payload)
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            return None
-        return found
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"Review v3 saved replay line {line_number} is invalid JSON"
+                ) from exc
+            if not isinstance(payload, Mapping):
+                raise RuntimeError(f"Review v3 saved replay line {line_number} is not an object")
+            if (
+                str(payload.get("section_id") or "") == section_id
+                and str(payload.get("binding_hash") or "") == binding_hash
+            ):
+                matches.append(dict(payload))
+        if len(matches) > 1:
+            raise RuntimeError(
+                f"Review v3 saved replay has ambiguous same-binding records for {section_id}"
+            )
+        return matches[0] if matches else None
+
+    def _receipt_snapshot_path(
+        self,
+        *,
+        section_id: str,
+        binding_hash: str,
+        receipt_hash: str,
+    ) -> Path:
+        safe = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in section_id)
+        return Path(
+            self.workspace.artifact_path(
+                f"review/receipt_snapshots/{safe}_{binding_hash[:24]}_{receipt_hash[:24]}.json"
+            )
+        )
+
+    @staticmethod
+    def _receipt_snapshot_artifact_id(
+        *,
+        section_id: str,
+        binding_hash: str,
+        receipt_hash: str,
+    ) -> str:
+        safe = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in section_id)
+        return f"review:receipt-snapshot:{safe}:{binding_hash[:24]}:{receipt_hash[:24]}"
+
+    def _persist_receipt_snapshot(
+        self,
+        *,
+        section_id: str,
+        binding: Mapping[str, Any],
+        receipt: ProviderCallReceiptV1,
+    ) -> Any:
+        binding_hash = hash_json(binding)
+        receipt_payload = receipt.to_dict()
+        receipt_hash = hash_json(receipt_payload)
+        snapshot_payload = {
+            "artifact_type": "review_provider_receipt_snapshot",
+            "artifact_version": "v1",
+            "status": "partial",
+            "job_id": self.job_id,
+            "stage_name": "stage3_review",
+            "section_id": section_id,
+            "binding_hash": binding_hash,
+            "closure_epoch_id": receipt.closure_epoch_id,
+            "logical_attempt_identity": receipt.logical_attempt_identity,
+            "call_id": receipt.call_id,
+            "expected_call_graph_hash": self.expected_call_graph_hash,
+            "receipt_id": receipt.receipt_id,
+            "receipt_hash": receipt_hash,
+            "receipt": receipt_payload,
+        }
+        return publish_json_artifact(
+            self.publication_context,
+            self.registry,
+            self._receipt_snapshot_path(
+                section_id=section_id,
+                binding_hash=binding_hash,
+                receipt_hash=receipt_hash,
+            ),
+            snapshot_payload,
+            artifact_role="provider_receipt_snapshot",
+            artifact_type="review_provider_receipt_snapshot",
+            artifact_version="v1",
+            producer="services.review_generation_service.ReviewGenerationService",
+            artifact_id=self._receipt_snapshot_artifact_id(
+                section_id=section_id,
+                binding_hash=binding_hash,
+                receipt_hash=receipt_hash,
+            ),
+            metadata={
+                "status": "partial",
+                "job_id": self.job_id,
+                "stage_name": "stage3_review",
+                "section_id": section_id,
+                "binding_hash": binding_hash,
+                "receipt_hash": receipt_hash,
+            },
+        )
 
     def _persist_review_replay(
         self,
@@ -603,25 +1011,32 @@ class ReviewGenerationService:
         binding: Mapping[str, Any],
         section_record: Any,
         section_hash: str,
-        receipt_id: str,
-        normalized_output_hash: str,
+        receipt: ProviderCallReceiptV1,
+        receipt_snapshot: Any,
     ) -> None:
         path = self._review_replay_path()
         binding_hash = hash_json(binding)
         existing = self._load_review_replay(section_id=section_id, binding=binding)
+        receipt_hash = hash_json(receipt.to_dict())
         payload = {
             "replay_version": "review-section-replay-v1",
             "job_id": self.job_id,
             "stage_name": "stage3_review",
             "closure_epoch_id": self.closure_epoch_id,
+            "logical_attempt_identity": receipt.logical_attempt_identity,
+            "expected_call_graph_hash": self.expected_call_graph_hash,
             "section_id": section_id,
             "binding_hash": binding_hash,
             "artifact_id": section_record.artifact_id,
             "artifact_path": section_record.path,
             "artifact_content_hash": section_hash,
             "registry_file_hash": section_record.content_hash,
-            "receipt_id": receipt_id,
-            "normalized_output_hash": normalized_output_hash,
+            "receipt_id": receipt.receipt_id,
+            "receipt_hash": receipt_hash,
+            "normalized_output_hash": receipt.response_hash or "",
+            "receipt_snapshot_artifact_id": receipt_snapshot.artifact_id,
+            "receipt_snapshot_path": receipt_snapshot.path,
+            "receipt_snapshot_content_hash": receipt_snapshot.content_hash,
         }
         if existing == payload:
             return
@@ -643,6 +1058,11 @@ class ReviewGenerationService:
             for dependency in dependencies
         ):
             dependencies.append(ArtifactDependencyRefV2.from_record(section_record))
+        if all(
+            dependency.artifact_id != receipt_snapshot.artifact_id
+            for dependency in dependencies
+        ):
+            dependencies.append(ArtifactDependencyRefV2.from_record(receipt_snapshot))
         line = (
             json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
             + "\n"
@@ -662,6 +1082,140 @@ class ReviewGenerationService:
         )
         del record
 
+    @staticmethod
+    def _replay_has_dependency(replay_record: Any, dependency_record: Any) -> bool:
+        if replay_record is None or dependency_record is None:
+            return False
+        return any(
+            dependency.job_id == dependency_record.job_id
+            and dependency.artifact_id == dependency_record.artifact_id
+            and dependency.artifact_type == dependency_record.artifact_type
+            and str(Path(dependency.path).resolve()) == str(Path(dependency_record.path).resolve())
+            and dependency.content_hash == dependency_record.content_hash
+            for dependency in replay_record.depends_on
+        )
+
+    def _load_receipt_snapshot(
+        self,
+        *,
+        section_id: str,
+        binding: Mapping[str, Any],
+        replay: Mapping[str, Any],
+        expected: ExpectedProviderCall,
+        replay_record: Any,
+    ) -> tuple[ProviderCallReceiptV1, Any, str]:
+        snapshot_id = str(replay.get("receipt_snapshot_artifact_id") or "")
+        snapshot_path = str(replay.get("receipt_snapshot_path") or "")
+        snapshot_hash = str(replay.get("receipt_snapshot_content_hash") or "")
+        replay_receipt_hash = str(replay.get("receipt_hash") or "")
+        if not all((snapshot_id, snapshot_path, snapshot_hash, replay_receipt_hash)):
+            raise RuntimeError(
+                f"Review v3 same-binding replay lacks receipt snapshot authority for {section_id}"
+            )
+        snapshot_record = self.registry.get(snapshot_id)
+        if (
+            snapshot_record is None
+            or snapshot_record.status != "ready"
+            or snapshot_record.job_id != self.job_id
+            or snapshot_record.artifact_role != "provider_receipt_snapshot"
+            or snapshot_record.artifact_type != "review_provider_receipt_snapshot"
+            or snapshot_record.artifact_version != "v1"
+            or snapshot_record.path != snapshot_path
+            or snapshot_record.content_hash != snapshot_hash
+            or not self._replay_has_dependency(replay_record, snapshot_record)
+        ):
+            raise RuntimeError(
+                f"Review v3 same-binding receipt snapshot Registry reference is missing, foreign, or changed for {section_id}"
+            )
+        snapshot_file = Path(snapshot_record.path)
+        try:
+            if file_sha256(snapshot_file) != snapshot_hash:
+                raise RuntimeError(
+                    f"Review v3 same-binding receipt snapshot bytes changed for {section_id}"
+                )
+            snapshot = json.loads(snapshot_file.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Review v3 same-binding receipt snapshot is unreadable for {section_id}"
+            ) from exc
+        binding_hash = hash_json(binding)
+        replay_epoch = str(replay.get("closure_epoch_id") or "")
+        replay_identity = str(replay.get("logical_attempt_identity") or "")
+        replay_graph_hash = str(replay.get("expected_call_graph_hash") or "")
+        receipt_payload = snapshot.get("receipt") if isinstance(snapshot, Mapping) else None
+        if not isinstance(snapshot, Mapping) or not isinstance(receipt_payload, Mapping):
+            raise RuntimeError(
+                f"Review v3 same-binding receipt snapshot payload is invalid for {section_id}"
+            )
+        receipt_hash = hash_json(receipt_payload)
+        if (
+            snapshot.get("artifact_type") != "review_provider_receipt_snapshot"
+            or snapshot.get("artifact_version") != "v1"
+            or snapshot.get("status") != "partial"
+            or str(snapshot.get("job_id") or "") != self.job_id
+            or str(snapshot.get("stage_name") or "") != "stage3_review"
+            or str(snapshot.get("section_id") or "") != section_id
+            or str(snapshot.get("binding_hash") or "") != binding_hash
+            or str(snapshot.get("closure_epoch_id") or "") != replay_epoch
+            or str(snapshot.get("logical_attempt_identity") or "") != replay_identity
+            or not replay_graph_hash
+            or str(snapshot.get("expected_call_graph_hash") or "") != replay_graph_hash
+            or str(snapshot.get("call_id") or "") != expected.call_id
+            or str(snapshot.get("receipt_id") or "") != str(replay.get("receipt_id") or "")
+            or str(snapshot.get("receipt_hash") or "") != receipt_hash
+            or replay_receipt_hash != receipt_hash
+        ):
+            raise RuntimeError(
+                f"Review v3 same-binding receipt snapshot hash or binding mismatch for {section_id}"
+            )
+        try:
+            receipt = ProviderCallReceiptV1.from_dict(receipt_payload)
+        except (ProviderRuntimeContractError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Review v3 same-binding provider receipt is invalid for {section_id}"
+            ) from exc
+        writer_config = self.settings.section("Writer_API")
+        expected_provider = str(
+            writer_config.get("provider_family") or writer_config.get("provider") or "generic"
+        )
+        expected_endpoint_type = str(writer_config.get("endpoint_type") or "responses")
+        if receipt.test_only and not self._fixture_context_enabled():
+            raise RuntimeError(
+                f"Review v3 same-binding test-only receipt cannot authorize production reuse for {section_id}"
+            )
+        if (
+            receipt.status != "success"
+            or receipt.incomplete_reason
+            or receipt.finish_reason == "length"
+            or receipt.attempts > expected.max_attempts
+            or receipt.job_id != self.job_id
+            or receipt.attempt_id != expected.attempt_id
+            or receipt.stage_name != expected.stage_name
+            or receipt.node_id != expected.node_id
+            or receipt.call_id != expected.call_id
+            or receipt.closure_epoch_id != replay_epoch
+            or receipt.logical_attempt_identity != replay_identity
+            or not replay_identity
+            or receipt.prompt_hash != expected.prompt_hash
+            or receipt.prompt_id != expected.prompt_id
+            or receipt.prompt_version != expected.prompt_version
+            or receipt.prompt_sha256 != expected.prompt_sha256
+            or receipt.input_hash != expected.input_hash
+            or receipt.config_hash != expected.config_hash
+            or receipt.schema_hash != expected.schema_hash
+            or receipt.route != "Writer_API"
+            or receipt.provider != expected_provider
+            or receipt.model != str(writer_config.get("model") or "")
+            or receipt.endpoint != str(writer_config.get("api_base") or "")
+            or receipt.endpoint_type != expected_endpoint_type
+            or receipt.response_hash != str(replay.get("normalized_output_hash") or "")
+            or (expected.usage_required and receipt.usage_status not in {"reported", "provider_not_supported"})
+        ):
+            raise RuntimeError(
+                f"Review v3 same-binding provider receipt identity or request mismatch for {section_id}"
+            )
+        return receipt, snapshot_record, receipt_hash
+
     def _load_section(
         self,
         section_id: str,
@@ -671,76 +1225,112 @@ class ReviewGenerationService:
         catalog: Mapping[str, Any],
         binding: Mapping[str, Any],
     ) -> dict[str, Any] | None:
-        record = self.registry.get(f"review-section:{section_id}")
-        path = Path(record.path) if record is not None else self._section_path(section_id)
-        if record is None or record.status != "ready" or not path.is_file():
-            return None
-        try:
-            envelope = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            return None
-        if not isinstance(envelope, Mapping) or envelope.get("status") != "ready":
-            return None
-        payload = envelope.get("section")
-        if not isinstance(payload, Mapping):
-            return None
         expected_binding_hash = hash_json(binding)
-        if envelope.get("binding_hash") != expected_binding_hash:
-            return None
-        if envelope.get("binding") != dict(binding):
-            return None
-        section_hash = hash_json(payload)
-        if envelope.get("content_hash") != section_hash:
-            return None
-        try:
-            if record.content_hash != file_sha256(path):
-                return None
-        except OSError:
+        current_section = self.registry.get(f"review-section:{section_id}")
+        current_binding_hash = str((current_section.metadata if current_section else {}).get("binding_hash") or "")
+        if current_binding_hash and current_binding_hash != expected_binding_hash:
             return None
         replay = self._load_review_replay(section_id=section_id, binding=binding)
         if replay is None:
+            if current_binding_hash == expected_binding_hash:
+                raise RuntimeError(
+                    f"Review v3 same-binding saved section lacks replay authority for {section_id}"
+                )
             return None
         replay_epoch_id = str(replay.get("closure_epoch_id") or "")
         if (
-            str(replay.get("job_id") or "") != self.job_id
+            replay.get("replay_version") != "review-section-replay-v1"
+            or str(replay.get("job_id") or "") != self.job_id
             or str(replay.get("stage_name") or "") != "stage3_review"
+            or str(replay.get("section_id") or "") != section_id
+            or str(replay.get("binding_hash") or "") != expected_binding_hash
             or not replay_epoch_id
+            or not str(replay.get("expected_call_graph_hash") or "")
         ):
-            return None
-        reuse_record = self.registry.get("review_replay")
-        if reuse_record is None or reuse_record.status != "ready":
-            return None
-        receipt_id = str(replay.get("receipt_id") or "")
-        receipt = next(
-            (item for item in self.receipt_ledger.list_receipts() if item.receipt_id == receipt_id),
-            None,
-        )
-        expected = self._expected_provider_calls.get(f"review:{section_id}")
-        if expected is None or receipt is None or receipt.status != "success":
-            return None
-        if receipt.test_only and not self._fixture_context_enabled():
-            return None
+            raise RuntimeError(
+                f"Review v3 same-binding replay identity is invalid for {section_id}"
+            )
+        record = self.registry.get(str(replay.get("artifact_id") or ""))
+        expected_artifact_id = f"review-section:{section_id}:{expected_binding_hash[:24]}"
         if (
-            receipt.job_id != self.job_id
-            or receipt.attempt_id != expected.attempt_id
-            or receipt.stage_name != expected.stage_name
-            or receipt.node_id != expected.node_id
-            or receipt.call_id != expected.call_id
-            or receipt.closure_epoch_id != replay_epoch_id
-            or receipt.prompt_hash != expected.prompt_hash
-            or receipt.input_hash != expected.input_hash
-            or receipt.config_hash != expected.config_hash
-            or receipt.schema_hash != expected.schema_hash
-            or receipt.response_hash != str(replay.get("normalized_output_hash") or "")
-            or str(replay.get("artifact_path") or "") != str(path)
+            record is None
+            or record.status != "ready"
+            or record.job_id != self.job_id
+            or record.artifact_role != "review_section"
+            or record.artifact_type != "review_section"
+            or record.artifact_version != "v3"
+            or record.artifact_id != expected_artifact_id
+            or str((record.metadata or {}).get("binding_hash") or "") != expected_binding_hash
+        ):
+            raise RuntimeError(
+                f"Review v3 same-binding section Registry reference is missing, foreign, or changed for {section_id}"
+            )
+        if current_section is not None and current_binding_hash == expected_binding_hash:
+            selected_id = str((current_section.metadata or {}).get("current_version_artifact_id") or "")
+            if selected_id and selected_id != record.artifact_id:
+                raise RuntimeError(
+                    f"Review v3 same-binding current section pointer differs from replay for {section_id}"
+                )
+        path = Path(record.path)
+        try:
+            if not path.is_file() or record.content_hash != file_sha256(path):
+                raise RuntimeError(
+                    f"Review v3 same-binding section Registry hash does not match its bytes for {section_id}"
+                )
+            envelope = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Review v3 same-binding section artifact is unreadable for {section_id}"
+            ) from exc
+        payload = envelope.get("section") if isinstance(envelope, Mapping) else None
+        if (
+            not isinstance(envelope, Mapping)
+            or envelope.get("status") != "ready"
+            or envelope.get("binding_hash") != expected_binding_hash
+            or envelope.get("binding") != dict(binding)
+            or not isinstance(payload, Mapping)
+        ):
+            raise RuntimeError(
+                f"Review v3 same-binding section envelope is invalid for {section_id}"
+            )
+        section_hash = hash_json(payload)
+        if (
+            envelope.get("content_hash") != section_hash
+            or str(replay.get("artifact_id") or "") != record.artifact_id
+            or str(replay.get("artifact_path") or "") != record.path
             or str(replay.get("artifact_content_hash") or "") != section_hash
             or str(replay.get("registry_file_hash") or "") != record.content_hash
         ):
-            return None
-        if expected.usage_required and receipt.usage_status not in {"reported", "provider_not_supported"}:
-            return None
+            raise RuntimeError(
+                f"Review v3 same-binding replay does not match the immutable section for {section_id}"
+            )
+        reuse_record = self.registry.get("review_replay")
+        if reuse_record is None or not self._replay_has_dependency(reuse_record, record):
+            raise RuntimeError(
+                f"Review v3 replay Registry dependencies omit the immutable section for {section_id}"
+            )
+        expected = self._expected_provider_calls.get(f"review:{section_id}")
+        if expected is None:
+            raise RuntimeError(
+                f"Review v3 same-binding replay has no expected call contract for {section_id}"
+            )
+        receipt, snapshot_record, receipt_hash = self._load_receipt_snapshot(
+            section_id=section_id,
+            binding=binding,
+            replay=replay,
+            expected=expected,
+            replay_record=reuse_record,
+        )
+        if receipt.receipt_id not in (payload.get("provider_receipt_ids") or []):
+            raise RuntimeError(
+                f"Review v3 same-binding section does not cite its exact provider receipt for {section_id}"
+            )
+        self.receipt_ledger.append(receipt)
         self._expected_provider_calls[expected.call_id] = replace(
             expected,
+            closure_epoch_id=receipt.closure_epoch_id,
+            logical_attempt_identity=receipt.logical_attempt_identity,
+            expected_call_graph_hash=str(replay["expected_call_graph_hash"]),
             provider_response_hash=receipt.response_hash or "",
             output_hash=receipt.response_hash or "",
             normalized_output_hash=receipt.response_hash or "",
@@ -756,20 +1346,27 @@ class ReviewGenerationService:
             reuse_evidence_artifact_hash=reuse_record.content_hash,
             reuse_evidence_record_hash=hash_json(replay),
         )
-        receipt_hash = hash_json(receipt.to_dict())
+        self._receipt_snapshot_records[expected.call_id] = snapshot_record
+        self._verified_reuse_receipts[expected.call_id] = receipt
         self._verified_reuse_proofs[expected.call_id] = {
             "receipt_hash": receipt_hash,
             "output_hash": receipt.response_hash or "",
             "reuse_evidence_artifact_id": reuse_record.artifact_id,
             "reuse_evidence_artifact_hash": reuse_record.content_hash,
             "reuse_evidence_record_hash": hash_json(replay),
+            "receipt_snapshot_artifact_id": snapshot_record.artifact_id,
+            "receipt_snapshot_path": snapshot_record.path,
+            "receipt_snapshot_content_hash": snapshot_record.content_hash,
             "authority_hash": hash_json(
                 {
-                    "authority_version": "review-section-replay-authority-v1",
+                    "authority_version": "review-section-replay-authority-v2",
                     "call_id": expected.call_id,
                     "binding_hash": expected_binding_hash,
                     "receipt_id": receipt.receipt_id,
                     "receipt_hash": receipt_hash,
+                    "receipt_snapshot_artifact_id": snapshot_record.artifact_id,
+                    "receipt_snapshot_path": snapshot_record.path,
+                    "receipt_snapshot_content_hash": snapshot_record.content_hash,
                     "reuse_evidence_artifact_id": reuse_record.artifact_id,
                     "reuse_evidence_artifact_hash": reuse_record.content_hash,
                     "reuse_evidence_record_hash": hash_json(replay),
@@ -812,6 +1409,8 @@ class ReviewGenerationService:
             "section": dict(section),
         }
         dependencies: list[ArtifactDependencyRefV2] = []
+        if self.provider_semantic_contract_version == PROVIDER_SEMANTIC_CONTRACT_V2:
+            dependencies.append(ArtifactDependencyRefV2.from_record(self._current_writer_inventory_record_v2()))
         for artifact_id in (
             "outline-v3:section_evidence_packets",
             "citation_ref_catalog",
@@ -861,7 +1460,91 @@ class ReviewGenerationService:
         )
         return immutable_record
 
+    def _reuse_source_revision_section(self, prepared: _PreparedWriterSection) -> None:
+        context = self.source_revision_replay_context
+        scope = prepared.writer_task_scope
+        if context is None or scope is None or prepared.persisted is not None:
+            return
+        from runtime.source_revision_replay import build_writer_source_revision_scope_v1
+        from services.writer_task_scope import validate_writer_task_output_v1
+
+        call_id = f"review:{prepared.section_id}"
+        expected = self._expected_provider_calls[call_id]
+        controller = provider_budget_controller_from_environment()
+        if controller is None:
+            raise RuntimeError("SourceRevision Writer reuse requires the original finite child budget")
+        controller.assert_response_reuse_allowed(
+            job_id=self.job_id, stage_name=expected.stage_name, call_id=call_id,
+        )
+        lookup = context.lookup_response(
+            expected_call=expected, request_payload=prepared.request_payload,
+            current_scope=build_writer_source_revision_scope_v1(scope, prepared.binding),
+            parent_scope_record=None,
+            route_identity={"route": "Writer_API", **{key: getattr(expected, key) for key in (
+                "provider", "model", "endpoint", "endpoint_type", "config_hash", "schema_hash",
+            )}},
+        )
+        match = lookup.match
+        if match is None:
+            return
+        content = match.response
+        if not isinstance(content, Mapping):
+            raise RuntimeError("SourceRevision Writer response is not an object")
+        checked = validate_writer_task_output_v1(
+            scope, content, provider_semantic_contract_version=self.provider_semantic_contract_version,
+        )
+        if checked["scope_status"] != "ready":
+            raise RuntimeError("SourceRevision Writer response requires source review")
+        result = {"status": "success", "content": content}
+        blocks = self._normalize_blocks(
+            result, section_number=prepared.section_number,
+            allowed_ref_ids=prepared.allowed_ref_ids, catalog=self._source_revision_catalog,
+            writer_task_scope=scope,
+        )
+        section = {
+            "section_number": prepared.section_number,
+            "section_title": str(prepared.section.get("title") or prepared.section_id).strip(),
+            "blocks": blocks, "evidence_packet_id": prepared.section_id,
+            "provider_receipt_ids": [], "writer_task_scope": scope,
+            "writer_task_dispositions": content["task_dispositions"],
+            "provider_semantic_contract_version": PROVIDER_SEMANTIC_CONTRACT_V2,
+        }
+        record = self._persist_section(
+            prepared.section_id, section, raw_section=prepared.section,
+            packet=prepared.packet, catalog=self._source_revision_catalog, binding=prepared.binding,
+        )
+        logical_hash = hash_json(section)
+        expected = replace(
+            expected, provider_response_hash=match.receipt.response_hash,
+            output_hash=match.receipt.response_hash, normalized_output_hash=hash_json(content),
+            artifact_payload_hash=logical_hash, artifact_content_hash=logical_hash,
+            registry_file_hash=record.content_hash, artifact_path=record.path,
+            registered_artifact_hash=logical_hash, node_output_hash=logical_hash,
+        )
+        proof = context.publish_child_reuse_proof(
+            match=match, child_output_record=record, child_plan_record=context.plan_record,
+            child_expected_call=expected, publication_context=self.publication_context,
+            path=self.workspace.artifact_path(f"source_revision_writer/{hash_json(call_id)}.json"),
+        )
+        self._expected_provider_calls[call_id] = replace(
+            expected, verified_reuse=True, reuse_evidence_artifact_id=proof.artifact_id,
+            reuse_evidence_artifact_hash=proof.content_hash,
+            reuse_evidence_record_hash=hash_json(asdict(proof)),
+        )
+        self._source_revision_sections[call_id] = section
+        self._source_revision_proofs[call_id] = (proof, record, match)
+
     def _persist_receipt_closure(self) -> None:
+        for call_id, (proof, output, match) in self._source_revision_proofs.items():
+            context = self.source_revision_replay_context
+            if context is None:
+                raise RuntimeError("SourceRevision Writer closure lost its executing context")
+            context.verify_child_reuse_proof(
+                proof, child_expected_call=self._expected_provider_calls[call_id],
+                child_output_record=output, current_scope=match.scope,
+                route_identity=match.route_identity,
+                external_registry_resolver=context.external_registry_resolver,
+            )
         reuse_record = self.registry.get("review_replay")
         if reuse_record is not None and reuse_record.status == "ready":
             for call_id, proof in self._verified_reuse_proofs.items():
@@ -880,9 +1563,13 @@ class ReviewGenerationService:
             if receipt.job_id == self.job_id and receipt.stage_name == "stage3_review"
         ]
         out_of_scope_receipts = [receipt for receipt in all_receipts if receipt not in scoped_receipts]
+        reuse_call_ids = {
+            call_id for call_id, expected in self._expected_provider_calls.items()
+            if expected.verified_reuse
+        }
         closure = ProviderReceiptClosure.evaluate(
             self._expected_provider_calls.values(),
-            scoped_receipts,
+            [receipt for receipt in scoped_receipts if receipt.call_id not in reuse_call_ids],
             out_of_scope=out_of_scope_receipts,
         )
         path = Path(self.workspace.artifact_path("review_provider_receipt_closure.json"))
@@ -925,6 +1612,8 @@ class ReviewGenerationService:
         ledger = self.registry.get("review_provider_receipts")
         add_dependency(ledger)
         add_dependency(self.registry.get("review_replay"))
+        for proof, _output, _match in self._source_revision_proofs.values():
+            add_dependency(proof)
         for artifact_id in (
             "citation_ref_catalog",
             "outline-v3:final_outline",
@@ -932,6 +1621,8 @@ class ReviewGenerationService:
             "outline-v3:adoption:current",
         ):
             add_dependency(self.registry.get(artifact_id))
+        for snapshot_record in self._receipt_snapshot_records.values():
+            add_dependency(snapshot_record)
         for expected in self._expected_provider_calls.values():
             expected_path = str(expected.artifact_path or "").strip()
             if not expected_path:
@@ -943,6 +1634,8 @@ class ReviewGenerationService:
                         record
                         for record in self.registry.list_records()
                         if record.status == "ready"
+                        and record.artifact_type == "review_section"
+                        and record.metadata.get("immutable") is True
                         and Path(record.path).resolve() == expected_resolved
                     ),
                     None,
@@ -1091,7 +1784,10 @@ class ReviewGenerationService:
         if writer_task_scope is not None:
             from services.writer_task_scope import validate_writer_task_output_v1
 
-            scoped_output = validate_writer_task_output_v1(writer_task_scope, content)
+            scoped_output = validate_writer_task_output_v1(
+                writer_task_scope, content,
+                provider_semantic_contract_version=self.provider_semantic_contract_version,
+            )
             if scoped_output.get("scope_status") != "ready":
                 raise RuntimeError("Writer returned non-adoptable source tasks requiring review")
             if writer_task_scope.get("schema_version") == "writer_task_scope/v2":
@@ -1291,9 +1987,15 @@ class ReviewGenerationService:
             "free_mode_context": dict(self.free_mode_context) if self.free_mode_context else None,
         }
         if writer_task_scope is not None:
-            from services.writer_wire_projection import project_writer_scope_for_provider_v1
+            from services.writer_wire_projection import (
+                project_writer_scope_for_provider_v1,
+            )
 
-            payload["writer_task_scope"] = project_writer_scope_for_provider_v1(writer_task_scope)
+            if self.provider_semantic_contract_version == PROVIDER_SEMANTIC_CONTRACT_V2 and self.free_mode_context:
+                raise RuntimeError("source-closed Writer Free Mode context projection is not supported yet")
+            payload["writer_task_scope"] = project_writer_scope_for_provider_v1(
+                writer_task_scope, provider_semantic_contract_version=self.provider_semantic_contract_version,
+            )
             payload.pop("source_evidence")
             payload["section_context"] = {
                 name: packet[name]
@@ -1376,6 +2078,7 @@ class ReviewGenerationService:
             prompt_id=self._review_prompt_identity.prompt_id,
             prompt_version=self._review_prompt_identity.version,
             prompt_sha256=self._review_prompt_identity.sha256,
+            response_snapshot_sink=self.response_snapshot_sink,
         )
 
     def _build_provider_request_inventory(
@@ -1420,9 +2123,51 @@ class ReviewGenerationService:
                 raise RuntimeError(
                     f"Review v3 Writer request identity changed before inventory for {call_id}"
                 )
+            expected = self._expected_provider_calls[call_id]
+            self._expected_provider_calls[call_id] = replace(
+                expected,
+                provider=route.provider_family,
+                model=route.model,
+                endpoint=str(writer_config.get("api_base") or ""),
+                endpoint_type=(
+                    str(writer_config.get("endpoint_type") or "responses")
+                    if self.writer is not None
+                    else route.endpoint_type
+                ),
+            )
+            if self.source_revision_replay_context is not None:
+                self._reuse_source_revision_section(prepared)
+            reused_receipt = self._verified_reuse_receipts.get(call_id)
+            if reused_receipt is not None and (
+                reused_receipt.provider != route.provider_family
+                or reused_receipt.model != route.model
+                or reused_receipt.endpoint != str(writer_config.get("api_base") or "")
+                or (
+                    not reused_receipt.test_only
+                    and reused_receipt.endpoint_type != route.endpoint_type
+                )
+                or (
+                    reused_receipt.test_only
+                    and writer_config.get("endpoint_type")
+                    and reused_receipt.endpoint_type != str(writer_config.get("endpoint_type"))
+                )
+            ):
+                raise RuntimeError(
+                    f"Review v3 same-binding receipt route differs from the current Writer route for {call_id}"
+                )
             verified_reuse: VerifiedProviderReuseAuthorityV1 | None = None
             reuse_proof = self._verified_reuse_proofs.get(call_id)
-            if prepared.persisted is not None:
+            source_reuse = self._source_revision_proofs.get(call_id)
+            if source_reuse is not None:
+                proof, output, match = source_reuse
+                context = self.source_revision_replay_context
+                if context is None:
+                    raise RuntimeError("SourceRevision Writer inventory lost its executing context")
+                verified_reuse = context.verified_provider_reuse_authority_v1(
+                    match=match, proof_record=proof, route_identity=route.identity,
+                    child_expected_call=self._expected_provider_calls[call_id], child_output_record=output,
+                )
+            elif prepared.persisted is not None:
                 if reuse_proof is None:
                     raise RuntimeError(
                         f"Review v3 Writer replay lacks verified receipt authority for {call_id}"
@@ -1521,6 +2266,10 @@ class ReviewGenerationService:
                 budget.max_wall_seconds - float(snapshot["elapsed_seconds"]),
             ),
         )
+        if fresh_rows and remaining_budget.max_wall_seconds <= 0:
+            raise ProviderBudgetExceeded(
+                "Writer stage preflight has no remaining aggregate wall-time budget"
+            )
         projection = build_full_stage_request_plan_v1(
             stage_plan=route_plan.stage_plan,
             reachable_route_plan=route_plan,
@@ -1532,12 +2281,14 @@ class ReviewGenerationService:
             ("provider_calls", "provider call"),
             ("requested_output_tokens", "output token"),
             ("provider_retries", "retry"),
-            ("wall_time", "wall-time"),
         ):
             if budget_status.get(key) == "exceeded":
                 raise ProviderBudgetExceeded(
                     f"Writer stage preflight exceeds remaining aggregate {label} budget"
                 )
+        # Summed configured request deadlines describe worst-case exposure,
+        # not the minimum duration required for the section work. The shared
+        # durable deadline still bounds admission and each active transport.
 
     def _ensure_receipt(
         self,

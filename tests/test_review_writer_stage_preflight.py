@@ -210,6 +210,37 @@ def test_strict_v2_preflight_blocks_insufficient_remaining_budget_before_writer_
         assert after[field] == before[field]
 
 
+@pytest.mark.parametrize("wall_seconds", [15.0, 0.0])
+def test_writer_stage_uses_global_deadline_without_requiring_sum_of_request_timeouts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wall_seconds: float,
+) -> None:
+    calls: list[str] = []
+
+    def stop_after_preflight(**_kwargs: Any) -> Mapping[str, Any]:
+        calls.append("writer")
+        raise RuntimeError("stop after finite deadline preflight")
+
+    service, outline, packets = _writer_fixture(tmp_path, writer=stop_after_preflight)
+    controller = ProviderBudgetController(ProviderAggregateBudgetV2(
+        max_provider_calls_total=100, max_output_tokens_total=100_000,
+        max_retry_attempts_total=2, max_wall_seconds=wall_seconds,
+    ))
+    monkeypatch.setattr(
+        review_generation_service, "provider_budget_controller_from_environment",
+        lambda: controller,
+    )
+    # Two requests each have a configured30s upper timeout. A remaining15s
+    # deadline can execute fast requests; zero remaining time admits none.
+    if wall_seconds:
+        with pytest.raises(RuntimeError, match="finite deadline preflight"):
+            _run(service, outline, packets)
+        assert calls == ["writer"]
+    else:
+        with pytest.raises(ProviderBudgetExceeded, match="wall-time"):
+            _run(service, outline, packets)
+        assert calls == []
+
+
 @pytest.mark.parametrize("remaining_retries", [0, 1, 6])
 def test_writer_optional_retries_share_remaining_run_allowance(
     tmp_path: Path,

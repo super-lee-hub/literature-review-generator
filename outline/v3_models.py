@@ -623,6 +623,7 @@ class ReviewIntent:
     language: str = ""
     target_depth: str = ""
     target_length: str = ""
+    required_comparisons: List[Dict[str, Any]] = field(default_factory=list)
     artifact_type: str = REVIEW_INTENT_ARTIFACT_TYPE
     artifact_version: str = OUTLINE_V3_VERSION
 
@@ -638,6 +639,8 @@ class ReviewIntent:
             "language": self.language,
             "target_depth": self.target_depth,
             "target_length": self.target_length,
+            **({"required_comparisons": _list_of_dicts(self.required_comparisons)}
+               if self.required_comparisons else {}),
             "artifact_type": self.artifact_type,
             "artifact_version": self.artifact_version,
         }
@@ -648,6 +651,24 @@ class ReviewIntent:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "ReviewIntent":
+        raw_comparisons = data.get("required_comparisons") or []
+        if not isinstance(raw_comparisons, list):
+            raise ValueError("review intent required_comparisons must be an array")
+        comparisons = []
+        for item in raw_comparisons:
+            if not isinstance(item, Mapping):
+                raise ValueError("required comparison must be an object")
+            raw_keys = item.get("paper_keys")
+            if (not isinstance(raw_keys, list) or len(raw_keys) < 2
+                    or any(not isinstance(key, str) or not key.strip() for key in raw_keys)
+                    or len(set(raw_keys)) != len(raw_keys)):
+                raise ValueError("required comparison needs complete, distinct canonical paper_keys")
+            if not str(item.get("question") or "").strip():
+                raise ValueError("required comparison needs its research question")
+            comparisons.append({
+                "paper_keys": sorted(raw_keys), "question": str(item["question"]).strip(),
+                "relation_type": str(item.get("relation_type") or "").strip(),
+            })
         return cls(
             review_question=str(data.get("review_question") or ""),
             scope=str(data.get("scope") or ""),
@@ -659,6 +680,7 @@ class ReviewIntent:
             language=str(data.get("language") or ""),
             target_depth=str(data.get("target_depth") or ""),
             target_length=str(data.get("target_length") or ""),
+            required_comparisons=sorted(comparisons, key=compute_v3_hash),
             artifact_type=str(data.get("artifact_type") or REVIEW_INTENT_ARTIFACT_TYPE),
             artifact_version=str(data.get("artifact_version") or OUTLINE_V3_VERSION),
         )
@@ -865,6 +887,8 @@ class GlobalRelationMap:
     paper_keys: List[str] = field(default_factory=list)
     source_artifact_hashes: Dict[str, str] = field(default_factory=dict)
     blocking_diagnostics: List[Dict[str, Any]] = field(default_factory=list)
+    cohorts: List[Dict[str, Any]] = field(default_factory=list)
+    comparison_coverage: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def relation_candidates(self) -> List[RelationCandidate]:
@@ -879,6 +903,11 @@ class GlobalRelationMap:
                 for relation in sorted(self.relations, key=lambda item: item.relation_id)
             ],
             "paper_keys": _stable_unique(self.paper_keys),
+            **({"cohorts": _list_of_dicts(sorted(
+                self.cohorts, key=lambda item: str(item.get("cohort_id") or ""),
+            ))} if self.cohorts else {}),
+            **({"comparison_coverage": _stable_mapping(self.comparison_coverage)}
+               if self.comparison_coverage else {}),
             "source_artifact_hashes": {
                 str(key): str(value)
                 for key, value in sorted(self.source_artifact_hashes.items(), key=lambda item: str(item[0]))
@@ -910,6 +939,8 @@ class GlobalRelationMap:
                 for key, value in _stable_mapping(data.get("source_artifact_hashes")).items()
             },
             blocking_diagnostics=_list_of_dicts(data.get("blocking_diagnostics")),
+            cohorts=_list_of_dicts(data.get("cohorts")),
+            comparison_coverage=_stable_mapping(data.get("comparison_coverage")),
         )
 
 
@@ -1326,8 +1357,11 @@ class PaperEvidenceDossier:
 
     def to_dict(self) -> Dict[str, Any]:
         payload = self.canonical_payload()
+        # Hash the same captured payload rather than rebuilding every nested
+        # study/claim a second time. Preserve custom subclass hash policies.
+        content_hash = compute_v3_hash(payload) if type(self) is PaperEvidenceDossier else self.content_hash
         payload["evidence_ids"] = self.evidence_ids
-        payload["content_hash"] = self.content_hash
+        payload["content_hash"] = content_hash
         return payload
 
     @classmethod

@@ -294,7 +294,6 @@ def test_executor_coverage_critic_failure_preserves_prior_nodes_and_resumes_exac
 
     assert first.ok is False
     assert first_calls == [
-        "relation_adjudication",
         "candidate_1_provider_generation",
         "candidate_2_provider_generation",
         "structure_critique",
@@ -306,6 +305,13 @@ def test_executor_coverage_critic_failure_preserves_prior_nodes_and_resumes_exac
     assert first_dag.get("candidate_2_provider_generation").status == "succeeded"
     assert first_dag.get("structure_critique").status == "succeeded"
     assert first_dag.get("coverage_critique").status == "failed"
+    empty_relation_record = first_executor.registry.get("outline-v3:relation_adjudication")
+    assert empty_relation_record is not None and empty_relation_record.status == "ready"
+    empty_relation = json.loads(Path(empty_relation_record.path).read_text(encoding="utf-8"))["payload"]
+    assert empty_relation["selection_status"] == "explicit_empty"
+    assert empty_relation["confirmed_relation_ids"] == []
+    assert empty_relation["rejected_relations"] == []
+    assert empty_relation["relation_decisions"] == []
 
     preserved_nodes = {
         node_id: first_dag.get(node_id)
