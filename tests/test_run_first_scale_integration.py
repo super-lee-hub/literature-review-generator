@@ -1352,6 +1352,7 @@ def _start_scale_server(
     if type(bind_port) is not int or not 0 <= bind_port <= 65535:
         raise ValueError("loopback fixture port must be an integer from 0 through 65535")
     server = ThreadingHTTPServer(("127.0.0.1", bind_port), _ScaleHTTPHandler, bind_and_activate=False)
+    server.request_queue_size = 64
     try:
         if bind_port:
             server.allow_reuse_address = False
