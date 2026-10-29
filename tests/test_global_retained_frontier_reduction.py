@@ -31,6 +31,10 @@ def _rewrite(value, mapping):
 
 def _case(tmp_path, *, large=True, count=6, deferred_from=4, opaque=0, bridge_note="", deferred_assertion=False, distinct_sources=True):
     executor, seeds, _bases, source_request = fold._case(tmp_path)
+    # Preserve this fixture's conservative retained-frontier reduction boundary.
+    # The route-derived default can fit this synthetic case in one direct call,
+    # bypassing the child-reduction and late-source mutation assertions below.
+    executor.max_source_prompt_tokens = 32_000
     executor.review_intent_input["required_comparisons"] = [
         {"task_id": f"required:{index}", "question": f"Retain question {index}"} for index in range(4)
     ]
