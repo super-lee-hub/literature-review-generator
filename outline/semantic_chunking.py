@@ -2320,8 +2320,8 @@ def _call_plan(
         else None
     )
     budgets = {
-        "single_input_target_tokens": "12000-24000",
-        "single_input_hard_limit_tokens": 32000,
+        "single_input_target_tokens": None,
+        "single_input_hard_limit_tokens": None,
         "call_plan_input_tokens_include": ["system", "schema", "tools", "navigation", "evidence", "serialization_wrapper"],
         "logical_node_count": len(calls),
         "estimated_physical_calls": planned,
@@ -2341,7 +2341,8 @@ def _call_plan(
         "relation_bundle_count": len(relation_bundles),
         "relation_navigation_count": len(relation_navigation),
         "topic_navigation_only": True,
-        "input_hard_limit_tokens": 32000,
+        "input_hard_limit_tokens": None,
+        "navigation_reference_window_tokens": 32000,
         "input_estimate_scope": "navigation_projection_not_serialized_provider_request",
         "navigation_oversized_logical_nodes": [
             item.logical_node_id for item in calls if item.complete_input_tokens > 32000

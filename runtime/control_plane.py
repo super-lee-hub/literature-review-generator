@@ -139,6 +139,35 @@ FORBIDDEN_ACTIONS = (
 )
 
 
+def _provider_context_profile_from_config(
+    api_config: Mapping[str, Any],
+    *,
+    max_output_tokens: int,
+    default_provider: str,
+    default_model: str = "",
+    default_endpoint_type: str = "responses",
+    outline_role: bool = False,
+) -> Any:
+    """Build one route profile with the same default reserves as its caller.
+
+    Outline routes reserve 2K reasoning and 1K safety unless the provider
+    section explicitly sets either value, including an explicit zero. The
+    returned context budget is an application estimate, not a gateway probe.
+    """
+
+    from runtime.provider_context import ProviderContextProfile
+
+    return ProviderContextProfile.from_api_config(
+        api_config,
+        max_output_tokens=max(1, int(max_output_tokens)),
+        default_provider=default_provider,
+        default_model=default_model,
+        default_endpoint_type=default_endpoint_type,
+        default_reasoning_reserve=2_048 if outline_role else 0,
+        default_safety_margin=1_024 if outline_role else 256,
+    )
+
+
 def _provider_free_shadow_capacity_comparisons(
     *,
     topic_call_lower_bound: int,
@@ -804,10 +833,10 @@ class ReviewControlPlane:
             output_tokens_per_call_upper_bound: int | None = None
             if model:
                 capability = resolve_model_capability(api_config)
-                profile_output_tokens = max(
+                route_output_tokens = max(
                     1, int(api_config.get("max_output_tokens") or 4_096)
                 )
-                output_tokens_per_call_upper_bound = profile_output_tokens
+                requested_output_upper = route_output_tokens
                 if stage_name == "analyze" and semantic_role in {
                     "primary_reader",
                     "backup_reader",
@@ -818,7 +847,7 @@ class ReviewControlPlane:
                         if semantic_role == "primary_reader"
                         else ("synthesis",)
                     )
-                    output_tokens_per_call_upper_bound = max(
+                    requested_output_upper = max(
                         stage1_output_budget_sequence(
                             stage,
                             stage1_input_settings,
@@ -826,54 +855,61 @@ class ReviewControlPlane:
                         )[-1]
                         for stage in stage1_budget_stages
                     )
-                if output_tokens_upper_bound is not None:
-                    bounded_output_tokens = max(1, int(output_tokens_upper_bound))
-                    profile_output_tokens = min(
-                        profile_output_tokens, bounded_output_tokens
-                    )
-                    output_tokens_per_call_upper_bound = min(
-                        output_tokens_per_call_upper_bound,
-                        bounded_output_tokens,
-                    )
-                if semantic_role == "evidence_critique":
-                    profile_output_tokens = min(profile_output_tokens, 2_048)
-                    output_tokens_per_call_upper_bound = min(
-                        output_tokens_per_call_upper_bound, 2_048
-                    )
-                elif semantic_role in {"structure_critique", "coverage_critique"}:
-                    profile_output_tokens = min(profile_output_tokens, 2_048)
-                    output_tokens_per_call_upper_bound = min(
-                        output_tokens_per_call_upper_bound, 2_048
-                    )
-                profile = ProviderContextProfile.from_api_config(
+                    # Stage 1 applies these per-stage request budgets after route
+                    # resolution; keep the route profile separate from that output
+                    # exposure, which is recorded below.
+                elif stage_name == "review" and semantic_role == "writer":
+                    from runtime.provider_context import writer_output_token_limit
+
+                    route_output_tokens = writer_output_token_limit(api_config)
+                    requested_output_upper = route_output_tokens
+                elif stage_name == "outline" and semantic_role == "evidence_critique":
+                    # Match OutlineV3Executor._outline_route_for_section: the role
+                    # profile is capped at 16K, while its ordinary critique calls
+                    # below reserve 2K per attempt.
+                    route_output_tokens = min(route_output_tokens, 16_000)
+                    requested_output_upper = route_output_tokens
+
+                profile = _provider_context_profile_from_config(
                     api_config,
-                    max_output_tokens=profile_output_tokens,
+                    max_output_tokens=route_output_tokens,
                     default_provider=capability.provider_family,
                     default_model=model,
                     default_endpoint_type=capability.endpoint_type,
+                    outline_role=stage_name == "outline",
                 )
-                if stage_name == "review" and semantic_role == "writer":
-                    from runtime.provider_context import writer_output_token_limit
-
-                    profile_output_tokens = writer_output_token_limit(api_config)
-                    output_tokens_per_call_upper_bound = profile_output_tokens
-                    profile = ProviderContextProfile.from_api_config(
-                        api_config,
-                        max_output_tokens=profile_output_tokens,
-                        default_model="writer",
+                if profile is None:
+                    raise ControlPlaneError("resolved provider route has no context profile")
+                if not (stage_name == "analyze" and semantic_role in {
+                    "primary_reader", "backup_reader"
+                }):
+                    requested_output_upper = min(
+                        int(profile.max_output_tokens), int(requested_output_upper)
                     )
+                if stage_name == "outline" and semantic_role in {
+                    "structure_critique",
+                    "coverage_critique",
+                    "evidence_critique",
+                }:
+                    requested_output_upper = min(requested_output_upper, 2_048)
+                if output_tokens_upper_bound is not None:
+                    requested_output_upper = min(
+                        requested_output_upper,
+                        max(1, int(output_tokens_upper_bound)),
+                    )
+                output_tokens_per_call_upper_bound = requested_output_upper
+
             input_tokens_upper_bound = (
                 int(profile.input_budget) if profile is not None else None
             )
             if profile is not None and stage_name == "outline":
-                configured_source_cap = int(
-                    settings.outline_stability.max_source_prompt_tokens or 32_000
+                configured_source_cap = max(
+                    0, int(settings.outline_stability.max_source_prompt_tokens or 0)
                 )
-                input_tokens_upper_bound = min(
-                    int(profile.input_budget),
-                    32_000,
-                    configured_source_cap,
-                )
+                if configured_source_cap > 0:
+                    input_tokens_upper_bound = min(
+                        int(profile.input_budget), configured_source_cap
+                    )
             retry_text = str(api_config.get("transport_retries") or "").strip()
             retry_bound = max(0, int(retry_text)) if retry_text else runtime_retries
             return UnplannedProviderExposureV1(
@@ -1000,8 +1036,28 @@ class ReviewControlPlane:
             )
             outline_exposures: list[UnplannedProviderExposureV1] = []
             if outline_route is not None:
-                semantic_output_cap = max(
-                    1, int(settings.outline.semantic_output_max_tokens or 4_096)
+                outline_api_config = get_api_config_for_section(
+                    dict(config), outline_route.section_name
+                )
+                outline_capability = resolve_model_capability(outline_api_config)
+                outline_route_profile = _provider_context_profile_from_config(
+                    outline_api_config,
+                    max_output_tokens=max(
+                        1, int(outline_api_config.get("max_output_tokens") or 4_096)
+                    ),
+                    default_provider=outline_capability.provider_family,
+                    default_model=str(outline_api_config.get("model") or outline_route.model),
+                    default_endpoint_type=outline_capability.endpoint_type,
+                    outline_role=True,
+                )
+                candidate_output_cap = int(outline_route_profile.max_output_tokens)
+                semantic_output_target = max(
+                    0, int(settings.outline.semantic_output_max_tokens or 0)
+                )
+                semantic_output_cap = (
+                    min(candidate_output_cap, semantic_output_target)
+                    if semantic_output_target > 0
+                    else candidate_output_cap
                 )
                 if outline_route.enabled and outline_route.required and outline_route.resolved:
                     for phase in (
@@ -1024,8 +1080,10 @@ class ReviewControlPlane:
                                     "stability": "outline_stability_mode_enabled",
                                 }.get(phase, ""),
                                 output_tokens_upper_bound=(
-                                    4_096
-                                    if phase in {"candidate_generation", "stability"}
+                                    min(candidate_output_cap, 4_096)
+                                    if phase == "stability"
+                                    else candidate_output_cap
+                                    if phase == "candidate_generation"
                                     else semantic_output_cap
                                 ),
                             )
@@ -1430,7 +1488,6 @@ class ReviewControlPlane:
                 route_section = str(outline_models.get("outline_model") or "Outline_API").strip()
                 from services.model_capabilities import resolve_model_capability
                 from services.model_selection import get_api_config_for_section
-                from runtime.provider_context import ProviderContextProfile
 
                 api_config = get_api_config_for_section(loaded_config, route_section)
                 model = str(api_config.get("model") or "").strip()
@@ -1452,14 +1509,13 @@ class ReviewControlPlane:
                         0,
                         int(configured_retries) if configured_retries else runtime_transport_retries,
                     )
-                    profile = ProviderContextProfile.conservative(
-                        provider=capability.provider_family,
-                        model=model,
-                        endpoint_type=capability.endpoint_type,
-                        model_context_limit=max(1, int(api_config.get("max_context_tokens") or 128_000)),
+                    profile = _provider_context_profile_from_config(
+                        api_config,
                         max_output_tokens=max(1, int(api_config.get("max_output_tokens") or 4_096)),
-                        reasoning_reserve=max(0, int(api_config.get("reasoning_reserve_tokens") or 2_048)),
-                        safety_margin=max(0, int(api_config.get("safety_margin_tokens") or 1_024)),
+                        default_provider=capability.provider_family,
+                        default_model=model,
+                        default_endpoint_type=capability.endpoint_type,
+                        outline_role=True,
                     )
                     route_profile = profile
                     from outline.provider_router import OutlineRoleRoute, build_outline_provider_router
@@ -1484,14 +1540,13 @@ class ReviewControlPlane:
                         output_tokens = max(1, int(role_config.get("max_output_tokens") or 4_096))
                         if role == "evidence_critique":
                             output_tokens = min(output_tokens, 16_000)
-                        role_profile = ProviderContextProfile.conservative(
-                            provider=role_capability.provider_family,
-                            model=role_model,
-                            endpoint_type=role_capability.endpoint_type,
-                            model_context_limit=max(1, int(role_config.get("max_context_tokens") or 128_000)),
+                        role_profile = _provider_context_profile_from_config(
+                            role_config,
                             max_output_tokens=output_tokens,
-                            reasoning_reserve=max(0, int(role_config.get("reasoning_reserve_tokens") or 2_048)),
-                            safety_margin=max(0, int(role_config.get("safety_margin_tokens") or 1_024)),
+                            default_provider=role_capability.provider_family,
+                            default_model=role_model,
+                            default_endpoint_type=role_capability.endpoint_type,
+                            outline_role=True,
                         )
                         route_config = dict(role_config)
                         if str(route_config.get("transport_retries") or "").strip() == "":
@@ -8048,7 +8103,6 @@ class ReviewControlPlane:
         return payload
 
     def doctor(self, *, config_path: str | Path | None = None, workspace: str | Path | None = None) -> dict[str, Any]:
-        from runtime.provider_context import ProviderContextProfile
         from services.model_selection import get_api_config_for_section
 
         checks: list[dict[str, Any]] = []
@@ -8090,6 +8144,11 @@ class ReviewControlPlane:
 
         provider_details: list[dict[str, Any]] = []
         missing_keys: list[str] = []
+        outline_role_sections = {
+            str(value).strip()
+            for value in (normalized_config.get("OutlineModels") or {}).values()
+            if str(value).strip()
+        }
         for section_name in _API_SECTIONS:
             section = dict(normalized_config.get(section_name) or {})
             if not section:
@@ -8112,10 +8171,13 @@ class ReviewControlPlane:
                     api_config = get_api_config_for_section(dict(normalized_config), section_name)
                     output_target = int(api_config.get("max_output_tokens") or 0)
                     if output_target > 0:
-                        profile = ProviderContextProfile.from_api_config(
-                            api_config, max_output_tokens=output_target,
+                        profile = _provider_context_profile_from_config(
+                            api_config,
+                            max_output_tokens=output_target,
                             default_provider=capability.provider_family,
+                            default_model=str(api_config.get("model") or ""),
                             default_endpoint_type=capability.endpoint_type,
+                            outline_role=section_name in outline_role_sections,
                         )
                         context_work_budget.update({
                             "configured_context_tokens": api_config.get("max_context_tokens"),

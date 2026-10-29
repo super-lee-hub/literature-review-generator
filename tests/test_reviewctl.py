@@ -174,8 +174,10 @@ def test_reviewctl_plan_projects_all_reachable_provider_work_without_posting(
         item for item in projection["unknown_exposures"]
         if item["stage_name"] == "outline"
     ]
+    # The public plan uses each role's route-derived work budget when no
+    # positive OutlineStability.max_source_prompt_tokens target is configured.
     assert all(
-        item["input_tokens_per_call_upper_bound"] <= 32_000
+        item["input_tokens_per_call_upper_bound"] > 32_000
         for item in outline_exposures
     )
     assert all(

@@ -87,6 +87,9 @@ def test_candidate_count_only_changes_organization_budget_not_shared_plan_hash()
     plan_three = build_semantic_chunk_plan(layers, relations, candidate_count=3)
     assert plan_two.shared_content_hash == plan_three.shared_content_hash
     assert plan_two.budgets["provider_posts_emitted"] == 0
+    assert plan_two.budgets["input_hard_limit_tokens"] is None
+    assert plan_two.budgets["single_input_hard_limit_tokens"] is None
+    assert plan_two.budgets["navigation_reference_window_tokens"] == 32000
     assert plan_three.budgets["provider_posts_emitted"] == 0
 
 
