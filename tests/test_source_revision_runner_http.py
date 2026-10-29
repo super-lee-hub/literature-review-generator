@@ -34,8 +34,8 @@ def _adopt_and_finish(result, control):
     return workspace, registry
 
 
-@pytest.mark.parametrize("input_cap", [32000, 24000], ids=["default", "topic-shards"])
-def test_source_revision_runner_http_consumes_plan_and_preserves_parent(tmp_path, input_cap):
+@pytest.mark.parametrize("topic_target", [0, 8000], ids=["default", "topic-shards"])
+def test_source_revision_runner_http_consumes_plan_and_preserves_parent(tmp_path, topic_target):
     papers = _scale_papers(4)
     old = tmp_path / "old"
     new = tmp_path / "new"
@@ -47,10 +47,15 @@ def test_source_revision_runner_http_consumes_plan_and_preserves_parent(tmp_path
         shutil.copyfile(old / f"{paper.stem}.pdf", new / f"{paper.stem}.pdf")
     server, thread, api_base = _start_scale_server(papers)
     try:
-        config = _local_config(tmp_path, api_base, provider_call_limit=200)
+        config = _local_config(
+            tmp_path, api_base, provider_call_limit=200,
+            technical_shard_target_tokens=topic_target,
+        )
         parser = configparser.ConfigParser(interpolation=None)
         parser.read(config, encoding="utf-8")
-        parser["OutlineStability"]["max_source_prompt_tokens"] = str(input_cap)
+        # Exercise normal route-sized requests; only the topic shard soft
+        # target varies, so global aggregation retains its available window.
+        parser["OutlineStability"]["max_source_prompt_tokens"] = "0"
         with config.open("w", encoding="utf-8") as stream:
             parser.write(stream)
         metadata = {
@@ -102,7 +107,7 @@ def test_source_revision_runner_http_consumes_plan_and_preserves_parent(tmp_path
         assert child_registry.get("source_revision_plan") is not None
         proofs = [r for r in child_registry.list_records() if r.artifact_type == "source_revision_provider_reuse"]
         assert proofs, "normal child execution did not consume parent provider results"
-        if input_cap == 24000:
+        if topic_target:
             assert any(record.metadata.get("stage_name") == "outline_v3" for record in proofs), "topic-sharded Runner did not reuse an eligible Outline response"
         assert len(server.calls) > before, "changed source work must still execute"
         sent = len(server.calls)
