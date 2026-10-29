@@ -36,8 +36,8 @@ def _adopt_and_finish(result, control):
 
 @pytest.mark.parametrize(
     ("topic_target", "input_cap", "semantic_target", "expect_model_reuse"),
-    [(0, 0, 0, False), (8000, 24000, 4096, True)],
-    ids=["default", "topic-shards"],
+    [(8000, 24000, 4096, True), (0, 0, 0, False)],
+    ids=["topic-shards", "default"],
 )
 def test_source_revision_runner_http_consumes_plan_and_preserves_parent(
     tmp_path, topic_target, input_cap, semantic_target, expect_model_reuse,
@@ -122,7 +122,7 @@ def test_source_revision_runner_http_consumes_plan_and_preserves_parent(
             if record.artifact_type == "stage1_summary_reuse_record"
         ]
         assert len(reused_summaries) == len(papers) - 1
-        assert sum(row.get("kind") == "stage1_reader" for row in server.calls[before:]) == 1
+        assert sum(row.get("stage") == "stage1_reader" for row in server.calls[before:]) == 1
         assert len(server.calls) > before, "changed source work must still execute"
         sent = len(server.calls)
         again = control.resume(workspace=child_ws.root_dir)
