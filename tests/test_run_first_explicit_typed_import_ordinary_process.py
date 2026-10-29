@@ -40,6 +40,13 @@ def _clear_inherited_context_environment() -> None:
 
 _clear_inherited_context_environment()
 
+# This temporary script can be launched by an isolated interpreter that ignores
+# PYTHONPATH. Bind the supplied repository before importing production modules.
+_SOURCE_ROOT = Path(sys.argv[2]).expanduser().resolve()
+if not (_SOURCE_ROOT / "runtime" / "control_plane.py").is_file():
+    raise RuntimeError("ordinary-process source root has no runtime control plane")
+sys.path.insert(0, str(_SOURCE_ROOT))
+
 from runtime.control_plane import ReviewControlPlane
 from runtime.explicit_stage1_scope import load_explicit_stage1_scope
 from runtime.job_spec import load_runtime_job_spec
