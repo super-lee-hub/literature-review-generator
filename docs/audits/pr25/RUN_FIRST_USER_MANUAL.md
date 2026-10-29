@@ -139,7 +139,7 @@ $ParentWorkspace = (Resolve-Path -LiteralPath (Read-Host '已完成 parent 的 w
 $ChildSpec = (Resolve-Path -LiteralPath (Read-Host '已审阅 child spec 的绝对路径')).Path
 $Work = Read-Host 'parent 和 child workspace 之外的新 SourceRevision 工作目录'
 if (Test-Path -LiteralPath $Work) { throw '工作目录已存在；选择一个新的独立目录。' }
-[void](New-Item -ItemType Directory -Path $Work)
+New-Item -ItemType Directory -Path $Work | Out-Null
 $Work = (Resolve-Path -LiteralPath $Work).Path
 $SourcePlanPath = Join-Path $Work 'source-revision-plan.json'
 $BoundChildSpec = Join-Path $Work 'child-bound.json'

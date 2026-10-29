@@ -8186,6 +8186,12 @@ class ReviewControlPlane:
                             "api_default_output_target": profile.max_output_tokens,
                             "additional_reasoning_buffer": profile.reasoning_reserve,
                             "safety_margin": profile.safety_margin,
+                            "reserve_defaults_scope": (
+                                "Outline role defaults for this section"
+                                if section_name in outline_role_sections
+                                else "non-Outline stage defaults"
+                            ),
+                            "request_scope_note": "Shared Reader/Writer routes use stage-specific targets; exact request plans and receipts are authoritative",
                             "context_basis": "declared context times 0.8; not gateway verification",
                             "estimate_method": "UTF-8 bytes/3 plus structural overhead; heuristic, not tokenizer or upper bound",
                         })

@@ -74,7 +74,7 @@ $Project = 'my_review'
 $JobId = 'review-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff')
 $Work = Join-Path $env:USERPROFILE ('review-runs\' + $JobId)
 if (Test-Path -LiteralPath $Work) { throw '目录已存在，请使用新的任务目录。' }
-[void](New-Item -ItemType Directory -Path $Work)
+[void] (New-Item -ItemType Directory -Path $Work)
 $WS = Join-Path $Work ($Project + '__' + $JobId)
 $SpecFile = Join-Path $Work 'runtime-job.json'
 $Spec = [ordered]@{
@@ -108,7 +108,7 @@ if ($Hosts.Count -gt 0) {
     if ((Read-Host '所有者已批准向上述精确主机发送本任务允许的数据？输入 APPROVE 才继续') -cne 'APPROVE') {
         throw '未获得该外部路由的明确授权。'
     }
-    $AckHours = [double](Read-Host '已批准主机声明有效小时数，须覆盖计划运行期且不超过 168 小时')
+    $AckHours = [double] (Read-Host '已批准主机声明有效小时数，须覆盖计划运行期且不超过 168 小时')
     if ([double]::IsNaN($AckHours) -or [double]::IsInfinity($AckHours) -or $AckHours -le 0 -or $AckHours -gt 168) {
         throw '声明有效期必须大于零且不超过七天。'
     }
@@ -141,10 +141,10 @@ if ($InitialPlan.status -ne 'planned') { throw '计划未建立；先阅读 erro
 ```powershell
 $Budget = [ordered]@{
     schema_version = 'provider-aggregate-budget-contract-v2'
-    max_provider_calls_total = [long](Read-Host '根据实际计划批准的总物理调用上限，正整数')
-    max_output_tokens_total = [long](Read-Host '批准的全部尝试累计输出 token 上限，正整数')
-    max_retry_attempts_total = [long](Read-Host '批准的累计重试上限，非负整数')
-    max_wall_seconds = [double](Read-Host '批准的运行墙钟秒数，有限正数')
+    max_provider_calls_total = [long] (Read-Host '根据实际计划批准的总物理调用上限，正整数')
+    max_output_tokens_total = [long] (Read-Host '批准的全部尝试累计输出 token 上限，正整数')
+    max_retry_attempts_total = [long] (Read-Host '批准的累计重试上限，非负整数')
+    max_wall_seconds = [double] (Read-Host '批准的运行墙钟秒数，有限正数')
 }
 $Spec.metadata.provider_budget = $Budget
 Write-Utf8Json (Join-Path $Work 'approved-budget.json') $Budget

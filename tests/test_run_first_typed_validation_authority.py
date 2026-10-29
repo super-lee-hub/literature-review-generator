@@ -12,6 +12,7 @@ import fitz
 import pytest
 
 from runtime.orchestrator import AgentRuntimeBridge
+from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
 from services.artifact_registry import ArtifactDependencyRefV2, RegistryError
 from services.job_workspace import publish_json_artifact
 from services.queue_service import LocalPublicationContext
@@ -147,7 +148,17 @@ def _validation_service(case: Any) -> Any:
             config={},
         ),
     )
-    return AgentRuntimeBridge.__new__(AgentRuntimeBridge).build_validation_service(session)
+    job_spec = RuntimeJobSpec(
+        project_name=workspace.job_id,
+        source=RuntimeSourceSpec(mode="direct", pdf_folder=str(workspace.root_dir)),
+        job_id=workspace.job_id,
+        action="validate_review",
+        workspace_path=str(workspace.root_dir),
+    )
+    job_spec.validate()
+    bridge = AgentRuntimeBridge.__new__(AgentRuntimeBridge)
+    bridge.job_spec = job_spec
+    return bridge.build_validation_service(session)
 
 
 def _fingerprint(service: Any, papers: list[dict[str, Any]], keys: list[str]) -> Any:

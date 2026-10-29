@@ -35,7 +35,7 @@ The 11 legacy runtime-control test functions all passed in the full suite. One e
 
 - Full R1 remains blocked before provider transport by the 24-call/topic lower bound and incomplete full-stage budget.
 - Historical B01 received HTTP 200 but `finish_reason=length`, 12,288 output tokens, invalid response, no retry, and `canonical_ready=false`; it is not successful R1 evidence.
-- The [V8 permission card](D:/tmp/pr25-v8-opus55-output-proposal-20260930-1b156d5/OWNER_PERMISSION_CARD_V8.md) binds B01/B05/B29 to `claude-opus-5-5` at `api.yhlxj.ai`, at most 3 POSTs, 36,864 output tokens, zero retries, one hour, and unknown currency cost. Its preflight passed with 0 network calls; the execution gate rejects without a current approval record. **No V8 POST has been made; exact V8 approval is pending.**
+- Historical local evidence: the V8 permission card was recorded on the originating machine at `D:/tmp/pr25-v8-opus55-output-proposal-20260930-1b156d5/OWNER_PERMISSION_CARD_V8.md`. It binds B01/B05/B29 to `claude-opus-5-5` at `api.yhlxj.ai`, at most 3 POSTs, 36,864 output tokens, zero retries, one hour, and unknown currency cost. Its preflight passed with 0 network calls; the execution gate rejects without a current approval record. **No V8 POST has been made; exact V8 approval is pending.**
 - F1 is separate and remains `NOT_EVALUATED`. No final adopted R1 DOCX exists for visual review, so DOCX layout remains `NOT_VERIFIED`.
 - The source recovery ZIP `PR25_SOURCE_RECOVERY_E6C986D.zip` is available locally; no push, merge, or main-branch change occurred.
 
