@@ -4,6 +4,7 @@
   "source_variant": "all_required_comparisons",
   "candidate_count": 5,
   "job_id": "pr25-r4-arbitration-overflow-http-role12k-10pdf",
+  "semantic_output_max_tokens": 4096,
   "effective_input_cap": 12000,
   "global_source_prompt_cap": 24000,
   "arbitrator_route_section": "Backup_Reader_API",

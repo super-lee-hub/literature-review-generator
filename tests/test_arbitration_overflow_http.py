@@ -127,6 +127,11 @@ def test_real_http_arbitration_overflow_survives_publish_crash_and_finishes_runt
         config = configparser.ConfigParser(interpolation=None)
         config.read(config_path, encoding="utf-8")
         config["Outline"]["candidate_count"] = str(case["candidate_count"])
+        semantic_output_max_tokens = case.get("semantic_output_max_tokens")
+        if semantic_output_max_tokens is not None:
+            if type(semantic_output_max_tokens) is not int or semantic_output_max_tokens < 1:
+                raise AssertionError("semantic_output_max_tokens must be a positive case value")
+            config["Outline"]["semantic_output_max_tokens"] = str(semantic_output_max_tokens)
         config["OutlineStability"]["mode"] = str(case["stability_mode"])
         config["OutlineStability"]["max_provider_calls"] = str(budget["max_provider_calls_total"])
         global_source_cap = int(case.get("global_source_prompt_cap", case["effective_input_cap"]))
