@@ -467,7 +467,9 @@ def test_switching_between_workflow_and_logs_keeps_ui_responsive(page, gui_serve
     page.wait_for_timeout(1200)
 
     _open_page(page, f'{gui_server["base_url"]}/logs')
-    expect(page.locator("textarea")).to_be_visible()
+    logs_page = page.locator(".ag-page")
+    expect(logs_page.get_by_text("最近日志文件", exact=True)).to_be_visible()
+    expect(logs_page.locator("textarea[readonly]")).to_be_visible()
     page.wait_for_timeout(1200)
 
     _open_page(page, f'{gui_server["base_url"]}/workflow')
@@ -576,7 +578,9 @@ def test_workflow_actions_and_links(page, gui_server):
 
 def test_logs_and_guide_pages_render(page, gui_server):
     _open_page(page, f'{gui_server["base_url"]}/logs')
-    expect(page.locator("textarea")).to_be_visible()
+    logs_page = page.locator(".ag-page")
+    expect(logs_page.get_by_text("最近日志文件", exact=True)).to_be_visible()
+    expect(logs_page.locator("textarea[readonly]")).to_be_visible()
 
     page.get_by_role("button", name="打开日志目录").click()
     expect(_notification(page)).to_contain_text("测试模式：已模拟打开路径")
