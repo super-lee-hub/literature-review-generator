@@ -34,8 +34,14 @@ def _adopt_and_finish(result, control):
     return workspace, registry
 
 
-@pytest.mark.parametrize("topic_target", [0, 8000], ids=["default", "topic-shards"])
-def test_source_revision_runner_http_consumes_plan_and_preserves_parent(tmp_path, topic_target):
+@pytest.mark.parametrize(
+    ("topic_target", "input_cap", "semantic_target", "mutate_source"),
+    [(0, 0, 0, False), (8000, 24000, 4096, True)],
+    ids=["default", "topic-shards"],
+)
+def test_source_revision_runner_http_consumes_plan_and_preserves_parent(
+    tmp_path, topic_target, input_cap, semantic_target, mutate_source,
+):
     papers = _scale_papers(4)
     old = tmp_path / "old"
     new = tmp_path / "new"
@@ -53,9 +59,11 @@ def test_source_revision_runner_http_consumes_plan_and_preserves_parent(tmp_path
         )
         parser = configparser.ConfigParser(interpolation=None)
         parser.read(config, encoding="utf-8")
-        # Exercise normal route-sized requests; only the topic shard soft
-        # target varies, so global aggregation retains its available window.
-        parser["OutlineStability"]["max_source_prompt_tokens"] = "0"
+        # The default case tests exact-source reuse with normal route windows.
+        # The incremental case retains the known conservative small-corpus
+        # profile, so unchanged topic fragments remain separate eligible work.
+        parser["OutlineStability"]["max_source_prompt_tokens"] = str(input_cap)
+        parser["Outline"]["semantic_output_max_tokens"] = str(semantic_target)
         with config.open("w", encoding="utf-8") as stream:
             parser.write(stream)
         metadata = {
@@ -85,10 +93,11 @@ def test_source_revision_runner_http_consumes_plan_and_preserves_parent(tmp_path
             str(path): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in Path(parent_ws.root_dir).rglob("*") if path.is_file()
         }
-        revised = replace(papers[-1], finding=papers[-1].finding + " Only adult participants were enrolled.")
-        _write_scale_pdf(new / f"{revised.stem}.pdf", revised,
-                         identity_doi=f"10.1234/source-revision-{revised.index}")
-        server.papers = [*papers[:-1], revised]
+        if mutate_source:
+            revised = replace(papers[-1], finding=papers[-1].finding + " Only adult participants were enrolled.")
+            _write_scale_pdf(new / f"{revised.stem}.pdf", revised,
+                             identity_doi=f"10.1234/source-revision-{revised.index}")
+            server.papers = [*papers[:-1], revised]
         child_spec = replace(
             parent_spec, job_id="child-http", source=RuntimeSourceSpec(mode="direct", pdf_folder=str(new)),
             workspace_path=str(Path(parent_ws.root_dir).parent / "revision-http__child-http"),
@@ -109,7 +118,12 @@ def test_source_revision_runner_http_consumes_plan_and_preserves_parent(tmp_path
         assert proofs, "normal child execution did not consume parent provider results"
         if topic_target:
             assert any(record.metadata.get("stage_name") == "outline_v3" for record in proofs), "topic-sharded Runner did not reuse an eligible Outline response"
-        assert len(server.calls) > before, "changed source work must still execute"
+        if mutate_source:
+            assert len(server.calls) > before, "changed source work must still execute"
+        else:
+            assert not any(
+                row.get("kind") == "stage1_reader" for row in server.calls[before:]
+            ), "identical PDFs must not be sent to Reader again"
         sent = len(server.calls)
         again = control.resume(workspace=child_ws.root_dir)
         assert again["canonical_ready"] is True, again
