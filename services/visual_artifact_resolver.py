@@ -17,26 +17,26 @@ def _text(value: Any) -> str:
 
 def normalize_visual_artifact(visual: Dict[str, Any]) -> Dict[str, Any]:
     """归一化视觉证据 artifact，统一字段命名
-    
+
     解决以下不一致问题：
     - caption_excerpt vs caption
     - image_path vs path
     - page_no vs page_range
-    
+
     Args:
         visual: 视觉证据 artifact
-        
+
     Returns:
         归一化后的视觉证据 artifact
     """
     normalized = {}
-    
+
     # 基本字段
     normalized["visual_id"] = visual.get("visual_id") or visual.get("id") or ""
     normalized["artifact_id"] = visual.get("artifact_id") or ""
     normalized["paper_key"] = visual.get("paper_key") or ""
     normalized["source_pdf"] = visual.get("source_pdf") or ""
-    
+
     # 页面信息
     normalized["page_no"] = int(visual.get("page_no") or visual.get("page_number") or -1)
     page_range = visual.get("page_range")
@@ -44,21 +44,21 @@ def normalize_visual_artifact(visual: Dict[str, Any]) -> Dict[str, Any]:
         normalized["page_range"] = page_range
     else:
         normalized["page_range"] = [normalized["page_no"]] if normalized["page_no"] >= 0 else []
-    
+
     # 位置信息
     normalized["bbox"] = visual.get("bbox") or []
-    
+
     # 类型信息
     normalized["artifact_type"] = visual.get("artifact_type") or ""
     normalized["source_type"] = visual.get("source_type") or ""
-    
+
     # 路径信息
     normalized["image_path"] = visual.get("image_path") or visual.get("path") or ""
-    
+
     # 文本信息
     normalized["caption_excerpt"] = visual.get("caption_excerpt") or visual.get("caption") or ""
     normalized["nearby_text_excerpt"] = visual.get("nearby_text_excerpt") or visual.get("nearby_text") or ""
-    
+
     # 选择信息
     normalized["selection_reason"] = visual.get("selection_reason") or ""
     normalized["selection_score"] = float(visual.get("selection_score") or 0.0)
@@ -96,7 +96,7 @@ def normalize_visual_artifact(visual: Dict[str, Any]) -> Dict[str, Any]:
         "image_bytes", "image_sha256",
     ):
         normalized[field_name] = visual.get(field_name) or (0 if field_name not in {"image_format", "image_sha256"} else "")
-    
+
     return normalized
 
 
@@ -288,10 +288,10 @@ class VisualArtifactResolver:
 
     def resolve_visual_manifest(self, paper_artifact_path: str) -> Optional[Dict[str, Any]]:
         """Resolve visual manifest from paper artifact and registry.
-        
+
         Args:
             paper_artifact_path: Path to paper artifact JSON file
-            
+
         Returns:
             Visual manifest dict if found, None otherwise
         """
@@ -300,10 +300,10 @@ class VisualArtifactResolver:
 
     def resolve_selected_visual_refs(self, paper_artifact_path: str) -> List[Dict[str, Any]]:
         """Resolve selected visual refs from paper artifact and registry.
-        
+
         Args:
             paper_artifact_path: Path to paper artifact JSON file
-            
+
         Returns:
             List of normalized selected visual refs
         """
@@ -328,10 +328,10 @@ class VisualArtifactResolver:
 
     def resolve_visual_artifact_by_id(self, visual_id: str) -> Optional[Dict[str, Any]]:
         """Resolve visual artifact by its ID.
-        
+
         Args:
             visual_id: Visual artifact ID
-            
+
         Returns:
             Normalized visual artifact dict if found, None otherwise
         """
@@ -350,10 +350,10 @@ class VisualArtifactResolver:
 
     def get_visual_artifacts_for_paper(self, paper_key: str) -> List[Dict[str, Any]]:
         """Get all visual artifacts for a specific paper.
-        
+
         Args:
             paper_key: Paper key
-            
+
         Returns:
             List of normalized visual artifacts for the paper
         """

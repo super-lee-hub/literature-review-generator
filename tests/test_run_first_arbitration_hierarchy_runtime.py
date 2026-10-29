@@ -139,4 +139,3 @@ def test_over_cap_final_arbitration_preserves_every_critic_row_in_one_admissible
     assert ledger["critique_hashes"] == plan["critique_hashes"]
     assert ledger["assessments"] == persisted[-1][1]["assessments"]
     assert len(calls) == len(plan["leaves"]) + 1
-

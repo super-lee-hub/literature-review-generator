@@ -38,7 +38,7 @@ from validation.review_validator import (
 
 class TestDependencyHashBundle:
     """Test DependencyHashBundle structure and behavior."""
-    
+
     def test_bundle_creation(self):
         bundle = DependencyHashBundle(
             summary_hash="abc123",
@@ -50,7 +50,7 @@ class TestDependencyHashBundle:
         assert bundle.paper_artifact_hash == "def456"
         assert bundle.visual_manifest_hash == "ghi789"
         assert bundle.selected_visual_refs_hash == "jkl012"
-    
+
     def test_bundle_to_dict(self):
         bundle = DependencyHashBundle(
             summary_hash="abc123",
@@ -61,7 +61,7 @@ class TestDependencyHashBundle:
         d = bundle.to_dict()
         assert d["summary_hash"] == "abc123"
         assert d["paper_artifact_hash"] == "def456"
-    
+
     def test_bundle_from_dict(self):
         data = {
             "summary_hash": "abc123",
@@ -82,7 +82,7 @@ class TestDependencyHashBundle:
 
 class TestPatchTargetSignature:
     """Test PatchTargetSignature structure."""
-    
+
     def test_signature_creation(self):
         sig = PatchTargetSignature(
             block_id="s1_b1",
@@ -94,7 +94,7 @@ class TestPatchTargetSignature:
         assert sig.anchor_hash == "a1b2c3d4"
         assert sig.span_start is None
         assert sig.span_end is None
-    
+
     def test_signature_with_span(self):
         sig = PatchTargetSignature(
             block_id="s1_b1",
@@ -109,7 +109,7 @@ class TestPatchTargetSignature:
 
 class TestPatchProposal:
     """Test PatchProposal structure."""
-    
+
     def test_proposal_creation(self):
         bundle = DependencyHashBundle(
             summary_hash="abc123",
@@ -137,7 +137,7 @@ class TestPatchProposal:
         assert proposal.proposal_id == "prop-001"
         assert proposal.root_cause == RepairRootCause.CITATION_MAPPING_ERROR
         assert proposal.granularity == PatchGranularity.SPAN
-    
+
     def test_proposal_to_dict(self):
         bundle = DependencyHashBundle(
             summary_hash="abc123",
@@ -170,7 +170,7 @@ class TestPatchProposal:
 
 class TestRepairPlan:
     """Test RepairPlan structure and behavior."""
-    
+
     def test_plan_creation(self):
         plan = RepairPlan(
             plan_id="plan-001",
@@ -183,7 +183,7 @@ class TestRepairPlan:
         assert plan.plan_id == "plan-001"
         assert plan.policy == RepairPolicy.REPORT_FIRST
         assert plan.artifact_type == "repair_plan"
-    
+
     def test_mapping_first_priority(self):
         """Test that citation_mapping_error proposals are prioritized."""
         bundle = DependencyHashBundle(
@@ -197,7 +197,7 @@ class TestRepairPlan:
             anchor_text="Text...",
             anchor_hash="a1b2c3d4",
         )
-        
+
         # Create proposals with different root causes
         prop_visual = PatchProposal(
             proposal_id="prop-visual",
@@ -211,7 +211,7 @@ class TestRepairPlan:
             fix_strategy="summary_recheck",
             dependency_bundle=bundle,
         )
-        
+
         prop_mapping = PatchProposal(
             proposal_id="prop-mapping",
             citation_id="cite-002",
@@ -224,7 +224,7 @@ class TestRepairPlan:
             fix_strategy="manifest_fix",
             dependency_bundle=bundle,
         )
-        
+
         plan = RepairPlan(
             plan_id="plan-001",
             created_at=datetime.now().isoformat(),
@@ -233,7 +233,7 @@ class TestRepairPlan:
             proposals=[prop_visual, prop_mapping],  # Visual first in list
             policy=RepairPolicy.REPORT_FIRST,
         )
-        
+
         mapping_first = plan.get_mapping_first_proposals()
         assert len(mapping_first) == 1
         assert mapping_first[0].proposal_id == "prop-mapping"
@@ -241,7 +241,7 @@ class TestRepairPlan:
 
 class TestApplyGuardResult:
     """Test ApplyGuardResult structure."""
-    
+
     def test_guard_result_creation(self):
         result = ApplyGuardResult(
             can_apply=True,
@@ -253,7 +253,7 @@ class TestApplyGuardResult:
         assert result.can_apply is True
         assert result.version_guard_passed is True
         assert result.auto_safe_guard_passed is True
-    
+
     def test_guard_result_blocked(self):
         result = ApplyGuardResult(
             can_apply=False,
@@ -268,7 +268,7 @@ class TestApplyGuardResult:
 
 class TestRepairPlanner:
     """Test RepairPlanner functionality."""
-    
+
     def test_create_plan_empty(self):
         """Test creating a plan with no validation findings."""
         report = ReviewValidationReport(
@@ -288,7 +288,7 @@ class TestRepairPlanner:
         }
         citation_manifest = {"citations": []}
         paper_artifacts = []
-        
+
         planner = RepairPlanner(
             validation_report=report,
             review_draft=review_draft,
@@ -296,10 +296,10 @@ class TestRepairPlanner:
             paper_artifacts=paper_artifacts,
             job_id="job-001",
         )
-        
+
         plan = planner.create_plan()
         assert len(plan.proposals) == 0
-    
+
     def test_mapping_first_priority_in_plan(self):
         """Test that mapping errors are prioritized in plan creation."""
         citation_result = CitationValidationResult(
@@ -356,7 +356,7 @@ class TestRepairPlanner:
             "analysis": {"ai_summary": {}},
             "stage1_inputs": {"selected_visual_refs": []},
         }
-        
+
         planner = RepairPlanner(
             validation_report=report,
             review_draft=review_draft,
@@ -364,7 +364,7 @@ class TestRepairPlanner:
             paper_artifacts=[paper_artifact],
             job_id="job-001",
         )
-        
+
         plan = planner.create_plan()
         assert len(plan.proposals) == 1
         assert plan.proposals[0].root_cause == RepairRootCause.CITATION_MAPPING_ERROR
@@ -436,7 +436,7 @@ class TestRepairPlanner:
 
 class TestApplyGuards:
     """Test guard enforcement in repair apply."""
-    
+
     def test_version_guard_failure(self):
         """Test that version guard blocks apply on invalid artifact type."""
         bundle = DependencyHashBundle(
@@ -462,15 +462,15 @@ class TestApplyGuards:
             fix_strategy="manifest_fix",
             dependency_bundle=bundle,
         )
-        
+
         # Invalid review_draft (wrong artifact_type)
         review_draft = {"artifact_type": "wrong_type"}
         paper_artifacts = []
-        
+
         result = check_apply_guards(proposal, review_draft, paper_artifacts)
         assert result.can_apply is False
         assert result.version_guard_passed is False
-    
+
     def test_anchor_hash_guard_failure(self):
         """Test that anchor hash guard blocks apply on mismatch."""
         bundle = DependencyHashBundle(
@@ -496,7 +496,7 @@ class TestApplyGuards:
             fix_strategy="manifest_fix",
             dependency_bundle=bundle,
         )
-        
+
         review_draft = {
             "artifact_type": "review_draft",
             "content": {
@@ -515,11 +515,11 @@ class TestApplyGuards:
             },
         }
         paper_artifacts = []
-        
+
         result = check_apply_guards(proposal, review_draft, paper_artifacts)
         assert result.can_apply is False
         assert result.anchor_hash_guard_passed is False
-    
+
     def test_dependency_guard_failure(self):
         """Test that dependency guard blocks apply on stale dependencies."""
         bundle = DependencyHashBundle(
@@ -546,7 +546,7 @@ class TestApplyGuards:
             dependency_bundle=bundle,
             metadata={"paper_id": "paper-001"},
         )
-        
+
         review_draft = {
             "artifact_type": "review_draft",
             "content": {
@@ -570,7 +570,7 @@ class TestApplyGuards:
             "analysis": {"ai_summary": {"new": "data"}},  # Different from bundle
             "stage1_inputs": {"selected_visual_refs": []},
         }
-        
+
         result = check_apply_guards(proposal, review_draft, [paper_artifact])
         assert result.can_apply is False
         assert result.dependency_guard_passed is False
@@ -744,12 +744,12 @@ class TestApplyGuards:
 
 class TestBlockSpanOnlyBehavior:
     """Test that patches are block/span only (no whole-section rewrite)."""
-    
+
     def test_granularity_is_block_or_span(self):
         """Test that only BLOCK and SPAN granularities exist."""
         assert PatchGranularity.BLOCK.value == "block"
         assert PatchGranularity.SPAN.value == "span"
-        
+
         # Should not have section or chapter granularity
         granularities = [g.value for g in PatchGranularity]
         assert "section" not in granularities
@@ -758,7 +758,7 @@ class TestBlockSpanOnlyBehavior:
 
 class TestVisualUnderstandingGapRouting:
     """Test visual_understanding_gap routing behavior."""
-    
+
     def test_visual_gap_fix_strategy(self):
         """Test that visual gaps use summary_recheck_visual_bundle strategy."""
         bundle = DependencyHashBundle(
@@ -790,7 +790,7 @@ class TestVisualUnderstandingGapRouting:
 
 class TestReportFirstPolicy:
     """Test that default policy is report-first, not auto-apply."""
-    
+
     def test_default_policy_is_report_first(self):
         """Test that default policy is REPORT_FIRST."""
         report = ReviewValidationReport(
@@ -807,7 +807,7 @@ class TestReportFirstPolicy:
         review_draft = {"artifact_type": "review_draft", "content": {"sections": []}}
         citation_manifest = {"citations": []}
         paper_artifacts = []
-        
+
         planner = RepairPlanner(
             validation_report=report,
             review_draft=review_draft,
@@ -815,14 +815,14 @@ class TestReportFirstPolicy:
             paper_artifacts=paper_artifacts,
             job_id="job-001",
         )
-        
+
         plan = planner.create_plan()
         assert plan.policy == RepairPolicy.REPORT_FIRST
 
 
 class TestRunRepairPlanning:
     """Test run_repair_planning entry point."""
-    
+
     def test_entry_point_returns_expected_structure(self):
         """Test that entry point returns expected structure."""
         report = ReviewValidationReport(
@@ -839,7 +839,7 @@ class TestRunRepairPlanning:
         review_draft = {"artifact_type": "review_draft", "content": {"sections": []}}
         citation_manifest = {"citations": []}
         paper_artifacts = []
-        
+
         result = run_repair_planning(
             validation_report=report,
             review_draft=review_draft,
@@ -847,7 +847,7 @@ class TestRunRepairPlanning:
             paper_artifacts=paper_artifacts,
             job_id="job-001",
         )
-        
+
         assert result["week4_repair_planning"] is True
         assert "plan" in result
         assert "report" in result
@@ -927,7 +927,7 @@ class TestRunRepairApply:
         annotations = citation_manifest["citation_sets"][0]["repair_annotations"]
         assert annotations[0]["proposal_id"] == "prop-structural"
         assert annotations[0]["structural_only"] is True
-    
+
     def test_dry_run_checks_guards(self):
         """Test that dry run checks guards without applying."""
         bundle = DependencyHashBundle(
@@ -982,7 +982,7 @@ class TestRunRepairApply:
         }
         citation_manifest = {"citations": []}
         paper_artifacts = []
-        
+
         result = run_repair_apply(
             repair_plan=plan,
             review_draft=review_draft,
@@ -991,7 +991,7 @@ class TestRunRepairApply:
             job_id="job-001",
             dry_run=True,
         )
-        
+
         assert result["week4_repair_apply"] is True
         assert result["dry_run"] is True
         assert "proposal_checks" in result

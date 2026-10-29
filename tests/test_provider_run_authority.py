@@ -954,4 +954,3 @@ def test_summed_per_call_retry_ceiling_can_use_known_run_pool() -> None:
     assert unknown_pool.aggregate_retry_pool_remaining is None
     assert unknown_pool.retry_attempts_upper_bound == 302
     assert unknown_pool.physical_attempts_upper_bound == 453
-

@@ -167,4 +167,3 @@ def test_actual_compact_fixture_paraphrase_round_trips_exact_claim_and_support_c
                 "candidate_fixture_provider_generation:local:fixture-shard",
                 foreign_slot_request,
             )
-

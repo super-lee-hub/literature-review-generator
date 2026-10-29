@@ -808,8 +808,3 @@ def verify_single_source_candidate_bindings(
         _rejected_occurrences=tuple(rejected),
         _seal=_VERIFIED_SEAL,
     )
-
-
-
-
-

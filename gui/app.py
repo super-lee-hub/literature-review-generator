@@ -1289,7 +1289,7 @@ class WorkspaceController:
             name: str(card.get("api_key") or "")
             for name, card in self.api_cards.items()
         }
-        
+
         # 初始化队列服务
         self._queue_service: Optional[Any] = None
         self._queue_runner: Optional[Any] = None

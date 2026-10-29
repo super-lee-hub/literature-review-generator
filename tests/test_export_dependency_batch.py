@@ -557,4 +557,3 @@ def test_attestation_graph_uses_one_captured_record_list(tmp_path: Path, monkeyp
     assert set(result.dependency_graph) == {original.artifact_id}
     assert "review_docx:late" not in result.dependency_graph
     assert capture_calls == 1
-

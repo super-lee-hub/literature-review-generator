@@ -40,7 +40,7 @@ class PreprocessEvidenceLoader:
         if limit <= 0:
             raise ValueError("max_artifact_bytes must be positive")
         self.max_artifact_bytes = limit
-    
+
     def load_evidence(
         self,
         normalized_text_path: Optional[str] = None,
@@ -54,7 +54,7 @@ class PreprocessEvidenceLoader:
         strict: bool = False,
     ) -> PreprocessEvidence:
         """加载预处理证据
-        
+
         Args:
             plain_text_path: 纯文本文件路径
             page_index_path: 页面索引文件路径
@@ -63,7 +63,7 @@ class PreprocessEvidenceLoader:
             manifest_path: 清单文件路径
             visual_artifacts_path: 视觉产物路径
             diagnostics_path: 诊断文件路径
-            
+
         Returns:
             PreprocessEvidence: 加载的证据对象
         """
@@ -88,7 +88,7 @@ class PreprocessEvidenceLoader:
         manifest = self._load_json(manifest_path, default={})
         visual_artifacts = self._load_json(visual_artifacts_path, default=[])
         diagnostics = self._load_json(diagnostics_path, default={})
-        
+
         return PreprocessEvidence(
             normalized_text=normalized_text,
             plain_text=plain_text,
@@ -378,7 +378,7 @@ class PreprocessEvidenceLoader:
                 f"validation evidence hash mismatch: {target.name}", path=path
             )
         return expectation
-    
+
     def _load_text(self, path: Optional[str]) -> str:
         """加载文本文件"""
         if not path or not os.path.exists(path):
@@ -388,7 +388,7 @@ class PreprocessEvidenceLoader:
                 return f.read()
         except Exception:
             return ""
-    
+
     def _load_json(self, path: Optional[str], default: Any) -> Any:
         """加载JSON文件"""
         if not path or not os.path.exists(path):
@@ -405,11 +405,11 @@ def build_evidence_context_from_preprocess(
     paper_artifact: Dict[str, Any],
 ) -> Dict[str, Any]:
     """从预处理证据构建证据上下文
-    
+
     Args:
         evidence: 预处理证据对象
         paper_artifact: 论文产物
-        
+
     Returns:
         Dict[str, Any]: 证据上下文
     """

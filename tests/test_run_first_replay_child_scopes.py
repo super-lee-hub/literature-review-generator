@@ -168,5 +168,3 @@ def test_multilevel_reducer_children_resume_without_calls_and_tampering_is_stale
     assert "prompt_payload_changed" in prompt_tamper.stale_reasons
     assert "input_artifacts_changed" in input_tamper.stale_reasons
     assert "execution_binding_changed" in binding_tamper.stale_reasons
-
-

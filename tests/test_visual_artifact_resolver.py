@@ -25,7 +25,7 @@ def test_resolve_visual_manifest_from_paper_artifact(tmp_path):
         "visuals": []
     }
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    
+
     # Register manifest
     registry.register_file(
         artifact_role="visual_manifest",
@@ -34,7 +34,7 @@ def test_resolve_visual_manifest_from_paper_artifact(tmp_path):
         path=str(manifest_path),
         producer="test"
     )
-    
+
     # Create paper artifact
     paper_artifact_path = tmp_path / "paper_artifact.json"
     paper_artifact = {
@@ -56,11 +56,11 @@ def test_resolve_visual_manifest_from_paper_artifact(tmp_path):
         }
     }
     paper_artifact_path.write_text(json.dumps(paper_artifact), encoding="utf-8")
-    
+
     # Test resolver
     resolver = VisualArtifactResolver(registry)
     resolved_manifest = resolver.resolve_visual_manifest(str(paper_artifact_path))
-    
+
     assert resolved_manifest is not None
     assert resolved_manifest["paper_key"] == "test_paper"
 
@@ -126,7 +126,7 @@ def test_resolve_visual_manifest_from_registry(tmp_path):
     manifest_path = tmp_path / "visual_manifest.json"
     manifest = _current_authority_manifest(tmp_path)
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    
+
     # Register manifest
     registry.register_file(
         artifact_role="visual_manifest",
@@ -135,7 +135,7 @@ def test_resolve_visual_manifest_from_registry(tmp_path):
         path=str(manifest_path),
         producer="test"
     )
-    
+
     # Create paper artifact without visual manifest path
     paper_artifact_path = tmp_path / "paper_artifact.json"
     paper_artifact = {
@@ -154,11 +154,11 @@ def test_resolve_visual_manifest_from_registry(tmp_path):
         "stage1_inputs": {}
     }
     paper_artifact_path.write_text(json.dumps(paper_artifact), encoding="utf-8")
-    
+
     # Test resolver
     resolver = VisualArtifactResolver(registry)
     resolved_manifest = resolver.resolve_visual_manifest(str(paper_artifact_path))
-    
+
     assert resolved_manifest is not None
     assert resolved_manifest["paper_key"] == "test_paper"
 
@@ -255,7 +255,7 @@ def test_resolve_selected_visual_refs_from_paper_artifact(tmp_path):
     # Create registry
     registry_path = tmp_path / "artifact_registry.json"
     registry = ArtifactRegistry(str(registry_path), "job-123")
-    
+
     # Create paper artifact with selected visual refs
     paper_artifact_path = tmp_path / "paper_artifact.json"
     selected_refs = [
@@ -294,11 +294,11 @@ def test_resolve_selected_visual_refs_from_paper_artifact(tmp_path):
         }
     }
     paper_artifact_path.write_text(json.dumps(paper_artifact), encoding="utf-8")
-    
+
     # Test resolver
     resolver = VisualArtifactResolver(registry)
     resolved_refs = resolver.resolve_selected_visual_refs(str(paper_artifact_path))
-    
+
     assert len(resolved_refs) == 1
     assert resolved_refs[0]["visual_id"] == "fig1"
 
@@ -308,7 +308,7 @@ def test_resolve_selected_visual_refs_from_manifest(tmp_path):
     # Create registry
     registry_path = tmp_path / "artifact_registry.json"
     registry = ArtifactRegistry(str(registry_path), "job-123")
-    
+
     # Create visual manifest
     manifest_path = tmp_path / "visual_manifest.json"
     visuals = [
@@ -343,7 +343,7 @@ def test_resolve_selected_visual_refs_from_manifest(tmp_path):
         "visuals": visuals
     }
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    
+
     # Register manifest
     registry.register_file(
         artifact_role="visual_manifest",
@@ -352,7 +352,7 @@ def test_resolve_selected_visual_refs_from_manifest(tmp_path):
         path=str(manifest_path),
         producer="test"
     )
-    
+
     # Create paper artifact without selected visual refs
     paper_artifact_path = tmp_path / "paper_artifact.json"
     paper_artifact = {
@@ -373,11 +373,11 @@ def test_resolve_selected_visual_refs_from_manifest(tmp_path):
         }
     }
     paper_artifact_path.write_text(json.dumps(paper_artifact), encoding="utf-8")
-    
+
     # Test resolver
     resolver = VisualArtifactResolver(registry)
     resolved_refs = resolver.resolve_selected_visual_refs(str(paper_artifact_path))
-    
+
     assert len(resolved_refs) == 1
     assert resolved_refs[0]["visual_id"] == "fig1"
 
@@ -387,7 +387,7 @@ def test_resolve_visual_artifact_by_id(tmp_path):
     # Create registry
     registry_path = tmp_path / "artifact_registry.json"
     registry = ArtifactRegistry(str(registry_path), "job-123")
-    
+
     # Create visual manifest
     manifest_path = tmp_path / "visual_manifest.json"
     visuals = [
@@ -422,7 +422,7 @@ def test_resolve_visual_artifact_by_id(tmp_path):
         "visuals": visuals
     }
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    
+
     # Register manifest
     registry.register_file(
         artifact_role="visual_manifest",
@@ -431,11 +431,11 @@ def test_resolve_visual_artifact_by_id(tmp_path):
         path=str(manifest_path),
         producer="test"
     )
-    
+
     # Test resolver
     resolver = VisualArtifactResolver(registry)
     resolved_artifact = resolver.resolve_visual_artifact_by_id("fig1")
-    
+
     assert resolved_artifact is not None
     assert resolved_artifact["visual_id"] == "fig1"
 
@@ -445,7 +445,7 @@ def test_get_visual_artifacts_for_paper(tmp_path):
     # Create registry
     registry_path = tmp_path / "artifact_registry.json"
     registry = ArtifactRegistry(str(registry_path), "job-123")
-    
+
     # Create visual manifest
     manifest_path = tmp_path / "visual_manifest.json"
     visuals = [
@@ -480,7 +480,7 @@ def test_get_visual_artifacts_for_paper(tmp_path):
         "visuals": visuals
     }
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    
+
     # Register manifest
     registry.register_file(
         artifact_role="visual_manifest",
@@ -489,11 +489,11 @@ def test_get_visual_artifacts_for_paper(tmp_path):
         path=str(manifest_path),
         producer="test"
     )
-    
+
     # Test resolver
     resolver = VisualArtifactResolver(registry)
     artifacts = resolver.get_visual_artifacts_for_paper("test_paper")
-    
+
     assert len(artifacts) == 1
     assert artifacts[0]["paper_key"] == "test_paper"
 
@@ -503,21 +503,21 @@ def test_missing_artifact_cases(tmp_path):
     # Create registry
     registry_path = tmp_path / "artifact_registry.json"
     registry = ArtifactRegistry(str(registry_path), "job-123")
-    
+
     # Test with non-existent paper artifact
     resolver = VisualArtifactResolver(registry)
     non_existent_path = str(tmp_path / "non_existent.json")
-    
+
     manifest = resolver.resolve_visual_manifest(non_existent_path)
     assert manifest is None
-    
+
     refs = resolver.resolve_selected_visual_refs(non_existent_path)
     assert len(refs) == 0
-    
+
     # Test with non-existent visual ID
     artifact = resolver.resolve_visual_artifact_by_id("non_existent")
     assert artifact is None
-    
+
     # Test with non-existent paper key
     artifacts = resolver.get_visual_artifacts_for_paper("non_existent")
     assert len(artifacts) == 0

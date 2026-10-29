@@ -72,18 +72,18 @@ def _register_validation_fixture(workspace: JobWorkspace, registry: ArtifactRegi
 
 class TestArtifactRegistryRegister:
     """Test ArtifactRegistry.register() method used by repair_integration."""
-    
+
     def test_register_method_exists(self):
         """Test that register() method exists and is callable."""
         with tempfile.TemporaryDirectory() as tmpdir:
             registry_path = os.path.join(tmpdir, "registry.json")
             registry = ArtifactRegistry(registry_path, "job-001")
-            
+
             # Create a dummy file to register
             test_file = os.path.join(tmpdir, "test.json")
             with open(test_file, "w") as f:
                 json.dump({"test": "data"}, f)
-            
+
             # Should not raise AttributeError
             record = registry.register(
                 artifact_id="test-artifact-001",
@@ -95,22 +95,22 @@ class TestArtifactRegistryRegister:
                 status="completed",
                 depends_on=[],
             )
-            
+
             assert record is not None
             assert record.artifact_id == "test-artifact-001"
             assert record.artifact_type == "test_type"
-    
+
     def test_register_with_dependencies(self):
         """Test register() with dependency tracking."""
         with tempfile.TemporaryDirectory() as tmpdir:
             registry_path = os.path.join(tmpdir, "registry.json")
             registry = ArtifactRegistry(registry_path, "job-001")
-            
+
             # Create dependency artifact first
             dep_file = os.path.join(tmpdir, "dep.json")
             with open(dep_file, "w") as f:
                 json.dump({"dep": "data"}, f)
-            
+
             dep_record = registry.register(
                 artifact_id="dep-001",
                 artifact_type="dependency",
@@ -119,12 +119,12 @@ class TestArtifactRegistryRegister:
                 producer="test",
                 job_id="job-001",
             )
-            
+
             # Create main artifact with dependency
             main_file = os.path.join(tmpdir, "main.json")
             with open(main_file, "w") as f:
                 json.dump({"main": "data"}, f)
-            
+
             main_record = registry.register(
                 artifact_id="main-001",
                 artifact_type="main",
@@ -134,21 +134,21 @@ class TestArtifactRegistryRegister:
                 job_id="job-001",
                 depends_on=[ArtifactDependencyRefV2.from_record(dep_record).to_dict()],
             )
-            
+
             assert len(main_record.depends_on) == 1
             assert main_record.depends_on[0].artifact_type == "dependency"
 
 
 class TestPersistRepairPlan:
     """Test persist_repair_plan function."""
-    
+
     def test_persist_and_register_repair_plan(self):
         """Test that repair plan is persisted and registered."""
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = JobWorkspace(tmpdir, "test_project", "job-001")
             registry = ArtifactRegistry(workspace.paths.registry_path, "job-001")
             _register_validation_fixture(workspace, registry)
-            
+
             plan = RepairPlan(
                 plan_id="plan-001",
                 created_at=datetime.now().isoformat(),
@@ -157,25 +157,25 @@ class TestPersistRepairPlan:
                 proposals=[],
                 policy=RepairPolicy.REPORT_FIRST,
             )
-            
+
             plan_path = persist_repair_plan(plan, workspace, registry)
-            
+
             # Check file exists
             assert os.path.exists(plan_path)
-            
+
             # Check registry has the artifact
             record = registry.get("repair_plan_plan-001")
             assert record is not None
             assert record.artifact_type == REPAIR_PLAN_ARTIFACT_TYPE
             assert record.artifact_version == "v1"
-    
+
     def test_persist_repair_plan_with_proposals(self):
         """Test persisting repair plan with patch proposals."""
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = JobWorkspace(tmpdir, "test_project", "job-001")
             registry = ArtifactRegistry(workspace.paths.registry_path, "job-001")
             _register_validation_fixture(workspace, registry)
-            
+
             bundle = DependencyHashBundle(
                 summary_hash="abc123",
                 paper_artifact_hash="def456",
@@ -199,7 +199,7 @@ class TestPersistRepairPlan:
                 fix_strategy="manifest_fix",
                 dependency_bundle=bundle,
             )
-            
+
             plan = RepairPlan(
                 plan_id="plan-002",
                 created_at=datetime.now().isoformat(),
@@ -208,13 +208,13 @@ class TestPersistRepairPlan:
                 proposals=[proposal],
                 policy=RepairPolicy.REPORT_FIRST,
             )
-            
+
             plan_path = persist_repair_plan(plan, workspace, registry)
-            
+
             # Load and verify
             with open(plan_path, "r") as f:
                 data = json.load(f)
-            
+
             assert data["plan_id"] == "plan-002"
             assert len(data["proposals"]) == 1
             assert data["proposals"][0]["proposal_id"] == "prop-001"
@@ -222,7 +222,7 @@ class TestPersistRepairPlan:
 
 class TestPersistRepairReport:
     """Test persist_repair_report function."""
-    
+
     def test_persist_repair_report(self):
         """Test that repair report is persisted and registered."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -241,7 +241,7 @@ class TestPersistRepairReport:
                 workspace,
                 registry,
             )
-            
+
             report = RepairReport(
                 report_id="report-001",
                 created_at=datetime.now().isoformat(),
@@ -251,12 +251,12 @@ class TestPersistRepairReport:
                 summary={"total_proposals": 5},
                 proposals_detail=[],
             )
-            
+
             report_path = persist_repair_report(report, workspace, registry)
-            
+
             # Check file exists
             assert os.path.exists(report_path)
-            
+
             # Check registry has the artifact
             record = registry.get("repair_report_report-001")
             assert record is not None
@@ -265,7 +265,7 @@ class TestPersistRepairReport:
 
 class TestPersistRepairApplyResult:
     """Test persist_repair_apply_result function."""
-    
+
     def test_persist_apply_result_with_records(self):
         """Test that apply result and patch records are persisted."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -284,7 +284,7 @@ class TestPersistRepairApplyResult:
                 workspace,
                 registry,
             )
-            
+
             apply_result = RepairApplyResult(
                 success=True,
                 plan_id="plan-001",
@@ -293,7 +293,7 @@ class TestPersistRepairApplyResult:
                 applied_proposals=["prop-001", "prop-002"],
                 rejected_proposals=[{"proposal_id": "prop-003", "reason": "guard_failed"}],
             )
-            
+
             applied_records = [
                 AppliedPatchRecord(
                     record_id="rec-001",
@@ -308,19 +308,19 @@ class TestPersistRepairApplyResult:
                     anchor_hash_after="hash2",
                 ),
             ]
-            
+
             result_path = persist_repair_apply_result(
                 apply_result, applied_records, workspace, registry, "job-001"
             )
-            
+
             # Check file exists
             assert os.path.exists(result_path)
-            
+
             # Check registry has the artifacts
             result_record = registry.get("repair_apply_result_plan-001")
             assert result_record is not None
             assert result_record.artifact_type == REPAIR_APPLY_RESULT_ARTIFACT_TYPE
-            
+
             patch_record = registry.get("applied_patch_rec-001")
             assert patch_record is not None
             assert patch_record.artifact_type == APPLIED_PATCH_RECORD_ARTIFACT_TYPE
@@ -328,22 +328,22 @@ class TestPersistRepairApplyResult:
 
 class TestLoadRepairPlan:
     """Test load_repair_plan function."""
-    
+
     def test_load_nonexistent_plan_returns_none(self):
         """Test loading a non-existent plan returns None."""
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = JobWorkspace(tmpdir, "test_project", "job-001")
-            
+
             result = load_repair_plan("nonexistent", workspace)
             assert result is None
-    
+
     def test_load_repair_plan_round_trip(self):
         """Test that a persisted plan can be loaded back correctly."""
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = JobWorkspace(tmpdir, "test_project", "job-001")
             registry = ArtifactRegistry(workspace.paths.registry_path, "job-001")
             _register_validation_fixture(workspace, registry)
-            
+
             # Create and persist a plan
             bundle = DependencyHashBundle(
                 summary_hash="abc123",
@@ -371,7 +371,7 @@ class TestLoadRepairPlan:
                 dependency_bundle=bundle,
                 metadata={"paper_ids": ["paper-001"]},
             )
-            
+
             original_plan = RepairPlan(
                 plan_id="plan-roundtrip",
                 created_at=datetime.now().isoformat(),
@@ -380,17 +380,17 @@ class TestLoadRepairPlan:
                 proposals=[proposal],
                 policy=RepairPolicy.REPORT_FIRST,
             )
-            
+
             persist_repair_plan(original_plan, workspace, registry)
-            
+
             # Load the plan back
             loaded_plan = load_repair_plan("plan-roundtrip", workspace)
-            
+
             assert loaded_plan is not None
             assert loaded_plan.plan_id == "plan-roundtrip"
             assert loaded_plan.policy == RepairPolicy.REPORT_FIRST
             assert len(loaded_plan.proposals) == 1
-            
+
             loaded_proposal = loaded_plan.proposals[0]
             assert loaded_proposal.proposal_id == "prop-001"
             assert loaded_proposal.root_cause == RepairRootCause.CITATION_MAPPING_ERROR
@@ -404,14 +404,14 @@ class TestLoadRepairPlan:
 
 class TestRepairPipelineIntegration:
     """Test run_repair_pipeline integration."""
-    
+
     def test_repair_pipeline_report_first_policy(self):
         """Test that default policy is report-first."""
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = JobWorkspace(tmpdir, "test_project", "job-001")
             registry = ArtifactRegistry(workspace.paths.registry_path, "job-001")
             _register_validation_fixture(workspace, registry)
-            
+
             # Create validation report with one non-supported citation
             citation_result = CitationValidationResult(
                 citation_id="cite-001",
@@ -439,7 +439,7 @@ class TestRepairPipelineIntegration:
                 needs_review_count=0,
                 citation_results=[citation_result],
             )
-            
+
             review_draft = {
                 "artifact_type": "review_draft",
                 "artifact_version": "v1",
@@ -468,7 +468,7 @@ class TestRepairPipelineIntegration:
                 "analysis": {"ai_summary": {}},
                 "stage1_inputs": {"selected_visual_refs": []},
             }
-            
+
             result = run_repair_pipeline(
                 validation_report=validation_report,
                 review_draft=review_draft,
@@ -479,7 +479,7 @@ class TestRepairPipelineIntegration:
                 registry=registry,
                 auto_apply=False,  # Default: report-first
             )
-            
+
             assert result["repair_pipeline"] is True
             assert result["policy"] == "report_first"
             assert result["applied"] is False
@@ -487,14 +487,14 @@ class TestRepairPipelineIntegration:
             assert "plan_path" in result
             assert "report_path" in result
             assert "message" in result  # Should have report-only message
-    
+
     def test_repair_pipeline_auto_apply(self):
         """Test auto_safe does not apply text-mutating generated proposals."""
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = JobWorkspace(tmpdir, "test_project", "job-001")
             registry = ArtifactRegistry(workspace.paths.registry_path, "job-001")
             _register_validation_fixture(workspace, registry)
-            
+
             citation_result = CitationValidationResult(
                 citation_id="cite-001",
                 paper_id="paper-001",
@@ -521,7 +521,7 @@ class TestRepairPipelineIntegration:
                 needs_review_count=0,
                 citation_results=[citation_result],
             )
-            
+
             review_draft = {
                 "artifact_type": "review_draft",
                 "artifact_version": "v1",
@@ -548,7 +548,7 @@ class TestRepairPipelineIntegration:
                 "analysis": {"ai_summary": {}},
                 "stage1_inputs": {"selected_visual_refs": []},
             }
-            
+
             result = run_repair_pipeline(
                 validation_report=validation_report,
                 review_draft=review_draft,
@@ -559,7 +559,7 @@ class TestRepairPipelineIntegration:
                 registry=registry,
                 auto_apply=True,  # Auto-apply mode
             )
-            
+
             assert result["repair_pipeline"] is True
             assert result["policy"] == "auto_apply_safe"
             assert result["repair_policy"] == "auto_safe"
@@ -743,14 +743,14 @@ class TestRepairPipelineIntegration:
 
 class TestRepairArtifactsDurability:
     """Test that repair artifacts are durably persisted."""
-    
+
     def test_all_artifact_types_registered(self):
         """Test that all repair artifact types are properly registered."""
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = JobWorkspace(tmpdir, "test_project", "job-001")
             registry = ArtifactRegistry(workspace.paths.registry_path, "job-001")
             _register_validation_fixture(workspace, registry)
-            
+
             # Create a full repair pipeline result
             plan = RepairPlan(
                 plan_id="durability-test",
@@ -760,9 +760,9 @@ class TestRepairArtifactsDurability:
                 proposals=[],
                 policy=RepairPolicy.REPORT_FIRST,
             )
-            
+
             plan_path = persist_repair_plan(plan, workspace, registry)
-            
+
             report = RepairReport(
                 report_id="durability-test",
                 created_at=datetime.now().isoformat(),
@@ -772,9 +772,9 @@ class TestRepairArtifactsDurability:
                 summary={"total": 0},
                 proposals_detail=[],
             )
-            
+
             report_path = persist_repair_report(report, workspace, registry)
-            
+
             apply_result = RepairApplyResult(
                 success=True,
                 plan_id="durability-test",
@@ -783,24 +783,24 @@ class TestRepairArtifactsDurability:
                 applied_proposals=[],
                 rejected_proposals=[],
             )
-            
+
             apply_path = persist_repair_apply_result(
                 apply_result, [], workspace, registry, "job-001"
             )
-            
+
             # Verify all files exist
             assert os.path.exists(plan_path)
             assert os.path.exists(report_path)
             assert os.path.exists(apply_path)
-            
+
             # Verify all are in registry
             assert registry.get("repair_plan_durability-test") is not None
             assert registry.get("repair_report_durability-test") is not None
             assert registry.get("repair_apply_result_durability-test") is not None
-            
+
             # Verify registry is saved to disk
             assert os.path.exists(registry.registry_path)
-            
+
             # Load registry fresh and verify
             registry2 = ArtifactRegistry(registry.registry_path, "job-001")
             assert registry2.get("repair_plan_durability-test") is not None

@@ -510,4 +510,3 @@ def test_comparison_and_organization_raw_artifacts_snapshot_receipts_and_restart
             assert replayed_receipt.test_only is False
             assert replayed_receipt.call_id == original_receipt.call_id
             assert replayed_receipt.response_hash == original_receipt.response_hash
-

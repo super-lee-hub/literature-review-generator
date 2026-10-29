@@ -293,7 +293,7 @@ def check_apply_guards(
     require_auto_safe: bool = False,
 ) -> ApplyGuardResult:
     """Check all guards before applying a patch.
-    
+
     Guards:
     1. Version guard - review_draft artifact_type and version match expected
     2. Anchor/hash guard - target block still has expected anchor_hash
@@ -307,14 +307,14 @@ def check_apply_guards(
     if review_draft.get("artifact_type") != "review_draft":
         version_guard_passed = False
         block_reasons.append("Invalid review_draft artifact_type")
-    
+
     if review_draft.get("artifact_version") != expected_artifact_version:
         version_guard_passed = False
         block_reasons.append(
             f"Version mismatch: expected {expected_artifact_version}, "
             f"got {review_draft.get('artifact_version')}"
         )
-    
+
     # Anchor/hash guard
     anchor_hash_guard_passed = True
     current_block, _current_section = _resolve_review_text_unit(
@@ -353,14 +353,14 @@ def check_apply_guards(
                     block_reasons.append(
                         f"Cell span is not bound to current cell text for block {proposal.target.block_id}"
                     )
-    
+
     # Dependency guard
     dependency_guard_passed = _check_dependency_bundle(
         proposal, paper_artifacts, review_draft, visual_manifest
     )
     if not dependency_guard_passed:
         block_reasons.append("Dependency bundle check failed - dependencies missing or stale")
-    
+
     auto_safe_guard_passed = True
     if require_auto_safe:
         auto_safe_guard_passed = is_auto_safe_proposal(proposal)
@@ -374,7 +374,7 @@ def check_apply_guards(
         and dependency_guard_passed
         and (not require_auto_safe or auto_safe_guard_passed)
     )
-    
+
     return ApplyGuardResult(
         can_apply=can_apply,
         version_guard_passed=version_guard_passed,
@@ -387,7 +387,7 @@ def check_apply_guards(
 
 def _apply_span_patch(block_text: str, proposal: PatchProposal) -> str:
     """Apply a true span-level patch to block text.
-    
+
     For citation_mapping_error: replace the problematic citation span.
     For other issues: apply the specific text replacement.
     """
@@ -399,7 +399,7 @@ def _apply_span_patch(block_text: str, proposal: PatchProposal) -> str:
             proposal.original_text,
             f"[CITATION_MAPPING_ERROR: {citation_id} - needs manual review]"
         )
-    
+
     # For true span patches with span_start/span_end
     if proposal.target.span_start is not None and proposal.target.span_end is not None:
         return (
@@ -407,14 +407,14 @@ def _apply_span_patch(block_text: str, proposal: PatchProposal) -> str:
             proposal.proposed_text +
             block_text[proposal.target.span_end:]
         )
-    
+
     # Fallback: replace original with proposed
     return block_text.replace(proposal.original_text, proposal.proposed_text)
 
 
 def _apply_block_patch(block_text: str, proposal: PatchProposal) -> str:
     """Apply a block-level patch.
-    
+
     Replaces the entire block content.
     """
     return proposal.proposed_text
@@ -532,7 +532,7 @@ def apply_patch(
     visual_manifest: Optional[Dict[str, Any]] = None,
 ) -> Optional[AppliedPatchRecord]:
     """Apply a single patch to review_draft.
-    
+
     Returns AppliedPatchRecord on success, None on failure.
     """
     # Check guards first (use inferred expected version from review_draft)
@@ -542,7 +542,7 @@ def apply_patch(
     )
     if not guard_result.can_apply:
         return None
-    
+
     block, section = _resolve_review_text_unit(review_draft, proposal.target.block_id)
     if block is None or section is None:
         return None
@@ -615,14 +615,14 @@ def _restore_text_unit(
 
 class RepairApplier:
     """Applies repair plans with guard enforcement.
-    
+
     Enforces:
     - Version guard (artifact_type + artifact_version)
     - Anchor/hash guard
     - Dependency guard
     - Block/span-only patch granularity (no whole-section rewrite)
     """
-    
+
     def __init__(
         self,
         repair_plan: RepairPlan,
@@ -642,22 +642,22 @@ class RepairApplier:
         self.require_auto_safe = require_auto_safe
         self.applied_records: List[AppliedPatchRecord] = []
         self.rejected_proposals: List[Dict[str, Any]] = []
-    
+
     def apply_all(self) -> RepairApplyResult:
         """Apply all patches in the plan.
-        
+
         Skips patches that fail guard checks.
         Returns result with applied and rejected counts.
         Automatically triggers targeted recheck after repair application.
         """
         applied_ids: List[str] = []
         recheck_triggered: List[str] = []
-        
+
         for proposal in self.repair_plan.proposals:
             # Add plan_id to metadata
             if "plan_id" not in proposal.metadata:
                 proposal.metadata["plan_id"] = self.repair_plan.plan_id
-            
+
             # Check guards (use inferred expected version)
             expected_version = infer_expected_review_draft_version(self.review_draft)
             guard_result = check_apply_guards(
@@ -665,7 +665,7 @@ class RepairApplier:
                 expected_artifact_version=expected_version,
                 require_auto_safe=self.require_auto_safe,
             )
-            
+
             if not guard_result.can_apply:
                 self.rejected_proposals.append({
                     "proposal_id": proposal.proposal_id,
@@ -674,7 +674,7 @@ class RepairApplier:
                     "block_reasons": guard_result.block_reasons,
                 })
                 continue
-            
+
             # Apply patch
             if self.require_auto_safe:
                 record = apply_structural_patch(
@@ -689,11 +689,11 @@ class RepairApplier:
                 record = apply_patch(
                     proposal, self.review_draft, self.paper_artifacts, self.job_id, self.visual_manifest
                 )
-            
+
             if record:
                 self.applied_records.append(record)
                 applied_ids.append(proposal.proposal_id)
-                
+
                 # Auto-trigger targeted recheck based on root cause
                 if proposal.root_cause == RepairRootCause.SUMMARY_DRIFT:
                     # Trigger targeted summary recheck (use first paper_id from v3 list)
@@ -712,10 +712,10 @@ class RepairApplier:
                     "citation_id": proposal.citation_id,
                     "reason": "apply_failed",
                 })
-        
+
         # Note: AppliedPatchRecord doesn't have metadata field, so we'll just track rechecks in the result
         # Rechecks are triggered based on root cause, and will be handled in the calling code
-        
+
         return RepairApplyResult(
             success=len(self.applied_records) > 0,
             plan_id=self.repair_plan.plan_id,
@@ -724,7 +724,7 @@ class RepairApplier:
             applied_proposals=applied_ids,
             rejected_proposals=self.rejected_proposals,
         )
-    
+
     def get_patched_review_draft(self) -> Dict[str, Any]:
         """Get the patched review_draft."""
         return self.review_draft
@@ -732,7 +732,7 @@ class RepairApplier:
     def get_patched_citation_manifest(self) -> Dict[str, Any]:
         """Get the citation manifest after structural repair annotations."""
         return self.citation_manifest
-    
+
     def get_applied_records(self) -> List[AppliedPatchRecord]:
         """Get records of all applied patches."""
         return self.applied_records
@@ -749,7 +749,7 @@ def run_repair_apply(
     require_auto_safe: bool = False,
 ) -> Dict[str, Any]:
     """Week 4 entry point for repair application.
-    
+
     Applies repair plan with full guard enforcement.
     If dry_run is True, only checks guards without applying.
     """
@@ -762,7 +762,7 @@ def run_repair_apply(
         visual_manifest=visual_manifest,
         require_auto_safe=require_auto_safe,
     )
-    
+
     if dry_run:
         # Just check guards for all proposals (use inferred expected version)
         expected_version = infer_expected_review_draft_version(review_draft)
@@ -784,13 +784,13 @@ def run_repair_apply(
             "plan_id": repair_plan.plan_id,
             "proposal_checks": results,
         }
-    
+
     # Apply all patches
     result = applier.apply_all()
     patched_draft = applier.get_patched_review_draft()
     patched_manifest = applier.get_patched_citation_manifest()
     applied_records = applier.get_applied_records()
-    
+
     return {
         "week4_repair_apply": True,
         "dry_run": False,

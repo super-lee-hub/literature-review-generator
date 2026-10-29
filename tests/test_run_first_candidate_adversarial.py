@@ -407,4 +407,3 @@ def test_compact_candidate_compiler_rejects_foreign_group_and_cannot_import_its_
             executor._expand_candidate_wire_payload(
                 foreign_response, ab_group.paper_keys, [cd_group.claim_group_id],
             )
-

@@ -1629,7 +1629,3 @@ def test_blocks_tampered_current_summary_bytes(tmp_path: Path, monkeypatch: pyte
             expected_source_bundle_hash=source_hash,
             expected_runtime_spec_hash=spec_hash,
         )
-
-
-
-

@@ -469,4 +469,3 @@ def test_unaligned_or_atomic_oversized_parent_fails_closed_before_any_leaf_can_d
             max_calls=64,
             output_cap=1024,
         )
-

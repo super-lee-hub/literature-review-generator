@@ -1243,6 +1243,3 @@ __all__ = [
     "Stage1PublicationRecoveryBlocked",
     "try_recover_registered_stage1_publication",
 ]
-
-
-

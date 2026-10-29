@@ -464,4 +464,3 @@ def test_direct_validator_rejects_unstarted_or_mismatched_run_without_ledger_wri
     assert registry_path.read_bytes() == before_registry
     if fixture["envelope_path"] is not None:
         assert fixture["envelope_path"].read_bytes() == before_envelope
-

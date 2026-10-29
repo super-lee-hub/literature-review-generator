@@ -3399,7 +3399,7 @@ class PreprocessManager:
             "Image too small to scale",
             "Line cannot be recognized",
         )
-        
+
         doc = fitz.open(pdf_path)
         plain_parts: List[str] = []
         page_diagnostics: List[PageDiagnostics] = []
@@ -3452,7 +3452,7 @@ class PreprocessManager:
                 )
         finally:
             doc.close()
-        
+
         # 记录解析器警告
         if parser_warnings:
             self._log(

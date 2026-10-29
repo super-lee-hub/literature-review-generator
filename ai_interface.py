@@ -4532,20 +4532,20 @@ def _smart_json_parser(content: str) -> Optional[Dict[str, Any]]:
     # 解析策略按优先级排序
     def parse_strategy_1() -> Optional[Dict[str, Any]]:
         return json.loads(content) if content else None
-    
+
     def parse_strategy_2() -> Optional[Dict[str, Any]]:
         match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', content, re.DOTALL | re.IGNORECASE)
         return json.loads(match.group(1)) if match and match.group(1) else None
-    
+
     def parse_strategy_3() -> Optional[Dict[str, Any]]:
         match = re.search(r'\{.*\}', content, re.DOTALL)
         return json.loads(match.group(0)) if match and match.group(0) else None
-    
+
     def parse_strategy_4() -> Optional[Dict[str, Any]]:
         start = content.find('{')
         end = content.rfind('}')
         return json.loads(content[start:end+1]) if start != -1 and end != -1 and end >= start else None
-    
+
     parse_strategies: List[Callable[[], Optional[Dict[str, Any]]]] = [
         parse_strategy_1,
         parse_strategy_2,
@@ -4574,26 +4574,26 @@ def _smart_json_parser(content: str) -> Optional[Dict[str, Any]]:
 def _auto_correct_json(content: str) -> Optional[Dict[str, Any]]:
     """
     自动纠错JSON，尝试修复常见的JSON格式错误
-    
+
     Args:
         content: AI返回的原始内容
-        
+
     Returns:
         修复后的字典，失败返回None
     """
     # 添加content None安全检查
     if not content:
         return None
-    
+
     try:
         # 提取可能的JSON字符串
         json_str: Optional[str] = _extract_json_string(content)
         if not json_str:
             return None
-        
+
         # 常见JSON错误修复
         corrected_json: str = _fix_common_json_errors(json_str)
-        
+
         # 尝试解析修复后的JSON
         try:
             return json.loads(corrected_json)
@@ -4614,35 +4614,35 @@ def _auto_correct_json(content: str) -> Optional[Dict[str, Any]]:
 def _extract_json_string(content: str) -> Optional[str]:
     """
     从内容中提取JSON字符串
-    
+
     Args:
         content: AI返回的原始内容
-        
+
     Returns:
         提取的JSON字符串
     """
     # 添加content None安全检查
     if not content:
         return None
-    
+
     # 尝试多种方法提取JSON字符串
-    
+
     # 方法1：查找JSON代码块
     json_match = re.search(r'```json\s*(.*?)\s*```', content, re.DOTALL)
     if json_match:
         return json_match.group(1)
-    
+
     # 方法2：查找JSON对象
     json_obj_match = re.search(r'(\{.*\})', content, re.DOTALL)
     if json_obj_match:
         return json_obj_match.group(1)
-    
+
     # 方法3：查找第一个{和最后一个}之间的内容
     first_brace = content.find('{')
     last_brace = content.rfind('}')
     if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
         return content[first_brace:last_brace+1]
-    
+
     # 如果都失败了，返回原内容
     return content if content else ""
 
@@ -4650,33 +4650,33 @@ def _extract_json_string(content: str) -> Optional[str]:
 def _fix_common_json_errors(json_str: str) -> str:
     """
     修复常见的JSON格式错误
-    
+
     Args:
         json_str: 原始JSON字符串
-        
+
     Returns:
         修复后的JSON字符串
     """
     # 修复1：移除注释
     json_str = re.sub(r'//.*', '', json_str)  # 移除单行注释
     json_str = re.sub(r'/\*.*?\*/', '', json_str, flags=re.DOTALL)  # 移除多行注释
-    
+
     # 修复2：移除尾随逗号
     json_str = re.sub(r',\s*}', '}', json_str)  # 对象中的尾随逗号
     json_str = re.sub(r',\s*]', ']', json_str)  # 数组中的尾随逗号
-    
+
     # 修复3：修复单引号为双引号
     # 这个修复比较复杂，需要确保不替换内容中的单引号
     # 简单处理：只替换键名和字符串值的单引号
     json_str = re.sub(r"(\w+)\s*:\s*'([^']*)'", r'"\1": "\2"', json_str)
-    
+
     # 修复4：修复未引用的键名
     json_str = re.sub(r'(\w+)\s*:', r'"\1":', json_str)
-    
+
     # 修复5：修复换行符问题
     json_str = re.sub(r'[\n\r]+', ' ', json_str)  # 将换行符替换为空格
     json_str = re.sub(r'\s+', ' ', json_str)  # 合并多个空格
-    
+
     # 变量类型注解
     corrected_json: str = json_str.strip()
     return corrected_json
@@ -4685,15 +4685,15 @@ def _fix_common_json_errors(json_str: str) -> str:
 def _aggressive_json_fix(json_str: str) -> str:
     """
     更激进的JSON修复方法 - 修复版
-    
+
     修复说明：
     - 原正则表达式 [^\"\\'\\{\\}\\[\\],]+ 无法匹配包含逗号、引号、大括号的值
     - 学术论文摘要必然包含这些字符，导致大规模失败
     - 新实现采用更智能的解析策略，能正确处理嵌套结构和特殊字符
-    
+
     Args:
         json_str: 原始JSON字符串
-        
+
     Returns:
         修复后的JSON字符串
     """
@@ -4703,48 +4703,48 @@ def _aggressive_json_fix(json_str: str) -> str:
             # 方法1：尝试查找所有键值对（改进的正则表达式）
             # 使用更健壮的匹配策略，能处理包含特殊字符的值
             pairs: List[Tuple[str, str]] = []
-            
+
             # 策略A：尝试匹配常见的键值对模式
             # 匹配：键: 值（值可以是字符串、数字、布尔值）
             simple_pairs = re.findall(r'["\']?(\w+)["\']?\s*:\s*("(?:\\.|[^"\\])*"|\d+|true|false|null)', json_str)
             if simple_pairs:
                 pairs.extend(simple_pairs)
-            
+
             # 策略B：如果策略A失败，尝试更宽松的匹配
             if not pairs:
                 # 匹配：键: "值"（值可以包含转义引号）
                 quoted_pairs = re.findall(r'["\']?(\w+)["\']?\s*:\s*"((?:\\.|[^"\\])*)"', json_str)
                 if quoted_pairs:
                     pairs.extend(quoted_pairs)
-            
+
             # 策略C：如果以上都失败，尝试提取所有可能的键值对（最宽松）
             if not pairs:
                 # 匹配：键: 值（值到下一个键或结束）
                 loose_pairs = re.findall(r'["\']?(\w+)["\']?\s*:\s*([^,\}]+)', json_str)
                 if loose_pairs:
                     pairs.extend(loose_pairs)
-            
+
             if pairs:
                 # 重建JSON对象
                 fixed_pairs: List[str] = []
                 for key, value in pairs:
                     key = key.strip()
                     value = value.strip()
-                    
+
                     # 确保键被引号包围
                     if not (key.startswith('"') and key.endswith('"')):
                         key = f'"{key}"'
-                    
+
                     # 如果值看起来像字符串（包含字母、中文、特殊字符），确保它被引号包围
-                    if (not (value.startswith('"') and value.endswith('"')) and 
-                        not value in ('true', 'false', 'null') and 
+                    if (not (value.startswith('"') and value.endswith('"')) and
+                        not value in ('true', 'false', 'null') and
                         not re.match(r'^\d+(\.\d+)?$', value)):
                         # 转义值中的引号
                         value = value.replace('"', '\\"')
                         value = f'"{value}"'
-                    
+
                     fixed_pairs.append(f'{key}: {value}')
-                
+
                 result_json = '{' + ', '.join(fixed_pairs) + '}'
                 # 验证生成的JSON是否有效
                 try:
@@ -4753,23 +4753,23 @@ def _aggressive_json_fix(json_str: str) -> str:
                 except json.JSONDecodeError:
                     # 如果无效，继续尝试其他方法
                     pass
-        
+
         # 如果看起来像是一个数组，尝试修复基本结构
         elif json_str.strip().startswith('['):
             # 尝试匹配数组元素（支持字符串和简单值）
             elements: List[str] = []
-            
+
             # 策略A：匹配引号包围的字符串
             quoted_elements = re.findall(r'"((?:\\.|[^"\\])*)"', json_str)
             if quoted_elements:
                 elements.extend(quoted_elements)
-            
+
             # 策略B：如果策略A失败，尝试匹配非引号值
             if not elements:
                 simple_elements = re.findall(r'\[\s*([^,\]]+)\s*\]', json_str)
                 if simple_elements:
                     elements.extend(simple_elements)
-            
+
             if elements:
                 # 重建JSON数组
                 fixed_elements: List[str] = []
@@ -4782,7 +4782,7 @@ def _aggressive_json_fix(json_str: str) -> str:
                             fixed_elements.append(f'"{elem}"')
                         else:
                             fixed_elements.append(elem)
-                
+
                 result_json = '[' + ', '.join(fixed_elements) + ']'
                 # 验证生成的JSON是否有效
                 try:
@@ -4791,7 +4791,7 @@ def _aggressive_json_fix(json_str: str) -> str:
                 except json.JSONDecodeError:
                     # 如果无效，继续尝试其他方法
                     pass
-        
+
     except Exception:
         # 激进修复出错，不需要打印
         pass
@@ -5140,7 +5140,7 @@ def get_summary_from_ai(prompt_text: str, primary_api_config: APIConfig, backup_
         ValueError: 当输入参数无效时
         requests.RequestException: 当API调用失败时
     """
-    if ('dummy' in (primary_api_config.get('api_key') or '') or 
+    if ('dummy' in (primary_api_config.get('api_key') or '') or
         'dummy' in (backup_api_config.get('api_key') or '')):
         return normalize_ai_summary(
             {

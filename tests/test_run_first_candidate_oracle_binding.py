@@ -416,4 +416,3 @@ def test_unadopted_final_outline_cannot_mint_source_bindings(tmp_path: Path) -> 
 
     with pytest.raises(CandidateOracleBindingError, match="adopted Outline"):
         verify_single_source_candidate_bindings(registry, final)
-

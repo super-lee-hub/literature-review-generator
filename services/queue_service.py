@@ -2890,7 +2890,7 @@ class QueueRunner:
                 # Pending or running dependency → keep this job waiting
                 if dep_runtime.state not in (QueueState.COMPLETED,):
                     return
-            
+
             # 更新任务状态为运行中
             lease = self.queue_service.claim_job(
                 job_spec.job_id,
@@ -2902,14 +2902,14 @@ class QueueRunner:
             with self._lock:
                 self._leases[job_spec.job_id] = lease
             self._start_heartbeat(job_spec.job_id, lease, cancel_token)
-            
+
             # 再次检查任务状态，确保没有被取消
             runtime = self.queue_service.get_job_runtime(job_spec.job_id)
             if runtime and (runtime.state == QueueState.CANCELLED or runtime.cancel_requested):
                 cancel_token.request_cancel()
                 self._acknowledge_cancelled(job_spec.job_id)
                 return
-            
+
             # Verify the frozen input receipt after the lease claim and before
             # any runtime/provider construction.  Mutable parameters are never
             # consulted here: execution is driven only by the strict spec that
@@ -2971,19 +2971,19 @@ class QueueRunner:
                 progress_tracker=progress_tracker,
                 publication_context=self.queue_service.publication_context(lease),
             )
-            
-            
+
+
             # 计算工作区路径（基于项目名称和任务ID）
             workspace_path = str(Path(job_spec.workspace_path).expanduser().resolve())
-            
+
             # 获取工作区锁
             workspace_lock = self._get_workspace_lock(workspace_path)
-            
+
             # 用工作区锁保护任务执行
             with workspace_lock:
                 # 更新当前阶段
                 self._update_job_stage(job_spec.job_id, "executing")
-                
+
                 # 执行任务，传入cancel_token
                 from runtime.provider_runtime import (
                     RuntimeControlIdentityV1,
@@ -3026,7 +3026,7 @@ class QueueRunner:
                         )
                     else:
                         result = self.job_runner.run(request, cancel_token=cancel_token)
-            
+
             # 最后检查一次任务状态
             if self._lease_is_lost(job_spec.job_id):
                 raise RuntimeError(f"queue lease lost for job {job_spec.job_id}")
@@ -3034,7 +3034,7 @@ class QueueRunner:
             if runtime and (runtime.state == QueueState.CANCELLED or runtime.cancel_requested):
                 self._acknowledge_cancelled(job_spec.job_id)
                 return
-            
+
             # 更新当前阶段
             self._update_job_stage(job_spec.job_id, "completing")
             self._update_job_runtime_info(job_spec.job_id, {
@@ -3043,7 +3043,7 @@ class QueueRunner:
                 "log_path": result.log_path if hasattr(result, 'log_path') else job_spec.log_path,
                 "produced_artifacts": result.produced_artifacts if hasattr(result, 'produced_artifacts') else [],
             })
-            
+
             job_status = str(getattr(result, "job_status", "failed") or "failed")
             raw_exit_code = getattr(result, "exit_code", None)
             try:
@@ -3115,7 +3115,7 @@ class QueueRunner:
                 if job_spec.job_id in self._cancel_tokens:
                     del self._cancel_tokens[job_spec.job_id]
                 self._leases.pop(job_spec.job_id, None)
-    
+
     def _update_job_stage(self, job_id: str, stage: str) -> None:
         """更新任务的当前阶段"""
         self._heartbeat(job_id)
@@ -3174,7 +3174,7 @@ class QueueRunner:
             error_message=error_message,
         ):
             raise RuntimeError(f"queue lease release lost for job {job_id}")
-    
+
     def _update_job_runtime_info(self, job_id: str, info: Dict[str, Any]) -> None:
         """更新任务的运行时信息"""
         self._heartbeat(job_id)
@@ -3283,10 +3283,10 @@ class QueueRunner:
 
     def cancel_job(self, job_id: str) -> bool:
         """取消指定的任务
-        
+
         Args:
             job_id: 要取消的任务ID
-            
+
         Returns:
             是否成功取消
         """
@@ -3295,23 +3295,23 @@ class QueueRunner:
             return False
 
         self.queue_service.request_cancel(job_id, reason="queue_runner_cancel")
-        
+
         # 如果任务正在运行，请求取消令牌
         with self._lock:
             if job_id in self._cancel_tokens:
                 self._cancel_tokens[job_id].request_cancel()
-        
+
         return True
 
     def run_single_job(self, job_id: str) -> bool:
         job = self.queue_service.get_job(job_id)
         if not job:
             return False
-        
+
         runtime = self.queue_service.get_job_runtime(job_id)
         if not runtime or runtime.state not in (QueueState.PENDING, QueueState.FAILED, QueueState.CANCELLED):
             return False
-        
+
         # 重置任务状态
         if runtime.state != QueueState.PENDING and not self.queue_service.prepare_retry(job_id):
             return False

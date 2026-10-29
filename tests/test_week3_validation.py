@@ -449,23 +449,23 @@ def test_evidence_resolver_receives_preprocess_and_visual_inputs():
             ],
         },
     }
-    
+
     # Build resolver context
     context = build_evidence_resolver_context(paper_artifact)
     resolver = EvidenceResolver(context)
-    
+
     # Resolve evidence
     cited_span = "cited information"
     selected_visual_refs = paper_artifact.get("stage1_inputs", {}).get("selected_visual_refs", [])
     candidates = resolver.resolve_evidence(cited_span, selected_visual_refs=selected_visual_refs)
-    
+
     # Verify candidates were found from both preprocess and visual sources
     assert len(candidates) > 0
-    
+
     # Check that at least one candidate came from preprocess chunks
     chunk_candidates = [c for c in candidates if c.resolver_tier == "preprocess_chunks"]
     assert len(chunk_candidates) > 0
-    
+
     # Check that at least one candidate came from visual refs
     visual_candidates = [c for c in candidates if c.resolver_tier == "visual_refs"]
     assert len(visual_candidates) > 0
@@ -475,7 +475,7 @@ def test_citation_paper_mapping_is_deterministic():
     """Test that citation -> paper mapping is deterministic and not based only on shared list index."""
     # Simulate the deterministic mapping logic
     from main import LiteratureReviewGenerator
-    
+
     # Create test summaries with paper info
     summaries = [
         {
@@ -493,13 +493,13 @@ def test_citation_paper_mapping_is_deterministic():
             }
         }
     ]
-    
+
     # Create references in different order
     references = [
         'Author C, D. (2023). Paper 2 Title. Journal of Testing.',
         'Author A, B. (2024). Paper 1 Title. Journal of Testing.'
     ]
-    
+
     # Build paper key to info mapping (simulating the logic in main.py)
     paper_key_to_info = {}
     for summary in summaries:
@@ -507,7 +507,7 @@ def test_citation_paper_mapping_is_deterministic():
         canonical_key = LiteratureReviewGenerator.get_paper_key(paper_info)
         if canonical_key:
             paper_key_to_info[canonical_key] = paper_info
-    
+
     # Test matching logic
     matched_papers = []
     for ref in references:
@@ -515,16 +515,16 @@ def test_citation_paper_mapping_is_deterministic():
         for summary in summaries:
             paper_info = summary.get('paper_info', {})
             canonical_key = LiteratureReviewGenerator.get_paper_key(paper_info)
-            
+
             title = paper_info.get('title', '').lower()
             authors = ''.join(paper_info.get('authors', [])).lower()
             ref_lower = ref.lower()
-            
+
             if (title and title in ref_lower) or (authors and authors in ref_lower):
                 matched_paper = canonical_key
                 break
         matched_papers.append(matched_paper)
-    
+
     # Verify that papers are matched correctly regardless of order
     assert len(matched_papers) == 2
     assert matched_papers[0] is not None  # Should match Paper 2
@@ -543,7 +543,7 @@ def test_validator_loads_real_paper_artifacts():
         # Create paper_artifacts directory
         paper_artifacts_dir = os.path.join(temp_dir, 'paper_artifacts')
         os.makedirs(paper_artifacts_dir)
-        
+
         # Create a paper artifact file
         paper_artifact = {
             "paper_identity": {
@@ -573,25 +573,25 @@ def test_validator_loads_real_paper_artifacts():
                 ],
             },
         }
-        
+
         # Save paper artifact to file
         artifact_file_path = os.path.join(paper_artifacts_dir, 'test_paper_artifact.json')
         with open(artifact_file_path, 'w', encoding='utf-8') as f:
             json.dump(paper_artifact, f)
-        
+
         # Verify file exists
         assert os.path.exists(artifact_file_path), "Paper artifact file should exist on disk"
-        
+
         # Load the artifact from file to verify it's valid
         with open(artifact_file_path, 'r', encoding='utf-8') as f:
             loaded_artifact = json.load(f)
-        
+
         # Verify loaded artifact has expected structure
         assert "paper_identity" in loaded_artifact
         assert "analysis" in loaded_artifact
         assert "preprocess" in loaded_artifact["analysis"]
         assert "stage1_inputs" in loaded_artifact
-        
+
         # Create test review draft and citation manifest
         review_draft = {
             "artifact_type": "review_draft",
@@ -615,7 +615,7 @@ def test_validator_loads_real_paper_artifacts():
                 ],
             },
         }
-        
+
         citation_manifest = {
             "artifact_type": "citation_manifest",
             "artifact_version": "v1",
@@ -633,7 +633,7 @@ def test_validator_loads_real_paper_artifacts():
                 }
             ],
         }
-        
+
         # Run validation with the loaded artifact
         result = validate_current_review_artifacts(review_draft, citation_manifest, [loaded_artifact])
         assert result["validation"] is True
@@ -642,7 +642,7 @@ def test_validator_loads_real_paper_artifacts():
 def test_end_to_end_week3_validation_with_real_artifacts():
     """Test end-to-end Week 3 validation works on a realistic persisted-artifact fixture."""
     from validation.review_validator import ReviewValidator
-    
+
     # Create realistic paper artifact with preprocess and visual refs
     paper_artifact = {
         "paper_identity": {
@@ -671,7 +671,7 @@ def test_end_to_end_week3_validation_with_real_artifacts():
             ],
         },
     }
-    
+
     # Create review draft and citation manifest
     review_draft = {
         "content": {
@@ -698,7 +698,7 @@ def test_end_to_end_week3_validation_with_real_artifacts():
             ],
         },
     }
-    
+
     citation_manifest = {
         "citation_sets": [
             {
@@ -730,15 +730,15 @@ def test_end_to_end_week3_validation_with_real_artifacts():
             }
         ]
     }
-    
+
     # Run validation
     validator = ReviewValidator(review_draft, citation_manifest, [paper_artifact])
     report = validator.validate()
-    
+
     # Verify validation completed successfully
     assert report.total_citations == 1
     assert len(report.citation_results) == 1
-    
+
     # Verify evidence was found
     result = report.citation_results[0]
     assert len(result.evidence_candidates) > 0
@@ -747,7 +747,7 @@ def test_end_to_end_week3_validation_with_real_artifacts():
 def test_missing_artifacts_fail_clearly():
     """Test that missing artifacts fail clearly."""
     from validation.review_validator import ReviewValidator
-    
+
     # Create review draft and citation manifest with non-existent paper ID
     review_draft = {
         "content": {
@@ -767,7 +767,7 @@ def test_missing_artifacts_fail_clearly():
             ],
         },
     }
-    
+
     citation_manifest = {
         "citations": [
             {
@@ -778,11 +778,11 @@ def test_missing_artifacts_fail_clearly():
             }
         ],
     }
-    
+
     # Run validation with empty paper artifacts
     validator = ReviewValidator(review_draft, citation_manifest, [])
     report = validator.validate()
-    
+
     # Verify validation fails for missing paper
     assert report.total_citations == 1
     assert report.wrong_source_count == 1
@@ -791,7 +791,7 @@ def test_missing_artifacts_fail_clearly():
 def test_evidence_resolver_explicit_tier_order(tmp_path):
     """Test that evidence resolver follows the explicit tier order: locator/page, chunks, normalized, plain, visual."""
     from validation.evidence_resolver import EvidenceResolver, EvidenceResolverContext
-    
+
     # Create test context with all tiers available
     context = EvidenceResolverContext(
         paper_key="test_key",
@@ -808,10 +808,10 @@ def test_evidence_resolver_explicit_tier_order(tmp_path):
         },
         paper_artifact={"source": {"source_pdf": "/test.pdf"}},
     )
-    
+
     resolver = EvidenceResolver(context)
     candidates = resolver.resolve_evidence(cited_span="cited text")
-    
+
     # Verify we have candidates from multiple tiers
     tier_names = [c.resolver_tier for c in candidates if c.confidence > 0]
     assert "locator_page_index" in tier_names
@@ -823,7 +823,7 @@ def test_evidence_resolver_explicit_tier_order(tmp_path):
 def test_negative_evidence_candidate_generation(tmp_path):
     """Test that negative evidence candidate is generated with clear reason."""
     from validation.evidence_resolver import EvidenceResolver, EvidenceResolverContext
-    
+
     context = EvidenceResolverContext(
         paper_key="test_key",
         paper_identity={"canonical_paper_key": "test_key"},
@@ -833,10 +833,10 @@ def test_negative_evidence_candidate_generation(tmp_path):
         },
         paper_artifact={"source": {"source_pdf": "/test.pdf"}},
     )
-    
+
     resolver = EvidenceResolver(context)
     candidates = resolver.resolve_evidence(cited_span="this text will never be found")
-    
+
     # Should have at least one candidate (negative evidence)
     assert len(candidates) >= 1
     negative_candidates = [c for c in candidates if c.resolver_tier == "negative"]
@@ -848,7 +848,7 @@ def test_negative_evidence_candidate_generation(tmp_path):
 def test_validator_uses_review_draft_v2_block_context(tmp_path):
     """Test that validator keeps review_draft_v2 block text as contextual evidence."""
     from validation.review_validator import ReviewValidator
-    
+
     # Create review_draft_v2 with blocks
     review_draft = {
         "content": {
@@ -868,7 +868,7 @@ def test_validator_uses_review_draft_v2_block_context(tmp_path):
             ]
         }
     }
-    
+
     # Create citation_manifest_v2
     citation_manifest = {
         "occurrences": [
@@ -885,7 +885,7 @@ def test_validator_uses_review_draft_v2_block_context(tmp_path):
             }
         ],
     }
-    
+
     # Create paper artifact with preprocess artifacts matching block text
     paper_artifacts = [
         {
@@ -901,10 +901,10 @@ def test_validator_uses_review_draft_v2_block_context(tmp_path):
             "stage1_inputs": {"selected_visual_refs": []},
         }
     ]
-    
+
     validator = ReviewValidator(review_draft, citation_manifest, paper_artifacts)
     report = validator.validate()
-    
+
     # Check that validation ran and kept block text as contextual evidence
     assert report.total_citations == 1
     result = report.citation_results[0]

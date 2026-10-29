@@ -1,1 +1,3 @@
 /acceptance_artifacts/f1_20260915/F1_D_AUXILIARY_OCR_FIXTURE_20260919.json text eol=lf
+# Existing Windows source snapshots use CRLF; retain normal whitespace checks.
+* whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol

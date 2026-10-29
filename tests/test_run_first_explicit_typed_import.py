@@ -518,4 +518,3 @@ def test_explicit_typed_import_invalid_manifest_fails_before_local_http_fallback
         server.shutdown()
         thread.join(timeout=5)
         server.server_close()
-

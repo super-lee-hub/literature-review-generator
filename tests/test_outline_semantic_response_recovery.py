@@ -242,4 +242,3 @@ def test_tamper_or_identity_mismatch_is_a_cache_miss(tmp_path: Path, kwargs) -> 
         receipt_source_records={"receipt-1": source},
         verified_receipts={"receipt-1": verified_receipt},
     ) is None
-

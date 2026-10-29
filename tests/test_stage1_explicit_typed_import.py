@@ -337,4 +337,3 @@ def test_explicit_import_rejects_conflicting_secondary_pdf_hash_declarations(
             full_bundle,
             external_registry_resolver=_owner_resolver(owner),
         )
-

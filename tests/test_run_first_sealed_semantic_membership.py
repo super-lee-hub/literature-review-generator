@@ -359,4 +359,3 @@ def test_final_fold_missing_a_sealed_reference_fails_before_provider_callback(
             {"topic_synthesis": "sealed-source-input"},
         )
     assert calls == []
-

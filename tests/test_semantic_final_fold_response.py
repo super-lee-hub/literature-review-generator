@@ -254,4 +254,3 @@ def test_v2_two_level_coverage_resolves_exact_original_fragments():
     proof["intermediate_items"].pop(hash_json(leaves[0]))
     with pytest.raises(ValueError):
         _build_v2([parent], full, proof)
-
