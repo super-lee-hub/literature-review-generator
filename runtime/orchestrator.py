@@ -216,6 +216,8 @@ class _OutlineProviderTransportAdapter:
         )
         if requested_output_tokens <= 0:
             raise ValueError("Outline provider output allowance must be positive")
+        if requested_output_tokens > self.profile.max_output_tokens:
+            raise ValueError("Outline provider output allowance exceeds the route ceiling")
         # The formal Anthropic, Chat Completions, and Responses payload builders
         # can prefer route-configured token fields over the max_tokens argument.
         # Keep the physical wire ceiling equal to the admitted reservation.
@@ -1670,7 +1672,6 @@ class InternalStageExecutorRegistry:
         if not model:
             return None
         capability = resolve_model_capability(api_config)
-        model_context_limit = self._positive_int(api_config.get("max_context_tokens"), 128_000)
         max_output_tokens = self._positive_int(api_config.get("max_output_tokens"), 4_096)
         # Evidence critique receives the largest request in the current v3
         # graph because it sees all candidate outputs.  Keep the generator
@@ -1680,18 +1681,18 @@ class InternalStageExecutorRegistry:
         # risk without changing the evidence input or contract.
         if role == "evidence_critique":
             max_output_tokens = min(max_output_tokens, 16_000)
-        profile = ProviderContextProfile.conservative(
-            provider=capability.provider_family,
-            model=model,
-            endpoint_type=capability.endpoint_type,
-            model_context_limit=model_context_limit,
+        profile = ProviderContextProfile.from_api_config(
+            api_config,
+            default_provider=capability.provider_family,
+            default_model=model,
+            default_endpoint_type=capability.endpoint_type,
             max_output_tokens=max_output_tokens,
             # Admission knobs are read from the role's own section. Left to the
             # conservative defaults, every role would silently inherit the
             # Outline model's headroom, which is wrong for a cheaper critic or a
             # larger-context generator.
-            reasoning_reserve=self._nonnegative_int(api_config.get("reasoning_reserve_tokens"), 2_048),
-            safety_margin=self._nonnegative_int(api_config.get("safety_margin_tokens"), 1_024),
+            default_reasoning_reserve=2_048,
+            default_safety_margin=1_024,
         )
         route_config = dict(api_config)
         if str(route_config.get("transport_retries") or "").strip() == "":
@@ -1754,17 +1755,18 @@ class InternalStageExecutorRegistry:
                 "sections are no longer completed by inheriting part of another provider."
             )
         capability = resolve_model_capability(api_config)
-        model_context_limit = self._positive_int(api_config.get("max_context_tokens"), 128_000)
         max_output_tokens = self._positive_int(
             api_config.get("max_output_tokens"),
             4_096,
         )
-        profile = ProviderContextProfile.conservative(
-            provider=capability.provider_family,
-            model=model,
-            endpoint_type=capability.endpoint_type,
-            model_context_limit=model_context_limit,
+        profile = ProviderContextProfile.from_api_config(
+            api_config,
+            default_provider=capability.provider_family,
+            default_model=model,
+            default_endpoint_type=capability.endpoint_type,
             max_output_tokens=max_output_tokens,
+            default_reasoning_reserve=2_048,
+            default_safety_margin=1_024,
         )
         provider = self._outline_provider(session, profile, api_config)
         provider_router = build_outline_provider_router(

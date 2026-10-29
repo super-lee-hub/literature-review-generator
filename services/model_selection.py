@@ -17,6 +17,8 @@ _API_CONFIG_OPTIONAL_FIELDS = (
     "reasoning_display",
     "text_verbosity",
     "max_output_tokens",
+    "provider_max_output_tokens",
+    "max_output_tokens_limit",
     "max_context_tokens",
     "temperature",
     "connect_timeout_seconds",

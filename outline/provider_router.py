@@ -94,6 +94,8 @@ _ROUTE_CONFIG_KEYS = frozenset(
         "text_verbosity",
         "max_context_tokens",
         "max_output_tokens",
+        "provider_max_output_tokens",
+        "max_output_tokens_limit",
         "temperature",
         "reasoning_reserve_tokens",
         "safety_margin_tokens",

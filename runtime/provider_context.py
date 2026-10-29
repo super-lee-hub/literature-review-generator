@@ -13,14 +13,33 @@ from dataclasses import dataclass
 from typing import Any
 
 
+def _configured_output_target(api_config: Mapping[str, Any], target: int) -> int:
+    """Apply explicit route ceilings without inferring gateway capabilities."""
+    for key in ("provider_max_output_tokens", "max_output_tokens_limit"):
+        raw = api_config.get(key)
+        if raw is None or str(raw).strip() == "":
+            continue
+        if isinstance(raw, bool):
+            raise ValueError(f"{key} must be a positive integer")
+        try:
+            limit = int(str(raw).strip())
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{key} must be a positive integer") from exc
+        if limit <= 0:
+            raise ValueError(f"{key} must be a positive integer")
+        target = min(target, limit)
+    return target
+
+
 def writer_output_token_limit(api_config: Mapping[str, Any]) -> int:
     """Apply the production Writer's output default and minimum consistently."""
 
     raw = api_config.get("max_output_tokens") or 32000
     try:
-        return max(256, int(raw))
+        target = max(256, int(raw))
     except (TypeError, ValueError):
-        return 32000
+        target = 32000
+    return _configured_output_target(api_config, target)
 
 
 @dataclass(frozen=True)
@@ -133,6 +152,8 @@ class ProviderContextProfile:
         default_provider: str = "configured",
         default_model: str = "",
         default_endpoint_type: str = "responses",
+        default_reasoning_reserve: int = 0,
+        default_safety_margin: int = 256,
     ) -> ProviderContextProfile:
         """Use the same configured reserves for planning and transport."""
 
@@ -143,14 +164,21 @@ class ProviderContextProfile:
                 return default
             return parsed if parsed > 0 else default
 
+        def nonnegative(value: Any, default: int) -> int:
+            try:
+                parsed = int(str(value).strip())
+            except (TypeError, ValueError):
+                return default
+            return parsed if parsed >= 0 else default
+
         return cls.conservative(
             provider=str(api_config.get("provider_family") or default_provider),
             model=str(api_config.get("model") or default_model),
             endpoint_type=str(api_config.get("endpoint_type") or default_endpoint_type),
             model_context_limit=positive(api_config.get("max_context_tokens"), 128_000),
-            max_output_tokens=max(1, int(max_output_tokens)),
-            reasoning_reserve=positive(api_config.get("reasoning_reserve_tokens"), 0),
-            safety_margin=positive(api_config.get("safety_margin_tokens"), 256),
+            max_output_tokens=_configured_output_target(api_config, max(1, int(max_output_tokens))),
+            reasoning_reserve=nonnegative(api_config.get("reasoning_reserve_tokens"), default_reasoning_reserve),
+            safety_margin=nonnegative(api_config.get("safety_margin_tokens"), default_safety_margin),
         )
 
     def estimate_tokens(self, value: Any) -> int:
