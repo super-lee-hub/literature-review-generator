@@ -1906,6 +1906,16 @@ def _scale_failure_snapshot(
     }
 
 
+def _scale_add_failure_loopback_extensions(
+    snapshot: dict[str, Any], extensions: Mapping[str, Any],
+) -> dict[str, Any]:
+    loopback = snapshot.get("loopback")
+    if not isinstance(loopback, Mapping):
+        raise AssertionError("existing scale failure snapshot has no loopback object")
+    snapshot["loopback"] = {**dict(loopback), **dict(extensions)}
+    return snapshot
+
+
 def _ready_outline_node_payload(registry: Any, node_id: str) -> dict[str, Any]:
     record = registry.get(f"outline-v3:{node_id}")
     if record is None or record.status != "ready":
@@ -1917,6 +1927,1185 @@ def _ready_outline_node_payload(registry: Any, node_id: str) -> dict[str, Any]:
         raise TypeError(f"Outline node payload is malformed: {node_id}")
     return dict(node_payload)
 
+
+def _scale_organization_layout_signature(organization_map: Mapping[str, Any]) -> tuple[tuple[int, ...], ...]:
+    return tuple(
+        tuple(int(value) for value in section.get("fragment_indices") or ())
+        for section in organization_map.get("sections") or ()
+    )
+
+
+def _scale_global_organization_map_signature(
+    request: Mapping[str, Any], organization_map: Mapping[str, Any],
+) -> tuple[Any, ...]:
+    partition = request.get("partition")
+    if isinstance(partition, Mapping):
+        local_to_global = [int(value) for value in partition.get("local_to_global_group_indices") or ()]
+        full_count = int(partition.get("full_bank_group_count") or 0)
+        if len(local_to_global) != int(request.get("bank_group_count") or 0):
+            raise AssertionError("partition organization map does not match its local-to-global index table")
+    else:
+        full_count = int(request.get("bank_group_count") or 0)
+        local_to_global = list(range(full_count))
+    if full_count <= 0 or len(set(local_to_global)) != len(local_to_global):
+        raise AssertionError("organization map has an invalid global fragment index space")
+
+    def global_index(local_index: Any) -> int:
+        if type(local_index) is not int or not 0 <= local_index < len(local_to_global):
+            raise AssertionError("organization map references a fragment outside its request partition")
+        return local_to_global[local_index]
+
+    paper_keys = [str(value) for value in request.get("paper_keys") or ()]
+    sections = []
+    for section in organization_map.get("sections") or ():
+        if not isinstance(section, Mapping):
+            raise AssertionError("organization map section is not an object")
+        global_fragments = tuple(global_index(value) for value in section.get("fragment_indices") or ())
+        roles = []
+        for role in section.get("paper_roles") or ():
+            if (
+                not isinstance(role, Sequence) or isinstance(role, (str, bytes)) or len(role) != 2
+                or type(role[0]) is not int or not 0 <= role[0] < len(paper_keys)
+            ):
+                raise AssertionError("organization map role is outside its local paper/fragment tables")
+            roles.append((paper_keys[role[0]], global_index(role[1])))
+        sections.append((
+            global_fragments,
+            int(section.get("metadata_index") or 0),
+            tuple(sorted(roles)),
+        ))
+    deferred = []
+    for row in organization_map.get("deferred") or ():
+        if not isinstance(row, Mapping):
+            raise AssertionError("organization map deferred row is not an object")
+        deferred.append((
+            str(row.get("reason_code") or ""),
+            tuple(global_index(value) for value in row.get("fragment_indices") or ()),
+        ))
+    return full_count, tuple(sections), tuple(deferred)
+
+
+def _scale_aggregate_partition_layouts(signatures: Sequence[tuple[Any, ...]]) -> tuple[Any, ...]:
+    if not signatures:
+        raise AssertionError("partitioned organization layout has no provider parts")
+    full_counts = {int(signature[0]) for signature in signatures}
+    if len(full_counts) != 1:
+        raise AssertionError("partitioned organization responses disagree on the full fragment bank size")
+    full_count = next(iter(full_counts))
+    sections = [section for signature in signatures for section in signature[1]]
+    deferred = [row for signature in signatures for row in signature[2]]
+    covered = [index for section in sections for index in section[0]]
+    covered.extend(index for _reason, indices in deferred for index in indices)
+    if len(covered) != len(set(covered)) or set(covered) != set(range(full_count)):
+        raise AssertionError("partitioned organization maps do not account for each global fragment exactly once")
+    return (
+        full_count,
+        tuple(sorted(sections, key=repr)),
+        tuple(sorted(deferred, key=repr)),
+    )
+
+
+def _scale_required_comparison_groups_by_pair(
+    organization_requests: Sequence[Mapping[str, Any]],
+    fragment_bank: Mapping[str, Any],
+    required_pairs: Sequence[Sequence[str]],
+) -> dict[tuple[str, ...], tuple[dict[str, Any], ...]]:
+    expected_pairs = {tuple(sorted(str(value) for value in pair)) for pair in required_pairs}
+    bank_groups = [row for row in fragment_bank.get("groups") or () if isinstance(row, Mapping)]
+    bank_groups_by_index: dict[int, Mapping[str, Any]] = {}
+    for entry in bank_groups:
+        bank_index = entry.get("index")
+        if type(bank_index) is not int or bank_index in bank_groups_by_index:
+            raise AssertionError("fragment bank has a missing or duplicate declared group index")
+        bank_groups_by_index[bank_index] = entry
+    if not organization_requests:
+        raise AssertionError("required comparison selection has no ready organization requests")
+    full_counts: set[int] = set()
+    for request in organization_requests:
+        partition = request.get("partition")
+        full_count = (
+            int(partition.get("full_bank_group_count") or 0)
+            if isinstance(partition, Mapping)
+            else int(request.get("bank_group_count") or 0)
+        )
+        if full_count <= 0:
+            raise AssertionError("required comparison request has no positive full bank group count")
+        full_counts.add(full_count)
+    if len(full_counts) != 1:
+        raise AssertionError("organization partitions disagree on the full bank group count")
+    full_bank_group_count = next(iter(full_counts))
+    if set(bank_groups_by_index) != set(range(full_bank_group_count)):
+        raise AssertionError("ready fragment bank declared indices do not cover its exact full index range")
+    bank_hash = str(fragment_bank.get("content_hash") or "")
+    if not bank_hash:
+        raise AssertionError("ready fragment bank has no content hash")
+    groups_by_pair: dict[tuple[str, ...], dict[str, dict[str, Any]]] = {}
+    for request in organization_requests:
+        if str(request.get("bank_hash") or "") != bank_hash:
+            raise AssertionError("required comparison request is not bound to the ready fragment bank")
+        partition = request.get("partition")
+        if isinstance(partition, Mapping):
+            if str(partition.get("full_bank_hash") or "") != bank_hash:
+                raise AssertionError("required comparison partition is bound to another full fragment bank")
+            raw_local_to_global = partition.get("local_to_global_group_indices") or ()
+            if any(type(value) is not int for value in raw_local_to_global):
+                raise AssertionError("required comparison partition contains a noninteger global index")
+            local_to_global = list(raw_local_to_global)
+            if len(local_to_global) != int(request.get("bank_group_count") or 0):
+                raise AssertionError("required comparison request has a malformed partition index table")
+            if any(not 0 <= value < full_bank_group_count for value in local_to_global):
+                raise AssertionError("required comparison partition maps outside the declared full bank")
+            if len(set(local_to_global)) != len(local_to_global):
+                raise AssertionError("required comparison partition repeats a global bank index")
+        else:
+            if int(request.get("bank_group_count") or 0) != full_bank_group_count:
+                raise AssertionError("direct required comparison request differs from the full bank size")
+            local_to_global = list(range(full_bank_group_count))
+        required_local_indices = {
+            value for value in request.get("required_group_indices") or () if type(value) is int
+        }
+        if len(required_local_indices) != len(request.get("required_group_indices") or ()):
+            raise AssertionError("required_group_indices contains invalid or duplicate local indices")
+        if any(not 0 <= value < len(local_to_global) for value in required_local_indices):
+            raise AssertionError("required_group_indices references a fragment outside its request")
+        expected_local_comparison_indices = {
+            local_index
+            for local_index in required_local_indices
+            if bank_groups_by_index[local_to_global[local_index]]
+            .get("claim_group", {}).get("claim_seed") is True
+        }
+        observed_rows = list(request.get("required_comparison_sections") or ())
+        if any(
+            not isinstance(row, Mapping) or type(row.get("group_index")) is not int
+            for row in observed_rows
+        ):
+            raise AssertionError("required_comparison_sections contains a malformed local group index")
+        observed_local_comparison_indices = {row["group_index"] for row in observed_rows}
+        if len(observed_local_comparison_indices) != len(observed_rows):
+            raise AssertionError("required_comparison_sections repeats a local group index")
+        if observed_local_comparison_indices != expected_local_comparison_indices:
+            raise AssertionError(
+                "required_comparison_sections do not exactly match the seeded required group indices"
+            )
+        for section in request.get("required_comparison_sections") or ():
+            if not isinstance(section, Mapping):
+                raise AssertionError("required comparison section metadata is not an object")
+            local_index = section.get("group_index")
+            if type(local_index) is not int or not 0 <= local_index < len(local_to_global):
+                raise AssertionError("required comparison index is outside its request partition")
+            if local_index not in required_local_indices:
+                raise AssertionError("required comparison section is absent from required_group_indices")
+            global_index = local_to_global[local_index]
+            entry = bank_groups_by_index.get(global_index)
+            if entry is None:
+                raise AssertionError("required comparison index is outside the ready fragment bank")
+            group = entry.get("claim_group") if isinstance(entry.get("claim_group"), Mapping) else None
+            if not isinstance(group, Mapping) or group.get("claim_seed") is not True:
+                raise AssertionError("required comparison index does not point to a seeded claim group")
+            if str(group.get("claim_kind") or "") != "model_authored_relation_comparison_slot":
+                raise AssertionError("required comparison index is not a comparison slot group")
+            group_task_contract = group.get("task_contract")
+            if not isinstance(group_task_contract, Mapping):
+                raise AssertionError("required comparison bank group has no task contract")
+            group_task_id = str(group.get("task_id") or "")
+            group_relation_id = str(group_task_contract.get("relation_id") or "")
+            if (
+                not group_task_id
+                or str(group_task_contract.get("task_id") or "") != group_task_id
+                or not group_relation_id
+                or group_relation_id not in {str(value) for value in group.get("relation_ids") or ()}
+            ):
+                raise AssertionError("required comparison bank task/relation identity is inconsistent")
+            group_pair = tuple(sorted(str(value) for value in group.get("paper_keys") or ()))
+            if group_pair not in expected_pairs:
+                raise AssertionError("organization request marks an unexpected paper pair as required")
+            request_papers = [str(value) for value in request.get("paper_keys") or ()]
+            section_paper_indices = section.get("paper_indices") or ()
+            if any(type(value) is not int or not 0 <= value < len(request_papers) for value in section_paper_indices):
+                raise AssertionError("required comparison paper index is outside its request table")
+            if {request_papers[value] for value in section_paper_indices} != set(group_pair):
+                raise AssertionError("required comparison request pair differs from its bank group identity")
+            group_id = str(group.get("claim_group_id") or "")
+            if not group_id:
+                raise AssertionError("required comparison group has no stable claim_group_id")
+            group_task_contract = group.get("task_contract")
+            if not isinstance(group_task_contract, Mapping):
+                raise AssertionError("required comparison group has no task contract")
+            if str(group_task_contract.get("task_id") or "") != str(group.get("task_id") or ""):
+                raise AssertionError("required comparison task contract differs from its bank task ID")
+            stored = {**dict(group), "bank_group_index": global_index}
+            existing = groups_by_pair.setdefault(group_pair, {}).get(group_id)
+            if existing is not None and existing != stored:
+                raise AssertionError("same required comparison group changed across organization partitions")
+            groups_by_pair[group_pair][group_id] = stored
+    missing_pairs = expected_pairs - set(groups_by_pair)
+    if missing_pairs:
+        raise AssertionError(f"organization requests omit required comparison pairs: {sorted(missing_pairs)}")
+    return {
+        pair: tuple(groups_by_pair[pair][group_id] for group_id in sorted(groups_by_pair[pair]))
+        for pair in sorted(expected_pairs)
+    }
+
+
+def _scale_assert_required_comparison_closures(
+    required_groups_by_pair: Mapping[tuple[str, ...], Sequence[Mapping[str, Any]]],
+    scope_payload: Mapping[str, Any],
+    candidate_sections: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    scope_groups = {
+        str(group.get("claim_group_id") or ""): group
+        for group in scope_payload.get("claim_groups") or ()
+        if isinstance(group, Mapping) and str(group.get("claim_group_id") or "")
+    }
+    slots_by_group: dict[str, list[dict[str, Any]]] = {}
+    slots_by_id: dict[str, dict[str, Any]] = {}
+    for slot in scope_payload.get("claim_slots") or ():
+        if not isinstance(slot, Mapping):
+            continue
+        group_id = str(slot.get("claim_group_id") or "")
+        slot_id = str(slot.get("claim_slot_id") or "")
+        if group_id:
+            slots_by_group.setdefault(group_id, []).append(dict(slot))
+        if slot_id:
+            if slot_id in slots_by_id:
+                raise AssertionError("output scope repeats a required comparison claim_slot_id")
+            slots_by_id[slot_id] = dict(slot)
+
+    observations: list[dict[str, Any]] = []
+    for pair, groups in required_groups_by_pair.items():
+        expected_papers = set(pair)
+        if not groups:
+            raise AssertionError(f"required comparison pair has no required task group: {pair}")
+        for group in groups:
+            group_id = str(group.get("claim_group_id") or "")
+            scope_group = scope_groups.get(group_id)
+            if scope_group is None:
+                raise AssertionError(f"required comparison group is absent from the output scope: {group_id}")
+            task_id = str(group.get("task_id") or "")
+            task_contract = group.get("task_contract")
+            task_contract = task_contract if isinstance(task_contract, Mapping) else {}
+            relation_id = str(task_contract.get("relation_id") or "")
+            group_papers = {str(value) for value in group.get("paper_keys") or ()}
+            if group_papers != expected_papers or not task_id or not relation_id:
+                raise AssertionError(f"required comparison task identity or pair is malformed: {group_id}")
+            scope_task_contract = scope_group.get("task_contract")
+            scope_task_contract = scope_task_contract if isinstance(scope_task_contract, Mapping) else {}
+            if (
+                str(scope_group.get("task_id") or "") != task_id
+                or str(scope_group.get("claim_kind") or "") != "model_authored_relation_comparison_slot"
+                or str(scope_task_contract.get("relation_id") or "") != relation_id
+                or str(scope_task_contract.get("task_id") or "") != task_id
+                or {str(value) for value in scope_group.get("paper_keys") or ()} != expected_papers
+                or relation_id not in {str(value) for value in scope_group.get("relation_ids") or ()}
+            ):
+                raise AssertionError(f"required comparison task differs from its output-scope group: {group_id}")
+            group_slots = slots_by_group.get(group_id) or []
+            required_slot_ids = {str(slot.get("claim_slot_id") or "") for slot in group_slots}
+            if len(required_slot_ids) != 2 or "" in required_slot_ids:
+                raise AssertionError(f"required comparison group does not have exactly two slots: {group_id}")
+            if {str(value) for value in group.get("support_slot_ids") or ()} != required_slot_ids:
+                raise AssertionError(f"required comparison group slot IDs differ from output scope: {group_id}")
+            if {str(slot.get("paper_key") or "") for slot in group_slots} != expected_papers:
+                raise AssertionError(f"required comparison slots do not cover both papers: {group_id}")
+            matching_sections = [
+                section for section in candidate_sections
+                if required_slot_ids.issubset({
+                    str(row.get("claim_slot_id") or "")
+                    for row in section.get("claim_support") or () if isinstance(row, Mapping)
+                })
+            ]
+            if len(matching_sections) != 1:
+                raise AssertionError(
+                    f"required comparison group is not complete in exactly one candidate section: {group_id}"
+                )
+            section_task_ids = {str(value) for value in matching_sections[0].get("task_ids") or ()}
+            section_relation_ids = {str(value) for value in matching_sections[0].get("relation_ids") or ()}
+            if task_id not in section_task_ids or relation_id not in section_relation_ids:
+                raise AssertionError(f"required comparison section omits its exact task/relation IDs: {group_id}")
+            support_rows = [
+                row for row in matching_sections[0].get("claim_support") or ()
+                if isinstance(row, Mapping) and str(row.get("claim_slot_id") or "") in required_slot_ids
+            ]
+            if (
+                len(support_rows) != 2
+                or {str(row.get("paper_key") or "") for row in support_rows} != expected_papers
+                or {str(row.get("task_id") or "") for row in support_rows} != {task_id}
+            ):
+                raise AssertionError(f"required comparison support closure is incomplete: {group_id}")
+            for row in support_rows:
+                slot_id = str(row.get("claim_slot_id") or "")
+                scope_slot = slots_by_id.get(slot_id)
+                if scope_slot is None or str(scope_slot.get("claim_group_id") or "") != group_id:
+                    raise AssertionError(f"required comparison support row is not bound to its exact scope slot: {slot_id}")
+                if any(
+                    str(row.get(field) or "") != str(scope_slot.get(field) or "")
+                    for field in ("paper_key", "primary_claim_id", "study_id")
+                ):
+                    raise AssertionError(f"required comparison identity differs from its scope slot: {slot_id}")
+                for field in ("source_claim_ids", "evidence_ids", "source_field_ids"):
+                    row_values = tuple(sorted(str(value) for value in row.get(field) or ()))
+                    slot_values = tuple(sorted(str(value) for value in scope_slot.get(field) or ()))
+                    if not row_values or row_values != slot_values:
+                        raise AssertionError(f"required comparison {field} differs from its exact scope slot: {slot_id}")
+            observations.append({
+                "claim_group_id": group_id,
+                "task_id": task_id,
+                "relation_id": relation_id,
+                "paper_keys": sorted(expected_papers),
+                "section_id": str(matching_sections[0].get("section_id") or ""),
+                "claim_slot_ids": sorted(required_slot_ids),
+                "support_rows": len(support_rows),
+                "source_closed": True,
+            })
+    return observations
+
+
+def _scale_fragment_membership_signature(
+    request: Mapping[str, Any], organization_map: Mapping[str, Any],
+) -> tuple[Any, ...]:
+    cards = {
+        int(row[0]): list(row)
+        for row in request.get("fragment_cards") or ()
+        if isinstance(row, (list, tuple)) and row and type(row[0]) is int
+    }
+    text_pool = request.get("text_pool") or ()
+    paper_keys = request.get("paper_keys") or ()
+    task_refs = request.get("task_refs") or ()
+    topic_refs = request.get("topic_refs") or ()
+    selected: set[int] = set()
+    deferred: dict[int, str] = {}
+    for section in organization_map.get("sections") or ():
+        for index in section.get("fragment_indices") or ():
+            if type(index) is not int or index not in cards or index in selected:
+                raise AssertionError("organization map duplicated or invented a fragment")
+            selected.add(index)
+    for row in organization_map.get("deferred") or ():
+        reason = str(row.get("reason_code") or "")
+        for index in row.get("fragment_indices") or ():
+            if type(index) is not int or index not in cards or index in selected or index in deferred:
+                raise AssertionError("organization map deferred fragment membership overlaps")
+            deferred[index] = reason
+    expected = set(cards)
+    if selected | set(deferred) != expected:
+        raise AssertionError("organization map does not partition its request fragment bank")
+
+    def card_signature(index: int) -> tuple[Any, ...]:
+        _fragment_index, text_index, paper_indices, state, task_index, *topic_tail = cards[index]
+        text = text_pool[text_index] if type(text_index) is int else None
+        papers = tuple(sorted(str(paper_keys[item]) for item in paper_indices))
+        task = str(task_refs[task_index]) if type(task_index) is int else ""
+        topic_index = topic_tail[0] if topic_tail else None
+        topic = str(topic_refs[topic_index]) if type(topic_index) is int else ""
+        return index, text, papers, str(state), task, topic
+
+    return (
+        tuple(card_signature(index) for index in sorted(selected)),
+        tuple((card_signature(index), deferred[index]) for index in sorted(deferred)),
+    )
+
+
+def _scale_organization_section_from_fragments(
+    request: Mapping[str, Any], *, section_index: int, metadata_index: int,
+    fragment_indices: Sequence[int],
+) -> dict[str, Any]:
+    cards = {
+        int(row[0]): list(row)
+        for row in request.get("fragment_cards") or ()
+        if isinstance(row, (list, tuple)) and row and type(row[0]) is int
+    }
+    indices = list(fragment_indices)
+    papers = sorted({
+        int(paper_index)
+        for index in indices for paper_index in cards[index][2]
+        if type(paper_index) is int
+    })
+    roles = []
+    for paper_index in papers:
+        role_fragment = next(
+            (index for index in indices if paper_index in cards[index][2]), None,
+        )
+        if role_fragment is None:
+            raise AssertionError(f"organization section lost source role for paper {paper_index}")
+        roles.append([paper_index, role_fragment])
+    return {
+        "section_index": section_index,
+        "metadata_index": metadata_index,
+        "fragment_indices": indices,
+        "paper_roles": roles,
+    }
+
+
+def _scale_merge_noncomparison_organization_fragments(
+    request: Mapping[str, Any],
+    base_map: Mapping[str, Any],
+    *,
+    validator: Callable[[Mapping[str, Any], Mapping[str, Any]], None],
+) -> dict[str, Any]:
+    """Compact candidate_2 context fragments while retaining every full fragment."""
+    # Match the existing fixture callback: private prompt authority is transport
+    # context, and the raw request object is never mutated.
+    logical = {key: value for key, value in request.items() if key != "_prompt_authority"}
+    result = json.loads(json.dumps(dict(base_map), ensure_ascii=False))
+    if str(logical.get("candidate_id") or "") != "candidate_2":
+        validator(result, logical)
+        return result
+
+    cards = {
+        int(row[0]): list(row)
+        for row in logical.get("fragment_cards") or ()
+        if isinstance(row, (list, tuple)) and row and type(row[0]) is int
+    }
+    comparison_indices = {
+        int(row["group_index"])
+        for row in logical.get("required_comparison_sections") or ()
+        if isinstance(row, Mapping) and type(row.get("group_index")) is int
+    }
+    required_sections: list[dict[str, Any]] = []
+    noncomparison_indices: list[int] = []
+    used: set[int] = set()
+    for raw in result.get("sections") or ():
+        section = dict(raw)
+        indices = [int(value) for value in section.get("fragment_indices") or ()]
+        if not indices or used.intersection(indices):
+            raise AssertionError("base organization map has empty or duplicate fragment membership")
+        used.update(indices)
+        if comparison_indices.intersection(indices):
+            if len(indices) != 1 or indices[0] not in comparison_indices:
+                raise AssertionError("base organization map mixed a required A/B fragment with another group")
+            required_sections.append(section)
+        else:
+            noncomparison_indices.extend(indices)
+
+    multi_source: list[int] = []
+    single_source: list[int] = []
+    for index in noncomparison_indices:
+        card = cards.get(index)
+        if card is None or str(card[3]) != "materialized":
+            raise AssertionError(f"selected context fragment {index} is not materialized")
+        papers = {int(value) for value in card[2] if type(value) is int}
+        if len(papers) > 1:
+            multi_source.append(index)
+        elif len(papers) == 1:
+            single_source.append(index)
+        else:
+            raise AssertionError(f"materialized fragment {index} has no source paper")
+
+    catalog = logical.get("metadata_catalog") or ()
+    fallback_metadata = next(
+        (int(section["metadata_index"]) for section in result.get("sections") or ()
+         if not comparison_indices.intersection(section.get("fragment_indices") or ())),
+        0,
+    )
+
+    def metadata_for(terms: tuple[str, ...]) -> int:
+        for index, row in enumerate(catalog):
+            title = str(row.get("title") or "").casefold() if isinstance(row, Mapping) else ""
+            if any(term in title for term in terms):
+                return index
+        return fallback_metadata
+
+    sections: list[dict[str, Any]] = []
+    for section in required_sections:
+        section["section_index"] = len(sections)
+        sections.append(section)
+    if multi_source:
+        sections.append(_scale_organization_section_from_fragments(
+            logical, section_index=len(sections),
+            metadata_index=metadata_for(("cross-source comparisons", "evidence across contexts", "source findings")),
+            fragment_indices=sorted(multi_source),
+        ))
+    if single_source:
+        sections.append(_scale_organization_section_from_fragments(
+            logical, section_index=len(sections),
+            metadata_index=metadata_for(("source findings", "conditions and boundaries", "evidence across contexts")),
+            fragment_indices=sorted(single_source),
+        ))
+
+    result["sections"] = sections
+    if _scale_fragment_membership_signature(logical, result) != _scale_fragment_membership_signature(logical, base_map):
+        raise AssertionError("candidate_2 organization layout changed source fragment membership")
+    validator(result, logical)
+    return result
+
+
+def _scale_candidate_support_multiset_signature(payload: Mapping[str, Any]) -> tuple[Any, ...]:
+    rows = []
+    for section in payload.get("sections") or ():
+        if not isinstance(section, Mapping):
+            continue
+        for support in section.get("claim_support") or ():
+            if not isinstance(support, Mapping):
+                continue
+            rows.append((
+                str(support.get("claim_slot_id") or ""),
+                str(support.get("task_id") or ""),
+                str(support.get("claim") or ""),
+                str(support.get("paper_key") or ""),
+                str(support.get("primary_claim_id") or ""),
+                tuple(sorted(str(value) for value in support.get("source_claim_ids") or ())),
+                tuple(sorted(str(value) for value in support.get("evidence_ids") or ())),
+                tuple(sorted(str(value) for value in support.get("source_field_ids") or ())),
+                str(support.get("study_id") or ""),
+            ))
+    return tuple(sorted(rows))
+
+
+def _scale_candidate_generation_layout_signature(payload: Mapping[str, Any]) -> tuple[Any, ...]:
+    sections = []
+    for section in payload.get("sections") or ():
+        if not isinstance(section, Mapping):
+            continue
+        support = tuple(sorted(
+            (
+                str(row.get("claim_slot_id") or ""),
+                str(row.get("task_id") or ""),
+                str(row.get("paper_key") or ""),
+            )
+            for row in section.get("claim_support") or ()
+            if isinstance(row, Mapping)
+        ))
+        sections.append((
+            str(section.get("title") or ""),
+            str(section.get("goal") or ""),
+            tuple(sorted(str(value) for value in section.get("paper_keys") or ())),
+            tuple(sorted(str(value) for value in section.get("task_ids") or ())),
+            tuple(sorted(str(value) for value in section.get("relation_ids") or ())),
+            support,
+        ))
+    return tuple(sections)
+
+
+def _scale_capture_model_visible_arbitration_layout(
+    node_id: str, request: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Read direct/final arbitration section layout through existing codecs."""
+    from outline.semantic_request_wire import expand_semantic_request_wire
+    from outline.candidate_arbitration_packing import expand_arbitration_candidate_support
+    from outline.v3_models import compute_v3_hash
+
+    logical = {key: value for key, value in request.items() if key != "_prompt_authority"}
+    hierarchy = logical.get("hierarchy")
+    hierarchy = hierarchy if isinstance(hierarchy, Mapping) else {}
+    leaf_id = str(hierarchy.get("leaf_id") or "")
+
+    def section_rows_from_contents(candidate_id: str, sections: Any) -> list[dict[str, Any]]:
+        if not isinstance(sections, list):
+            return []
+        rows = []
+        for position, section in enumerate(sections):
+            if not isinstance(section, Mapping):
+                raise AssertionError("model-visible candidate section is not an object")
+            rows.append({
+                "candidate_id": candidate_id,
+                "position": position,
+                "section_id": str(section.get("section_id") or ""),
+                "section_hash": compute_v3_hash(dict(section)),
+                "source_closure_hash": compute_v3_hash(section.get("claim_support") or []),
+                "title": str(section.get("title") or ""),
+                "goal": str(section.get("goal") or ""),
+                "paper_keys": sorted(str(value) for value in section.get("paper_keys") or ()),
+                "task_ids": sorted(str(value) for value in section.get("task_ids") or ()),
+                "relation_ids": sorted(str(value) for value in section.get("relation_ids") or ()),
+            })
+        return rows
+
+    def section_rows_from_index(candidate_id: str, rows: Any) -> list[dict[str, Any]]:
+        if not isinstance(rows, list):
+            return []
+        result = []
+        for position, row in enumerate(rows):
+            if not isinstance(row, Mapping):
+                raise AssertionError("decoded candidate section index row is not an object")
+            result.append({
+                "candidate_id": candidate_id,
+                "position": row.get("position", position),
+                "section_id": str(row.get("section_id") or ""),
+                "section_hash": str(row.get("section_hash") or ""),
+                "source_closure_hash": str(row.get("source_closure_hash") or ""),
+                "title": str(row.get("title") or ""),
+                "goal": str(row.get("goal") or ""),
+                "paper_keys": sorted(str(value) for value in row.get("paper_keys") or ()),
+                "task_ids": sorted(str(value) for value in row.get("task_ids") or ()),
+                "relation_ids": sorted(str(value) for value in row.get("relation_ids") or ()),
+            })
+        return result
+
+    parsed_request_sha256 = hashlib.sha256(
+        json.dumps(logical, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+    # Hierarchical leaves expose the full section index plus only their bound subset.
+    if leaf_id:
+        raw_index = logical.get("candidate_section_index")
+        raw_bindings = logical.get("candidate_section_bindings")
+        if isinstance(raw_index, Mapping) and isinstance(raw_bindings, Mapping):
+            raw_rows = raw_index.get("candidate_2") or ()
+            binding_rows = raw_bindings.get("candidate_2") or ()
+            binding_ids = {
+                str(row.get("section_id") or "")
+                for row in binding_rows if isinstance(row, Mapping)
+            }
+            selected_rows = [
+                row for row in raw_rows if isinstance(row, Mapping)
+                and str(row.get("section_id") or "") in binding_ids
+            ]
+            if selected_rows:
+                return {
+                    "node_id": node_id,
+                    "capture_kind": "hierarchical_leaf",
+                    "leaf_id": leaf_id,
+                    "hierarchy_level": str(hierarchy.get("level") or ""),
+                    "candidate_ids": [str(value) for value in logical.get("candidate_ids") or () if str(value)],
+                    "candidate_2_binding_section_ids": sorted(binding_ids),
+                    "candidate_1_section_rows": section_rows_from_index(
+                        "candidate_1", [row for row in raw_index.get("candidate_1") or ()
+                                        if isinstance(row, Mapping)
+                                        and str(row.get("section_id") or "") in {
+                                            str(value.get("section_id") or "") for value in raw_bindings.get("candidate_1") or ()
+                                            if isinstance(value, Mapping)
+                                        }]
+                    ),
+                    "candidate_2_section_rows": section_rows_from_index("candidate_2", selected_rows),
+                    "parsed_request_sha256": parsed_request_sha256,
+                }
+
+    is_final_arbitration = (
+        node_id == "arbitration"
+        or node_id.startswith("arbitration:final:")
+        or hierarchy.get("level") == "all_candidate_final_arbitration"
+    )
+    if not is_final_arbitration:
+        return None
+
+    from outline.critique_coverage_wire import expand_critique_coverage_certificates
+    from outline.candidate_arbitration_final_projection import expand_arbitration_final_projection
+    from outline.candidate_arbitration_ledger_packing import expand_arbitration_final_ledger
+
+    expanded = expand_semantic_request_wire(logical)
+    if isinstance(expanded.get("candidate_support_packing"), Mapping):
+        expanded = expand_arbitration_candidate_support(expanded)
+    expanded = expand_critique_coverage_certificates(expanded)
+    if isinstance(expanded.get("arbitration_final_projection"), Mapping):
+        expanded = expand_arbitration_final_projection(expanded)
+    raw_ledger = expanded.get("arbitration_evaluation_ledger")
+    wire_ledger = logical.get("arbitration_evaluation_ledger")
+    wire_index = wire_ledger.get("candidate_section_index") if isinstance(wire_ledger, Mapping) else None
+    raw_c2_rows = wire_index.get("candidate_2") if isinstance(wire_index, Mapping) else None
+    ledger = raw_ledger
+    if isinstance(ledger, Mapping) and isinstance(ledger.get("ledger_packing"), Mapping):
+        ledger = expand_arbitration_final_ledger(ledger)
+        expanded = {**dict(expanded), "arbitration_evaluation_ledger": ledger}
+
+    candidate_contents = expanded.get("candidate_contents")
+    c1_content = candidate_contents.get("candidate_1") if isinstance(candidate_contents, Mapping) else None
+    c2_content = candidate_contents.get("candidate_2") if isinstance(candidate_contents, Mapping) else None
+    content_rows_1 = section_rows_from_contents(
+        "candidate_1", c1_content.get("sections") if isinstance(c1_content, Mapping) else None,
+    )
+    content_rows_2 = section_rows_from_contents(
+        "candidate_2", c2_content.get("sections") if isinstance(c2_content, Mapping) else None,
+    )
+    ledger = expanded.get("arbitration_evaluation_ledger")
+    index = ledger.get("candidate_section_index") if isinstance(ledger, Mapping) else None
+    index_rows_1 = section_rows_from_index(
+        "candidate_1", index.get("candidate_1") if isinstance(index, Mapping) else None,
+    )
+    index_rows_2 = section_rows_from_index(
+        "candidate_2", index.get("candidate_2") if isinstance(index, Mapping) else None,
+    )
+    candidate_1_rows = content_rows_1 or index_rows_1
+    candidate_2_rows = content_rows_2 or index_rows_2
+    if not candidate_2_rows:
+        return None
+    return {
+        "node_id": node_id,
+        "capture_kind": "final_arbitration_model_request",
+        "hierarchy_level": str(hierarchy.get("level") or ""),
+        "request_schema_version": str(expanded.get("schema_version") or ""),
+        "candidate_ids": [str(value) for value in expanded.get("candidate_ids") or () if str(value)],
+        "projection_aliases": list(
+            (logical.get("arbitration_final_projection") or {}).get("aliases") or ()
+        ) if isinstance(logical.get("arbitration_final_projection"), Mapping) else [],
+        "ledger_packing_schema": str(
+            (wire_ledger.get("ledger_packing") or {}).get("schema_version") or ""
+        ) if isinstance(wire_ledger, Mapping) else "",
+        "raw_candidate_2_positional_index_row_count": (
+            len(raw_c2_rows) if isinstance(raw_c2_rows, list) else None
+        ),
+        "parsed_request_sha256": parsed_request_sha256,
+        "candidate_1_section_rows": candidate_1_rows,
+        "candidate_2_section_rows": candidate_2_rows,
+    }
+
+def _scale_model_visible_rows_match_candidate(
+    rows: Sequence[Mapping[str, Any]], candidate: Mapping[str, Any],
+) -> bool:
+    from outline.v3_models import compute_v3_hash
+
+    sections = [row for row in candidate.get("sections") or () if isinstance(row, Mapping)]
+    by_id = {str(row.get("section_id") or ""): row for row in sections}
+    visible_by_id = {str(row.get("section_id") or ""): row for row in rows}
+    if not by_id or len(visible_by_id) != len(rows) or set(visible_by_id) != set(by_id):
+        return False
+    expected_order = [str(row.get("section_id") or "") for row in sections]
+    observed_order = [str(row.get("section_id") or "") for row in sorted(
+        rows, key=lambda item: int(item.get("position") or 0),
+    )]
+    if observed_order != expected_order:
+        return False
+    for section_id, section in by_id.items():
+        visible = visible_by_id[section_id]
+        if visible.get("section_hash") != compute_v3_hash(dict(section)):
+            return False
+        for field in ("title", "goal", "paper_keys", "task_ids", "relation_ids"):
+            expected = section.get(field) or "" if field in {"title", "goal"} else sorted(
+                str(value) for value in section.get(field) or ()
+            )
+            observed = visible.get(field) or "" if field in {"title", "goal"} else sorted(
+                str(value) for value in visible.get(field) or ()
+            )
+            if observed != expected:
+                return False
+        if visible.get("source_closure_hash") and visible["source_closure_hash"] != compute_v3_hash(
+            section.get("claim_support") or ()
+        ):
+            return False
+    return True
+
+def test_scale_candidate_organization_layout_roundtrip_preserves_source_closure(tmp_path: Path) -> None:
+    from outline.candidate_fragment_bank import validate_candidate_organization_map_for_request_v1
+    from tests import run_first_candidate_fragments_fixture as organization_fixture
+    from tests import test_run_first_candidate_fragment_bank as bank_test
+
+    fixture = bank_test._sealed_scope(tmp_path)
+    scope = fixture[-1]
+    required = bank_test._seed_group(scope, "relation:required-ab")
+    optional = bank_test._seed_group(scope, "relation:optional-ab")
+    comparison_rows = [
+        bank_test._comparison_row(required, "required"),
+        bank_test._comparison_row(optional, "optional"),
+    ]
+    _canonical, bank = bank_test._build_bank(
+        fixture, comparison_rows=comparison_rows, required_group_ids=[required],
+    )
+    request, _axis, _plan, _catalog = bank_test._organization_context(
+        bank, scope, candidate_id="candidate_2", required_group_ids=[required],
+    )
+    required_indices = set(int(value) for value in request["required_group_indices"])
+    preferred = [
+        int(card[0]) for card in request["fragment_cards"]
+        if card[3] == "materialized" and int(card[0]) not in required_indices
+    ]
+    base = organization_fixture._organization_response(request, preferred_indices=preferred)
+    # A unit-only split layout uses complete bank fragments, never partial claims.
+    split_sections = []
+    comparison_indices = {
+        int(row["group_index"]) for row in request.get("required_comparison_sections") or ()
+    }
+    cards = {int(row[0]): list(row) for row in request["fragment_cards"]}
+    for section in base["sections"]:
+        indices = [int(value) for value in section["fragment_indices"]]
+        if comparison_indices.intersection(indices):
+            split_sections.append(dict(section))
+        else:
+            for index in indices:
+                paper_indices = sorted(set(int(value) for value in cards[index][2]))
+                split_sections.append({
+                    "section_index": len(split_sections),
+                    "metadata_index": int(section["metadata_index"]),
+                    "fragment_indices": [index],
+                    "paper_roles": [[paper, index] for paper in paper_indices],
+                })
+    for index, section in enumerate(split_sections):
+        section["section_index"] = index
+    split = dict(base)
+    split["sections"] = split_sections
+    validate_candidate_organization_map_for_request_v1(split, request)
+    compact = _scale_merge_noncomparison_organization_fragments(
+        request, split, validator=validate_candidate_organization_map_for_request_v1,
+    )
+    assert len(compact["sections"]) < len(split["sections"])
+    assert _scale_organization_layout_signature(compact) != _scale_organization_layout_signature(split)
+    assert _scale_fragment_membership_signature(request, split) == _scale_fragment_membership_signature(request, compact)
+
+    expanded_split = bank_test._expand_from_request(split, request, bank, scope, [required])
+    expanded_compact = bank_test._expand_from_request(compact, request, bank, scope, [required])
+    scope.validate(expanded_split)
+    scope.validate(expanded_compact)
+    assert _scale_candidate_support_multiset_signature(expanded_split) == _scale_candidate_support_multiset_signature(expanded_compact)
+    required_slots = {
+        slot.claim_slot_id for slot in scope.claim_slots if slot.claim_group_id == required
+    }
+    assert len(required_slots) == 2
+    for payload in (expanded_split, expanded_compact):
+        matching = [
+            section for section in payload["sections"]
+            if required_slots.issubset({str(row.get("claim_slot_id") or "")
+                                        for row in section.get("claim_support") or ()})
+        ]
+        assert len(matching) == 1
+        rows = [row for row in matching[0]["claim_support"]
+                if str(row.get("claim_slot_id") or "") in required_slots]
+        assert {str(row["paper_key"]) for row in rows} == set(bank_test.PAPER_KEYS)
+        assert all(row["source_claim_ids"] and row["evidence_ids"] and row["source_field_ids"]
+                   for row in rows)
+
+
+def test_scale_partition_layout_aggregation_and_hierarchical_leaf_capture() -> None:
+    request_a = {
+        "bank_group_count": 2,
+        "paper_keys": ["paper-a", "paper-c"],
+        "partition": {"full_bank_group_count": 4, "local_to_global_group_indices": [0, 2]},
+    }
+    request_b = {
+        "bank_group_count": 2,
+        "paper_keys": ["paper-b", "paper-d"],
+        "partition": {"full_bank_group_count": 4, "local_to_global_group_indices": [1, 3]},
+    }
+    split_a = {
+        "sections": [{"metadata_index": 2, "fragment_indices": [0], "paper_roles": [[0, 0]]}],
+        "deferred": [{"reason_code": "optional_unresolved", "fragment_indices": [1]}],
+    }
+    split_b = {
+        "sections": [
+            {"metadata_index": 2, "fragment_indices": [0], "paper_roles": [[0, 0]]},
+            {"metadata_index": 2, "fragment_indices": [1], "paper_roles": [[1, 1]]},
+        ],
+        "deferred": [],
+    }
+    merged_a = {
+        "sections": [{"metadata_index": 2, "fragment_indices": [0], "paper_roles": [[0, 0]]}],
+        "deferred": [{"reason_code": "optional_unresolved", "fragment_indices": [1]}],
+    }
+    merged_b = {
+        "sections": [{"metadata_index": 2, "fragment_indices": [0, 1], "paper_roles": [[0, 0], [1, 1]]}],
+        "deferred": [],
+    }
+    split_layout = _scale_aggregate_partition_layouts((
+        _scale_global_organization_map_signature(request_a, split_a),
+        _scale_global_organization_map_signature(request_b, split_b),
+    ))
+    merged_layout = _scale_aggregate_partition_layouts((
+        _scale_global_organization_map_signature(request_a, merged_a),
+        _scale_global_organization_map_signature(request_b, merged_b),
+    ))
+    assert split_layout != merged_layout
+    assert split_layout[0] == merged_layout[0] == 4
+    for layout in (split_layout, merged_layout):
+        global_membership = [index for section in layout[1] for index in section[0]]
+        global_membership.extend(index for _reason, indices in layout[2] for index in indices)
+        assert sorted(global_membership) == [0, 1, 2, 3]
+
+    leaf_request = {
+        "hierarchy": {"leaf_id": "leaf-1", "level": "candidate_leaf_arbitration"},
+        "candidate_ids": ["candidate_1", "candidate_2"],
+        "candidate_section_index": {
+            "candidate_2": [
+                {"position": 0, "section_id": "c2s0", "section_hash": "hash-0", "source_closure_hash": "support-0"},
+                {"position": 1, "section_id": "c2s1", "section_hash": "hash-1", "source_closure_hash": "support-1"},
+            ],
+        },
+        "candidate_section_bindings": {
+            "candidate_2": [{"section_id": "c2s1"}],
+        },
+    }
+    leaf_view = _scale_capture_model_visible_arbitration_layout("arbitration:leaf:leaf-1", leaf_request)
+    assert leaf_view is not None
+    assert leaf_view["capture_kind"] == "hierarchical_leaf"
+    assert leaf_view["candidate_2_binding_section_ids"] == ["c2s1"]
+    assert [row["section_id"] for row in leaf_view["candidate_2_section_rows"]] == ["c2s1"]
+
+
+def test_scale_required_comparison_closure_keeps_same_pair_tasks_distinct() -> None:
+    pair = ["paper-a", "paper-b"]
+
+    def comparison_group(group_id: str, task_id: str, relation_id: str, relation_type: str) -> dict[str, Any]:
+        return {
+            "claim_group_id": group_id,
+            "task_id": task_id,
+            "claim_kind": "model_authored_relation_comparison_slot",
+            "claim_seed": True,
+            "paper_keys": list(pair),
+            "support_slot_ids": [f"{group_id}-{paper}" for paper in pair],
+            "relation_ids": [relation_id],
+            "task_contract": {
+                "relation_id": relation_id,
+                "relation_type": relation_type,
+                "task_id": task_id,
+            },
+        }
+
+    optional = comparison_group("group-optional-qualifies", "task-qualifies", "relation-qualifies", "qualifies")
+    required = comparison_group(
+        "group-required-magnitude", "task-magnitude", "relation-magnitude", "reported_magnitude_contrast",
+    )
+    # The bank array is intentionally not the global index table; use the
+    # declared global `index` plus the partition binding.
+    bank_groups = [
+        {
+            "index": index,
+            "claim_group": {
+                "claim_group_id": f"filler-{index}",
+                "task_id": f"task-filler-{index}",
+                "claim_kind": "canonical_claim_bundle",
+                "claim_seed": False,
+                "paper_keys": ["paper-a"],
+                "relation_ids": [],
+                "task_contract": {"task_id": f"task-filler-{index}"},
+            },
+        }
+        for index in range(72)
+    ]
+    bank_groups[62]["claim_group"] = optional
+    bank_groups[68]["claim_group"] = required
+    bank = {"content_hash": "synthetic-bank-hash", "groups": list(reversed(bank_groups))}
+    required_request = {
+        "bank_group_count": 1,
+        "required_group_indices": [0],
+        "bank_hash": "synthetic-bank-hash",
+        "paper_keys": list(pair),
+        "partition": {"full_bank_hash": "synthetic-bank-hash", "full_bank_group_count": 72, "local_to_global_group_indices": [68]},
+        "required_comparison_sections": [{"group_index": 0, "paper_indices": [0, 1]}],
+    }
+    optional_request = {
+        "bank_group_count": 1,
+        "required_group_indices": [0],
+        "bank_hash": "synthetic-bank-hash",
+        "paper_keys": list(pair),
+        "partition": {"full_bank_hash": "synthetic-bank-hash", "full_bank_group_count": 72, "local_to_global_group_indices": [62]},
+        "required_comparison_sections": [{"group_index": 0, "paper_indices": [0, 1]}],
+    }
+    one_by_pair = _scale_required_comparison_groups_by_pair([required_request], bank, [pair])
+    both_by_pair = _scale_required_comparison_groups_by_pair(
+        [optional_request, required_request], bank, [pair],
+    )
+    pair_key = tuple(pair)
+    assert [row["claim_group_id"] for row in one_by_pair[pair_key]] == [required["claim_group_id"]]
+    assert [row["claim_group_id"] for row in both_by_pair[pair_key]] == [
+        optional["claim_group_id"], required["claim_group_id"],
+    ]
+
+    scope_payload = {
+        "claim_groups": [optional, required],
+        "claim_slots": [
+            {
+                "claim_group_id": group["claim_group_id"],
+                "claim_slot_id": f"{group['claim_group_id']}-{paper}",
+                "paper_key": paper,
+                "primary_claim_id": f"primary:{group['claim_group_id']}:{paper}",
+                "study_id": "",
+                "source_claim_ids": [f"claim:{group['claim_group_id']}:{paper}"],
+                "evidence_ids": [f"evidence:{group['claim_group_id']}:{paper}"],
+                "source_field_ids": [f"field:{group['claim_group_id']}:{paper}"],
+            }
+            for group in (optional, required)
+            for paper in pair
+        ],
+    }
+    support_rows = [
+        {
+            "claim_slot_id": f"{group['claim_group_id']}-{paper}",
+            "task_id": group["task_id"],
+            "paper_key": paper,
+            "primary_claim_id": f"primary:{group['claim_group_id']}:{paper}",
+            "study_id": "",
+            "source_claim_ids": [f"claim:{group['claim_group_id']}:{paper}"],
+            "evidence_ids": [f"evidence:{group['claim_group_id']}:{paper}"],
+            "source_field_ids": [f"field:{group['claim_group_id']}:{paper}"],
+        }
+        for group in (optional, required)
+        for paper in pair
+    ]
+    candidate_sections = [{
+        "section_id": "ab-section",
+        "task_ids": [optional["task_id"], required["task_id"]],
+        "relation_ids": ["relation-qualifies", "relation-magnitude"],
+        "claim_support": support_rows,
+    }]
+    one_observation = _scale_assert_required_comparison_closures(one_by_pair, scope_payload, candidate_sections)
+    both_observations = _scale_assert_required_comparison_closures(both_by_pair, scope_payload, candidate_sections)
+    assert len(one_observation) == 1
+    assert one_observation[0]["claim_group_id"] == required["claim_group_id"]
+    assert len(both_observations) == 2
+    assert {row["claim_group_id"] for row in both_observations} == {
+        optional["claim_group_id"], required["claim_group_id"],
+    }
+    assert all(row["source_closed"] and row["section_id"] == "ab-section" for row in both_observations)
+
+
+def _scale_add_candidate_design_profiles(
+    papers: Sequence[ScalePaper],
+) -> tuple[list[ScalePaper], dict[str, Any]]:
+    """Add small synthetic experiment-design evidence without changing outcomes or identities."""
+    design_profiles = (
+        ("randomized_parallel_groups", "randomized parallel-group experiment"),
+        ("counterbalanced_within_subject", "counterbalanced within-subject experiment"),
+        ("cluster_randomized_field", "cluster-randomized field experiment"),
+        ("blocked_randomized_parallel", "blocked randomized parallel-group experiment"),
+        ("randomized_crossover", "randomized crossover experiment"),
+    )
+    bridge_statement = (
+        "Article-level bridge: coupon/reference-price framing and bundle-price presentation "
+        "are distinct promotion questions; estimates are not pooled and no shared mediator is asserted."
+    )
+    enriched: list[ScalePaper] = []
+    rows: list[dict[str, Any]] = []
+    for paper in papers:
+        design_type, design_name = design_profiles[paper.index % len(design_profiles)]
+        multi_study = paper.index % 11 == 0
+        design_statement = (
+            f"Reported Study A design: {design_name}."
+            if multi_study
+            else f"Research design: {design_name}."
+        )
+        # The oracle's printed-field grammar stops a condition at a new
+        # Method field, preserving the measured condition as a separate fact.
+        condition_description = f"{paper.condition_description.rstrip()}\nMethod: {design_statement}"
+        limitation = (
+            paper.limitation.rstrip()
+            + " Design scope remains the stated experimental conditions, observed sample, and 30-day follow-up."
+        )
+        if multi_study:
+            limitation += " The design statement applies to the reported Study A estimate; no Study B design or effect is added."
+        if paper.index == 0:
+            limitation += " " + bridge_statement
+        updated = replace(
+            paper,
+            condition_description=condition_description,
+            limitation=limitation,
+        )
+        if (
+            updated.paper_key != paper.paper_key or updated.stem != paper.stem
+            or updated.title != paper.title or updated.finding != paper.finding
+            or updated.sample_description != paper.sample_description
+            or updated.table_note != paper.table_note
+            or updated.extended_source_english != paper.extended_source_english
+            or updated.extended_source_chinese != paper.extended_source_chinese
+        ):
+            raise AssertionError("design overlay changed a source identity, result, sample, or printed study record")
+        enriched.append(updated)
+        rows.append({
+            "paper_index": paper.index,
+            "design_type": design_type,
+            "design_statement": design_statement,
+            "study_scope": "Study A only" if multi_study else "single reported study",
+        })
+    return enriched, {
+        "scope": "synthetic test fixture only; no scientific-quality claim",
+        "designs": rows,
+        "article_bridge_statement": bridge_statement,
+    }
+
+
+def test_scale_layout_design_profiles_are_source_and_reader_visible(tmp_path: Path) -> None:
+    baseline_papers = _scale_papers(10, source_variant="all_required_comparisons")
+    profiled_papers, profile = _scale_add_candidate_design_profiles(baseline_papers)
+    assert len({row["design_type"] for row in profile["designs"]}) >= 5
+    assert all(
+        {"paper_index", "design_type", "design_statement", "study_scope"}.issubset(row)
+        for row in profile["designs"]
+    )
+    assert all(
+        (profiled.paper_key, profiled.stem, profiled.title, profiled.finding,
+         profiled.sample_description, profiled.table_note, profiled.extended_source_english,
+         profiled.extended_source_chinese)
+        == (baseline.paper_key, baseline.stem, baseline.title, baseline.finding,
+            baseline.sample_description, baseline.table_note, baseline.extended_source_english,
+            baseline.extended_source_chinese)
+        for baseline, profiled in zip(baseline_papers, profiled_papers, strict=True)
+    )
+
+    baseline_dir, profiled_dir = tmp_path / "baseline", tmp_path / "profiled"
+    baseline_dir.mkdir()
+    profiled_dir.mkdir()
+    baseline_paths: dict[str, Path] = {}
+    profiled_paths: dict[str, Path] = {}
+    design_rows = {int(row["paper_index"]): row for row in profile["designs"]}
+    for baseline, profiled in zip(baseline_papers, profiled_papers, strict=True):
+        baseline_path = baseline_dir / f"{baseline.stem}.pdf"
+        profiled_path = profiled_dir / f"{profiled.stem}.pdf"
+        _write_scale_pdf(baseline_path, baseline)
+        _write_scale_pdf(profiled_path, profiled)
+        baseline_paths[baseline.paper_key] = baseline_path
+        profiled_paths[profiled.paper_key] = profiled_path
+        with fitz.open(profiled_path) as document:
+            assert document.page_count == 2
+            first_page = " ".join(document[0].get_text("text").split())
+        design_row = design_rows[profiled.index]
+        parsed_design_studies = re.findall(
+            r"\bStudy\s+([A-Z0-9]+)\b", str(design_row["design_statement"]), re.IGNORECASE,
+        )
+        assert parsed_design_studies == (["A"] if profiled.index % 11 == 0 else [])
+        assert " ".join(profiled.condition_description.split()) in first_page
+        assert " ".join(profiled.limitation.split()) in first_page
+        assert design_row["design_statement"] in first_page
+        reader = _reader_content(profiled)
+        core = reader.get("core_analysis")
+        assert isinstance(core, Mapping)
+        assert design_row["design_statement"] in str(core.get("methodology") or "")
+        assert design_row["design_statement"] in str(core.get("limitations") or "")
+        empirical = (reader.get("specialized_details") or {}).get("empirical")
+        assert isinstance(empirical, Mapping)
+        assert design_row["design_statement"] in str(empirical.get("analysis_technique") or "")
+        if profiled.index == 0:
+            bridge = profile["article_bridge_statement"]
+            assert bridge in first_page
+            assert bridge in str(core.get("limitations") or "")
+            assert "Study B" not in design_row["design_statement"]
+            assert "no separate Study B" in profiled.sample_description
+
+    baseline_corpus = ControlledPdfCorpus.from_pdfs(baseline_paths)
+    profiled_corpus = ControlledPdfCorpus.from_pdfs(profiled_paths)
+    for baseline, profiled in zip(baseline_papers, profiled_papers, strict=True):
+        original = baseline_corpus.documents[baseline.paper_key]
+        source = profiled_corpus.documents[profiled.paper_key]
+        assert original.parse_diagnostics == source.parse_diagnostics == ()
+        assert len(original.facts) == len(source.facts) == 1
+        old_fact, fact = original.facts[0], source.facts[0]
+        assert (
+            fact.study_label, fact.sample_size, fact.direction, fact.magnitude_points,
+            fact.condition, fact.follow_up_days, fact.required_qualifiers,
+        ) == (
+            old_fact.study_label, old_fact.sample_size, old_fact.direction, old_fact.magnitude_points,
+            old_fact.condition, old_fact.follow_up_days, old_fact.required_qualifiers,
+        )
+        if "no measurable change" in baseline.finding.casefold():
+            expected_effect = ("null", None)
+        elif "reduced the primary outcome by" in baseline.finding.casefold():
+            match = re.search(r"reduced the primary outcome by (\d+) points", baseline.finding)
+            assert match is not None
+            expected_effect = ("decrease", int(match.group(1)))
+        else:
+            match = re.search(r"increased the primary outcome by (\d+) points", baseline.finding)
+            assert match is not None
+            expected_effect = ("increase", int(match.group(1)))
+        assert (fact.direction, fact.magnitude_points, fact.sample_size, fact.follow_up_days) == (
+            expected_effect[0], expected_effect[1], 24, 30,
+        )
+        assert [
+            (row.study_label, row.sample_size) for row in source.study_samples
+        ] == [
+            (row.study_label, row.sample_size) for row in original.study_samples
+        ]
+        if baseline.index % 11 == 0:
+            assert fact.study_label == "Study A"
+            assert [(row.study_label, row.sample_size) for row in source.study_samples] == [
+                ("Study A", 24), ("Study B", 31),
+            ]
+            assert not any(row.study_label == "Study B" for row in source.facts)
+        else:
+            assert fact.study_label is None
+            assert len(source.study_samples) == 1
+
+    original_pairs = _scale_required_comparisons(baseline_papers, "all_required_comparisons")
+    profiled_pairs = _scale_required_comparisons(profiled_papers, "all_required_comparisons")
+    assert profiled_pairs == original_pairs
+    by_key = {paper.paper_key: paper for paper in profiled_papers}
+    pair_indices = [[by_key[key].index for key in pair] for pair in profiled_pairs]
+    assert pair_indices == [[0, 1], [0, 2], [0, 3], [0, 9]]
+    assert profiled_corpus.documents[profiled_papers[2].paper_key].facts[0].direction == "null"
+    assert profiled_corpus.documents[profiled_papers[3].paper_key].facts[0].direction == "decrease"
+    assert profiled_corpus.documents[profiled_papers[9].paper_key].facts[0].condition.casefold() == _RARE_SCALE_CONDITION.casefold()
 
 def _assert_required_comparisons_have_complete_executed_bundles(
     registry: Any,
@@ -2132,6 +3321,32 @@ def test_scale_diagnostic_capture_failure_reraises_original_exception() -> None:
     assert caught.value is original
 
 
+def test_scale_failure_snapshot_keeps_layout_replay_in_loopback_extensions() -> None:
+    from types import SimpleNamespace
+
+    extensions = {
+        "candidate_organization_layout_captures": [{"candidate_id": "candidate_2", "provider_call_id": "candidate_organization_provider:candidate_2:partition:1"}],
+        "candidate_arbitration_model_visible_captures": [{"node_id": "arbitration:final:abc", "candidate_2_section_rows": []}],
+        "reader_design_transport_captures": [{"paper_key": "paper-a", "request_body_sha256": "a" * 64}],
+    }
+    snapshot = _scale_failure_snapshot(
+        control=None,
+        job_id="failure-capture-test",
+        first=None,
+        plan=None,
+        plan_seconds=None,
+        server=SimpleNamespace(calls=[], errors=[], trace=[]),
+        source_kind="synthetic_pdf_cold",
+        source_variant="all_required_comparisons",
+        source_receipt={},
+        size=10,
+        exception=AssertionError("captured fixture failure"),
+    )
+    _scale_add_failure_loopback_extensions(snapshot, extensions)
+    assert snapshot["schema_version"] == "run-first-scale-failure-diagnostic/v1"
+    assert {key: snapshot["loopback"][key] for key in extensions} == extensions
+
+
 @pytest.mark.optional
 @pytest.mark.integration
 @pytest.mark.slow
@@ -2214,8 +3429,137 @@ def test_run_first_scale_local_http_full_chain(
         source_kind,
         expect_blocked=expect_budget_blocked,
     )
+    candidate_layout_capture: list[dict[str, Any]] = []
+    candidate_layout_arbitration_capture: list[dict[str, Any]] = []
+    candidate_layout_arbitration_capture_errors: list[dict[str, str]] = []
+    reader_design_transport_capture: list[dict[str, Any]] = []
+    fixture_transport_targets: Counter[tuple[str, str, int | None]] = Counter()
+    fixture_transport_origin: tuple[str, str, int | None] | None = None
+    candidate_layout_metrics: dict[str, Any] | None = None
+    candidate_layout_variant_enabled = (
+        source_variant == "all_required_comparisons"
+        and source_kind in {"synthetic_pdf_cold", "synthetic_pdf_warm"}
+        and not identity_quarantine_extra
+    )
+    if candidate_layout_variant_enabled:
+        import contextvars
+        from outline.candidate_fragment_bank import validate_candidate_organization_map_for_request_v1
+        from tests import run_first_candidate_fragments_fixture as organization_fixture
+        import sys
+
+        original_organization_response = organization_fixture._organization_response
+        current_organization_node: contextvars.ContextVar[str] = contextvars.ContextVar(
+            "scale_candidate_organization_node", default="",
+        )
+
+        def organization_response_with_candidate_layout(raw_request, *, preferred_indices=()):
+            # Match the current fixture callback: transport-only authority is
+            # stripped from a copy, and the original provider request stays untouched.
+            request = {
+                key: value for key, value in raw_request.items()
+                if key != "_prompt_authority"
+            }
+            base_map = original_organization_response(
+                request, preferred_indices=preferred_indices,
+            )
+            variant_map = _scale_merge_noncomparison_organization_fragments(
+                request, base_map, validator=validate_candidate_organization_map_for_request_v1,
+            )
+            axis = request.get("axis_payload")
+            axis = axis if isinstance(axis, Mapping) else {}
+            candidate_id = str(request.get("candidate_id") or "")
+            provider_call_id = current_organization_node.get()
+            expected_node_prefix = f"candidate_organization_provider:{candidate_id}"
+            if not (
+                provider_call_id == expected_node_prefix
+                or provider_call_id.startswith(expected_node_prefix + ":partition:")
+            ):
+                raise AssertionError("organization fixture response is not bound to its actual provider node")
+            base_membership = _scale_fragment_membership_signature(request, base_map)
+            variant_membership = _scale_fragment_membership_signature(request, variant_map)
+            base_global_layout = _scale_global_organization_map_signature(request, base_map)
+            variant_global_layout = _scale_global_organization_map_signature(request, variant_map)
+            partition = request.get("partition")
+            candidate_layout_capture.append({
+                "candidate_id": candidate_id,
+                "provider_call_id": provider_call_id,
+                "partition_index": int(partition.get("partition_index")) if isinstance(partition, Mapping) else None,
+                "partition_count": int(partition.get("partition_count")) if isinstance(partition, Mapping) else 1,
+                "full_bank_group_count": int(partition.get("full_bank_group_count")) if isinstance(partition, Mapping) else int(request.get("bank_group_count") or 0),
+                "partition_local_to_global_group_indices": (
+                    [int(value) for value in partition.get("local_to_global_group_indices") or ()]
+                    if isinstance(partition, Mapping) else None
+                ),
+                "required_group_indices": [
+                    int(value) for value in request.get("required_group_indices") or ()
+                ],
+                "required_comparison_sections": [
+                    {
+                        key: row.get(key)
+                        for key in ("group_index", "metadata_index", "paper_indices")
+                        if key in row
+                    }
+                    for row in request.get("required_comparison_sections") or ()
+                    if isinstance(row, Mapping)
+                ],
+                "axis_id": str(axis.get("axis_id") or ""),
+                "organizing_logic": str(axis.get("organizing_logic") or ""),
+                "preferred_dimensions": list(axis.get("preferred_dimensions") or ()),
+                "base_section_count": len(base_map.get("sections") or ()),
+                "variant_section_count": len(variant_map.get("sections") or ()),
+                "base_layout": _scale_organization_layout_signature(base_map),
+                "variant_layout": _scale_organization_layout_signature(variant_map),
+                "base_global_layout": base_global_layout,
+                "variant_global_layout": variant_global_layout,
+                "base_membership_sha256": hashlib.sha256(
+                    json.dumps(base_membership, ensure_ascii=False, sort_keys=True).encode("utf-8")
+                ).hexdigest(),
+                "variant_membership_sha256": hashlib.sha256(
+                    json.dumps(variant_membership, ensure_ascii=False, sort_keys=True).encode("utf-8")
+                ).hexdigest(),
+            })
+            return variant_map
+
+        monkeypatch.setattr(
+            organization_fixture,
+            "_organization_response",
+            organization_response_with_candidate_layout,
+        )
+        original_outline_provider_response = _outline_provider_response
+
+        def outline_provider_response_with_layout_readback(
+            node_id: str,
+            request: Mapping[str, Any],
+            fixture_trace: list[dict[str, Any]] | None = None,
+            arbitration_fixture_state: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            try:
+                model_view = _scale_capture_model_visible_arbitration_layout(node_id, request)
+            except Exception as exc:  # Read-only capture errors must not alter the fixture response.
+                candidate_layout_arbitration_capture_errors.append({
+                    "node_id": str(node_id),
+                    "error_type": type(exc).__name__,
+                    "message": str(exc)[:400],
+                })
+                model_view = None
+            if model_view is not None:
+                candidate_layout_arbitration_capture.append(model_view)
+            token = current_organization_node.set(str(node_id))
+            try:
+                return original_outline_provider_response(
+                    node_id, request, fixture_trace, arbitration_fixture_state,
+                )
+            finally:
+                current_organization_node.reset(token)
+
+        monkeypatch.setattr(
+            sys.modules[__name__],
+            "_outline_provider_response",
+            outline_provider_response_with_layout_readback,
+        )
     repo_root = Path(__file__).resolve().parents[1]
     source_receipt: dict[str, Any] = {}
+    candidate_design_profile: dict[str, Any] | None = None
     controlled_pdf_oracle: ControlledPdfCorpus | None = None
     distant_pair: list[str] | None = None
     extra_quarantine_paper: ScalePaper | None = None
@@ -2242,6 +3586,8 @@ def test_run_first_scale_local_http_full_chain(
             )
             extra_quarantine_paper = _scale_papers(size + 1, source_variant="baseline")[-1]
             quarantine_expected_doi = "10.5555/rfs-expected-extra"
+        if candidate_layout_variant_enabled:
+            papers, candidate_design_profile = _scale_add_candidate_design_profiles(papers)
         pdf_dir = tmp_path / "papers"
         pdf_dir.mkdir()
         for paper in papers:
@@ -2476,6 +3822,138 @@ def test_run_first_scale_local_http_full_chain(
                 else None
             ),
         )
+        if candidate_layout_variant_enabled:
+            import requests
+            import socket
+            from urllib.parse import urlsplit
+
+            local_config = configparser.ConfigParser(interpolation=None)
+            local_config.read(config_path, encoding="utf-8")
+            configured_origins = {
+                (parts.scheme, parts.hostname or "", parts.port)
+                for section in local_config.sections()
+                if (api_value := str(local_config[section].get("api_base") or "").strip())
+                and (parts := urlsplit(api_value)).scheme
+                and parts.hostname
+            }
+            expected_parts = urlsplit(api_base)
+            fixture_transport_origin = (
+                expected_parts.scheme,
+                expected_parts.hostname or "",
+                expected_parts.port,
+            )
+            if (
+                len(configured_origins) != 1
+                or configured_origins != {fixture_transport_origin}
+                or fixture_transport_origin[0] != "http"
+                or fixture_transport_origin[1] not in {"127.0.0.1", "localhost", "::1"}
+            ):
+                raise AssertionError("layout fixture configuration is not bound to one loopback HTTP origin")
+            monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost,::1")
+            monkeypatch.setenv("no_proxy", "127.0.0.1,localhost,::1")
+
+            allowed_socket_target = ("127.0.0.1", int(fixture_transport_origin[2] or 0))
+            socket_targets: Counter[tuple[str, int]] = Counter()
+            original_socket_connect = socket.socket.connect
+            original_socket_connect_ex = socket.socket.connect_ex
+
+            def require_fixture_socket_target(address):
+                if not isinstance(address, tuple) or len(address) < 2:
+                    raise AssertionError("local fixture socket attempted a non-IP connection")
+                target = (str(address[0]), int(address[1]))
+                if target != allowed_socket_target:
+                    raise AssertionError("local fixture socket attempted a connection outside its server address")
+                socket_targets[target] += 1
+
+            def fixture_only_socket_connect(sock, address):
+                require_fixture_socket_target(address)
+                return original_socket_connect(sock, address)
+
+            def fixture_only_socket_connect_ex(sock, address):
+                require_fixture_socket_target(address)
+                return original_socket_connect_ex(sock, address)
+
+            monkeypatch.setattr(socket.socket, "connect", fixture_only_socket_connect)
+            monkeypatch.setattr(socket.socket, "connect_ex", fixture_only_socket_connect_ex)
+
+            design_by_index = {
+                int(row["paper_index"]): dict(row)
+                for row in (candidate_design_profile or {}).get("designs") or ()
+                if isinstance(row, Mapping)
+            }
+            paper_key_by_index = {paper.index: paper.paper_key for paper in papers}
+            original_send = requests.Session.send
+
+            def layout_fixture_only_send(session, prepared_request, **kwargs):
+                target = urlsplit(str(prepared_request.url or ""))
+                target_origin = (target.scheme, target.hostname or "", target.port)
+                if target_origin != fixture_transport_origin:
+                    raise AssertionError("layout fixture attempted an HTTP request outside its local origin")
+                proxy_map = kwargs.get("proxies")
+                if isinstance(proxy_map, Mapping) and any(str(value or "").strip() for value in proxy_map.values()):
+                    raise AssertionError("local fixture request has an effective HTTP proxy")
+                fixture_transport_targets[target_origin] += 1
+                if str(prepared_request.method or "").upper() == "POST":
+                    body = prepared_request.body
+                    if isinstance(body, str):
+                        raw_body = body.encode("utf-8")
+                    elif isinstance(body, bytes):
+                        raw_body = body
+                    else:
+                        raw_body = b""
+                    if raw_body:
+                        try:
+                            payload = json.loads(raw_body)
+                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            payload = None
+                        if isinstance(payload, Mapping) and payload.get("model") == "rfs-reader-local":
+                            messages = payload.get("messages") or ()
+                            user_text = "\n".join(
+                                str(item.get("content") or "")
+                                for item in messages
+                                if isinstance(item, Mapping) and item.get("role") == "user"
+                            )
+                            identifier = _RFS_ID.search(user_text)
+                            if identifier is None:
+                                raise AssertionError("reader HTTP request omitted its source paper identifier")
+                            paper_index = int(identifier.group(1))
+                            design_row = design_by_index.get(paper_index)
+                            if design_row is None:
+                                raise AssertionError("reader HTTP request paper is outside the design-profile fixture")
+                            normalized_user_text = " ".join(user_text.split()).casefold()
+                            design_statement = " ".join(
+                                str(design_row.get("design_statement") or "").split()
+                            ).casefold()
+                            design_present = bool(design_statement) and design_statement in normalized_user_text
+                            if not design_present:
+                                raise AssertionError(
+                                    "actual Reader HTTP user message omitted its paper's human-readable design statement"
+                                )
+                            bridge_expected = paper_index == 0
+                            bridge_statement = " ".join(
+                                str((candidate_design_profile or {}).get("article_bridge_statement") or "").split()
+                            ).casefold()
+                            bridge_present = bridge_expected and bridge_statement in normalized_user_text
+                            estimates_not_pooled = bridge_expected and "estimates are not pooled" in normalized_user_text
+                            no_shared_mediator = bridge_expected and "no shared mediator is asserted" in normalized_user_text
+                            if bridge_expected and not all((bridge_present, estimates_not_pooled, no_shared_mediator)):
+                                raise AssertionError(
+                                    "actual Reader HTTP user message omitted the article bridge or its non-pooling limits"
+                                )
+                            reader_design_transport_capture.append({
+                                "paper_index": paper_index,
+                                "paper_key": paper_key_by_index[paper_index],
+                                "design_type": str(design_row.get("design_type") or ""),
+                                "design_statement_present": design_present,
+                                "article_bridge_present": bridge_present,
+                                "estimates_not_pooled_present": estimates_not_pooled,
+                                "no_shared_mediator_present": no_shared_mediator,
+                                "request_body_sha256": hashlib.sha256(raw_body).hexdigest(),
+                                "user_text_sha256": hashlib.sha256(user_text.encode("utf-8")).hexdigest(),
+                            })
+                return original_send(session, prepared_request, **kwargs)
+
+            monkeypatch.setattr(requests.Session, "send", layout_fixture_only_send)
         spec_metadata: dict[str, Any] = {
             "review_intent": review_intent,
             **(
@@ -3231,9 +4709,380 @@ def test_run_first_scale_local_http_full_chain(
         assert model_counts["rfs-reader-local"] == reader_expected, {
             "reader_posts": model_counts["rfs-reader-local"], "expected_reader_posts": reader_expected,
         }
+        if candidate_layout_variant_enabled:
+            assert len(reader_design_transport_capture) == model_counts["rfs-reader-local"], {
+                "reader_transport_captures": len(reader_design_transport_capture),
+                "reader_posts": model_counts["rfs-reader-local"],
+            }
+            assert {
+                int(row["paper_index"]) for row in reader_design_transport_capture
+            }.issuperset({paper.index for paper in papers})
+            assert all(
+                row["design_statement_present"]
+                and len(str(row["request_body_sha256"])) == 64
+                and len(str(row["user_text_sha256"])) == 64
+                for row in reader_design_transport_capture
+            )
+            assert any(int(row["paper_index"]) == 0 for row in reader_design_transport_capture)
+            assert all(
+                row["article_bridge_present"]
+                and row["estimates_not_pooled_present"]
+                and row["no_shared_mediator_present"]
+                for row in reader_design_transport_capture
+                if int(row["paper_index"]) == 0
+            )
+            assert fixture_transport_origin is not None
+            assert fixture_transport_targets
+            assert set(fixture_transport_targets) == {fixture_transport_origin}
+            assert socket_targets
+            assert set(socket_targets) == {allowed_socket_target}
         assert by_stage["stage4_validator"] > 0
         unique_hash_count = len({str(call.get("user_text_sha256") or "") for call in calls})
         total_user_text_bytes = sum(int(call.get("user_text_bytes") or 0) for call in calls)
+        if candidate_layout_variant_enabled:
+            rows_by_candidate: dict[str, list[dict[str, Any]]] = {}
+            for row in candidate_layout_capture:
+                rows_by_candidate.setdefault(str(row.get("candidate_id") or ""), []).append(row)
+                assert row["base_membership_sha256"] == row["variant_membership_sha256"]
+            expected_candidate_ids = {f"candidate_{index}" for index in range(1, 6)}
+            assert expected_candidate_ids.issubset(rows_by_candidate), sorted(rows_by_candidate)
+            assert all(
+                row["base_global_layout"] == row["variant_global_layout"]
+                for row in rows_by_candidate["candidate_1"]
+            )
+
+            def _organization_candidate_from_node(node_id: str) -> str:
+                prefix = "candidate_organization_provider:"
+                if not node_id.startswith(prefix):
+                    return ""
+                candidate_id = node_id[len(prefix):].split(":", 1)[0]
+                return candidate_id if candidate_id in expected_candidate_ids else ""
+
+            organization_maps: dict[str, list[dict[str, Any]]] = {}
+            organization_maps_by_node: dict[str, dict[str, Any]] = {}
+            for record in registry.list_records():
+                if record.artifact_type != "candidate_organization_map_result" or record.status != "ready":
+                    continue
+                raw = json.loads(Path(record.path).read_text(encoding="utf-8"))
+                payload = raw.get("payload") if isinstance(raw, Mapping) else None
+                payload = payload if isinstance(payload, Mapping) else raw
+                request = raw.get("provider_request") if isinstance(raw, Mapping) else None
+                node_id = str((record.metadata or {}).get("node_id") or "")
+                candidate_id = str(payload.get("candidate_id") or "") if isinstance(payload, Mapping) else ""
+                if isinstance(payload, Mapping) and isinstance(request, Mapping) and node_id:
+                    item = {
+                        "candidate_id": candidate_id,
+                        "node_id": node_id,
+                        "request": dict(request),
+                        "payload": dict(payload),
+                        "global_layout": _scale_global_organization_map_signature(request, payload),
+                    }
+                    organization_maps.setdefault(candidate_id, []).append(item)
+                    if node_id in organization_maps_by_node:
+                        raise AssertionError(f"Registry has duplicate ready organization maps for provider node {node_id}")
+                    organization_maps_by_node[node_id] = item
+            assert organization_maps.get("candidate_1") and organization_maps.get("candidate_2")
+            candidate_one_map_sections = sum(
+                len(row["payload"].get("sections") or ()) for row in organization_maps["candidate_1"]
+            )
+            candidate_two_map_sections = sum(
+                len(row["payload"].get("sections") or ()) for row in organization_maps["candidate_2"]
+            )
+            actual_outline_nodes = {
+                str(call.get("node_id") or "")
+                for call in calls if str(call.get("stage") or "") == "outline"
+            }
+            for candidate_id in sorted(expected_candidate_ids):
+                actual_nodes = {
+                    node for node in actual_outline_nodes
+                    if _organization_candidate_from_node(node) == candidate_id
+                }
+                captured_nodes = {
+                    str(row.get("provider_call_id") or "") for row in rows_by_candidate[candidate_id]
+                }
+                artifact_nodes = {
+                    str(row.get("node_id") or "") for row in organization_maps.get(candidate_id) or ()
+                }
+                if not actual_nodes or actual_nodes != captured_nodes or actual_nodes != artifact_nodes:
+                    raise AssertionError(
+                        f"{candidate_id} organization responses are not bound across fixture, HTTP, and ready Registry: "
+                        f"actual={sorted(actual_nodes)} captured={sorted(captured_nodes)} ready={sorted(artifact_nodes)}"
+                    )
+                captured_by_node = {
+                    str(row["provider_call_id"]): row for row in rows_by_candidate[candidate_id]
+                }
+                for ready in organization_maps.get(candidate_id) or ():
+                    captured = captured_by_node[str(ready["node_id"])]
+                    if captured["variant_global_layout"] != ready["global_layout"]:
+                        raise AssertionError(
+                            f"{candidate_id} provider grouping differs from its ready organization-map artifact: "
+                            f"node={ready['node_id']}"
+                        )
+
+            candidate_one_base_layout = _scale_aggregate_partition_layouts(
+                [row["base_global_layout"] for row in rows_by_candidate["candidate_1"]],
+            )
+            candidate_one_ready_layout = _scale_aggregate_partition_layouts(
+                [row["global_layout"] for row in organization_maps["candidate_1"]],
+            )
+            candidate_two_base_layout = _scale_aggregate_partition_layouts(
+                [row["base_global_layout"] for row in rows_by_candidate["candidate_2"]],
+            )
+            candidate_two_variant_layout = _scale_aggregate_partition_layouts(
+                [row["variant_global_layout"] for row in rows_by_candidate["candidate_2"]],
+            )
+            candidate_two_ready_layout = _scale_aggregate_partition_layouts(
+                [row["global_layout"] for row in organization_maps["candidate_2"]],
+            )
+            assert candidate_one_base_layout == candidate_one_ready_layout
+            assert candidate_two_variant_layout == candidate_two_ready_layout
+            assert candidate_two_variant_layout != candidate_two_base_layout, (
+                "candidate_2 organization fixture did not produce a different global fragment grouping"
+            )
+            assert candidate_two_variant_layout != candidate_one_base_layout, (
+                "candidate_1 and candidate_2 ready organization maps did not preserve distinct global layouts"
+            )
+
+            def _candidate_generation_payload(candidate_id: str) -> dict[str, Any]:
+                record = registry.get(f"outline-v3:{candidate_id}_provider_generation")
+                if record is None or record.status != "ready":
+                    raise AssertionError(f"{candidate_id} provider-generation artifact is not ready")
+                raw = json.loads(Path(record.path).read_text(encoding="utf-8"))
+                payload = raw.get("payload") if isinstance(raw, Mapping) else None
+                payload = payload if isinstance(payload, Mapping) else raw
+                if not isinstance(payload, Mapping):
+                    raise AssertionError(f"{candidate_id} provider-generation payload is not an object")
+                return dict(payload)
+
+            generation_one = _candidate_generation_payload("candidate_1")
+            generation_two = _candidate_generation_payload("candidate_2")
+            support_one = _scale_candidate_support_multiset_signature(generation_one)
+            support_two = _scale_candidate_support_multiset_signature(generation_two)
+            assert support_one == support_two, "candidate_1 and candidate_2 changed source/evidence/qualifier membership"
+            sections_one = list(generation_one.get("sections") or ())
+            sections_two = list(generation_two.get("sections") or ())
+            generation_layout_one = _scale_candidate_generation_layout_signature(generation_one)
+            generation_layout_two = _scale_candidate_generation_layout_signature(generation_two)
+            assert generation_layout_one != generation_layout_two, (
+                "candidate_1 and candidate_2 provider-generation artifacts have the same support-to-section layout"
+            )
+
+            scope_record = registry.get("outline-v3:candidate_output_scope")
+            assert scope_record is not None and scope_record.status == "ready"
+            raw_scope = json.loads(Path(scope_record.path).read_text(encoding="utf-8"))
+            scope_payload = raw_scope.get("payload") if isinstance(raw_scope, Mapping) else None
+            scope_payload = scope_payload if isinstance(scope_payload, Mapping) else raw_scope
+            assert isinstance(scope_payload, Mapping)
+            bank_record = registry.get("outline-v3:candidate_fragment_bank")
+            assert bank_record is not None and bank_record.status == "ready"
+            raw_bank = json.loads(Path(bank_record.path).read_text(encoding="utf-8"))
+            bank_payload = raw_bank.get("payload") if isinstance(raw_bank, Mapping) else None
+            bank_payload = bank_payload if isinstance(bank_payload, Mapping) else raw_bank
+            assert isinstance(bank_payload, Mapping)
+            required_groups_by_pair = _scale_required_comparison_groups_by_pair(
+                [row["request"] for row in organization_maps["candidate_2"]],
+                bank_payload,
+                required_comparisons,
+            )
+            assert set(required_groups_by_pair) == {
+                tuple(sorted(str(value) for value in pair)) for pair in required_comparisons
+            }
+            _scale_assert_required_comparison_closures(
+                required_groups_by_pair, scope_payload, sections_two,
+            )
+
+            outline_record = registry.get("outline-v3:final_outline")
+            assert outline_record is not None and outline_record.status == "ready"
+            raw_outline = json.loads(Path(outline_record.path).read_text(encoding="utf-8"))
+            selected_outline = raw_outline.get("payload") if isinstance(raw_outline, Mapping) else None
+            selected_outline = selected_outline if isinstance(selected_outline, Mapping) else raw_outline
+            assert isinstance(selected_outline, Mapping)
+            assert str(selected_outline.get("candidate_id") or "") == "candidate_1"
+            assert len(selected_outline.get("sections") or ()) >= 2
+            ready_drafts = [
+                record for record in registry.list_records()
+                if record.artifact_type == "review_draft" and record.status == "ready"
+            ]
+            writer_outline_bound = any(
+                dependency.artifact_id == outline_record.artifact_id
+                and dependency.content_hash == outline_record.content_hash
+                for record in ready_drafts for dependency in record.depends_on
+            )
+            assert writer_outline_bound, "Writer draft did not bind the selected multi-section outline"
+            arbitration_http_nodes = {
+                node for node in actual_outline_nodes
+                if node == "arbitration" or node.startswith("arbitration:")
+            }
+            assert arbitration_http_nodes, "no direct or hierarchical arbitration HTTP request was executed"
+            assert any(
+                str(view.get("node_id") or "") in arbitration_http_nodes
+                for view in candidate_layout_arbitration_capture
+            ), "no captured model-visible arbitration index is bound to an actual HTTP node"
+
+            expected_candidate_two_ids = {
+                str(section.get("section_id") or "")
+                for section in sections_two if isinstance(section, Mapping)
+            }
+            complete_arbitration_views = []
+            for view in candidate_layout_arbitration_capture:
+                rows = [row for row in view.get("candidate_2_section_rows") or () if isinstance(row, Mapping)]
+                if {str(row.get("section_id") or "") for row in rows} != expected_candidate_two_ids:
+                    continue
+                if not _scale_model_visible_rows_match_candidate(rows, generation_two):
+                    raise AssertionError("model-visible C2 section index differs from its ready generation artifact")
+                c1_rows = [row for row in view.get("candidate_1_section_rows") or () if isinstance(row, Mapping)]
+                if c1_rows and not _scale_model_visible_rows_match_candidate(c1_rows, generation_one):
+                    raise AssertionError("model-visible C1 section index differs from its ready generation artifact")
+                http_rows = [
+                    call for call in calls
+                    if str(call.get("stage") or "") == "outline"
+                    and str(call.get("node_id") or "") == str(view.get("node_id") or "")
+                ]
+                if len(http_rows) != 1:
+                    raise AssertionError(
+                        "model-visible arbitration layout does not bind to exactly one HTTP request body: "
+                        f"node={view.get('node_id')} count={len(http_rows)}"
+                    )
+                http_call = http_rows[0]
+                request_hash = str(http_call.get("request_sha256") or "")
+                user_hash = str(http_call.get("user_text_sha256") or "")
+                if len(request_hash) != 64 or len(user_hash) != 64:
+                    raise AssertionError("arbitration model-visible layout is missing actual HTTP body hashes")
+                complete_arbitration_views.append({
+                    **dict(view),
+                    "http_request_body_sha256": request_hash,
+                    "http_user_text_sha256": user_hash,
+                    "candidate_2_index_matches_ready_generation": True,
+                    "candidate_1_index_matches_ready_generation": bool(c1_rows),
+                })
+            if not complete_arbitration_views:
+                # Hierarchical leaf requests can expose C2 section-index subsets.
+                # Their union must cover the complete ready candidate before Writer.
+                leaf_rows_by_id: dict[str, dict[str, Any]] = {}
+                leaf_calls = []
+                for view in candidate_layout_arbitration_capture:
+                    if view.get("capture_kind") != "hierarchical_leaf":
+                        continue
+                    for row in view.get("candidate_2_section_rows") or ():
+                        if not isinstance(row, Mapping):
+                            continue
+                        section_id = str(row.get("section_id") or "")
+                        previous = leaf_rows_by_id.get(section_id)
+                        if previous is not None and previous.get("section_hash") != row.get("section_hash"):
+                            raise AssertionError(f"arbitration leaf section hash changed for {section_id}")
+                        leaf_rows_by_id[section_id] = dict(row)
+                    leaf_calls.extend(
+                        call for call in calls
+                        if str(call.get("stage") or "") == "outline"
+                        and str(call.get("node_id") or "") == str(view.get("node_id") or "")
+                    )
+                if set(leaf_rows_by_id) != expected_candidate_two_ids:
+                    raise AssertionError(
+                        "model-visible arbitration has neither a complete C2 index nor complete leaf union"
+                    )
+                leaf_rows = sorted(
+                    leaf_rows_by_id.values(), key=lambda row: int(row.get("position") or 0),
+                )
+                if not _scale_model_visible_rows_match_candidate(leaf_rows, generation_two):
+                    raise AssertionError("model-visible C2 leaf union differs from the ready generation artifact")
+                if not leaf_calls or any(len(str(call.get("request_sha256") or "")) != 64 for call in leaf_calls):
+                    raise AssertionError("arbitration leaf layout is missing actual HTTP body hashes")
+                complete_arbitration_views.append({
+                    "capture_kind": "hierarchical_leaf_union",
+                    "node_ids": sorted({str(call.get("node_id") or "") for call in leaf_calls}),
+                    "candidate_2_section_rows": leaf_rows,
+                    "candidate_2_index_matches_ready_generation": True,
+                    "http_request_body_sha256": sorted(str(call.get("request_sha256") or "") for call in leaf_calls),
+                    "http_user_text_sha256": sorted(str(call.get("user_text_sha256") or "") for call in leaf_calls),
+                })
+            model_visible_layout = complete_arbitration_views[-1]
+            candidate_layout_metrics = {
+                "status": "executed_fixture_layout_variant",
+                "boundary": "synthetic local HTTP engineering evidence; not semantic or real-model quality",
+                "candidate_1_organizing_logic": rows_by_candidate["candidate_1"][0]["organizing_logic"],
+                "candidate_2_organizing_logic": rows_by_candidate["candidate_2"][0]["organizing_logic"],
+                "synthetic_research_design_profile": candidate_design_profile,
+                "reader_source_text_transport": {
+                    "status": "verified_from_actual_reader_http_user_messages",
+                    "reader_request_count": len(reader_design_transport_capture),
+                    "design_and_bridge_checks": sorted(
+                        reader_design_transport_capture,
+                        key=lambda row: (int(row["paper_index"]), str(row["request_body_sha256"])),
+                    ),
+                    "all_session_targets_matched_local_origin": True,
+                    "fixture_origin": {
+                        "scheme": fixture_transport_origin[0],
+                        "host": fixture_transport_origin[1],
+                        "port": fixture_transport_origin[2],
+                    },
+                    "session_send_count": sum(fixture_transport_targets.values()),
+                    "socket_connect_count": sum(socket_targets.values()),
+                    "socket_target": {
+                        "host": allowed_socket_target[0],
+                        "port": allowed_socket_target[1],
+                    },
+                    "effective_proxy_targets": 0,
+                },
+                "candidate_1_organization_sections": candidate_one_map_sections,
+                "candidate_2_organization_sections": candidate_two_map_sections,
+                "candidate_1_generation_sections": len(sections_one),
+                "candidate_2_generation_sections": len(sections_two),
+                "candidate_1_global_organization_layout_sha256": hashlib.sha256(
+                    json.dumps(candidate_one_ready_layout, ensure_ascii=False, sort_keys=True).encode("utf-8")
+                ).hexdigest(),
+                "candidate_2_global_organization_layout_sha256": hashlib.sha256(
+                    json.dumps(candidate_two_ready_layout, ensure_ascii=False, sort_keys=True).encode("utf-8")
+                ).hexdigest(),
+                "candidate_1_generation_layout_sha256": hashlib.sha256(
+                    json.dumps(generation_layout_one, ensure_ascii=False, sort_keys=True).encode("utf-8")
+                ).hexdigest(),
+                "candidate_2_generation_layout_sha256": hashlib.sha256(
+                    json.dumps(generation_layout_two, ensure_ascii=False, sort_keys=True).encode("utf-8")
+                ).hexdigest(),
+                "candidate_organization_provider_node_ids": {
+                    candidate_id: sorted(row["node_id"] for row in organization_maps[candidate_id])
+                    for candidate_id in ("candidate_1", "candidate_2")
+                },
+                "candidate_1_base_layout_hashes": sorted(
+                    hashlib.sha256(json.dumps(row["base_layout"], sort_keys=True).encode("utf-8")).hexdigest()
+                    for row in rows_by_candidate["candidate_1"]
+                ),
+                "candidate_2_variant_layout_hashes": sorted(
+                    hashlib.sha256(json.dumps(row["variant_layout"], sort_keys=True).encode("utf-8")).hexdigest()
+                    for row in rows_by_candidate["candidate_2"]
+                ),
+                "same_candidate_support_multiset": True,
+                "candidate_support_rows": len(support_one),
+                "candidate_support_multiset_sha256": hashlib.sha256(
+                    json.dumps(support_one, ensure_ascii=False, sort_keys=True).encode("utf-8")
+                ).hexdigest(),
+                "required_ab_comparisons_kept_complete": len(required_comparisons),
+                "selected_candidate": str(selected_outline.get("candidate_id") or ""),
+                "selected_outline_sections": len(selected_outline.get("sections") or ()),
+                "writer_outline_bound": writer_outline_bound,
+                "provider_candidate_layout_calls": sorted(
+                    node for node in actual_outline_nodes
+                    if node.startswith("candidate_organization_provider:")
+                ),
+                "arbitration_http_call_seen": bool(arbitration_http_nodes),
+                "model_visible_arbitration": {
+                    "capture_kind": model_visible_layout.get("capture_kind"),
+                    "node_id": model_visible_layout.get("node_id"),
+                    "node_ids": model_visible_layout.get("node_ids"),
+                    "candidate_2_index_matches_ready_generation": model_visible_layout.get("candidate_2_index_matches_ready_generation") is True,
+                    "hierarchy_level": model_visible_layout.get("hierarchy_level"),
+                    "request_schema_version": model_visible_layout.get("request_schema_version"),
+                    "candidate_ids": model_visible_layout.get("candidate_ids"),
+                    "projection_aliases": model_visible_layout.get("projection_aliases"),
+                    "ledger_packing_schema": model_visible_layout.get("ledger_packing_schema"),
+                    "raw_candidate_2_positional_index_row_count": model_visible_layout.get("raw_candidate_2_positional_index_row_count"),
+                    "parsed_request_sha256": model_visible_layout.get("parsed_request_sha256"),
+                    "capture_errors": list(candidate_layout_arbitration_capture_errors),
+                    "candidate_2_section_rows": model_visible_layout.get("candidate_2_section_rows") or [],
+                    "http_request_body_sha256": model_visible_layout.get("http_request_body_sha256"),
+                    "http_user_text_sha256": model_visible_layout.get("http_user_text_sha256"),
+                },
+            }
         metrics = {
             "schema_version": "run-first-scale-local-http-measurement/v1",
             "evidence_class": (
@@ -3323,6 +5172,7 @@ def test_run_first_scale_local_http_full_chain(
             "relation_request_observations": relation_request_observations,
             "scientific_support_oracle": scientific_support_oracle,
             "candidate_section_count": len(candidate_sections),
+            "candidate_layout_variant": candidate_layout_metrics,
             "candidate_support_slot_count": len(candidate_support),
             "writer_task_count": len(writer_tasks),
             "writer_qualifier_closed_task_count": sum(bool(task.get("qualifier_source_field_ids")) for task in writer_tasks),
@@ -3340,6 +5190,53 @@ def test_run_first_scale_local_http_full_chain(
                 source_kind=source_kind,
                 source_variant=source_variant,
             )
+            safe_section_fields = (
+                "position", "section_id", "section_hash", "source_closure_hash",
+                "paper_keys", "task_ids", "relation_ids",
+            )
+            failure_layout_capture = [
+                {
+                    key: row.get(key)
+                    for key in (
+                        "candidate_id", "provider_call_id", "partition_index", "partition_count",
+                        "full_bank_group_count", "partition_local_to_global_group_indices",
+                        "required_group_indices", "required_comparison_sections",
+                        "base_global_layout", "variant_global_layout",
+                        "base_membership_sha256", "variant_membership_sha256",
+                    )
+                }
+                for row in candidate_layout_capture if isinstance(row, Mapping)
+            ]
+            failure_arbitration_capture = [
+                {
+                    key: row.get(key)
+                    for key in (
+                        "node_id", "capture_kind", "leaf_id", "hierarchy_level", "candidate_ids",
+                        "request_schema_version", "projection_aliases", "ledger_packing_schema",
+                        "raw_candidate_2_positional_index_row_count", "parsed_request_sha256",
+                        "candidate_2_binding_section_ids",
+                    )
+                }
+                | {
+                    candidate_key: [
+                        {key: section.get(key) for key in safe_section_fields if key in section}
+                        for section in row.get(candidate_key) or () if isinstance(section, Mapping)
+                    ]
+                    for candidate_key in ("candidate_1_section_rows", "candidate_2_section_rows")
+                }
+                for row in candidate_layout_arbitration_capture if isinstance(row, Mapping)
+            ]
+            failure_reader_capture = [
+                {
+                    key: row.get(key)
+                    for key in (
+                        "paper_index", "paper_key", "design_type", "design_statement_present",
+                        "article_bridge_present", "estimates_not_pooled_present",
+                        "no_shared_mediator_present", "request_body_sha256", "user_text_sha256",
+                    )
+                }
+                for row in reader_design_transport_capture if isinstance(row, Mapping)
+            ]
             diagnostic = _scale_failure_snapshot(
                 control=control,
                 job_id=job_id,
@@ -3353,6 +5250,24 @@ def test_run_first_scale_local_http_full_chain(
                 size=size,
                 exception=original_error,
                 latest_execution_result=latest_execution_result,
+            )
+            _scale_add_failure_loopback_extensions(
+                diagnostic,
+                {
+                    "candidate_organization_layout_captures": failure_layout_capture,
+                    "candidate_arbitration_model_visible_captures": failure_arbitration_capture,
+                    "candidate_arbitration_capture_errors": [
+                        {
+                            "node_id": _diagnostic_text(row.get("node_id")),
+                            "error_type": _diagnostic_text(row.get("error_type")),
+                            "message_sha256": hashlib.sha256(
+                                str(row.get("message") or "").encode("utf-8")
+                            ).hexdigest(),
+                        }
+                        for row in candidate_layout_arbitration_capture_errors if isinstance(row, Mapping)
+                    ],
+                    "reader_design_transport_captures": failure_reader_capture,
+                },
             )
             _persist_scale_failure_snapshot(diagnostic_path, diagnostic)
         _capture_scale_failure_or_reraise(exc, capture_failure)
