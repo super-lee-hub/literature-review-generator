@@ -45,28 +45,107 @@ def _write_gui_test_config(config_path: Path, output_dir: Path) -> None:
         parser.write(handle)
 
 
-def _wait_for_server(base_url: str, process: subprocess.Popen[str], timeout: float = 30.0) -> None:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+def _wait_for_server(
+    base_url: str, process: subprocess.Popen[str], timeout: float = 30.0,
+    *, log_path: Path | None = None,
+) -> None:
+    deadline = time.monotonic() + timeout
+    last_error = ""
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            break
         try:
             with urllib.request.urlopen(base_url, timeout=2) as response:
                 if response.status == 200:
                     return
-        except Exception:
-            pass
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
         time.sleep(0.5)
 
     output = ""
-    if process.stdout:
+    if log_path is not None and log_path.exists():
         try:
-            output = process.stdout.read()
+            with log_path.open("rb") as log:
+                log.seek(0, os.SEEK_END)
+                log.seek(max(0, log.tell() - 8000))
+                output = log.read(8000).decode("utf-8", errors="replace")
+        except OSError:
+            output = "Startup log could not be read."
+    elif process.poll() is not None and process.stdout:
+        try:
+            output, _ = process.communicate(timeout=1)
         except Exception:
             output = ""
-    raise RuntimeError(f"GUI server did not start in time.\nCaptured output:\n{output}")
+    raise RuntimeError(
+        f"GUI server did not start in time. Last readiness error: {last_error}\n"
+        f"Captured output:\n{output}"
+    )
 
 
 def _notification(page):
     return page.locator(".q-notification").last
+
+
+def test_startup_wait_does_not_read_a_live_process_pipe():
+    from types import SimpleNamespace
+
+    reads = []
+
+    def read():
+        reads.append(True)
+        return "a live pipe has no EOF"
+
+    process = SimpleNamespace(stdout=SimpleNamespace(read=read), poll=lambda: None)
+    with pytest.raises(RuntimeError, match="did not start"):
+        _wait_for_server("http://127.0.0.1:1", process, timeout=0)
+    assert reads == []
+
+
+def test_startup_wait_failure_cleans_up_the_owned_gui_process(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    terminated = []
+    process = SimpleNamespace(
+        terminate=lambda: terminated.append(True),
+        wait=lambda timeout: 0,
+    )
+    monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(sys.modules[__name__], "_pick_free_port", lambda: 12000)
+
+    def fail_startup(*_args, **_kwargs):
+        raise RuntimeError("startup failure")
+
+    monkeypatch.setattr(sys.modules[__name__], "_wait_for_server", fail_startup)
+    fixture = gui_server.__wrapped__(tmp_path)
+    with pytest.raises(RuntimeError, match="startup failure"):
+        next(fixture)
+    assert terminated == [True]
+
+
+def test_startup_wait_live_launch_failure_closes_the_model_fixture(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from tests import test_pr25_repair_v2 as fixtures
+
+    closed = []
+    server = SimpleNamespace(
+        shutdown=lambda: closed.append("shutdown"),
+        server_close=lambda: closed.append("close"),
+    )
+    thread = SimpleNamespace(join=lambda timeout: closed.append("join"))
+    monkeypatch.setattr(fixtures, "_write_source_pdf", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(fixtures, "_runtime_config", lambda *_args: tmp_path / "config.ini")
+    monkeypatch.setattr(fixtures, "_start_local_model_fixture", lambda: (server, thread, "http://127.0.0.1:1/v1"))
+    monkeypatch.setattr(sys.modules[__name__], "_pick_free_port", lambda: 12000)
+
+    def fail_launch(*_args, **_kwargs):
+        raise OSError("launch failure")
+
+    monkeypatch.setattr(subprocess, "Popen", fail_launch)
+    fixture = live_gui_server.__wrapped__(tmp_path)
+    with pytest.raises(OSError, match="launch failure"):
+        next(fixture)
+    assert closed == ["shutdown", "join", "close"]
 
 
 def _field_input(page, label_text: str):
@@ -119,31 +198,28 @@ def gui_server(tmp_path):
     env["AUTO_GENERATE_ENV_PATH"] = str(env_path)
     env["NICEGUI_SCREEN_TEST_PORT"] = str(port)
 
-    process = subprocess.Popen(
-        [sys.executable, "launch_gui.py", "--no-show", "--port", str(port), "--config", str(config_path)],
-        cwd=REPO_ROOT,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-
     base_url = f"http://127.0.0.1:{port}"
-    _wait_for_server(base_url, process)
-
-    yield {
-        "base_url": base_url,
-        "config_path": config_path,
-        "env_path": env_path,
-        "output_dir": output_dir,
-        "pdf_dir": pdf_dir,
-    }
-
-    process.terminate()
-    try:
-        process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        process.kill()
+    log_path = temp_dir / "gui_server.log"
+    with log_path.open("w", encoding="utf-8") as log:
+        process = subprocess.Popen(
+            [sys.executable, "launch_gui.py", "--no-show", "--strict-port", "--port", str(port), "--config", str(config_path)],
+            cwd=REPO_ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, text=True,
+        )
+        try:
+            _wait_for_server(base_url, process, log_path=log_path)
+            yield {
+                "base_url": base_url,
+                "config_path": config_path,
+                "env_path": env_path,
+                "output_dir": output_dir,
+                "pdf_dir": pdf_dir,
+            }
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
 
 
 @pytest.fixture(scope="session")
@@ -191,42 +267,43 @@ def live_gui_server(tmp_path: Path):
         )
 
     model_server, model_thread, api_base = _start_local_model_fixture()
-    config_path = _runtime_config(task_dir, api_base)
-    env_path = task_dir / ".env"
-    env_path.write_text("", encoding="utf-8")
-    port = _pick_free_port()
-    env = os.environ.copy()
-    env.pop("AUTO_GENERATE_GUI_TEST_MODE", None)
-    env["AUTO_GENERATE_ENV_PATH"] = str(env_path)
-    env["NICEGUI_SCREEN_TEST_PORT"] = str(port)
-
-    process = subprocess.Popen(
-        [sys.executable, "launch_gui.py", "--no-show", "--port", str(port), "--config", str(config_path)],
-        cwd=REPO_ROOT,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-    base_url = f"http://127.0.0.1:{port}"
+    process = None
     try:
-        _wait_for_server(base_url, process)
-        yield {
-            "base_url": base_url,
-            "config_path": config_path,
-            "output_dir": output_dir,
-            "pdf_dir": pdf_dir,
-            "model_server": model_server,
-        }
+        config_path = _runtime_config(task_dir, api_base)
+        env_path = task_dir / ".env"
+        env_path.write_text("", encoding="utf-8")
+        port = _pick_free_port()
+        env = os.environ.copy()
+        env.pop("AUTO_GENERATE_GUI_TEST_MODE", None)
+        env["AUTO_GENERATE_ENV_PATH"] = str(env_path)
+        env["NICEGUI_SCREEN_TEST_PORT"] = str(port)
+        base_url = f"http://127.0.0.1:{port}"
+        log_path = task_dir / "gui_server.log"
+        with log_path.open("w", encoding="utf-8") as log:
+            process = subprocess.Popen(
+                [sys.executable, "launch_gui.py", "--no-show", "--strict-port", "--port", str(port), "--config", str(config_path)],
+                cwd=REPO_ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, text=True,
+            )
+            _wait_for_server(base_url, process, log_path=log_path)
+            yield {
+                "base_url": base_url,
+                "config_path": config_path,
+                "output_dir": output_dir,
+                "pdf_dir": pdf_dir,
+                "model_server": model_server,
+            }
     finally:
-        process.terminate()
         try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            process.kill()
-        model_server.shutdown()
-        model_thread.join(timeout=5)
-        model_server.server_close()
+            if process is not None:
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+        finally:
+            model_server.shutdown()
+            model_thread.join(timeout=5)
+            model_server.server_close()
 
 
 def test_dashboard_shows_search_topbar(page, gui_server):
