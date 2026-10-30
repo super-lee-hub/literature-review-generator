@@ -20,9 +20,9 @@
 
 `reviewctl doctor` 脱敏打印 API 默认工作预算、推导来源、Outline 目标以及 `network_probe=false`。预计能完成、允许最多花多少、条件分支最坏情况必须分开；未知的未来调用量不是已经消费的请求。
 
-官方文档核对日期为 2026-10-29：[GPT-5.6 Sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol) 列出 1,050,000 context / 128,000 max output；[Claude Opus 5.5](https://platform.claude.com/docs/en/models/opus-5-5/overview) 和 [Fable 5.1](https://platform.claude.com/docs/en/models/fable-5-1/migration-guide) 列出 1M / 128K；[DeepSeek 模型列表](https://api-docs.deepseek.com/api/list-models/)列出 1,048,576 / 393,216。这些是相应官方模型/接口规格，不是任意代理 host 的能力证明。真实部署要分别保留配置声明、官方文档、网关文档、已有匹配回执和校准证据；缺失项写 unknown，不填大数字冒充验证。
+官方文档核对日期为 2026-10-30：[GPT-5.6 Sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol) 列出 1,050,000 context / 128,000 max output；[Claude Opus 5.5](https://platform.claude.com/docs/en/models/opus-5-5/overview) 和 [Fable 5.1](https://platform.claude.com/docs/en/models/fable-5-1/overview) 列出 1M / 128K；[DeepSeek 模型表](https://api-docs.deepseek.com/quick_start/pricing/)列出 1M / 384K。未取得精确 token 数证明时保留官方表中的单位，不自行换算为更大的精确整数。这些是相应官方模型/接口规格，不是任意代理 host 的能力证明。真实部署要分别保留配置声明、官方文档、网关文档、已有匹配回执和校准证据；缺失项写 unknown，不填大数字冒充验证。
 
-[OpenAI 的输出上限](https://developers.openai.com/api/docs/guides/token-counting)包含可见内容、reasoning 和非可见格式 token；不能把整个 `max_output_tokens` 当作可读正文空间，也不能把已包含的 reasoning 再当作实际用量计费。其他 provider 和兼容网关按其实际协议核对。现有 reasoning/safety reserve 是规划缓冲，不是已经发生的 token 用量。
+[OpenAI 的推理与输出预算说明](https://developers.openai.com/api/docs/guides/reasoning)说明输出预算包含可见内容、reasoning 和非可见格式 token；不能把整个 `max_output_tokens` 当作可读正文空间，也不能把已包含的 reasoning 再当作实际用量计费。其他 provider 和兼容网关按其实际协议核对。现有 reasoning/safety reserve 是规划缓冲，不是已经发生的 token 用量。
 
 已合法且能装入适用工作窗口的直接请求优先。先减少长身份、重复闭包、重复 schema 和账本传输，映射留在本地精确保存；完整学术证据和必要语境仍须送到当前任务。窗口确实不足或质量/稳定性试验不适合时再分层。不能用哈希、ID 并集或引用句全正确来证明重要机制、限定或反证没有遗漏。模型无法访问本地路径；声称回取时必须验证实际后续请求含对应原文内容。
 
@@ -219,3 +219,11 @@ if ($Export.bundle_path) { Get-FileHash -LiteralPath $Export.bundle_path -Algori
 本地 fixture、localhost transport 和合成 Provider 只证明相应的软件流程；不证明真实外部 Provider/backend、论文科学结论、真实规模验收或发布条件。配置里记录的 Provider/model/endpoint 及 route fingerprint 也不是独立的物理 backend 证明。
 
 来源损坏、预算耗尽、回执不确定或运行中断时，先按[恢复流程](../../en/RECOVERY_RUNBOOK.md)读取 Registry、request audit、receipt ledger 和 next action。保留 PDF、Registry、回执及已消费账本；不要手改健康状态或重置额度、首次启动时间和 deadline。
+
+## 6. 已知成功的部分 Stage 1 恢复
+
+确认原进程已经停止后，使用同一 workspace 的 `resume`。对于尚未发布完整 Stage 1 终端的纯 synthesis 调用，运行时可以重解析已保存的完整成功响应，再通过原摘要校验与发布链；只有被原账本证明尚未开始的调用才重新进入正常预算准入和发送路径。不需要手工导入临时摘要或更换任务 ID。
+
+该路径要求来源、配置、固化请求图、prompt/schema/route、原始回执及响应字节均匹配；原预算必须可以与全部已消费回执准确对账、没有未知结果或未结预留，且原截止时间未过期。恢复保留原 Stage 1 logical attempt、closure epoch 和 receipt ID。新执行实例可以轮换用于 fencing 的 budget owner UUID；配额、已消费计数、首次启动时间、deadline 和独立 run identity 不得重置。
+
+缺失或被篡改的响应、已发送但结果未知的请求、visual/MinerU 以及混合摘要复用的部分图不属于这条自动恢复路径，仍按现有保护阻断。保留证据并查看 `next-action`，不要改任务种类、补写回执或换 ID 来强行重发。已经完整闭合的阶段和完成的任务继续使用既有恢复与导出路径；这不授予新的模型额度。时长按真实经过时间计算，包括机器待机。

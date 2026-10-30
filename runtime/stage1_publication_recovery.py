@@ -275,7 +275,7 @@ def prepare_partial_stage1_recovery(
         raise _blocked("current RuntimeJobSpec differs from the published Stage 1 configuration")
 
     source_document = _payload(_read_json(source_bundle.path, label="Stage 1 source bundle"))
-    runtime_document = _payload(_read_json(runtime_spec.path, label="Stage 1 RuntimeJobSpec"))
+    _payload(_read_json(runtime_spec.path, label="Stage 1 RuntimeJobSpec"))
     graph_document = _payload(_read_json(graph.path, label="Stage 1 expected-call graph"))
     graph_hash = str(graph_document.get("expected_call_graph_hash") or "")
     attempt_id = str(graph_document.get("attempt_id") or "")
