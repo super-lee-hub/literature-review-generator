@@ -16,6 +16,7 @@ import outline.v3_executor as executor_module
 from runtime.checkout_identity import read_checkout_sha
 from runtime.provider_runtime import bind_acceptance_execution_context, hash_json
 from tests.test_pr25_v4_pilot_integration import (
+    _FIXTURE_CHECKOUT_SHA,
     _acceptance_binding,
     _executor,
     _pilot,
@@ -82,7 +83,7 @@ def _external_pilot_case(
         probe_patch.setattr(
             executor_module,
             "read_checkout_sha",
-            lambda _root, *, require_clean: "c1ad0da869bc68869a521f60bbda07342fb16058",
+            lambda _root, *, require_clean: _FIXTURE_CHECKOUT_SHA,
         )
         executor, _registry = _executor(
             tmp_path,

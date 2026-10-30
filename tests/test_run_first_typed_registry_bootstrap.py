@@ -106,6 +106,7 @@ def test_typed_reuse_discovers_outside_sibling_owner_and_original_validation_tex
     expected_path = str(Path(case.parent_registry.registry_path).resolve())
     assert verified_typed_reuse_registry_paths(case.child_registry) == (expected_path,)
     bridge = AgentRuntimeBridge.__new__(AgentRuntimeBridge)
+    bridge.job_spec = SimpleNamespace(metadata={})
     session = _binding_session(case)
     resolver = AgentRuntimeRunner._external_registry_resolver(case.child_workspace)
     resolved = resolver(case.parent_workspace.job_id)
@@ -176,6 +177,7 @@ def test_used_resolver_still_rejects_later_source_bytes_drift(
     resolver = AgentRuntimeRunner._external_registry_resolver(case.child_workspace)
     assert resolver(case.parent_workspace.job_id) is not None
     bridge = AgentRuntimeBridge.__new__(AgentRuntimeBridge)
+    bridge.job_spec = SimpleNamespace(metadata={})
     record = bridge._ensure_validation_source_binding(
         _binding_session(case), case.child_registry, external_registry_resolver=resolver
     )

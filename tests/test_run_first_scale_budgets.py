@@ -250,3 +250,33 @@ def test_seed_reader_floor_uses_the_shipped_stage1_input_policy():
     parser = configparser.ConfigParser(interpolation=None)
     parser.read(Path(__file__).resolve().parents[1] / "config.ini.example", encoding="utf-8")
     assert int(parser["Stage1_Input"]["stage1_synthesis_max_output_tokens"]) == 64000
+
+
+def test_local_outline_output_experiment_changes_only_its_route(tmp_path):
+    import configparser
+
+    from tests.test_run_first_scale_integration import _local_config
+
+    baseline_dir = tmp_path / "baseline"
+    experiment_dir = tmp_path / "experiment"
+    baseline_dir.mkdir()
+    experiment_dir.mkdir()
+    before = configparser.ConfigParser(interpolation=None)
+    after = configparser.ConfigParser(interpolation=None)
+    before.read(_local_config(baseline_dir, "http://127.0.0.1:54321/v1"), encoding="utf-8")
+    after.read(_local_config(experiment_dir, "http://127.0.0.1:54321/v1",
+                             outline_output_tokens=32_000), encoding="utf-8")
+    changed = {(section, key) for section in before.sections() for key in before[section]
+               if before[section][key] != after[section][key]}
+    assert changed == {("Outline_API", "max_output_tokens"),
+                       ("Paths", "output_path"), ("Preprocess", "cache_dir")}
+    assert before["Outline_API"]["max_output_tokens"] == "16000"
+    assert after["Outline_API"]["max_output_tokens"] == "32000"
+
+
+@pytest.mark.parametrize("invalid", [0, -1, True, False, 1.5, "32000"])
+def test_local_outline_output_experiment_rejects_invalid_allowance(tmp_path, invalid):
+    from tests.test_run_first_scale_integration import _local_config
+
+    with pytest.raises(AssertionError, match="positive integer"):
+        _local_config(tmp_path, "http://127.0.0.1:54321/v1", outline_output_tokens=invalid)

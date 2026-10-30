@@ -55,6 +55,9 @@ def _case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, fault: str = "") -
 
     monkeypatch.setattr(fold_fixtures, "_source_comparison", long_source)
     executor, request, cross, canonical_output = fold_fixtures._global_case(tmp_path)
+    # Preserve the original conservative 32k alias-regression case even when
+    # the default route advertises a larger input cap.
+    executor.max_source_prompt_tokens = 32_000
     cross_parent = {
         "execution_mode": "source_closed_retention", "provider_output": cross,
         "coverage_ledger": executor._payloads["cross_group_comparison"]["coverage_ledger"],
@@ -82,8 +85,9 @@ def _case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, fault: str = "") -
         catalog, canonical_request = executor._semantic_identifier_plans[catalog_hash]
         profile = executor._node_route("candidate_1_provider_generation").profile
         unaliased_wire = pack_semantic_request_wire(canonical_request, source_keys=("topic_synthesis", "cross_group_comparison"))
-        assert profile.estimate_tokens(unaliased_wire) > 32_000
-        assert profile.estimate_tokens(wire) < 32_000
+        input_cap = executor._effective_input_cap(profile)
+        assert profile.estimate_tokens(unaliased_wire) > input_cap
+        assert profile.estimate_tokens(wire) < input_cap
         assert hash_json(expand_identifier_alias_request(aliased, catalog)) == hash_json(canonical_request)
         assert "forward" not in aliased[ALIAS_KEY] and "reverse" not in aliased[ALIAS_KEY]
         raw = _encode_output(canonical_output, catalog["forward"])

@@ -23,6 +23,8 @@ in a new job with the same PDFs/server/config. Process RSS sampling is always
 enabled; Python allocation tracing is opt-in via RUN_FIRST_SCALE_TRACE_ALLOCATIONS=1.
 RUN_FIRST_SCALE_VARIANT defaults to the unchanged baseline. Opt-in adversarial
 profiles select null, reverse, distant cross-shard, or one combined four-comparison profile.
+RUN_FIRST_SCALE_OUTLINE_OUTPUT_TOKENS optionally sets this loopback experiment's
+Outline output allowance; omission preserves the shipped route setting.
 The opt-in identity-quarantine case also fixtures the report parser and PDF
 lookup; production PDF identity checks must isolate the mismatched extra source.
 """
@@ -1491,6 +1493,7 @@ def _local_config(
     provider_call_limit: int | None = None,
     admission_overrides: Mapping[str, int] | None = None,
     technical_shard_target_tokens: int = 0,
+    outline_output_tokens: int | None = None,
 ) -> Path:
     if (
         type(technical_shard_target_tokens) is not int
@@ -1498,6 +1501,10 @@ def _local_config(
         or technical_shard_target_tokens not in {0, 8_000}
     ):
         raise AssertionError("scale fixture only supports the existing 0 or minimum 8000 token shard target")
+    if outline_output_tokens is not None and (
+        type(outline_output_tokens) is not int or outline_output_tokens <= 0
+    ):
+        raise AssertionError("local Outline output allowance must be a positive integer")
     parser = configparser.ConfigParser(interpolation=None)
     parser.read(Path(__file__).resolve().parents[1] / "config.ini.example", encoding="utf-8")
     parser["Paths"]["output_path"] = str(tmp_path / "output")
@@ -1534,6 +1541,10 @@ def _local_config(
         settings.setdefault("max_context_tokens", "128000")
         if section in routes:
             settings["model"] = routes[section]
+    if outline_output_tokens is not None:
+        # An explicit loopback experiment setting, not a product default or
+        # evidence of any external gateway's output capability.
+        parser["Outline_API"]["max_output_tokens"] = str(outline_output_tokens)
     parser["Outline"]["require_explicit_adoption"] = "true"
     parser["Outline"]["technical_shard_target_tokens"] = str(technical_shard_target_tokens)
     parser["OutlineStability"]["mode"] = "off"
@@ -2458,6 +2469,11 @@ def test_run_first_scale_local_http_full_chain(
             ),
             technical_shard_target_tokens=(
                 8_000 if source_variant in {"distant_cross_shard", "all_required_comparisons"} else 0
+            ),
+            outline_output_tokens=(
+                int(os.environ["RUN_FIRST_SCALE_OUTLINE_OUTPUT_TOKENS"])
+                if os.environ.get("RUN_FIRST_SCALE_OUTLINE_OUTPUT_TOKENS", "").strip()
+                else None
             ),
         )
         spec_metadata: dict[str, Any] = {
