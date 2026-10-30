@@ -8,6 +8,7 @@ from outline.adoption_transaction import (
     OutlineAdoptionTransaction,
     current_adoption_record,
 )
+from outline.v3_artifacts import OutlineStageHealth
 from tests.test_outline_v3_semantic_execution import _executor
 
 
@@ -41,6 +42,26 @@ def test_adoption_uses_versioned_identity_and_current_pointer(tmp_path: Path) ->
     adopted_payload = json.loads(Path(adopted_record.path).read_text(encoding="utf-8"))["payload"]
     assert adopted_payload["adoption_identity"] == adopted.adopted_artifact_id
     assert adopted_payload["current_pointer_artifact_id"] == ADOPTION_POINTER_ARTIFACT_ID
+
+    old_bytes = Path(adopted_record.path).read_bytes()
+    health = registry.get("outline-v3:stage_health")
+    assert health is not None
+    envelope = json.loads(Path(health.path).read_text(encoding="utf-8"))
+    updated_payload = {**envelope["payload"], "diagnostics": ["Eligibility evidence refreshed for the same source."]}
+    executor._persist(
+        "stage_health", OutlineStageHealth(
+            job_id=registry.job_id, dependency_hashes=envelope["dependency_hashes"], payload=updated_payload,
+        ), depends_on=("stability_audit", "provider_receipt_closure"), model="deterministic", provider="local",
+    )
+    assert current_adoption_record(registry) is None
+    refreshed = OutlineAdoptionTransaction(executor.workspace, registry).adopt(
+        source_artifact_id=source.artifact_id, actor="test-researcher",
+        reason="explicitly adopt the repaired eligibility closure", expected_hash=source.content_hash,
+    )
+    assert refreshed.status == "succeeded"
+    assert refreshed.adopted_artifact_id.startswith(adopted.adopted_artifact_id + ":gates:")
+    assert current_adoption_record(registry).artifact_id == refreshed.adopted_artifact_id
+    assert Path(adopted_record.path).read_bytes() == old_bytes
 
 
 def test_stale_adoption_pointer_is_not_used_as_current(tmp_path: Path) -> None:

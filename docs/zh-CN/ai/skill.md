@@ -22,7 +22,7 @@ specification 是 `RuntimeJobSpec`。
 ## 当前契约
 
 - Outline Intelligence v3 是唯一生产 Outline 路径。
-- Outline v3 按 `[OutlineModels]` 做真实的节点级路由：Claude Opus 5 负责候选生成/最终
+- Outline v3 按 `[OutlineModels]` 做真实的节点级路由：Claude Opus 5.5 负责候选生成/最终
   仲裁，GPT-5.6-sol 负责结构/证据审查，DeepSeek V4 Pro 负责关系/覆盖度审查；每条
   route 都有自己的 transport、budget、binding、receipt 和 replay identity，缺失时
   fail-closed。

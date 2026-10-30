@@ -36,6 +36,8 @@ OUTLINE_V3_ARTIFACT_TYPES = frozenset(
         "relation_adjudication_result",
         "confirmed_global_relation_map",
         "outline_candidate",
+        "candidate_organization_map_result",
+        "candidate_comparison_fragments_result",
         "structure_critique",
         "coverage_critique",
         "evidence_critique",
@@ -61,6 +63,10 @@ OUTLINE_V3_ARTIFACT_TYPES = frozenset(
 # the unified ready-artifact dispatch below.
 CURRENT_PRODUCTION_ARTIFACT_TYPES = frozenset(
     {
+        "outline_candidate_output_scope",
+        "outline_candidate_fragment_bank",
+        "provider_run_envelope",
+        "accepted_runtime_run_scope",
         "review_draft",
         "review_draft_repaired",
         "citation_manifest",
@@ -89,11 +95,18 @@ CURRENT_PRODUCTION_ARTIFACT_TYPES = frozenset(
         "outline_adoption_pointer",
         "outline_request_payload_audit",
         "outline_hierarchical_call_graph",
+        "outline_topic_pilot_plan",
+        "outline_topic_pilot_receipt_closure",
+        "outline_topic_pilot_checkpoint",
         "export_bundle",
         "forensic_attestation",
         "provider_receipt_ledger",
         "provider_verified_reuse",
         "review_section",
+        "review_provider_receipt_snapshot",
+        "provider_response_snapshot",
+        "source_revision_plan",
+        "source_revision_provider_reuse",
         "stage1_portable_summary_source",
         "stage1_portable_summary_manifest",
         "stage1_portable_provider_closure",
@@ -144,6 +157,8 @@ _ENVELOPE_TYPES = frozenset(
         "relation_adjudication_result",
         "confirmed_global_relation_map",
         "outline_candidate",
+        "candidate_organization_map_result",
+        "candidate_comparison_fragments_result",
         "structure_critique",
         "coverage_critique",
         "evidence_critique",
@@ -164,6 +179,8 @@ _REQUIRED_PAYLOAD_FIELDS: dict[str, tuple[str, ...]] = {
     "relation_adjudication_result": ("confirmed_relation_ids", "rejected_relations"),
     "confirmed_global_relation_map": ("relations", "paper_keys"),
     "outline_candidate": ("candidate_id",),
+    "candidate_organization_map_result": ("schema_version", "candidate_id", "bank_hash", "sections", "deferred"),
+    "candidate_comparison_fragments_result": ("schema_version", "scope_hash", "parent_scope_hash", "fragments"),
     "structure_critique": ("passed", "blocking_diagnostics"),
     "coverage_critique": ("passed", "blocking_diagnostics"),
     "evidence_critique": ("passed", "blocking_diagnostics"),
@@ -335,11 +352,34 @@ def _validate_envelope(record: Any, root: Mapping[str, Any]) -> None:
         "payload": payload,
         "blocking_diagnostics": [dict(item) for item in blocking if isinstance(item, Mapping)],
     }
+    if artifact_type in {"candidate_organization_map_result", "candidate_comparison_fragments_result"}:
+        from runtime.provider_runtime import hash_json
+
+        request = _require_nonempty_mapping(root.get("provider_request"), f"{artifact_type}.provider_request")
+        if dependency_hashes.get("request_payload_hash") != hash_json(request):
+            raise ArtifactSchemaError(f"{artifact_type} request differs from its bound payload hash")
+        canonical["provider_request"] = request
     expected_hash = compute_v3_hash(canonical)
     if str(root.get("content_hash") or "") != expected_hash:
         raise ArtifactSchemaError(f"{artifact_type}.content_hash does not match canonical payload")
     if status == "ready" and blocking:
         raise ArtifactSchemaError(f"ready {artifact_type} cannot carry blocking diagnostics")
+    if artifact_type in {"candidate_organization_map_result", "candidate_comparison_fragments_result"}:
+        request = dict(root["provider_request"])
+        # Prompt authority is transport-owned and remains in the canonical
+        # envelope/request hash. The logical map grammar does not own it.
+        request.pop("_prompt_authority", None)
+        try:
+            if artifact_type == "candidate_organization_map_result":
+                from outline.candidate_fragment_bank import validate_candidate_organization_map_for_request_v1
+
+                validate_candidate_organization_map_for_request_v1(payload, request)
+            else:
+                from outline.candidate_relation_fragments import validate_candidate_comparison_fragments_output_v1
+
+                validate_candidate_comparison_fragments_output_v1(payload, request)
+        except (ValueError, TypeError, KeyError) as exc:
+            raise ArtifactSchemaError(f"{artifact_type} response contract is invalid: {exc}") from exc
 
 
 def _validate_model(record: Any, root: Mapping[str, Any]) -> None:
@@ -401,6 +441,66 @@ def _validate_review_json(record: Any, _path: str | Path, root: Mapping[str, Any
     _require_fields(root, ("created_at", "draft_identity", "generation_context", "content", "projections"), artifact_type)
     if not isinstance(root.get("content"), Mapping) or not isinstance(root.get("draft_identity"), Mapping):
         raise ArtifactSchemaError(f"{artifact_type} content and draft_identity must be objects")
+    from services.review_draft import validate_review_section_writer_scope
+
+    for section in root["content"].get("sections", []):
+        if not isinstance(section, Mapping):
+            raise ArtifactSchemaError(f"{artifact_type} section must be an object")
+        if section.get("writer_task_scope") or any(block.get("table_layout_schema_version") for block in section.get("blocks", [])):
+            try:
+                validate_review_section_writer_scope(section)
+            except (TypeError, ValueError, KeyError) as exc:
+                raise ArtifactSchemaError(f"{artifact_type} source/layout contract is invalid: {exc}") from exc
+    generation_context = root.get("generation_context")
+    if not isinstance(generation_context, Mapping):
+        raise ArtifactSchemaError(f"{artifact_type} generation_context must be an object")
+    if str(generation_context.get("generation_mode") or "") != "outline_v3":
+        return
+
+    for field in (
+        "outline_artifact_id",
+        "outline_source_path",
+        "adoption_artifact_id",
+    ):
+        if not str(generation_context.get(field) or "").strip():
+            raise ArtifactSchemaError(
+                f"{artifact_type} Outline v3 lineage is missing {field}"
+            )
+    for field in ("outline_artifact_hash", "adoption_artifact_hash"):
+        digest = str(generation_context.get(field) or "").strip().lower()
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise ArtifactSchemaError(
+                f"{artifact_type} Outline v3 lineage has an invalid {field}"
+            )
+
+    section_artifacts = generation_context.get("writer_section_artifacts")
+    sections = root["content"].get("sections")
+    if (
+        not isinstance(section_artifacts, list)
+        or not section_artifacts
+        or not isinstance(sections, list)
+        or len(section_artifacts) != len(sections)
+    ):
+        raise ArtifactSchemaError(
+            f"{artifact_type} writer_section_artifacts must contain one reference per section"
+        )
+    artifact_ids: set[str] = set()
+    for index, reference in enumerate(section_artifacts):
+        if not isinstance(reference, Mapping) or set(reference) != {"artifact_id", "content_hash"}:
+            raise ArtifactSchemaError(
+                f"{artifact_type} writer_section_artifacts[{index}] must contain exactly artifact_id and content_hash"
+            )
+        artifact_id = str(reference.get("artifact_id") or "").strip()
+        digest = str(reference.get("content_hash") or "").strip().lower()
+        if not artifact_id or artifact_id in artifact_ids:
+            raise ArtifactSchemaError(
+                f"{artifact_type} writer_section_artifacts[{index}] has a missing or duplicate artifact_id"
+            )
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise ArtifactSchemaError(
+                f"{artifact_type} writer_section_artifacts[{index}] has an invalid content_hash"
+            )
+        artifact_ids.add(artifact_id)
 
 
 def _validate_citation_json(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
@@ -583,6 +683,45 @@ def _validate_receipt_closure(record: Any, _path: str | Path, root: Mapping[str,
         raise ArtifactSchemaError("provider_receipt_closure payload has invalid call graph fields")
     if not isinstance(payload.get("complete"), bool) or not str(payload.get("closure_hash") or ""):
         raise ArtifactSchemaError("provider_receipt_closure payload has invalid completion identity")
+    _validate_outline_receipt_output_dependencies(record, payload)
+
+
+def _validate_outline_receipt_output_dependencies(record: Any, payload: Mapping[str, Any]) -> None:
+    """A recovered Outline closure must directly bind each physical output."""
+    if payload.get("stage_name") != "stage2_outline":
+        return
+    expected = payload.get("expected_calls")
+    if not isinstance(expected, list):
+        if payload.get("expected_call_ids"):
+            raise ArtifactSchemaError("Outline receipt closure has no expected output bindings")
+        return
+    dependencies = list(getattr(record, "depends_on", ()) or ())
+    dependency_hashes_by_path: dict[Path, list[str]] = {}
+    # Reuse path resolution only inside this validation call. Distinct raw
+    # aliases still resolve independently and merge under their resolved path.
+    resolved_paths_by_raw: dict[str, Path] = {}
+
+    def resolve_path(raw_path: str) -> Path:
+        resolved = resolved_paths_by_raw.get(raw_path)
+        if resolved is None:
+            resolved = Path(raw_path).resolve()
+            resolved_paths_by_raw[raw_path] = resolved
+        return resolved
+
+    for ref in dependencies:
+        ref_path = str(getattr(ref, "path", ""))
+        if ref_path:
+            dependency_hashes_by_path.setdefault(resolve_path(ref_path), []).append(str(ref.content_hash))
+    for call in expected:
+        if not isinstance(call, Mapping):
+            raise ArtifactSchemaError("Outline receipt closure expected output is invalid")
+        output_path = str(call.get("artifact_path") or "")
+        output_hash = str(call.get("registry_file_hash") or "")
+        matching_hashes = dependency_hashes_by_path.get(resolve_path(output_path), ()) if output_path else ()
+        if not output_path or not output_hash or not matching_hashes:
+            raise ArtifactSchemaError("Outline receipt closure expected output lacks a direct Registry dependency")
+        if any(value != output_hash for value in matching_hashes):
+            raise ArtifactSchemaError("Outline receipt closure expected output dependency hash differs")
 
 
 def _validate_provider_expected_call_graph(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
@@ -847,11 +986,14 @@ def _validate_stage1_reusable_summary_manifest(
     _path: str | Path,
     root: Mapping[str, Any],
 ) -> None:
+    version = str(getattr(record, "artifact_version", "") or "")
+    if version not in {"v1", "v2"}:
+        raise ArtifactSchemaError("stage1 reusable manifest version is unsupported")
     _validate_production_identity(
         record,
         root,
         expected_types=("stage1_reusable_summary_manifest",),
-        expected_version="v1",
+        expected_version=version,
     )
     _require_fields(
         root,
@@ -911,6 +1053,25 @@ def _validate_stage1_reusable_summary_manifest(
             raise ArtifactSchemaError(
                 f"stage1_reusable_summary_manifest.{hash_label} is not a SHA-256 hex digest"
             )
+    if version == "v2":
+        _validate_owner_corrected_manifest_shape(root)
+
+
+def _validate_owner_corrected_manifest_shape(root: Mapping[str, Any]) -> None:
+    from services.stage1_reuse import Stage1ReusableSummaryBindingV1, _validate_manifest_self_binding
+
+    binding_value = root.get("binding")
+    paper_info = root.get("paper_info")
+    summary_payload = root.get("summary_payload")
+    if not all(isinstance(item, Mapping) for item in (binding_value, paper_info, summary_payload)):
+        raise ArtifactSchemaError("owner corrected manifest requires binding, paper and summary objects")
+    manifest, reason = _validate_manifest_self_binding(
+        root,
+        binding=Stage1ReusableSummaryBindingV1.from_mapping(binding_value),
+        previous_summary={"paper_info": paper_info, "ai_summary": summary_payload},
+    )
+    if manifest is None:
+        raise ArtifactSchemaError(f"owner corrected manifest is invalid: {reason}")
 
 
 def _validate_stage1_portable_metadata(record: Any, *, expected_type: str) -> Mapping[str, Any]:
@@ -963,6 +1124,28 @@ def _validate_stage1_portable_metadata(record: Any, *, expected_type: str) -> Ma
             "stage1 portable summary manifest metadata is not self-bound"
         )
     return metadata
+
+
+def _validate_stage1_portable_owner_correction(
+    record: Any,
+    _path: str | Path,
+    root: Mapping[str, Any],
+) -> None:
+    expected_type = str(getattr(record, "artifact_type", ""))
+    metadata = _validate_stage1_portable_metadata(record, expected_type=expected_type)
+    headers = {
+        "stage1_portable_owner_correction_origin_source": ("stage1_canonical_summaries", "v1"),
+        "stage1_portable_owner_correction_prior_manifest": ("stage1_reusable_summary_manifest", "v1"),
+        "stage1_portable_owner_correction_derived_summary_set": ("stage1_derived_summary_set", "owner-corrected-v1"),
+        "stage1_portable_owner_correction_adoption_receipt": ("stage1_summary_correction_adoption_receipt", "v1"),
+    }
+    artifact_type, artifact_version = headers[expected_type]
+    if (
+        root.get("artifact_type") != artifact_type
+        or root.get("artifact_version") != artifact_version
+        or root.get("job_id") != metadata.get("source_authority_job_id")
+    ):
+        raise ArtifactSchemaError("portable owner correction source header is invalid")
 
 
 def _validate_stage1_portable_summary_source(
@@ -1027,7 +1210,7 @@ def _validate_stage1_portable_summary_manifest(
     )
     if (
         root.get("artifact_type") != "stage1_reusable_summary_manifest"
-        or root.get("artifact_version") != "v1"
+        or root.get("artifact_version") not in {"v1", "v2"}
         or str(root.get("job_id") or "")
         != str(metadata.get("source_authority_job_id") or "")
         or str(root.get("stage_name") or "") != "stage1_analyze"
@@ -1035,6 +1218,8 @@ def _validate_stage1_portable_summary_manifest(
         or not isinstance(root.get("binding"), Mapping)
     ):
         raise ArtifactSchemaError("stage1 portable summary manifest identity is invalid")
+    if root.get("artifact_version") == "v2":
+        _validate_owner_corrected_manifest_shape(root)
     qualification_issues = validate_current_visual_evidence_qualification_pair(root)
     if qualification_issues:
         raise ArtifactSchemaError(
@@ -1471,6 +1656,41 @@ def _validate_lease_publication_manifest(record: Any, _path: str | Path, root: M
         raise ArtifactSchemaError("lease_publication_manifest Registry metadata is inconsistent")
 
 
+def _validate_candidate_output_scope(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
+    from outline.candidate_output_scope import validate_candidate_output_scope_intrinsic_v1
+
+    if str(getattr(record, "artifact_version", "") or "") != "v1":
+        raise ArtifactSchemaError("outline_candidate_output_scope requires version v1")
+    binding = root.get("source_inventory_binding")
+    if (not isinstance(binding, Mapping)
+            or binding.get("registry_job_id") != str(getattr(record, "job_id", "") or "")):
+        raise ArtifactSchemaError("candidate scope belongs to another job")
+    if not any(ref.artifact_id == binding.get("artifact_id") and ref.content_hash == binding.get("artifact_hash")
+               for ref in getattr(record, "depends_on", ())):
+        raise ArtifactSchemaError("candidate scope lacks its exact source inventory dependency")
+    try:
+        validate_candidate_output_scope_intrinsic_v1(root)
+    except (ValueError, TypeError, KeyError) as exc:
+        raise ArtifactSchemaError(f"candidate scope is invalid: {exc}") from exc
+
+
+def _validate_candidate_fragment_bank(
+    record: Any, _path: str | Path, root: Mapping[str, Any],
+) -> None:
+    from outline.candidate_fragment_bank import validate_candidate_fragment_bank_intrinsic_v1
+
+    if str(getattr(record, "artifact_version", "") or "") != "v1":
+        raise ArtifactSchemaError("outline_candidate_fragment_bank requires version v1")
+    binding = root.get("scope_binding")
+    if (not isinstance(binding, Mapping)
+            or binding.get("registry_job_id") != str(getattr(record, "job_id", "") or "")):
+        raise ArtifactSchemaError("candidate fragment bank belongs to another job")
+    try:
+        validate_candidate_fragment_bank_intrinsic_v1(root)
+    except (ValueError, TypeError, KeyError) as exc:
+        raise ArtifactSchemaError(f"candidate fragment bank is invalid: {exc}") from exc
+
+
 def _validate_receipt_ledger(record: Any, path: str | Path, _root: Mapping[str, Any] | None = None) -> None:
     if str(getattr(record, "artifact_version", "") or "") != "v1":
         raise ArtifactSchemaError("provider_receipt_ledger must use artifact_version v1")
@@ -1624,6 +1844,137 @@ def _validate_repair_lineage(record: Any, _path: str | Path, root: Mapping[str, 
 def _validate_review_section(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
     _validate_production_identity(record, root, expected_types=("review_section",), expected_version="v3")
     _require_fields(root, ("status", "section_id", "binding_hash", "binding", "content_hash", "section"), "review_section")
+
+
+def _require_source_revision_dependencies(record: Any, refs: Any) -> None:
+    actual = {
+        (ref.dependency_kind, ref.job_id, ref.artifact_id, ref.artifact_type,
+         str(Path(ref.path).resolve()), ref.content_hash)
+        for ref in record.depends_on
+    }
+    for ref in refs:
+        if not isinstance(ref, Mapping):
+            raise ArtifactSchemaError("SourceRevision dependency reference is invalid")
+        expected = (
+            ref.get("dependency_kind"), ref.get("job_id"), ref.get("artifact_id"),
+            ref.get("artifact_type"), str(Path(str(ref.get("path") or "")).resolve()),
+            ref.get("content_hash"),
+        )
+        if expected not in actual:
+            raise ArtifactSchemaError("SourceRevision proof lacks an exact Registry dependency")
+
+
+def _validate_source_revision_plan(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
+    from runtime.source_revision_admission import _validate_body
+    from runtime.provider_runtime import hash_json
+
+    _validate_body(root)
+    if (record.job_id != root["child_job_id"] or record.artifact_id != "source_revision_plan"
+            or record.metadata.get("plan_content_hash") != hash_json(root)):
+        raise ArtifactSchemaError("SourceRevision plan owner or content binding differs")
+    refs = [
+        {**dict(ref), "dependency_kind": "external_job"}
+        for ref in (*root["parent"]["authority_refs"], *root["parent"]["response_snapshot_refs"])
+    ]
+    _require_source_revision_dependencies(record, refs)
+    if not any(ref.dependency_kind == "local_job" and ref.job_id == record.job_id
+               and ref.artifact_id == "runtime_job_spec" for ref in record.depends_on):
+        raise ArtifactSchemaError("SourceRevision plan lacks its child runtime spec")
+
+
+def _validate_source_revision_reuse(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
+    from runtime.provider_runtime import hash_json
+
+    _validate_production_identity(
+        record, root, expected_types=("source_revision_provider_reuse",), expected_version="v1",
+    )
+    if root.get("proof_hash") != hash_json({key: value for key, value in root.items() if key != "proof_hash"}):
+        raise ArtifactSchemaError("SourceRevision reuse proof hash differs")
+    authority = root.get("source_authority")
+    if not isinstance(authority, Mapping):
+        raise ArtifactSchemaError("SourceRevision reuse proof has no parent authority")
+    _require_source_revision_dependencies(record, [
+        root.get("child_output_ref"), root.get("child_runtime_spec_ref"),
+        *(authority.get(key) for key in (
+            "parent_closure_ref", "parent_ledger_ref", "parent_response_snapshot_ref",
+            "parent_accepted_output_ref", "parent_scope_record_ref",
+        )),
+        *authority.get("parent_lineage_refs", []), *root.get("stage_lineage_refs", []),
+    ])
+    if not any(ref.dependency_kind == "local_job" and ref.job_id == record.job_id
+               and ref.artifact_id == root.get("plan_artifact_id")
+               and ref.content_hash == root.get("plan_artifact_hash") for ref in record.depends_on):
+        raise ArtifactSchemaError("SourceRevision reuse proof lacks its child plan")
+
+
+def _validate_provider_response_snapshot(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
+    from runtime.provider_response_snapshot import (
+        SNAPSHOT_PRODUCER,
+        validate_provider_response_snapshot,
+    )
+    from runtime.provider_runtime import hash_json
+
+    _validate_production_identity(
+        record, root, expected_types=("provider_response_snapshot",), expected_version="v1",
+    )
+    validate_provider_response_snapshot(root)
+    expected_id = "provider-response-snapshot:" + hash_json({
+        "job_id": root["job_id"], "receipt_id": root["receipt_id"],
+    })
+    if (record.artifact_id != expected_id or record.artifact_role != "provider_response_snapshot"
+            or record.producer != SNAPSHOT_PRODUCER):
+        raise ArtifactSchemaError("provider response snapshot Registry identity differs")
+    for name in ("stage_name", "call_id", "node_id", "receipt_id", "receipt_hash", "response_hash"):
+        if record.metadata.get(name) != root[name]:
+            raise ArtifactSchemaError(f"provider response snapshot Registry {name} differs")
+
+
+def _validate_review_receipt_snapshot(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
+    from runtime.provider_runtime import ProviderCallReceiptV1, hash_json
+
+    _validate_production_identity(
+        record, root, expected_types=("review_provider_receipt_snapshot",), expected_version="v1",
+    )
+    _require_fields(
+        root,
+        ("status", "stage_name", "section_id", "binding_hash", "closure_epoch_id",
+         "logical_attempt_identity", "call_id", "expected_call_graph_hash",
+         "receipt_id", "receipt_hash", "receipt"),
+        "review_provider_receipt_snapshot",
+    )
+    if root.get("status") != "partial" or root.get("stage_name") != "stage3_review":
+        raise ArtifactSchemaError("review receipt snapshot must identify a partial stage3_review result")
+    section_id = root.get("section_id")
+    if not isinstance(section_id, str) or not section_id or root.get("call_id") != f"review:{section_id}":
+        raise ArtifactSchemaError("review receipt snapshot section/call identity is invalid")
+    for field_name in ("binding_hash", "expected_call_graph_hash", "receipt_hash"):
+        value = root.get(field_name)
+        if not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+            raise ArtifactSchemaError(f"review receipt snapshot {field_name} must be a SHA-256 hash")
+    receipt_payload = root.get("receipt")
+    if not isinstance(receipt_payload, Mapping):
+        raise ArtifactSchemaError("review receipt snapshot receipt must be an object")
+    try:
+        receipt = ProviderCallReceiptV1.from_dict(receipt_payload)
+    except (RuntimeError, TypeError, ValueError) as exc:
+        raise ArtifactSchemaError("review receipt snapshot provider receipt is invalid") from exc
+    if (receipt.status != "success" or receipt.incomplete_reason or receipt.finish_reason == "length"
+            or not receipt.response_hash or hash_json(receipt_payload) != root["receipt_hash"]):
+        raise ArtifactSchemaError("review receipt snapshot requires one complete, hash-bound success receipt")
+    for field_name, expected in (
+        ("job_id", root.get("job_id")), ("stage_name", "stage3_review"),
+        ("node_id", section_id), ("call_id", root.get("call_id")),
+        ("receipt_id", root.get("receipt_id")), ("closure_epoch_id", root.get("closure_epoch_id")),
+        ("logical_attempt_identity", root.get("logical_attempt_identity")),
+    ):
+        if not expected or getattr(receipt, field_name) != expected:
+            raise ArtifactSchemaError(f"review receipt snapshot receipt {field_name} mismatch")
+    safe_section_id = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in section_id)
+    expected_id = (
+        f"review:receipt-snapshot:{safe_section_id}:{root['binding_hash'][:24]}:{root['receipt_hash'][:24]}"
+    )
+    if record.artifact_id != expected_id or record.artifact_role != "provider_receipt_snapshot":
+        raise ArtifactSchemaError("review receipt snapshot Registry identity mismatch")
 
 
 def _validate_export_bundle(record: Any, path: str | Path, _root: Mapping[str, Any] | None = None) -> None:
@@ -2609,10 +2960,123 @@ def _validate_playwright_trace(
         raise ArtifactSchemaError("Playwright trace archive is invalid") from exc
 
 
+def _validate_outline_topic_pilot_artifact(
+    record: Any, _path: str | Path, root: Mapping[str, Any] | None
+) -> None:
+    """Keep a pilot checkpoint distinct from a canonical Outline result."""
+
+    if not isinstance(root, Mapping):
+        raise ArtifactSchemaError("topic pilot artifact must be a JSON object")
+    kind = str(getattr(record, "artifact_type", "") or "")
+    schemas = {
+        "outline_topic_pilot_plan": "outline-topic-pilot-plan/v1",
+        "outline_topic_pilot_receipt_closure": "outline-topic-pilot-receipt-closure/v1",
+        "outline_topic_pilot_checkpoint": "outline-topic-pilot-checkpoint/v1",
+    }
+    if root.get("schema_version") != schemas.get(kind):
+        raise ArtifactSchemaError("topic pilot artifact schema identity is invalid")
+
+    def sha(value: Any) -> bool:
+        return isinstance(value, str) and len(value) == 64 and all(
+            character in "0123456789abcdef" for character in value
+        )
+
+    if not sha(root.get("pilot_scope_hash")) or not str(root.get("acceptance_run_id") or ""):
+        raise ArtifactSchemaError("topic pilot scope or acceptance identity is missing")
+    if kind == "outline_topic_pilot_plan":
+        rows = root.get("selected_requests")
+        if (
+            root.get("status") != "accepted_before_transport"
+            or root.get("provider_posts_emitted") != 0
+            or not sha(root.get("source_summary_set_hash"))
+            or not sha(root.get("route_fingerprint"))
+            or not isinstance(rows, list)
+            or not rows
+        ):
+            raise ArtifactSchemaError("topic pilot plan is incomplete")
+        ids = [str(item.get("node_id") or "") for item in rows if isinstance(item, Mapping)]
+        if (
+            len(ids) != len(rows)
+            or len(set(ids)) != len(ids)
+            or any(not item.startswith("topic_synthesis_provider:batch:") for item in ids)
+            or any(not sha(item.get("request_hash")) for item in rows)
+            or root.get("logical_call_count") != len(rows)
+            or not isinstance(root.get("physical_attempt_upper_bound"), int)
+            or isinstance(root.get("physical_attempt_upper_bound"), bool)
+            or root["physical_attempt_upper_bound"] < len(rows)
+            or not isinstance(root.get("output_token_all_attempts_upper_bound"), int)
+            or isinstance(root.get("output_token_all_attempts_upper_bound"), bool)
+            or root["output_token_all_attempts_upper_bound"] <= 0
+        ):
+            raise ArtifactSchemaError("topic pilot plan request envelope is invalid")
+        return
+    if kind == "outline_topic_pilot_receipt_closure":
+        selected = root.get("selected_call_ids")
+        if (
+            root.get("complete") is not True
+            or root.get("canonical_outline_complete") is not False
+            or not isinstance(selected, list)
+            or not selected
+            or any(not isinstance(item, str) or not item for item in selected)
+            or sorted(selected) != sorted(root.get("expected_call_ids") or ())
+            or len(set(selected)) != len(selected)
+            or not sha(root.get("closure_hash"))
+            or any(
+                root.get(field)
+                for field in (
+                    "missing_call_ids", "stale_call_ids", "failed_call_ids",
+                    "incomplete_call_ids", "hash_mismatches", "unexpected_receipts",
+                    "retry_exceeded_call_ids", "usage_incomplete_call_ids",
+                )
+            )
+        ):
+            raise ArtifactSchemaError("topic pilot receipt closure is incomplete")
+        return
+    selected = root.get("selected_topic_batch_ids")
+    result_hashes = root.get("topic_result_hashes")
+    output_ids = root.get("provider_output_artifact_ids")
+    if (
+        root.get("status") != "TOPIC_PILOT_COMPLETE"
+        or root.get("canonical_ready") is not False
+        or root.get("auto_continue") is not False
+        or root.get("adoption_authorized") is not False
+        or root.get("final_outline_artifact_id") != ""
+        or not sha(root.get("source_summary_set_hash"))
+        or not sha(root.get("receipt_closure_hash"))
+        or not isinstance(selected, list)
+        or not selected
+        or any(not isinstance(item, str) or not item for item in selected)
+        or len(set(selected)) != len(selected)
+        or not isinstance(result_hashes, Mapping)
+        or set(result_hashes) != set(selected)
+        or any(not sha(value) for value in result_hashes.values())
+        or not isinstance(output_ids, list)
+        or len(output_ids) != len(selected)
+        or any(not isinstance(item, str) or not item for item in output_ids)
+        or len(set(output_ids)) != len(output_ids)
+        or not str(root.get("receipt_closure_artifact_id") or "")
+    ):
+        raise ArtifactSchemaError("topic pilot checkpoint is incomplete or canonicalized")
+    dependencies = {
+        str(item.artifact_id): str(item.content_hash)
+        for item in getattr(record, "depends_on", ())
+    }
+    if (
+        dependencies.get(str(root["receipt_closure_artifact_id"]))
+        != root["receipt_closure_hash"]
+        or any(str(item) not in dependencies for item in output_ids)
+    ):
+        raise ArtifactSchemaError("topic pilot checkpoint dependency binding is incomplete")
+
+
 def _validate_current_production_artifact(record: Any, path: str | Path, root: Mapping[str, Any] | None) -> None:
     artifact_type = str(getattr(record, "artifact_type", "") or "")
     version = str(getattr(record, "artifact_version", "") or "")
     validators = {
+        ("outline_candidate_output_scope", "v1"): _validate_candidate_output_scope,
+        ("outline_candidate_fragment_bank", "v1"): _validate_candidate_fragment_bank,
+        ("provider_run_envelope", "v1"): _validate_provider_run_envelope,
+        ("accepted_runtime_run_scope", "v1"): _validate_accepted_runtime_run_scope,
         ("review_draft", "v3"): _validate_review_json,
         ("review_draft_repaired", "v1"): _validate_repaired_json,
         ("citation_manifest", "v3"): _validate_citation_json,
@@ -2628,13 +3092,21 @@ def _validate_current_production_artifact(record: Any, path: str | Path, root: M
         ("provider_expected_call_graph", "v1"): _validate_provider_expected_call_graph,
         ("stage1_summary_reuse_record", "v1"): _validate_stage1_summary_reuse_record,
         ("stage1_reusable_summary_manifest", "v1"): _validate_stage1_reusable_summary_manifest,
+        ("stage1_reusable_summary_manifest", "v2"): _validate_stage1_reusable_summary_manifest,
         ("stage1_portable_summary_source", "v1"): _validate_stage1_portable_summary_source,
         ("stage1_portable_summary_manifest", "v1"): _validate_stage1_portable_summary_manifest,
         ("stage1_portable_provider_closure", "v1"): _validate_stage1_portable_provider_closure,
         ("stage1_portable_provider_ledger", "v1"): _validate_stage1_portable_provider_ledger,
+        ("stage1_portable_owner_correction_origin_source", "v1"): _validate_stage1_portable_owner_correction,
+        ("stage1_portable_owner_correction_prior_manifest", "v1"): _validate_stage1_portable_owner_correction,
+        ("stage1_portable_owner_correction_derived_summary_set", "v1"): _validate_stage1_portable_owner_correction,
+        ("stage1_portable_owner_correction_adoption_receipt", "v1"): _validate_stage1_portable_owner_correction,
         ("outline_provider_call_plan", "v1"): _validate_outline_provider_call_plan,
         ("outline_request_payload_audit", "v1"): _validate_outline_request_payload_audit,
         ("outline_hierarchical_call_graph", "v1"): _validate_outline_hierarchical_call_graph,
+        ("outline_topic_pilot_plan", "v1"): _validate_outline_topic_pilot_artifact,
+        ("outline_topic_pilot_receipt_closure", "v1"): _validate_outline_topic_pilot_artifact,
+        ("outline_topic_pilot_checkpoint", "v1"): _validate_outline_topic_pilot_artifact,
         ("validation_disposition", "v1"): _validate_validation_disposition,
         ("lease_publication_manifest", "v1"): _validate_lease_publication_manifest,
         ("provider_receipt_ledger", "v1"): _validate_receipt_ledger,
@@ -2653,6 +3125,10 @@ def _validate_current_production_artifact(record: Any, path: str | Path, root: M
         ("export_bundle", "v1"): _validate_export_bundle,
         ("forensic_attestation", "v1"): _validate_forensic_attestation,
         ("review_section", "v3"): _validate_review_section,
+        ("review_provider_receipt_snapshot", "v1"): _validate_review_receipt_snapshot,
+        ("provider_response_snapshot", "v1"): _validate_provider_response_snapshot,
+        ("source_revision_plan", "v1"): _validate_source_revision_plan,
+        ("source_revision_provider_reuse", "v1"): _validate_source_revision_reuse,
         ("free_mode_intent_input", "v1"): _validate_free_mode_intent_input,
         ("free_mode_review_intent_projection", "v1"): _validate_free_mode_review_intent_projection,
         ("validation_adjudication_reuse_record", "v1"): _validate_validation_adjudication_reuse_record,
@@ -2676,6 +3152,112 @@ def _validate_current_production_artifact(record: Any, path: str | Path, root: M
             f"no version-aware current validator is registered for {(artifact_type, version)!r}"
         )
     validator(record, path, root)
+
+
+def _validate_provider_run_envelope(record: Any, path: Path, payload: Any) -> None:
+    from runtime.provider_run_envelope import ProviderRunEnvelopeV1
+
+    try:
+        envelope = ProviderRunEnvelopeV1.from_dict(payload)
+    except (TypeError, ValueError) as exc:
+        raise ArtifactSchemaError("provider run envelope schema or hash is invalid") from exc
+    if (record.metadata.get("job_id") != envelope.job_id
+            or record.metadata.get("envelope_sha256") != envelope.to_dict()["envelope_sha256"]):
+        raise ArtifactSchemaError("provider run envelope Registry identity does not match its payload")
+
+
+def _validate_accepted_runtime_run_scope(record: Any, path: Path, payload: Any) -> None:
+    from runtime.provider_runtime import ProviderAggregateBudgetV2
+
+    if not isinstance(payload, Mapping) or payload.get("schema_version") != "accepted-provider-run-scope/v1":
+        raise ArtifactSchemaError("accepted runtime run scope schema is invalid")
+    required = (
+        "job_id",
+        "run_id",
+        "scenario_id",
+        "acceptance_plan_sha256",
+        "acceptance_spec_file_sha256",
+        "runtime_spec_sha256",
+        "runtime_spec_file_sha256",
+        "input_identity_sha256",
+        "workspace_identity_sha256",
+        "final_executable_sha",
+        "runtime_spec_artifact_id",
+        "runtime_spec_artifact_sha256",
+        "source_inventory_artifact_id",
+        "source_inventory_artifact_sha256",
+        "provider_budget",
+        "scope_hashes",
+    )
+    _require_fields(payload, required, "accepted_runtime_run_scope")
+    if any(not str(payload.get(name) or "").strip() for name in required[:13]):
+        raise ArtifactSchemaError("accepted runtime run scope identity fields are empty")
+
+    def sha256(value: Any) -> bool:
+        return isinstance(value, str) and len(value) == 64 and all(
+            character in "0123456789abcdef" for character in value
+        )
+
+    for name in (
+        "acceptance_plan_sha256",
+        "acceptance_spec_file_sha256",
+        "runtime_spec_sha256",
+        "runtime_spec_file_sha256",
+        "input_identity_sha256",
+        "workspace_identity_sha256",
+        "runtime_spec_artifact_sha256",
+        "source_inventory_artifact_sha256",
+    ):
+        if not sha256(payload.get(name)):
+            raise ArtifactSchemaError(f"accepted runtime run scope {name} is invalid")
+    final_sha = str(payload.get("final_executable_sha") or "")
+    if len(final_sha) not in {40, 64} or any(
+        character not in "0123456789abcdef" for character in final_sha
+    ):
+        raise ArtifactSchemaError("accepted runtime run scope executable SHA is invalid")
+    provider_budget = payload.get("provider_budget")
+    if not isinstance(provider_budget, Mapping):
+        raise ArtifactSchemaError("accepted runtime run scope budget is not strict V2")
+    try:
+        ProviderAggregateBudgetV2.from_mapping(provider_budget)
+    except (TypeError, ValueError) as exc:
+        raise ArtifactSchemaError("accepted runtime run scope budget is not strict V2") from exc
+    scope_hashes = payload.get("scope_hashes")
+    expected_scope_names = {
+        "runtime_spec_sha256",
+        "effective_config_sha256",
+        "source_snapshot_sha256",
+        "review_goal_sha256",
+        "route_plan_sha256",
+        "stage_work_contract_sha256",
+    }
+    if not isinstance(scope_hashes, Mapping) or set(scope_hashes) != expected_scope_names:
+        raise ArtifactSchemaError("accepted runtime run scope hash set is invalid")
+    if any(not sha256(value) for value in scope_hashes.values()):
+        raise ArtifactSchemaError("accepted runtime run scope contains an invalid scope hash")
+    if scope_hashes.get("runtime_spec_sha256") != payload.get("runtime_spec_sha256"):
+        raise ArtifactSchemaError("accepted runtime run scope normalized spec hash differs")
+    metadata = getattr(record, "metadata", {})
+    if (
+        not isinstance(metadata, Mapping)
+        or metadata.get("job_id") != payload.get("job_id")
+        or metadata.get("acceptance_run_id") != payload.get("run_id")
+        or metadata.get("acceptance_plan_sha256") != payload.get("acceptance_plan_sha256")
+    ):
+        raise ArtifactSchemaError("accepted runtime run scope Registry metadata differs")
+    dependencies = {
+        str(item.artifact_id): str(item.content_hash)
+        for item in getattr(record, "depends_on", ())
+    }
+    if (
+        dependencies.get(str(payload["runtime_spec_artifact_id"]))
+        != payload["runtime_spec_artifact_sha256"]
+        or dependencies.get(str(payload["source_inventory_artifact_id"]))
+        != payload["source_inventory_artifact_sha256"]
+    ):
+        raise ArtifactSchemaError(
+            "accepted runtime run scope lacks RuntimeJobSpec or canonical source dependencies"
+        )
 
 
 def validate_registered_artifact(record: Any, path: str | Path) -> None:
@@ -2757,6 +3339,10 @@ def validate_current_outline_artifact(record: Any, path: str | Path) -> None:
         _validate_outline_provider_call_plan(record, path, root)
     else:
         _validate_model(record, root)
+    if artifact_type == "provider_receipt_closure":
+        payload = root.get("payload")
+        if isinstance(payload, Mapping):
+            _validate_outline_receipt_output_dependencies(record, payload)
 
 
 def make_outline_schema_validators() -> dict[str, Any]:

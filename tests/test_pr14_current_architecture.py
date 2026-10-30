@@ -184,9 +184,10 @@ def test_current_outline_dag_hash_and_resume_closure_are_deterministic() -> None
         "coverage_audit",
         "final_outline",
         "provider_receipt_closure",
-        "section_evidence_packets",
-        "selected_candidate",
-        "stability_audit",
+            "section_evidence_packets",
+            "selected_candidate",
+            "selected_candidate_revision",
+            "stability_audit",
         "stage_health",
         "structure_critique",
     ]

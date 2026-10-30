@@ -146,11 +146,11 @@ The shipped role mapping is:
 | Outline role | API section | Model | Wire endpoint / network ownership |
 | --- | --- | --- | --- |
 | Relation adjudication | `Free_Mode_API` | DeepSeek V4 Pro | DeepSeek Chat Completions, DeepSeek official API |
-| Candidate generation | `Outline_API` | Claude Opus 5 | Native Anthropic Messages through `chat.178266.xyz`, third-party gateway |
+| Candidate generation | `Outline_API` | Claude Opus 5.5 | Native Anthropic Messages through `chat.178266.xyz`, third-party gateway |
 | Structure critique | `Writer_API` | GPT-5.6-sol | OpenAI Responses-compatible transport through `ai.saigou.work`, third-party gateway |
 | Coverage critique | `Free_Mode_API` | DeepSeek V4 Pro | DeepSeek Chat Completions, DeepSeek official API |
 | Evidence critique | `Writer_API` | GPT-5.6-sol | OpenAI Responses-compatible transport through `ai.saigou.work`, third-party gateway |
-| Arbitration | `Outline_API` | Claude Opus 5 | Native Anthropic Messages through `chat.178266.xyz`, third-party gateway |
+| Arbitration | `Outline_API` | Claude Opus 5.5 | Native Anthropic Messages through `chat.178266.xyz`, third-party gateway |
 
 The endpoint/protocol and the model brand are separate facts. A request sent to
 `chat.178266.xyz` or `ai.saigou.work` is a request to a third-party gateway; the
@@ -178,7 +178,7 @@ receipts, while credentials remain in `.env` or the local credential store.
 * the response `content` is a block list, and only blocks with `type == "text"`
   count as answer content.
 
-For Claude Opus 5, the current request policy is adaptive thinking with
+For Claude Opus 5.5, the current request policy is adaptive thinking with
 `output_config.effort`; the legacy `enabled` plus `budget_tokens` form is not
 sent. `thinking_budget_tokens` is retained only for manually configured legacy
 Claude generations that still require it.

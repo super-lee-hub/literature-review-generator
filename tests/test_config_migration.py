@@ -86,6 +86,79 @@ def test_dead_retry_sections_are_removed() -> None:
     _assert_valid_and_idempotent(migrated)
 
 
+def test_obsolete_gpt_route_blocks_and_fallback_key_are_removed() -> None:
+    text = (
+        "[Application]\nconfig_schema = 4\n"
+        "[Outline_API]\nmodel = current\n"
+        "[Writer_API]\nfallback_section = Writer_GPT_Fallback_API\n"
+        "[Outline_GPT_API]\nmodel = obsolete\n"
+        "[Outline_GPT_Fallback_API]\nmodel = obsolete-fallback\n"
+        "[Writer_GPT_Fallback_API]\nmodel = obsolete-writer-fallback\n"
+    )
+    migrated, report = migrate_config_text(text)
+
+    parsed = _parse(migrated)
+    assert "Outline_GPT_API" not in parsed
+    assert "Outline_GPT_Fallback_API" not in parsed
+    assert "Writer_GPT_Fallback_API" not in parsed
+    assert "fallback_section" not in parsed["Writer_API"]
+    assert any("removed dead legacy section [Outline_GPT_API]" in change for change in report.changes)
+    _assert_valid_and_idempotent(migrated)
+
+
+def test_obsolete_route_references_are_migrated_in_outline_models() -> None:
+    text = (
+        "[Application]\nconfig_schema = 4\n"
+        "[Backup_Reader_API]\nmodel = backup\n"
+        "[Outline_GPT_API]\nmodel = backup\n"
+        "[Writer_GPT_Fallback_API]\nmodel = backup\n"
+        "[OutlineModels]\n"
+        "outline_model = Outline_API\n"
+        "structure_critic_model = Outline_GPT_API\n"
+        "evidence_critic_model = Writer_GPT_Fallback_API\n"
+    )
+    migrated, report = migrate_config_text(text)
+
+    parsed = _parse(migrated)
+    assert parsed["OutlineModels"]["structure_critic_model"] == "Backup_Reader_API"
+    assert parsed["OutlineModels"]["evidence_critic_model"] == "Backup_Reader_API"
+    assert any("structure_critic_model" in change for change in report.changes)
+    _assert_valid_and_idempotent(migrated)
+
+
+def test_provider_route_migration_rejects_different_destination_without_leaking_values(
+    tmp_path,
+) -> None:
+    text = (
+        "[Application]\nconfig_schema = 4\n"
+        "[Backup_Reader_API]\nmodel = backup-model\napi_key = backup-secret-placeholder\n"
+        "[Outline_GPT_API]\nmodel = old-model\napi_key = old-secret-placeholder\n"
+        "[OutlineModels]\nstructure_critic_model = Outline_GPT_API\n"
+    )
+    config_path = tmp_path / "config.ini"
+    config_path.write_text(text, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="would change the configured destination") as exc:
+        migrate_config_file(config_path)
+
+    assert "model" in str(exc.value)
+    assert "api_key" in str(exc.value)
+    assert "backup-secret-placeholder" not in str(exc.value)
+    assert "old-secret-placeholder" not in str(exc.value)
+    assert config_path.read_text(encoding="utf-8") == text
+    assert not list(tmp_path.glob("config.ini.backup_before_*"))
+
+
+def test_provider_route_migration_rejects_missing_legacy_route_definition() -> None:
+    text = (
+        "[Application]\nconfig_schema = 4\n"
+        "[Backup_Reader_API]\nmodel = backup-model\n"
+        "[OutlineModels]\nstructure_critic_model = Outline_GPT_API\n"
+    )
+    with pytest.raises(ValueError, match="must both be present"):
+        migrate_config_text(text)
+
+
 def test_test_dev_fixture_mode_is_removed() -> None:
     text = "[Outline]\ncandidate_count = 5\ntest_dev_fixture_mode = false\n"
     migrated, _ = migrate_config_text(text)

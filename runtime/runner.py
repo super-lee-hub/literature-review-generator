@@ -10,6 +10,7 @@ from free_mode.intent_input import (
     build_free_mode_writer_context,
 )
 from runtime.attempt_store import (
+    ATTEMPT_SNAPSHOT_ROLE,
     AttemptAlreadyRunningError,
     AttemptExecutionLease,
     AttemptStore,
@@ -25,12 +26,14 @@ from runtime.reconcile import (
     RuntimeReconciler,
     validate_review_batch_manifest_for_bootstrap,
 )
-from runtime.stage_contracts import SourceBundle, StageResult
+from runtime.stage_contracts import SourceBundle, StageArtifactRef, StageResult
+from runtime.source_intake import stage1_paper_work_item_basis
 from runtime.stage_terminal import StageTerminalStore, TerminalStageRecordV1
 from services.artifact_registry import (
     ArtifactDependencyRefV2,
     ArtifactRecord,
     ArtifactRegistry,
+    CurrentArtifactSetV1,
     RegistryError,
     file_sha256,
 )
@@ -38,7 +41,7 @@ from services.job_outcome import JobOutcomeV1, load_canonical_job_outcome
 from services.job_workspace import JobWorkspace, publish_json_artifact, utc_now_iso
 from services.queue_service import JobCancelledError
 from services.queue_service import CancelToken
-from runtime.provider_runtime import hash_json
+from runtime.provider_runtime import ProviderCancellationRequested, hash_json
 
 
 class RuntimeRunnerError(RuntimeError):
@@ -84,6 +87,8 @@ class RuntimeExecutionResult:
 def _evaluate_runtime_completion(
     outcome: JobOutcomeV1,
     registry: ArtifactRegistry,
+    *,
+    external_registry_resolver: Callable[[str], ArtifactRegistry | None] | None = None,
 ) -> CompletionEvaluationV1:
     """Read and verify the durable evidence used by status projections."""
 
@@ -112,7 +117,7 @@ def _evaluate_runtime_completion(
             validation_record = validation_record or record.artifact_type == "validation_run_result"
         from validation.closure import resolve_current_stage_closure_map
 
-        current_stage_closure_map = resolve_current_stage_closure_map(registry).to_dict()
+        current_stage_closure_map = resolve_current_stage_closure_map(registry, external_registry_resolver=external_registry_resolver).to_dict()
         provider_entries = current_stage_closure_map.get("provider_closures_by_stage")
         if required_provider_stages:
             if not isinstance(provider_entries, Mapping):
@@ -175,6 +180,8 @@ def _evaluate_runtime_completion(
         current_set = None
     if current_set is not None and current_set.validation_status == "not_requested":
         validation_status = "not_requested"
+    elif current_set is not None and current_set.validation_status == "findings" and validation_record:
+        validation_status = "findings"
     return CanonicalCompletionEvaluator.evaluate(
         {
             "job_id": outcome.job_id,
@@ -375,8 +382,11 @@ class AgentRuntimeRunner:
     def _schema_validators(cls) -> dict[str, Callable[[ArtifactRecord, Path], None]]:
         from runtime.reconcile import DEFAULT_SCHEMA_VALIDATORS
         from runtime.artifact_validators import make_outline_schema_validators
+        from runtime.downstream_continuation import validate_continuation_artifact
 
         validators = dict(DEFAULT_SCHEMA_VALIDATORS)
+        for artifact_type in ("downstream_continuation_grant", "downstream_continuation_pointer"):
+            validators[artifact_type] = validate_continuation_artifact
         for artifact_type, current_validator in make_outline_schema_validators().items():
             fallback_validator = validators.get(artifact_type)
 
@@ -405,7 +415,19 @@ class AgentRuntimeRunner:
         fault_injector: FaultInjector | None = None,
         cancel_token: CancelToken | None = None,
         publication_context: Any | None = None,
+        queue_resume_intent: Mapping[str, Any] | None = None,
     ) -> None:
+        if queue_resume_intent is not None:
+            from services.queue_service import QueuePublicationContext
+
+            if not isinstance(publication_context, QueuePublicationContext):
+                raise RuntimeRunnerError("queue resume intent requires a lease-bound publication context")
+            lease = publication_context.lease
+            if job_spec.job_id != lease.job_id or not publication_context.queue_service.lease_is_current(
+                lease.job_id, lease_id=lease.lease_id, worker_id=lease.worker_id,
+                lease_generation=lease.lease_generation, fence_token=lease.fence_token,
+            ):
+                raise RuntimeRunnerError("queue resume intent requires the current job lease")
         from runtime.provider_runtime import provider_budget_controller_from_environment
 
         provider_budget_controller_from_environment()
@@ -438,6 +460,44 @@ class AgentRuntimeRunner:
         self.fault_injector = fault_injector
         self.cancel_token = cancel_token
         self.publication_context = publication_context
+        self.queue_resume_intent = dict(queue_resume_intent) if queue_resume_intent is not None else None
+
+    def _apply_queue_resume_intent(self, session: AgentRuntimeSession) -> None:
+        intent = self.queue_resume_intent
+        if intent is None:
+            return
+        from services.queue_service import QueueOwnedArtifactRegistry
+
+        if not isinstance(session.context.registry, QueueOwnedArtifactRegistry):
+            raise RuntimeRunnerError("queue resume requires the lease-bound Registry")
+        expected_fields = {
+            "schema_version", "job_id", "workspace_path", "execution_fingerprint",
+            "runtime_spec_sha256", "expected_cancel_marker_sha256",
+        }
+        if (
+            set(intent) != expected_fields
+            or intent.get("schema_version") != "queue-resume-intent-v1"
+            or intent.get("job_id") != session.context.workspace.job_id
+            or intent.get("workspace_path") != str(Path(session.context.workspace.root_dir).resolve())
+            or intent.get("runtime_spec_sha256") != hash_json(self.job_spec.to_dict())
+            or not isinstance(intent.get("execution_fingerprint"), str)
+            or len(intent["execution_fingerprint"]) != 64
+        ):
+            raise RuntimeRunnerError("queue resume intent does not match the persisted runtime identity")
+        if self.cancel_token is not None:
+            self.cancel_token.check_cancelled()
+        from runtime.cancellation import CancellationRequestError, CancellationRequestStore
+
+        store = CancellationRequestStore(session.context.workspace, session.context.registry)
+        try:
+            store.clear(
+                cleared_by="queue_runner", reason="explicit_queue_retry",
+                expected_hash=intent["expected_cancel_marker_sha256"],
+            )
+        except CancellationRequestError as exc:
+            if store.is_requested():
+                raise JobCancelledError("new cancellation preserved during queue retry") from exc
+            raise RuntimeRunnerError(f"queue retry cancellation state is invalid: {exc}") from exc
 
     @staticmethod
     def _require_explicit_path_origins(spec: RuntimeJobSpec) -> None:
@@ -478,7 +538,7 @@ class AgentRuntimeRunner:
         from runtime.test_dependencies import current_runtime_test_dependencies
         from runtime.trust_admission import (
             ExternalHostAdmissionError,
-            build_external_host_policy,
+            build_runtime_external_host_policy,
             validate_external_host_acknowledgement,
         )
 
@@ -491,7 +551,15 @@ class AgentRuntimeRunner:
             test_dependencies = current_runtime_test_dependencies()
             if test_dependencies is not None:
                 test_dependencies.validate()
-            resolved_config = load_config(
+            explicit_scope = None
+            if metadata.get("stage1_summary_input_mode") == "explicit_typed_import":
+                from runtime.explicit_stage1_scope import load_explicit_stage1_scope
+
+                explicit_scope = load_explicit_stage1_scope(
+                    self.job_spec,
+                    allow_template_credentials=bool(test_dependencies and test_dependencies.allow_template_credentials),
+                )
+            resolved_config = explicit_scope.config if explicit_scope is not None else load_config(
                 self.job_spec.config,
                 action=self.job_spec.action,
                 requested_stages=requested_stages,
@@ -515,15 +583,18 @@ class AgentRuntimeRunner:
             # external-host acknowledgement.  Ordinary environment variables
             # are never an authority boundary for production run/resume.
             if test_dependencies is None:
-                policy = build_external_host_policy(
+                reachable = (
+                    explicit_scope.provider_route_plan if explicit_scope is not None
+                    else build_reachable_provider_route_plan(
+                        resolved_config, action=self.job_spec.action,
+                        requested_stages=requested_stages, free_mode_enabled=free_mode_enabled, stage_plan=plan,
+                    )
+                )
+                policy = build_runtime_external_host_policy(
                     resolved_config,
-                    build_reachable_provider_route_plan(
-                        resolved_config,
-                        action=self.job_spec.action,
-                        requested_stages=requested_stages,
-                        free_mode_enabled=free_mode_enabled,
-                        stage_plan=plan,
-                    ),
+                    reachable,
+                    requested_stages=(reachable.stage_plan.requested_stages if explicit_scope is not None else requested_stages),
+                    outline_pilot=metadata.get("outline_pilot"),
                 )
                 validate_external_host_acknowledgement(
                     policy,
@@ -623,9 +694,16 @@ class AgentRuntimeRunner:
         *,
         registry_paths: Sequence[str | Path] = (),
     ) -> Callable[[str], ArtifactRegistry | None]:
+        from services.stage1_reuse import verified_typed_reuse_registry_paths
+        from runtime.source_revision_binding import source_revision_registry_paths
+
         cache: dict[str, ArtifactRegistry | None] = {}
         explicit_paths: dict[str, list[Path]] = {}
-        for value in registry_paths:
+        local_registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+        source_paths = verified_typed_reuse_registry_paths(local_registry)
+        discovered_paths = AgentRuntimeRunner._review_batch_registry_paths(local_registry)
+        revision_paths = source_revision_registry_paths(local_registry)
+        for value in (*registry_paths, *source_paths, *discovered_paths, *revision_paths):
             candidate = Path(value).expanduser().resolve()
             try:
                 payload = json.loads(candidate.read_text(encoding="utf-8"))
@@ -667,7 +745,6 @@ class AgentRuntimeRunner:
                     if isinstance(payload, Mapping) and str(payload.get("job_id") or "") == job_id:
                         matches.append(registry_path)
             if len(matches) != 1:
-                cache[job_id] = None
                 return None
             try:
                 resolved = ArtifactRegistry(matches[0], job_id)
@@ -741,8 +818,17 @@ class AgentRuntimeRunner:
                     or self._external_registry_resolver(session.context.workspace)
                 ),
             )
-            for output_ref in output_refs:
-                reconciler.validate_dependency_ref(output_ref)
+            def validate_outputs() -> bool:
+                for output_ref in output_refs:
+                    reconciler.validate_dependency_ref(output_ref)
+                return True
+
+            # Share one operation snapshot and the existing final source/record fences.
+            if reconciler._run_completion_query(stage_name, validate_outputs) is not True:
+                diagnostics = "; ".join(reconciler.last_completion_diagnostics)
+                raise ReconcileValidationError(
+                    f"stage outputs are not valid for {stage_name}: {diagnostics}"
+                )
         record = TerminalStageRecordV1.create(
             job_id=session.context.workspace.job_id,
             attempt_id=attempt_id,
@@ -782,6 +868,45 @@ class AgentRuntimeRunner:
             raise
         except Exception as exc:
             raise RuntimeRunnerError(f"built-in stage executor failed for {stage}: {exc}") from exc
+
+    @staticmethod
+    def _restore_analyze_host_summaries(
+        session: AgentRuntimeSession,
+        result: StageResult,
+        *,
+        external_registry_resolver: Callable[[str], ArtifactRegistry | None] | None = None,
+    ) -> None:
+        """Restore the canonical output of a reconciled Analyze stage.
+
+        Request summary sources are inputs to Stage 1. Re-reading them beside
+        its materialized output would duplicate papers with different reuse
+        provenance, even when their source facts are identical.
+        """
+        from runtime.orchestrator import InternalStageExecutorRegistry
+
+        outputs = [item for item in result.artifacts if item.artifact_type == "summary_file"]
+        if not result.success or result.stage_name != "analyze" or len(outputs) != 1:
+            raise RuntimeRunnerError("recovered Analyze requires one canonical summary output")
+        output = outputs[0]
+        registry = session.context.registry
+        record = registry.get(output.artifact_id)
+        if (
+            record is None
+            or record.status != "ready"
+            or record.job_id != session.context.workspace.job_id
+            or record.artifact_type != output.artifact_type
+            or record.artifact_version != output.artifact_version
+            or Path(record.path).resolve() != Path(output.path).resolve()
+        ):
+            raise RuntimeRunnerError("recovered Analyze summary has no matching Registry authority")
+        registry.verify_ready_artifact_closure(
+            record, external_registry_resolver=external_registry_resolver,
+        )
+        summaries = InternalStageExecutorRegistry._summary_payloads_from_file(record.path)
+        if not summaries:
+            raise RuntimeRunnerError("recovered Analyze summary output is empty")
+        session.stage_host.summaries = summaries
+        session.stage_host.summary_file = record.path
 
     @staticmethod
     def _publish_optional_current_artifact_set(session: AgentRuntimeSession) -> None:
@@ -986,14 +1111,295 @@ class AgentRuntimeRunner:
             prepared_promotion_record=promotion_record,
         )
 
+    @staticmethod
+    def _recover_promoted_repair_validation(
+        session: AgentRuntimeSession,
+        *,
+        external_registry_resolver: Callable[[str], ArtifactRegistry | None] | None = None,
+    ) -> StageResult | None:
+        """Rehydrate an approved repair's completed validation without a new call."""
+
+        from validation.run_result import (
+            ValidationExecutionStatus,
+            ValidationRunDisposition,
+            ValidationRunResultV1,
+        )
+
+        registry = session.context.registry
+        current_set = registry.resolve_current_artifact_set()
+        if current_set is None:
+            return None
+        if external_registry_resolver is None:
+            external_registry_resolver = AgentRuntimeRunner._external_registry_resolver(
+                session.context.workspace,
+            )
+        # A validation run may have committed a new set over a promoted
+        # repair just before the process crashed. Traverse immutable parent
+        # sets so that recovery still recognizes the repaired lineage.
+        lineage = current_set
+        repaired_lineage = False
+        seen_set_ids: set[str] = set()
+        for _depth in range(32):
+            if lineage.set_id in seen_set_ids:
+                raise RuntimeRunnerError("current artifact set lineage is cyclic")
+            seen_set_ids.add(lineage.set_id)
+            if lineage.promotion_transaction_id.startswith("repair-promotion:"):
+                repaired_lineage = True
+                break
+            if not lineage.promotion_transaction_id.startswith("runtime-validation:"):
+                break
+            if not lineage.previous_set_id:
+                break
+            parent_record = registry.get(lineage.previous_set_id)
+            if parent_record is None or parent_record.status != "ready":
+                raise RuntimeRunnerError("repaired validation parent set is missing")
+            registry.verify_ready_artifact_closure(
+                parent_record, external_registry_resolver=external_registry_resolver,
+            )
+            parent = CurrentArtifactSetV1.from_dict(
+                json.loads(Path(parent_record.path).read_text(encoding="utf-8"))
+            )
+            if (
+                parent.job_id != current_set.job_id
+                or parent.set_id != lineage.previous_set_id
+                or parent.content_addressed_id() != parent.set_id
+                or any(
+                    getattr(parent, name) != getattr(current_set, name)
+                    for name in (
+                        "review_draft_artifact_id",
+                        "review_draft_artifact_hash",
+                        "citation_manifest_artifact_id",
+                        "citation_manifest_artifact_hash",
+                        "review_docx_artifact_id",
+                        "review_docx_artifact_hash",
+                    )
+                )
+            ):
+                raise RuntimeRunnerError(
+                    "runtime validation changed the repaired current input lineage"
+                )
+            lineage = parent
+        else:
+            raise RuntimeRunnerError(
+                "repaired current artifact set lineage exceeds the recovery bound"
+            )
+        if not repaired_lineage:
+            return None
+        if current_set.validation_status != "clean":
+            raise RuntimeRunnerError(
+                "promoted repair has no clean current validation result"
+            )
+        required = {
+            "review_draft": (
+                current_set.review_draft_artifact_id,
+                current_set.review_draft_artifact_hash,
+            ),
+            "citation_manifest": (
+                current_set.citation_manifest_artifact_id,
+                current_set.citation_manifest_artifact_hash,
+            ),
+            "review_docx": (
+                current_set.review_docx_artifact_id,
+                current_set.review_docx_artifact_hash,
+            ),
+            "validation": (
+                current_set.validation_run_result_artifact_id,
+                current_set.validation_run_result_artifact_hash,
+            ),
+            "receipt_closure": (
+                current_set.validation_receipt_closure_artifact_id,
+                current_set.validation_receipt_closure_artifact_hash,
+            ),
+            "current_set": (current_set.set_id, ""),
+            "promotion": (current_set.promotion_transaction_id, ""),
+        }
+        records: dict[str, ArtifactRecord] = {}
+        for role, (artifact_id, expected_hash) in required.items():
+            record = registry.get(artifact_id)
+            if (
+                record is None
+                or record.status != "ready"
+                or (expected_hash and record.content_hash != expected_hash)
+            ):
+                raise RuntimeRunnerError(
+                    f"promoted repair {role} is missing or changed"
+                )
+            registry.verify_ready_artifact_closure(
+                record, external_registry_resolver=external_registry_resolver,
+            )
+            records[role] = record
+        closure_record = records["receipt_closure"]
+        if closure_record.metadata.get("complete") is not True:
+            raise RuntimeRunnerError(
+                "promoted repair validation receipt closure is incomplete"
+            )
+        validation = ValidationRunResultV1.from_dict(
+            json.loads(Path(records["validation"].path).read_text(encoding="utf-8"))
+        )
+        if (
+            validation.job_id != session.context.workspace.job_id
+            or validation.execution_status is not ValidationExecutionStatus.SUCCEEDED
+            or validation.validation_disposition is not ValidationRunDisposition.CLEAN
+            or not validation.contract_satisfied
+            or validation.input_artifacts.review_draft_id
+            != records["review_draft"].artifact_id
+            or validation.input_artifacts.review_draft_hash
+            != records["review_draft"].content_hash
+            or validation.input_artifacts.citation_manifest_id
+            != records["citation_manifest"].artifact_id
+            or validation.input_artifacts.citation_manifest_hash
+            != records["citation_manifest"].content_hash
+        ):
+            raise RuntimeRunnerError(
+                "promoted repair validation is not bound to the current draft and manifest"
+            )
+        closure_payload = json.loads(
+            Path(closure_record.path).read_text(encoding="utf-8")
+        )
+        receipt_counts = closure_payload.get("payload")
+        if not isinstance(receipt_counts, Mapping) or receipt_counts.get("complete") is not True:
+            raise RuntimeRunnerError(
+                "promoted repair receipt closure payload is incomplete"
+            )
+        record_id = "stage-terminal-repair-" + hash_json(
+            {
+                "current_set_id": current_set.set_id,
+                "validation_hash": records["validation"].content_hash,
+            }
+        )[:24]
+        terminal_store = StageTerminalStore(
+            session.context.workspace,
+            registry,
+            publication_context=session.context.publication_context,
+        )
+        observed = {
+            str(item) for item in receipt_counts.get("observed_call_ids") or ()
+            if str(item)
+        }
+        reused = {
+            str(item) for item in receipt_counts.get("verified_reuse_call_ids") or ()
+            if str(item)
+        }
+        model_call_count = len(observed - reused)
+        input_refs = tuple(
+            ArtifactDependencyRefV2.from_record(records[role])
+            for role in ("review_draft", "citation_manifest", "review_docx")
+        )
+        output_refs = tuple(
+            ArtifactDependencyRefV2.from_record(records[role])
+            for role in ("validation", "receipt_closure", "current_set")
+        )
+        recovery_producer = "runtime.runner.AgentRuntimeRunner.recover_promoted_repair"
+        existing = registry.get(record_id)
+        if existing is None:
+            terminal = TerminalStageRecordV1.create(
+                job_id=session.context.workspace.job_id,
+                attempt_id=validation.attempt_id,
+                stage_name="validate",
+                status="succeeded",
+                producer=recovery_producer,
+                input_artifact_refs=input_refs,
+                output_artifact_refs=output_refs,
+                model_call_count=model_call_count,
+                terminal_reason="verified promoted repair revalidation reused without provider call",
+                reconstructed_by_reconcile=True,
+                record_id=record_id,
+            )
+            terminal_store.persist(terminal)
+        else:
+            registry.verify_ready_artifact_closure(
+                existing, external_registry_resolver=external_registry_resolver,
+            )
+            terminal = TerminalStageRecordV1.from_dict(
+                json.loads(Path(existing.path).read_text(encoding="utf-8"))
+            )
+            if (
+                existing.artifact_id != record_id
+                or existing.artifact_type != "runtime_stage_terminal"
+                or existing.artifact_version != "v1"
+                or existing.artifact_role != "runtime_stage_terminal"
+                or existing.job_id != session.context.workspace.job_id
+                or existing.status != "ready"
+                or tuple(existing.depends_on) != output_refs
+                or Path(existing.path).resolve().parent
+                != terminal_store.path_for(terminal).resolve().parent
+                or not Path(existing.path).name.startswith(
+                    terminal_store.path_for(terminal).stem + "__"
+                )
+                or terminal.record_id != record_id
+                or terminal.job_id != session.context.workspace.job_id
+                or terminal.attempt_id != validation.attempt_id
+                or terminal.stage_name != "validate"
+                or terminal.status != "succeeded"
+                or terminal.producer != recovery_producer
+                or tuple(terminal.input_artifact_refs) != input_refs
+                or tuple(terminal.output_artifact_refs) != output_refs
+                or terminal.model_call_count != model_call_count
+                or not terminal.reconstructed_by_reconcile
+                or existing.metadata.get("stage_name") != "validate"
+                or existing.metadata.get("stage_status") != "succeeded"
+                or existing.metadata.get("attempt_id") != validation.attempt_id
+                or existing.metadata.get("model_call_count") != model_call_count
+                or existing.metadata.get("reconstructed_by_reconcile") is not True
+            ):
+                raise RuntimeRunnerError(
+                    "promoted repair recovery terminal has conflicting identity"
+                )
+        return StageResult(
+            stage_name="validate",
+            success=True,
+            artifacts=[
+                StageArtifactRef(
+                    artifact_role=record.artifact_role,
+                    artifact_type=record.artifact_type,
+                    artifact_version=record.artifact_version,
+                    path=record.path,
+                    artifact_id=record.artifact_id,
+                )
+                for role in ("validation", "receipt_closure", "current_set")
+                for record in (records[role],)
+            ],
+            metadata={
+                "validation_disposition": "clean",
+                "validation_run_id": validation.validation_run_id,
+                "execution_status": "succeeded",
+                "recovered_from_terminal": record_id,
+                "model_call_count_this_attempt": 0,
+            },
+        )
+
     def run(self) -> RuntimeExecutionResult:
-        return self._execute(resume=False)
+        if self.queue_resume_intent is not None:
+            raise RuntimeRunnerError("queue resume intent cannot authorize a new run")
+        from runtime.provider_runtime import current_runtime_control_context, runtime_control_lifecycle
+
+        if current_runtime_control_context() is not None:
+            return self._execute(resume=False)
+        with runtime_control_lifecycle():
+            return self._execute(resume=False)
 
     def resume(self) -> RuntimeExecutionResult:
-        return self._execute(resume=True)
+        from runtime.provider_runtime import current_runtime_control_context, runtime_control_lifecycle
+
+        if current_runtime_control_context() is not None:
+            return self._execute(resume=True)
+        with runtime_control_lifecycle():
+            return self._execute(resume=True)
 
     def _execute(self, *, resume: bool) -> RuntimeExecutionResult:
+        config_source_id = str(Path(self.job_spec.config).expanduser().resolve())
+        try:
+            config_source_sha256 = file_sha256(config_source_id)
+        except OSError as exc:
+            raise RuntimeRunnerError("configuration source cannot be read") from exc
         spec = self._normalized_spec(resume=resume)
+        if file_sha256(config_source_id) != config_source_sha256:
+            raise RuntimeRunnerError("configuration source changed during runtime normalization")
+        verified_source_revision_plan = None
+        if "source_revision_plan" in spec.metadata:
+            from runtime.source_revision_admission import verify_source_revision_plan_v1
+
+            verified_source_revision_plan = verify_source_revision_plan_v1(spec)
         batch_spec = self._review_batch_spec(spec)
         if spec.action == "derive_review_batch" and batch_spec is None:
             raise RuntimeRunnerError("derive_review_batch action requires a review batch spec")
@@ -1026,7 +1432,10 @@ class AgentRuntimeRunner:
                 batch_spec.parent_selection()
             )
             validated_batch_parent_registry_path = validated_parent_registry.registry_path
-        bridge = AgentRuntimeBridge(spec, publication_context=self.publication_context)
+        bridge = AgentRuntimeBridge(
+            spec, publication_context=self.publication_context,
+            verified_source_revision_plan=verified_source_revision_plan,
+        )
         normalized_spec_payload = spec.to_dict()
         resume_preflight = None
         workspace_preflight = None
@@ -1064,6 +1473,8 @@ class AgentRuntimeRunner:
                 workspace_preflight=workspace_preflight,
                 publish_running_state=False,
             )
+            if file_sha256(config_source_id) != config_source_sha256:
+                raise RuntimeRunnerError("configuration source changed during runtime bootstrap")
         except BaseException as exc:
             if execution_lease is not None:
                 execution_lease.release()
@@ -1079,27 +1490,507 @@ class AgentRuntimeRunner:
             except AttemptAlreadyRunningError as exc:
                 raise RuntimeRunnerError(f"run rejected: {exc}") from exc
         try:
-            from runtime.provider_runtime import provider_budget_controller_from_environment
+            from runtime.provider_runtime import (
+                RuntimeControlIdentityV1,
+                bind_runtime_control_context,
+                bind_provider_run_budget,
+                ProviderBudgetController,
+                ProviderAggregateBudgetV2,
+                current_acceptance_execution_context,
+                provider_run_budget_controller_from_environment,
+                ProviderRuntimeContractError,
+                validate_started_acceptance_execution_context,
+            )
 
-            acceptance_budget = provider_budget_controller_from_environment()
-            if acceptance_budget is not None:
+            acceptance_context = current_acceptance_execution_context()
+            from runtime.downstream_continuation import (
+                bind_current_continuation,
+                controller_for_continuation,
+                load_current_continuation,
+            )
+
+            continuation = load_current_continuation(
+                session.context.workspace, session.context.registry, spec.to_dict(),
+            ) if resume else None
+            if continuation is not None and acceptance_context is not None:
+                raise RuntimeRunnerError("downstream continuation cannot replace accepted-run authority")
+            try:
+                acceptance_budget = controller_for_continuation(continuation) if continuation else provider_run_budget_controller_from_environment(
+                    runtime_spec_budget=spec.metadata.get("provider_budget"),
+                )
+            except ProviderRuntimeContractError as exc:
+                raise RuntimeRunnerError(f"provider run authority rejected: {exc}") from exc
+            ordinary_run_budget = acceptance_context is None
+            if acceptance_budget is None:
+                from runtime.run_budget_binding import resolve_run_provider_budget
+
+                budget, _authority = resolve_run_provider_budget(spec.metadata, session.stage_host.config)
+                acceptance_budget = ProviderBudgetController(budget)
+            if acceptance_context is not None:
+                from runtime.checkout_identity import read_checkout_sha
+
+                current_executable_sha = read_checkout_sha(
+                    Path(__file__).resolve().parents[1],
+                    require_clean=True,
+                )
+                validate_started_acceptance_execution_context(
+                    acceptance_context,
+                    acceptance_budget,
+                    current_executable_sha=current_executable_sha,
+                )
+            if acceptance_budget is not None and continuation is None:
                 acceptance_state_path = _acceptance_budget_state_path(
                     session.context.workspace
                 )
                 acceptance_budget.bind_state_path(
-                    acceptance_state_path
+                    acceptance_state_path,
+                    acceptance_run_id=(
+                        acceptance_context.acceptance_run_id if acceptance_context
+                        else f"run:{session.context.workspace.job_id}" if ordinary_run_budget else ""
+                    ),
+                    state_started=(resume if ordinary_run_budget else bool(
+                        acceptance_context
+                        and acceptance_context.provider_budget_state_started
+                    )),
                 )
-            return self._execute_with_lease(
-                session=session,
-                spec=spec,
-                bridge=bridge,
-                batch_spec=batch_spec,
-                validated_batch_parent_registry_path=validated_batch_parent_registry_path,
-                resume=resume,
-                normalized_spec_payload=normalized_spec_payload,
+            if self.queue_resume_intent is not None:
+                if not resume:
+                    raise RuntimeRunnerError("queue resume intent cannot authorize a new run")
+                # Spec/fingerprint, continuation and the original budget have
+                # all been validated. Clear only the captured prior marker;
+                # its Registry keeps the current queue publication fence.
+                self._apply_queue_resume_intent(session)
+            control_identity = RuntimeControlIdentityV1(
+                job_id=session.context.workspace.job_id,
+                workspace_path=str(session.context.workspace.root_dir),
+                acceptance_run_id=(
+                    continuation.run_id if continuation is not None
+                    else acceptance_context.acceptance_run_id if acceptance_context
+                    else f"run:{session.context.workspace.job_id}" if ordinary_run_budget else ""
+                ),
+                provider_budget_started=ordinary_run_budget or bool(
+                    acceptance_context
+                    and acceptance_context.provider_budget_state_started
+                ),
             )
+            from contextlib import nullcontext
+
+            budget_binding = (bind_provider_run_budget(acceptance_budget)
+                              if ordinary_run_budget and isinstance(acceptance_budget.budget, ProviderAggregateBudgetV2)
+                              else nullcontext())
+            continuation_binding = bind_current_continuation(continuation) if continuation else nullcontext()
+            with continuation_binding, budget_binding, bind_runtime_control_context(
+                control_identity,
+                workspace=session.context.workspace,
+                registry=session.context.registry,
+            ):
+                return self._execute_with_lease(
+                    session=session,
+                    spec=spec,
+                    bridge=bridge,
+                    batch_spec=batch_spec,
+                    validated_batch_parent_registry_path=validated_batch_parent_registry_path,
+                    resume=resume,
+                    normalized_spec_payload=normalized_spec_payload,
+                    config_source_id=config_source_id,
+                    config_source_sha256=config_source_sha256,
+                )
         finally:
             execution_lease.release()
+
+    def _admit_run_provider_envelope(self, session: AgentRuntimeSession, spec: RuntimeJobSpec) -> None:
+        from runtime.provider_runtime import (
+            ProviderAggregateBudgetV2,
+            build_provider_run_scope_hashes_v1,
+            current_acceptance_execution_context,
+            provider_run_budget_controller_from_environment,
+            provider_run_scope_authorization_from_verified_artifact,
+            provider_run_scope_payload_from_plan_binding,
+            provider_run_scope_proof_from_verified_artifact,
+            provider_run_workspace_identity_sha256,
+            validate_provider_run_plan_binding,
+            validate_provider_run_scope_authority,
+            validate_provider_run_scope_authorization,
+            validate_started_acceptance_execution_context,
+        )
+        from runtime.provider_run_envelope import ProviderRunEnvelopeV1, build_provider_run_envelope_v1
+        from runtime.control_plane import ReviewControlPlane
+        from runtime.run_budget_binding import resolve_run_provider_budget
+        from runtime.provider_routes import build_reachable_provider_route_plan
+        from runtime.stage_planning import StagePlan
+        from runtime.checkout_identity import read_checkout_sha
+        from runtime.downstream_continuation import current_continuation, load_current_continuation
+
+        acceptance = current_acceptance_execution_context()
+        continuation = current_continuation()
+        controller = provider_run_budget_controller_from_environment(
+            runtime_spec_budget=spec.metadata.get("provider_budget"),
+        )
+        if controller is None:
+            raise RuntimeRunnerError("run has no durable finite provider budget")
+        if not isinstance(controller.budget, ProviderAggregateBudgetV2):
+            raise RuntimeRunnerError(
+                "new runtime runs require a strict finite V2 provider budget"
+            )
+        stage_policy = dict(session.context.readiness_policy_snapshot["stage_plan"])
+        stage_plan = StagePlan(
+            **{
+                **stage_policy,
+                "requested_stages": tuple(stage_policy["requested_stages"]),
+                "required_stages": tuple(stage_policy["required_stages"]),
+            }
+        )
+        route_plan = build_reachable_provider_route_plan(
+            session.stage_host.config,
+            action=spec.action,
+            requested_stages=stage_plan.requested_stages,
+            free_mode_enabled=bool(
+                spec.free_mode_profile or spec.free_mode_idea or spec.metadata.get("free_mode_input")
+            ),
+            stage_plan=stage_plan,
+        )
+        if spec.metadata.get("stage1_summary_input_mode") == "explicit_typed_import":
+            from runtime.explicit_stage1_scope import resolve_explicit_stage1_scope
+
+            route_plan = resolve_explicit_stage1_scope(
+                spec, session.stage_host.config, stage_plan,
+                external_registry_resolver=self._external_registry_resolver(session.context.workspace),
+            ).provider_route_plan
+        scope_hashes = build_provider_run_scope_hashes_v1(
+            normalized_runtime_spec=spec.to_dict(),
+            effective_config_sha256=str(session.context.fingerprint_bundle["config_hash"]),
+            source_snapshot_sha256=str(session.context.fingerprint_bundle["source_hash"]),
+            review_goal=spec.metadata.get("review_intent") or {},
+            route_plan=route_plan,
+            stage_work_contract=session.context.readiness_policy_snapshot.get("stage_plan") or {},
+        )
+        if continuation is not None:
+            verified = load_current_continuation(
+                session.context.workspace, session.context.registry, spec.to_dict(),
+                expected_scope_hashes=scope_hashes,
+            )
+            if verified is None or verified.artifact_record.content_hash != continuation.artifact_record.content_hash:
+                raise RuntimeRunnerError("downstream continuation authority changed during admission")
+        workspace_identity_sha256 = provider_run_workspace_identity_sha256(
+            session.context.workspace.root_dir,
+            job_id=session.context.workspace.job_id,
+        )
+
+        accepted_scope_record = None
+        accepted_scope_authorization = None
+        current_executable_sha = ""
+        if acceptance is not None:
+            try:
+                current_executable_sha = read_checkout_sha(
+                    Path(__file__).resolve().parents[1],
+                    require_clean=True,
+                )
+                validate_started_acceptance_execution_context(
+                    acceptance,
+                    controller,
+                    current_executable_sha=current_executable_sha,
+                )
+                binding = validate_provider_run_plan_binding(
+                    controller,
+                    job_id=session.context.workspace.job_id,
+                    runtime_spec_sha256=scope_hashes["runtime_spec_sha256"],
+                    scope_hashes=scope_hashes,
+                    workspace_identity_sha256=workspace_identity_sha256,
+                    current_executable_sha=current_executable_sha,
+                )
+            except Exception as exc:
+                raise RuntimeRunnerError(
+                    f"accepted provider run scope binding rejected: {exc}"
+                ) from exc
+
+            runtime_spec_record = session.context.registry.get("runtime_job_spec")
+            source_inventory_record = session.context.registry.get("source_inventory")
+            if (
+                runtime_spec_record is None
+                or runtime_spec_record.status != "ready"
+                or source_inventory_record is None
+                or source_inventory_record.status != "ready"
+            ):
+                raise RuntimeRunnerError(
+                    "accepted runtime scope requires ready RuntimeJobSpec and canonical source inventory artifacts"
+                )
+            try:
+                session.context.registry.verify_ready_artifact_closure(runtime_spec_record)
+                session.context.registry.verify_ready_artifact_closure(source_inventory_record)
+            except Exception as exc:
+                raise RuntimeRunnerError(
+                    "accepted runtime scope source/spec closure is invalid"
+                ) from exc
+            config_binding = (
+                runtime_spec_record.metadata.get("config_snapshot_binding")
+                if isinstance(runtime_spec_record.metadata, Mapping)
+                else None
+            )
+            if (
+                not isinstance(config_binding, Mapping)
+                or config_binding.get("effective_config_sha256")
+                != scope_hashes["effective_config_sha256"]
+                or config_binding.get("normalized_spec_payload_sha256")
+                != hash_json(spec.to_dict())
+            ):
+                raise RuntimeRunnerError(
+                    "accepted runtime scope config/spec binding differs from the active run"
+                )
+
+            accepted_scope_payload = provider_run_scope_payload_from_plan_binding(
+                controller,
+                job_id=session.context.workspace.job_id,
+                scope_hashes=scope_hashes,
+                workspace_identity_sha256=workspace_identity_sha256,
+                current_executable_sha=current_executable_sha,
+            )
+            accepted_scope_payload.update(
+                {
+                    "runtime_spec_artifact_id": runtime_spec_record.artifact_id,
+                    "runtime_spec_artifact_sha256": runtime_spec_record.content_hash,
+                    "source_inventory_artifact_id": source_inventory_record.artifact_id,
+                    "source_inventory_artifact_sha256": source_inventory_record.content_hash,
+                }
+            )
+            accepted_scope_record = session.context.registry.get(
+                "accepted_runtime_run_scope"
+            )
+            if accepted_scope_record is None:
+                accepted_scope_record = publish_json_artifact(
+                    session.context.publication_context,
+                    session.context.registry,
+                    session.context.workspace.artifact_path(
+                        "accepted_runtime_run_scope_v1.json"
+                    ),
+                    accepted_scope_payload,
+                    artifact_role="accepted_runtime_run_scope",
+                    artifact_type="accepted_runtime_run_scope",
+                    artifact_version="v1",
+                    producer="runtime.runner.AgentRuntimeRunner",
+                    artifact_id="accepted_runtime_run_scope",
+                    depends_on=[
+                        ArtifactDependencyRefV2.from_record(runtime_spec_record),
+                        ArtifactDependencyRefV2.from_record(source_inventory_record),
+                    ],
+                    metadata={
+                        "job_id": session.context.workspace.job_id,
+                        "acceptance_run_id": acceptance.acceptance_run_id,
+                        "acceptance_plan_sha256": binding.acceptance_plan_sha256,
+                    },
+                )
+            try:
+                accepted_scope_record = session.context.registry.verify_ready_artifact_closure(
+                    accepted_scope_record
+                )
+                accepted_scope_payload = json.loads(
+                    Path(accepted_scope_record.path).read_text(encoding="utf-8")
+                )
+                accepted_scope_authorization = provider_run_scope_authorization_from_verified_artifact(
+                    accepted_scope_payload,
+                    artifact_id=accepted_scope_record.artifact_id,
+                    artifact_type=accepted_scope_record.artifact_type,
+                    artifact_version=accepted_scope_record.artifact_version,
+                    artifact_role=accepted_scope_record.artifact_role,
+                    artifact_status=accepted_scope_record.status,
+                    artifact_sha256=accepted_scope_record.content_hash,
+                )
+            except Exception as exc:
+                raise RuntimeRunnerError(
+                    f"accepted runtime scope Registry artifact is invalid: {exc}"
+                ) from exc
+            if accepted_scope_payload != {
+                **provider_run_scope_payload_from_plan_binding(
+                    controller,
+                    job_id=session.context.workspace.job_id,
+                    scope_hashes=scope_hashes,
+                    workspace_identity_sha256=workspace_identity_sha256,
+                    current_executable_sha=current_executable_sha,
+                ),
+                "runtime_spec_artifact_id": runtime_spec_record.artifact_id,
+                "runtime_spec_artifact_sha256": runtime_spec_record.content_hash,
+                "source_inventory_artifact_id": source_inventory_record.artifact_id,
+                "source_inventory_artifact_sha256": source_inventory_record.content_hash,
+            }:
+                raise RuntimeRunnerError(
+                    "accepted runtime scope artifact differs from the current source, goal, route, spec, or plan"
+                )
+
+        if acceptance is None and session.context.registry.get(
+            "accepted_runtime_run_scope"
+        ) is not None:
+            raise RuntimeRunnerError(
+                "accepted runtime scope artifact cannot be reused without its ControlPlane entry"
+            )
+        if acceptance is not None:
+            try:
+                validate_provider_run_scope_authorization(
+                    controller,
+                    job_id=session.context.workspace.job_id,
+                    scope_hashes=scope_hashes,
+                    workspace_identity_sha256=workspace_identity_sha256,
+                    current_executable_sha=current_executable_sha,
+                    authorization=accepted_scope_authorization,
+                )
+            except Exception as exc:
+                raise RuntimeRunnerError(
+                    f"accepted runtime source/goal/route scope is not authorized: {exc}"
+                ) from exc
+        envelope_id = (
+            "provider_run_envelope:" + hash_json(continuation.run_id)
+            if continuation is not None else "provider_run_envelope"
+        )
+        existing = session.context.registry.get(envelope_id)
+        if existing is not None:
+            session.context.registry.verify_ready_artifact_closure(existing)
+            try:
+                saved_payload = json.loads(Path(existing.path).read_text(encoding="utf-8"))
+                for _ in range(3):
+                    if not isinstance(saved_payload, Mapping) or not isinstance(
+                        saved_payload.get("payload"), Mapping
+                    ):
+                        break
+                    saved_payload = saved_payload["payload"]
+                saved = ProviderRunEnvelopeV1.from_dict(saved_payload)
+            except Exception as exc:
+                raise RuntimeRunnerError(
+                    "persisted provider run envelope is invalid"
+                ) from exc
+            expected_run_id = (
+                continuation.run_id if continuation is not None
+                else acceptance.acceptance_run_id
+                if acceptance is not None
+                else f"run:{session.context.workspace.job_id}"
+            )
+            if (
+                saved.job_id != session.context.workspace.job_id
+                or saved.run_id != expected_run_id
+                or saved.scope_hashes != scope_hashes
+                or saved.provider_budget != controller.budget
+            ):
+                raise RuntimeRunnerError(
+                    "run envelope source, goal, route, configuration or budget changed; approval/reconciliation required"
+                )
+            if continuation is not None and (
+                saved.budget_authority != "downstream_continuation"
+                or ArtifactDependencyRefV2.from_record(continuation.artifact_record) not in existing.depends_on
+            ):
+                raise RuntimeRunnerError("downstream envelope lost its exact grant dependency")
+            if saved.admission_status == "blocked_budget":
+                raise RuntimeRunnerError(
+                    "run-start provider budget is insufficient; approve a finite run scope before POST"
+                )
+            if acceptance is not None:
+                try:
+                    proof = provider_run_scope_proof_from_verified_artifact(
+                        saved.to_dict(),
+                        artifact_id=existing.artifact_id,
+                        artifact_role=existing.artifact_role,
+                        artifact_status=existing.status,
+                        artifact_sha256=existing.content_hash,
+                    )
+                    validate_provider_run_scope_authority(
+                        controller,
+                        job_id=session.context.workspace.job_id,
+                        scope_hashes=scope_hashes,
+                        workspace_identity_sha256=workspace_identity_sha256,
+                        current_executable_sha=current_executable_sha,
+                        authorization=accepted_scope_authorization,
+                        proof=proof,
+                    )
+                except Exception as exc:
+                    raise RuntimeRunnerError(
+                        f"accepted continuation run-scope proof is invalid: {exc}"
+                    ) from exc
+            from runtime.arbitration_work_policy import publish_arbitration_surface
+
+            session.stage_host.arbitration_work_policy_record = publish_arbitration_surface(
+                registry=session.context.registry, workspace=session.context.workspace,
+                publication_context=session.context.publication_context,
+                envelope_record=existing, route_plan=route_plan.to_dict(),
+                candidate_count=session.context.settings.outline_candidate_count(),
+                stage1_work_item_basis=session.context.stage1_work_item_basis,
+                existing_run_envelope=True,
+            )
+            return
+        _budget, authority = resolve_run_provider_budget(spec.metadata, session.stage_host.config)
+        if acceptance is not None:
+            authority = "bound_acceptance_context"
+        elif continuation is not None:
+            authority = "downstream_continuation"
+        control = ReviewControlPlane(repo_root=Path(__file__).resolve().parents[1])
+        # Project only the newly authorized work; execution still uses the
+        # original immutable spec and verifies all completed upstream stages.
+        planning_spec = replace(spec, metadata={
+            **spec.metadata, "requested_stages": ["review", "validate"],
+        }) if continuation is not None else spec
+        projection = control._full_stage_request_plan_for_spec(
+            planning_spec,
+            aggregate_budget_override=controller.budget,
+            stage1_work_item_basis=session.context.stage1_work_item_basis,
+            derive_stage1_work_item_basis=False,
+        )
+        envelope = build_provider_run_envelope_v1(
+            job_id=session.context.workspace.job_id,
+            run_id=continuation.run_id if continuation is not None else acceptance.acceptance_run_id if acceptance is not None else f"run:{session.context.workspace.job_id}",
+            budget_authority=authority, provider_budget=controller.budget,
+            scope_hashes=scope_hashes, full_stage_request_plan=projection,
+        )
+        envelope_dependencies = [
+            ArtifactDependencyRefV2.from_record(source)
+            for name in ("runtime_job_spec", "source_inventory")
+            if (source := session.context.registry.get(name)) is not None
+        ]
+        if accepted_scope_record is not None:
+            envelope_dependencies.append(
+                ArtifactDependencyRefV2.from_record(accepted_scope_record)
+            )
+        if continuation is not None:
+            envelope_dependencies.append(ArtifactDependencyRefV2.from_record(continuation.artifact_record))
+        record = publish_json_artifact(
+            session.context.publication_context, session.context.registry,
+            session.context.workspace.artifact_path(
+                "downstream_continuations/" + hash_json(continuation.run_id) + "/provider_run_envelope_v1.json"
+                if continuation is not None else "provider_run_envelope_v1.json"
+            ), envelope.to_dict(),
+            artifact_role="provider_run_envelope", artifact_type="provider_run_envelope", artifact_version="v1",
+            producer="runtime.runner.AgentRuntimeRunner", artifact_id=envelope_id,
+            depends_on=envelope_dependencies,
+            metadata={"job_id": session.context.workspace.job_id, "envelope_sha256": envelope.to_dict()["envelope_sha256"]},
+        )
+        record = session.context.registry.verify_ready_artifact_closure(record)
+        if envelope.admission_status == "blocked_budget":
+            raise RuntimeRunnerError("run-start provider budget is insufficient; approve a finite run scope before POST")
+        if acceptance is not None:
+            try:
+                proof = provider_run_scope_proof_from_verified_artifact(
+                    envelope.to_dict(),
+                    artifact_id=record.artifact_id,
+                    artifact_role=record.artifact_role,
+                    artifact_status=record.status,
+                    artifact_sha256=record.content_hash,
+                )
+                validate_provider_run_scope_authority(
+                    controller,
+                    job_id=session.context.workspace.job_id,
+                    scope_hashes=scope_hashes,
+                    workspace_identity_sha256=workspace_identity_sha256,
+                    current_executable_sha=current_executable_sha,
+                    authorization=accepted_scope_authorization,
+                    proof=proof,
+                )
+            except Exception as exc:
+                raise RuntimeRunnerError(
+                    f"fresh accepted run-scope envelope proof is invalid: {exc}"
+                ) from exc
+        from runtime.arbitration_work_policy import publish_arbitration_surface
+
+        session.stage_host.arbitration_work_policy_record = publish_arbitration_surface(
+            registry=session.context.registry, workspace=session.context.workspace,
+            publication_context=session.context.publication_context,
+            envelope_record=record, route_plan=route_plan.to_dict(),
+            candidate_count=session.context.settings.outline_candidate_count(),
+            stage1_work_item_basis=session.context.stage1_work_item_basis,
+        )
 
     def _execute_with_lease(
         self,
@@ -1111,7 +2002,11 @@ class AgentRuntimeRunner:
         validated_batch_parent_registry_path: str | None,
         resume: bool,
         normalized_spec_payload: Mapping[str, Any],
+        config_source_id: str,
+        config_source_sha256: str,
     ) -> RuntimeExecutionResult:
+        if file_sha256(config_source_id) != config_source_sha256:
+            raise RuntimeRunnerError("configuration source changed before runtime publication")
         normalized_spec_path = session.context.workspace.artifact_path("runtime_job_spec_v1.json")
         attempt_store = AttemptStore(session.context.workspace, session.context.registry)
         started = attempt_store.start(
@@ -1136,6 +2031,9 @@ class AgentRuntimeRunner:
             if validated_batch_parent_registry_path is not None
             else ()
         )
+        if bridge.source_revision_plan is not None:
+            external_registry_paths = (*external_registry_paths,
+                                       str(bridge.source_revision_plan["parent"]["registry_path"]))
         external_registry_resolver = self._external_registry_resolver(
             session.context.workspace,
             registry_paths=external_registry_paths,
@@ -1161,12 +2059,31 @@ class AgentRuntimeRunner:
                     "stage_plan_hash": str(
                         (normalized_spec_payload.get("metadata") or {}).get("stage_plan_hash") or ""
                     ),
+                    "config_snapshot_binding": {
+                        "schema_version": "runtime-config-source/v1",
+                        "config_source_id": config_source_id,
+                        "config_source_sha256": config_source_sha256,
+                        "effective_config_sha256": str(session.context.fingerprint_bundle["config_hash"]),
+                        "normalized_spec_payload_sha256": hash_json(normalized_spec_payload),
+                    },
                 },
             )
         self._fault("after_artifact_write_before_registry", artifact_type="runtime_job_spec")
 
         try:
+            active_stage = "run_admission"
+            self._admit_run_provider_envelope(session, spec)
+            bridge.bind_source_revision_replay(session, external_registry_resolver)
+            active_stage = "source_intake"
             bundle = bridge.build_source_bundle()
+            if (
+                session.context.stage1_work_item_basis is not None
+                and stage1_paper_work_item_basis(bundle)
+                != dict(session.context.stage1_work_item_basis)
+            ):
+                raise RuntimeRunnerError(
+                    "Stage 1 source work items changed after run admission"
+                )
             f1_binding = spec.metadata.get("f1_corpus_binding")
             if f1_binding is not None:
                 from runtime.source_intake import validate_f1_corpus_source_bundle
@@ -1227,16 +2144,10 @@ class AgentRuntimeRunner:
                     results[batch_stage] = recovered_batch
                     completed.append(batch_stage)
                     if batch_stage == "analyze":
-                        summary_artifact = next(
-                            (
-                                artifact
-                                for artifact in recovered_batch.artifacts
-                                if artifact.artifact_type == "summary_file"
-                            ),
-                            None,
+                        self._restore_analyze_host_summaries(
+                            session, recovered_batch,
+                            external_registry_resolver=external_registry_resolver,
                         )
-                        if summary_artifact is not None:
-                            session.stage_host.summary_file = summary_artifact.path
                 else:
                     derived = bridge.derive_review_batch(
                         session,
@@ -1280,31 +2191,155 @@ class AgentRuntimeRunner:
                 if stage in results:
                     continue
                 if resume:
+                    if stage == "validate":
+                        promoted_validation = self._recover_promoted_repair_validation(
+                            session, external_registry_resolver=external_registry_resolver,
+                        )
+                        if promoted_validation is not None:
+                            results[stage] = promoted_validation
+                            completed.append(stage)
+                            continue
                     recovered_result = reconciler.load_completed_stage_result(stage)
+                    if recovered_result is None and stage == "analyze":
+                        from runtime.stage1_publication_recovery import (
+                            Stage1PublicationRecoveryBlocked,
+                            prepare_partial_stage1_recovery,
+                            try_recover_registered_stage1_publication,
+                        )
+                        from runtime.provider_runtime import (
+                            provider_budget_controller_from_environment,
+                        )
+
+                        source_bundle_record = session.context.registry.get("source_bundle")
+                        runtime_spec_record = session.context.registry.get("runtime_job_spec")
+                        try:
+                            expected_source_bundle_hash = (
+                                source_bundle_record.content_hash
+                                if source_bundle_record is not None
+                                and source_bundle_record.status == "ready"
+                                else ""
+                            )
+                            expected_runtime_spec_hash = (
+                                runtime_spec_record.content_hash
+                                if runtime_spec_record is not None
+                                and runtime_spec_record.status == "ready"
+                                else ""
+                            )
+                            provider_budget_controller = provider_budget_controller_from_environment()
+                            partial_recovery = prepare_partial_stage1_recovery(
+                                session.context.workspace,
+                                session.context.registry,
+                                expected_source_bundle_hash=expected_source_bundle_hash,
+                                expected_runtime_spec_hash=expected_runtime_spec_hash,
+                                provider_budget_controller=provider_budget_controller,
+                                external_registry_resolver=external_registry_resolver,
+                            )
+                            if partial_recovery is not None:
+                                bridge.stage1_partial_recovery_context = partial_recovery
+                                recovery_proposal = None
+                            else:
+                                recovery_proposal = try_recover_registered_stage1_publication(
+                                    session.context.workspace,
+                                    session.context.registry,
+                                    expected_source_bundle_hash=(
+                                        expected_source_bundle_hash
+                                    ),
+                                    expected_runtime_spec_hash=(
+                                        expected_runtime_spec_hash
+                                    ),
+                                    provider_budget_controller=provider_budget_controller,
+                                    external_registry_resolver=external_registry_resolver,
+                                    schema_validators=self._schema_validators(),
+                                )
+                        except Stage1PublicationRecoveryBlocked as exc:
+                            raise RuntimeRunnerError(str(exc)) from exc
+                        if recovery_proposal is not None:
+                            recovery_result = reconciler.reconcile(
+                                stage_recoveries=(recovery_proposal,),
+                            )
+                            if stage not in recovery_result.completed_stages:
+                                raise RuntimeRunnerError(
+                                    "Stage 1 recovery did not register a completed Analyze terminal"
+                                )
+                            recovered_result = reconciler.load_completed_stage_result(stage)
+                            if recovered_result is None:
+                                raise RuntimeRunnerError(
+                                    "Stage 1 recovery terminal could not be rehydrated"
+                                )
                     if recovered_result is not None:
+                        if stage == "analyze":
+                            self._restore_analyze_host_summaries(
+                                session, recovered_result,
+                                external_registry_resolver=external_registry_resolver,
+                            )
                         results[stage] = recovered_result
                         completed.append(stage)
                         continue
                 started_at = utc_now_iso()
-                result, model_calls = self._execute_stage(
-                    stage,
-                    bridge=bridge,
-                    session=session,
-                    spec=spec,
-                    bundle=bundle,
-                    results=results,
-                    attempt_id=running_attempt.attempt_id,
-                    external_registry_resolver=external_registry_resolver,
-                )
+                try:
+                    result, model_calls = self._execute_stage(
+                        stage,
+                        bridge=bridge,
+                        session=session,
+                        spec=spec,
+                        bundle=bundle,
+                        results=results,
+                        attempt_id=running_attempt.attempt_id,
+                        external_registry_resolver=external_registry_resolver,
+                    )
+                finally:
+                    if stage == "analyze":
+                        bridge.stage1_partial_recovery_context = None
+                if stage == "analyze" and result.success:
+                    external_registry_resolver = self._external_registry_resolver(
+                        session.context.workspace, registry_paths=external_registry_paths,
+                    )
+                    reconciler.external_registry_resolver = external_registry_resolver
                 self._persist_terminal(
                     session,
                     attempt_id=running_attempt.attempt_id,
-                    stage_name=stage,
+                    stage_name=(
+                        "outline_topic_pilot"
+                        if stage == "outline" and result.metadata.get("pilot_checkpoint_complete")
+                        else stage
+                    ),
                     result=result,
                     started_at=started_at,
                     model_call_count=model_calls,
                     external_registry_resolver=external_registry_resolver,
                 )
+                if stage == "outline" and result.metadata.get("pilot_checkpoint_complete"):
+                    if (
+                        not isinstance(spec.metadata.get("outline_pilot"), Mapping)
+                        or not result.success
+                        or result.stage_name != "outline_topic_pilot"
+                        or result.metadata.get("outline_v3_status") != "topic_pilot_complete"
+                    ):
+                        raise RuntimeRunnerError("topic pilot stage result has an invalid terminal shape")
+                    checkpoint_id = str(result.metadata.get("pilot_checkpoint_artifact_id") or "")
+                    checkpoint = session.context.registry.get(checkpoint_id)
+                    if (
+                        checkpoint is None
+                        or checkpoint.status != "ready"
+                        or checkpoint.content_hash != result.metadata.get("pilot_checkpoint_hash")
+                        or checkpoint_id == "outline-v3:final_outline"
+                    ):
+                        raise RuntimeRunnerError("topic pilot checkpoint is not ready or has drifted")
+                    reason = (
+                        "selected topic pilot checkpoint complete; Outline remains incomplete "
+                        "and requires separate approval before continuation"
+                    )
+                    attempt_store.finish(running_attempt, "succeeded", reason=reason)
+                    return self._finalize_result(
+                        session,
+                        status="completed",
+                        disposition="needs_review",
+                        canonical_ready=False,
+                        completed=(*completed, "outline_topic_pilot"),
+                        failed_stage=None,
+                        requires_attention=True,
+                        message=reason,
+                    )
                 if not result.success:
                     validation_required = bool(
                         session.context.readiness_policy_snapshot.get("validation_required", False)
@@ -1384,7 +2419,7 @@ class AgentRuntimeRunner:
             except Exception as persistence_error:
                 raise exc from persistence_error
             raise
-        except (KeyboardInterrupt, JobCancelledError) as exc:
+        except (KeyboardInterrupt, JobCancelledError, ProviderCancellationRequested) as exc:
             try:
                 history = attempt_store.load_history()
             except Exception as inspection_error:
@@ -1466,7 +2501,12 @@ class AgentRuntimeRunner:
             raise RuntimeRunnerError(
                 f"canonical job outcome is invalid after finalization: {exc}"
             ) from exc
-        evaluation = _evaluate_runtime_completion(outcome, session.context.registry)
+        evaluation = _evaluate_runtime_completion(
+            outcome, session.context.registry,
+            external_registry_resolver=self._external_registry_resolver(
+                session.context.workspace, registry_paths=self._review_batch_registry_paths(session.context.registry),
+            ),
+        )
         stage1_projection = _stage1_status_projection(session.context.registry)
         return RuntimeExecutionResult(
             job_id=outcome.job_id,
@@ -1548,6 +2588,73 @@ class AgentRuntimeRunner:
                 )
         return tuple(dict.fromkeys(paths))
 
+    @staticmethod
+    def _verified_current_attempt_message(
+        workspace: JobWorkspace,
+        registry: ArtifactRegistry,
+        outcome: JobOutcomeV1,
+    ) -> str:
+        """Read a failure reason only from the verified current attempt head."""
+
+        if outcome.job_status != "failed":
+            return ""
+        try:
+            store = AttemptStore(workspace, registry)
+            history = store.load_history()
+            for sequence, snapshot in enumerate(history, start=1):
+                artifact_id = store._artifact_id(snapshot, sequence)
+                record = registry.get(artifact_id)
+                if (
+                    record is None
+                    or record.artifact_id != artifact_id
+                    or record.artifact_role != ATTEMPT_SNAPSHOT_ROLE
+                    or record.artifact_type != "job_attempt"
+                    or record.artifact_version != "v1"
+                    or record.job_id != outcome.job_id
+                    or record.status != "ready"
+                    or not isinstance(record.metadata, Mapping)
+                ):
+                    return ""
+                expected_metadata = {
+                    "attempt_id": snapshot.attempt_id,
+                    "attempt_number": snapshot.attempt_number,
+                    "attempt_status": snapshot.status,
+                    "snapshot_sequence": sequence,
+                }
+                if any(
+                    record.metadata.get(name) != value
+                    for name, value in expected_metadata.items()
+                ):
+                    return ""
+                expected_path = store._snapshot_path(sequence).resolve(strict=True)
+                if Path(record.path).expanduser().resolve(strict=True) != expected_path:
+                    return ""
+                ArtifactRegistry._verify_ready_artifact(record)
+                payload = json.loads(expected_path.read_text(encoding="utf-8"))
+                if (
+                    not isinstance(payload, Mapping)
+                    or type(payload.get("snapshot_sequence")) is not int
+                    or payload.get("snapshot_sequence") != sequence
+                    or payload != {**snapshot.to_dict(), "snapshot_sequence": sequence}
+                ):
+                    return ""
+        except (OSError, RuntimeError, TypeError, ValueError):
+            # Status remains available from the canonical JobOutcome, but an
+            # unverified or corrupt attempt chain cannot supply its message.
+            return ""
+
+        if not history:
+            return ""
+        current = history[-1]
+        if (
+            current.job_id != outcome.job_id
+            or current.attempt_number != outcome.attempt_number
+            or current.status != "failed"
+            or outcome.job_status != "failed"
+        ):
+            return ""
+        return current.terminal_reason.strip()
+
     @classmethod
     def status(cls, workspace_path: str | Path) -> RuntimeExecutionResult:
         """Read the canonical job head without mutating workspace state."""
@@ -1560,8 +2667,12 @@ class AgentRuntimeRunner:
         outcome_path = Path(outcome_record.path)
         if outcome.job_id != workspace.job_id:
             raise RuntimeRunnerError("job outcome belongs to another workspace")
-        evaluation = _evaluate_runtime_completion(outcome, _registry)
+        evaluation = _evaluate_runtime_completion(
+            outcome, _registry,
+            external_registry_resolver=cls._external_registry_resolver(workspace, registry_paths=cls._review_batch_registry_paths(_registry)),
+        )
         stage1_projection = _stage1_status_projection(_registry)
+        message = cls._verified_current_attempt_message(workspace, _registry, outcome)
         return RuntimeExecutionResult(
             job_id=outcome.job_id,
             workspace_path=workspace.root_dir,
@@ -1574,7 +2685,7 @@ class AgentRuntimeRunner:
             completed_stages=outcome.completed_stages,
             failed_stage=outcome.failed_stage,
             job_outcome_path=str(outcome_path),
-            message="",
+            message=message,
             completion_status=evaluation.status,
             completion_reasons=evaluation.reasons,
             completion_evidence_hash=evaluation.evidence_hash,

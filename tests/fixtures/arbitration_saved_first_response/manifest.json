@@ -1,0 +1,9 @@
+{
+  "schema_version": "synthetic-localhost-arbitration-fixture/v1",
+  "provenance": "Synthetic ten-PDF localhost engineering case; not external model or scientific acceptance",
+  "file": "synthetic_localhost_response.json.gz",
+  "compressed_bytes": 627364,
+  "json_bytes": 8603436,
+  "sha256": "669267942b9819fbdae6b2e852e59f79462d5cb8306a45bb8ac2a55d16e371b5",
+  "json_sha256": "728420267dc5e7c5c65c8fdbed51f62d8980d6c574d83cc08ab19ab8d24bc844"
+}

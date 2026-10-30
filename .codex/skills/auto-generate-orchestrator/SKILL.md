@@ -37,7 +37,7 @@ code uses it. It is not an alternate public peer to `RuntimeJobSpec`.
 - Stage 1 uses the current source identity, preprocessing, summary, and reuse
   contracts.
 - Stage 2 is Outline Intelligence v3 only. Do not use or describe Outline v2.
-- Outline v3 role routing is real node-level routing: Claude Opus 5 handles
+- Outline v3 role routing is real node-level routing: Claude Opus 5.5 handles
   candidate generation/arbitration, GPT-5.6-sol handles structure/evidence
   critique, and DeepSeek V4 Pro handles relation/coverage critique when the
   shipped `[OutlineModels]` mapping is used. Each route owns its transport,

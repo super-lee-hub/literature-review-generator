@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import json
+import configparser
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 import pytest
 
 from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
+from runtime.provider_receipt_closure import ProviderReceiptClosure
 from runtime.provider_runtime import ProviderRuntimeLedger
 from runtime.runner import AgentRuntimeRunner
 from services.artifact_registry import ArtifactRegistry, file_sha256
 from services.job_workspace import JobWorkspace
-from validation.closure import resolve_current_stage_closure_map
+from validation.closure import _provider_closure_entry, resolve_current_stage_closure_map
 from tests.test_current_runtime_full_e2e import _reader_summary, _test_config, _write_pdf
 
 
@@ -43,6 +45,7 @@ def _run_stage1(
     reuse_stage1: bool | None = None,
     requested_stages: tuple[str, ...] = ("analyze",),
     action: str = "analyze",
+    output_root: Path | None = None,
 ) -> tuple[Any, JobWorkspace, ArtifactRegistry]:
     pdf_dir = tmp_path / ("empty-papers" if not papers else "source-papers")
     if papers:
@@ -73,11 +76,18 @@ def _run_stage1(
         "services.stage1_analysis_service.Stage1AnalysisService._call_reader",
         configured_reader,
     )
+    config_path = _test_config(tmp_path)
+    if output_root is not None:
+        config = configparser.ConfigParser(interpolation=None)
+        config.read(config_path, encoding="utf-8")
+        config["Paths"]["output_path"] = str(output_root)
+        with Path(config_path).open("w", encoding="utf-8") as stream:
+            config.write(stream)
     spec = RuntimeJobSpec(
         project_name=job_id,
         source=RuntimeSourceSpec(mode="direct", pdf_folder=str(pdf_dir)),
         job_id=job_id,
-        config=str(_test_config(tmp_path)),
+        config=str(config_path),
         action=action,
         summary_file=summary_file,
         reuse_summary_files=reuse_summary_files,
@@ -564,6 +574,72 @@ def test_stage1_typed_manifest_portable_authority_closes_and_tampering_blocks(
     )
     assert len(manifest_paths) == 3
 
+    from services.stage1_analysis_service import Stage1AnalysisResult, Stage1AnalysisService
+    from validation import closure as closure_module
+
+    original_evaluate = ProviderReceiptClosure.evaluate
+    original_run_with_scope = Stage1AnalysisService._run_with_verification_scope
+    original_entry_impl = closure_module._provider_closure_entry_impl
+    source_proof_evaluations = 0
+    run_scope_evaluations: list[int] = []
+    entry_scope_evaluations: list[int] = []
+    stage1_results: list[Stage1AnalysisResult] = []
+
+    def tracked_evaluate(cls: type, expected: Any, observed: Any, **kwargs: Any) -> Any:
+        nonlocal source_proof_evaluations
+        expected_rows = list(expected)
+        expected_jobs = {
+            str(row.get("job_id") or "")
+            if isinstance(row, Mapping)
+            else str(getattr(row, "job_id", ""))
+            for row in expected_rows
+        }
+        if expected_rows and expected_jobs == {"stage1-typed-seed"}:
+            source_proof_evaluations += 1
+        return original_evaluate(expected_rows, observed, **kwargs)
+
+    # Runner's resolver setup verifies seed authority in separate scopes.
+    def tracked_run_with_scope(
+        self: Any,
+        bundle: Any,
+        *,
+        existing_summaries: Any = (),
+        explicit_typed_imports: Any = None,
+        _verification_scope: Any,
+    ) -> Stage1AnalysisResult:
+        before = source_proof_evaluations
+        result = original_run_with_scope(
+            self,
+            bundle,
+            existing_summaries=existing_summaries,
+            explicit_typed_imports=explicit_typed_imports,
+            _verification_scope=_verification_scope,
+        )
+        run_scope_evaluations.append(source_proof_evaluations - before)
+        stage1_results.append(result)
+        return result
+
+    def tracked_entry_impl(*args: Any, **kwargs: Any) -> Any:
+        # The map also verifies source authority outside this closure reader.
+        before = source_proof_evaluations
+        entry = original_entry_impl(*args, **kwargs)
+        if args[0] == "analyze":
+            entry_scope_evaluations.append(source_proof_evaluations - before)
+        return entry
+
+    monkeypatch.setattr(
+        ProviderReceiptClosure, "evaluate", classmethod(tracked_evaluate)
+    )
+    monkeypatch.setattr(
+        Stage1AnalysisService,
+        "_run_with_verification_scope",
+        tracked_run_with_scope,
+    )
+    monkeypatch.setattr(closure_module, "_provider_closure_entry_impl", tracked_entry_impl)
+
+    def source_resolver(job_id: str) -> ArtifactRegistry | None:
+        return seed_registry if job_id == seed_registry.job_id else None
+
     result, workspace, registry = _run_stage1(
         tmp_path,
         monkeypatch,
@@ -575,12 +651,51 @@ def test_stage1_typed_manifest_portable_authority_closes_and_tampering_blocks(
     assert seed_result.completion_status == "complete", seed_result
     assert result.job_status == "completed", result
     assert result.completion_status == "complete", result
-    baseline_map = resolve_current_stage_closure_map(registry)
+    assert len(stage1_results) == 1
+    assert stage1_results[0].reused_count == 3
+    assert stage1_results[0].generated_count == 0
+    assert stage1_results[0].receipt_ids == ()
+    assert run_scope_evaluations == [1]
+    before_map = len(entry_scope_evaluations)
+    baseline_map = resolve_current_stage_closure_map(
+        registry, external_registry_resolver=source_resolver
+    )
+    assert entry_scope_evaluations[before_map:] == [1]
     assert baseline_map.blocking_issues == (), baseline_map.to_dict()
     baseline_entry = baseline_map.provider_closures_by_stage["analyze"]
     assert baseline_entry["complete"] is True
     assert baseline_entry["expected_call_ids"] == []
     assert baseline_entry["observed_call_ids"] == []
+
+    before_repeated_map = len(entry_scope_evaluations)
+    repeated_map = resolve_current_stage_closure_map(
+        registry, external_registry_resolver=source_resolver
+    )
+    assert entry_scope_evaluations[before_repeated_map:] == [1]
+    assert repeated_map.blocking_issues == baseline_map.blocking_issues
+    assert repeated_map.provider_closures_by_stage == baseline_map.provider_closures_by_stage
+
+    closure_record = registry.get(str(baseline_entry["artifact_id"]))
+    terminal_record = registry.get(str(baseline_entry["terminal_artifact_id"]))
+    assert closure_record is not None and terminal_record is not None
+    terminal_payload = json.loads(
+        Path(terminal_record.path).read_text(encoding="utf-8")
+    )
+    expected_revision, _records = registry.capture_record_snapshot()
+    before_direct = len(entry_scope_evaluations)
+    direct_entry, direct_issues = _provider_closure_entry(
+        "analyze",
+        closure_record,
+        terminal_record,
+        terminal_payload,
+        registry,
+        current_set=registry.resolve_current_artifact_set(),
+        external_registry_resolver=source_resolver,
+        expected_registry_revision=expected_revision,
+    )
+    assert entry_scope_evaluations[before_direct:] == [1]
+    assert direct_issues == [], direct_issues
+    assert direct_entry == baseline_entry
 
     reuse_records = [
         record

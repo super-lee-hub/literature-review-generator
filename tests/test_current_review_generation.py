@@ -12,6 +12,8 @@ from services.job_workspace import JobWorkspace
 from services.review_generation_service import ReviewGenerationService
 from services.settings import ApplicationSettings
 from services.stage1_analysis_service import Stage1AnalysisService
+from services.writer_task_scope import WriterTaskScopeError
+from tests.writer_source_fixture import bind_production_writer_sources, scoped_writer_content
 
 from test_current_stage1_generation import _canonical_summary, _write_pdf
 
@@ -63,11 +65,10 @@ def test_current_review_writer_consumes_packet_and_emits_structured_citation(tmp
         seen.append(kwargs)
         return {
             "status": "success",
-            "content": {
-                "blocks": [
-                    {"text": "The controlled result supports the mechanism [[cite_ref:R001]]."}
-                ]
-            },
+            "content": scoped_writer_content(
+                str(kwargs.get("prompt_text") or ""),
+                "The controlled result supports the mechanism [[cite_ref:R001]].",
+            ),
         }
 
     service = ReviewGenerationService(
@@ -80,21 +81,23 @@ def test_current_review_writer_consumes_packet_and_emits_structured_citation(tmp
         writer=writer,
     )
     paper_key = summary["paper_info"]["canonical_paper_key"]
+    packets = [
+        {
+            "section_id": "section_1",
+            "section_goal": "Synthesize the result",
+            "planned_claims": ["The treatment improves the outcome."],
+            "paper_keys": [paper_key],
+            "source_summary_hashes": ["summary-hash"],
+            "retrieval_provenance": {"source": "stage1_summary", "paper_keys": [paper_key]},
+        }
+    ]
+    bind_production_writer_sources(service, packets)
     result = service.run(
         outline_payload={
             "title": "Evidence-led review",
             "sections": [{"section_id": "section_1", "title": "Results", "goal": "Synthesize the result"}],
         },
-        evidence_packets=[
-            {
-                "section_id": "section_1",
-                "section_goal": "Synthesize the result",
-                "planned_claims": ["The treatment improves the outcome."],
-                "paper_keys": [paper_key],
-                "source_summary_hashes": ["summary-hash"],
-                "retrieval_provenance": {"source": "stage1_summary", "paper_keys": [paper_key]},
-            }
-        ],
+        evidence_packets=packets,
     )
 
     assert len(seen) == 1
@@ -121,27 +124,28 @@ def test_current_review_writer_rejects_unresolved_citation(tmp_path: Path) -> No
         summaries=[summary],
         writer=lambda **kwargs: {
             "status": "success",
-            "content": {"blocks": [{"text": "Unsupported source [[cite_ref:R999]]."}]},
+            "content": scoped_writer_content(
+                str(kwargs.get("prompt_text") or ""),
+                "Unsupported source [[cite_ref:R999]].",
+            ),
         },
     )
     paper_key = summary["paper_info"]["canonical_paper_key"]
-    try:
+    packets = [
+        {
+            "section_id": "section_1",
+            "planned_claims": ["Claim"],
+            "paper_keys": [paper_key],
+            "source_summary_hashes": ["hash"],
+            "retrieval_provenance": {"source": "test"},
+        }
+    ]
+    bind_production_writer_sources(service, packets)
+    with pytest.raises(WriterTaskScopeError, match="cites foreign refs: R999"):
         service.run(
             outline_payload={"sections": [{"section_id": "section_1", "title": "Results"}]},
-            evidence_packets=[
-                {
-                    "section_id": "section_1",
-                    "planned_claims": ["Claim"],
-                    "paper_keys": [paper_key],
-                    "source_summary_hashes": ["hash"],
-                    "retrieval_provenance": {"source": "test"},
-                }
-            ],
+            evidence_packets=packets,
         )
-    except RuntimeError as exc:
-        assert "outside its evidence packet" in str(exc) or "unresolved" in str(exc)
-    else:
-        raise AssertionError("unresolved Writer citation was accepted")
 
 
 def test_current_review_resume_after_section_two_crash_reuses_section_one(tmp_path: Path) -> None:
@@ -171,7 +175,10 @@ def test_current_review_resume_after_section_two_crash_reuses_section_one(tmp_pa
             raise RuntimeError("simulated section 2 process crash")
         return {
             "status": "success",
-            "content": {"blocks": [{"text": "The result supports the claim [[cite_ref:R001]]."}]},
+            "content": scoped_writer_content(
+                str(kwargs.get("prompt_text") or ""),
+                "The result supports the claim [[cite_ref:R001]].",
+            ),
             "usage_status": "provider_not_supported",
         }
 
@@ -184,6 +191,7 @@ def test_current_review_resume_after_section_two_crash_reuses_section_one(tmp_pa
         summaries=[summary],
         writer=crash_on_section_two,
     )
+    bind_production_writer_sources(first_service, packets)
     with pytest.raises(RuntimeError, match="simulated section 2 process crash"):
         first_service.run(
             outline_payload={
@@ -219,7 +227,10 @@ def test_current_review_resume_after_section_two_crash_reuses_section_one(tmp_pa
         retry_calls.append(int(kwargs["section_number"]))
         return {
             "status": "success",
-            "content": {"blocks": [{"text": "The result supports the claim [[cite_ref:R001]]."}]},
+            "content": scoped_writer_content(
+                str(kwargs.get("prompt_text") or ""),
+                "The result supports the claim [[cite_ref:R001]].",
+            ),
             "usage_status": "provider_not_supported",
         }
 
@@ -232,6 +243,7 @@ def test_current_review_resume_after_section_two_crash_reuses_section_one(tmp_pa
         summaries=[summary],
         writer=retry_writer,
     )
+    bind_production_writer_sources(retry_service, packets)
     resumed = retry_service.run(
         outline_payload={
             "title": "Evidence-led review",

@@ -1,0 +1,215 @@
+{
+  "schema_version": "pr25-source-manifest-v11",
+  "repository": "super-lee-hub/literature-review-generator",
+  "source_head": "4bd05b10a8a744e9891b650324c718133f5da599",
+  "branch": "codex/pr25-v4-controlled-pilot",
+  "tracked_diff_bytes": 130138,
+  "tracked_diff_sha256": "982ee8e97ce8719e00560e4785462b987fe27ccdbecea6aaa63c759a22f0b4a1",
+  "tracked_patch_path": "D:\\tmp\\pr25-final-hardening-20260930\\RECOVERABLE_TRACKED_SOURCE_V11.patch",
+  "tracked_patch_sha256": "982ee8e97ce8719e00560e4785462b987fe27ccdbecea6aaa63c759a22f0b4a1",
+  "source_files": [
+    {
+      "path": "docs/audits/pr25/implementation_v3/FINAL_ACCEPTANCE_MATRIX_V11.json",
+      "status": "untracked",
+      "bytes": 7219,
+      "sha256": "851012fab6a31034002ca116f10b92800c3eaba52e23dd6ffa4839626f6e3640"
+    },
+    {
+      "path": "docs/audits/pr25/implementation_v3/FINAL_IMPLEMENTATION_STATUS_V11.md",
+      "status": "untracked",
+      "bytes": 9199,
+      "sha256": "e9c6ac5c575df0397c418ffb38a7aa373c0388d23bf77f7d03e28f367b584f96"
+    },
+    {
+      "path": "docs/audits/pr25/implementation_v3/SUBAGENT_LEDGER_V11.json",
+      "status": "untracked",
+      "bytes": 2563,
+      "sha256": "bc85e5ca9eef6e578f903a65f6d91b9840cace71245f02b6a066f6faaf58b0e2"
+    },
+    {
+      "path": "outline/semantic_chunking.py",
+      "status": "modified",
+      "bytes": 96308,
+      "sha256": "3bf18ba5e4c917e4b32673817d25664fd3bb7075f0c80e9086e9cbf3b819cbb8"
+    },
+    {
+      "path": "outline/v3_executor.py",
+      "status": "modified",
+      "bytes": 866171,
+      "sha256": "db04445e39357d3bace0219a6457d271cc7f1c245dca3d3d868ddbb306a4d69a"
+    },
+    {
+      "path": "outline/v3_models.py",
+      "status": "modified",
+      "bytes": 81288,
+      "sha256": "573ea91f3d05186a5ee92b651c356369927b4231a67bfe583cc1a2f1fb5c605b"
+    },
+    {
+      "path": "outline/v3_relations.py",
+      "status": "modified",
+      "bytes": 21080,
+      "sha256": "c295eb6fa1158286c5e8a1b3df27eb7beb5ee05c5678f83437da66c3ed81a779"
+    },
+    {
+      "path": "runtime/artifact_validators.py",
+      "status": "modified",
+      "bytes": 135728,
+      "sha256": "1d045018adc2220e9a5cd19cda07db3d192aa1d7e7890c118020231e8a34c24e"
+    },
+    {
+      "path": "runtime/control_plane.py",
+      "status": "modified",
+      "bytes": 358583,
+      "sha256": "0604f5a7fd1d2f3479992081a807f512b94713e873b5b40f7e7e7cc0cbf039f1"
+    },
+    {
+      "path": "runtime/orchestrator.py",
+      "status": "modified",
+      "bytes": 178536,
+      "sha256": "254b1eae2fd8a176d999935e104cf6c13510bb50787e40e87ae2d6358a2c994d"
+    },
+    {
+      "path": "runtime/provider_runtime.py",
+      "status": "modified",
+      "bytes": 151012,
+      "sha256": "cb1988924cfb1fb056e8a17e1a7badd99061685c73454036c9ffbb87a479e2d3"
+    },
+    {
+      "path": "runtime/reconcile.py",
+      "status": "modified",
+      "bytes": 110254,
+      "sha256": "2df3fba469661c729860384a2058495fa5cfda35b1b0c280cc9fd351d382d4b5"
+    },
+    {
+      "path": "runtime/release_acceptance.py",
+      "status": "modified",
+      "bytes": 304112,
+      "sha256": "36cefb3c6d6a0ff4c63af60ea199f8c7f00c14add4bd6e6360201b122293c992"
+    },
+    {
+      "path": "runtime/stage_planning.py",
+      "status": "modified",
+      "bytes": 40583,
+      "sha256": "dbc8518f58cd8de75fab48f9aafe365625ee03a93cff0d28e780e13fdf0993b0"
+    },
+    {
+      "path": "services/model_selection.py",
+      "status": "modified",
+      "bytes": 6217,
+      "sha256": "4936e1efd7f3350b5c469a4a3ee384a15a0a88142a046f60d60d9f034d2290a2"
+    },
+    {
+      "path": "services/review_draft.py",
+      "status": "modified",
+      "bytes": 14791,
+      "sha256": "1be0e945fb75a370c1a293f5606cf6ba10f990cce61c0b94d89ccc3292fbe6a2"
+    },
+    {
+      "path": "services/settings.py",
+      "status": "modified",
+      "bytes": 39846,
+      "sha256": "6c501121eec042bc07ad53777491a3da525066a7ba3ccbe92f1bd0d265c4b316"
+    },
+    {
+      "path": "tests/test_current_runtime_full_e2e.py",
+      "status": "modified",
+      "bytes": 42030,
+      "sha256": "470e4732c420fcce9f71d69b9ec91d457ef809fbd46ef3c1479f8138f23fd4d8"
+    },
+    {
+      "path": "tests/test_outline_v3_semantic_execution.py",
+      "status": "modified",
+      "bytes": 121922,
+      "sha256": "dd9474ea5d3dfca2fe1895ab5838649ccb408b6f0d77b51ad1343bb13d394e7c"
+    },
+    {
+      "path": "tests/test_pr25_all_stage_plan_v2.py",
+      "status": "modified",
+      "bytes": 25640,
+      "sha256": "c7a195e1746397cc26400cb8b4eebf6a6c004510aff1d7a8daa8c6061fc11bf9"
+    },
+    {
+      "path": "tests/test_pr25_final_hardening_regressions.py",
+      "status": "untracked",
+      "bytes": 24831,
+      "sha256": "3f04350a4371463b0e009c113641b99752c7c93293277fe8e72fc99dcc8192cf"
+    },
+    {
+      "path": "tests/test_pr25_v3_regressions.py",
+      "status": "modified",
+      "bytes": 122608,
+      "sha256": "a1d3b3c7af8faa4ac36bd3d434c1d85201904b3d3015bcd1a52a8a623398c865"
+    },
+    {
+      "path": "tests/test_pr25_v4_pilot_integration.py",
+      "status": "modified",
+      "bytes": 45513,
+      "sha256": "58e79913a1391ac5136a6e553d7eea5e6fddc5bded74e7b974bfc34a66790dea"
+    },
+    {
+      "path": "tests/test_provider_local_http_integration.py",
+      "status": "modified",
+      "bytes": 21607,
+      "sha256": "af0f701a484d8f705b22b3a66992c94253918ac208da5a74e04d3a520df5be8e"
+    },
+    {
+      "path": "tests/test_review_draft_v3_lineage.py",
+      "status": "untracked",
+      "bytes": 12821,
+      "sha256": "13ce1289742770c5cfe79c84adffbe2957587398875cc306e23cf58af2812e4d"
+    },
+    {
+      "path": "tests/test_reviewctl.py",
+      "status": "modified",
+      "bytes": 26767,
+      "sha256": "55220386ddf0cb22fe09e3208dc76be1c2fb7b599ef97bb407dfa15913d5d618"
+    },
+    {
+      "path": "tests/test_semantic_chunking.py",
+      "status": "modified",
+      "bytes": 7172,
+      "sha256": "415afacba1d0759105a8a250bf61f9c6a49501c95aa98879a145c2df4631b0e5"
+    },
+    {
+      "path": "workspace/config.ini.example",
+      "status": "workspace_only",
+      "bytes": 9443,
+      "sha256": "153bd6068071199783f1ee68f82bc003631f91f45cda76cc57459036cd6832c7"
+    }
+  ],
+  "evidence_files": [
+    {
+      "path": "evidence/V11_PROVIDER_FREE_REQUEST_MATERIALIZATION.json",
+      "bytes": 2114,
+      "sha256": "0756f7bc783c0049ccd449050d2b7aacc692dda47b860f28d0b137d5f928287e"
+    },
+    {
+      "path": "evidence/TOPIC_SCALING_PLAN_V11_PROVIDER_FREE.json",
+      "bytes": 870999,
+      "sha256": "256a35c4585e00c409b02bbb8b8de9f6e0f472b35115cfcb8ac35477c1dfbe0f"
+    },
+    {
+      "path": "evidence/OWNER_PERMISSION_CARD_V11_PROPOSED.md",
+      "bytes": 2657,
+      "sha256": "6ec07ab8d37b5c9abacfd19a750c1805c2127b8b35f860807284ec397b3bac52"
+    },
+    {
+      "path": "evidence/QUARANTINE_RECORD.json",
+      "bytes": 769,
+      "sha256": "601cd5e42c6cde8aed268a4230fe69f7bbf99845d8f26071e980989a26a03361"
+    },
+    {
+      "path": "evidence/README.md",
+      "bytes": 573,
+      "sha256": "7eb000d51a1c8a274cc92e28b88009587b51a7f792b00514969e2828c89927ab"
+    }
+  ],
+  "secret_scan": {
+    "method": "targeted local high-signal regex scan; no match content emitted",
+    "findings": [],
+    "status": "NO_HIGH_SIGNAL_MATCHES",
+    "active_config_ini_included": false,
+    "raw_provider_responses_included": false
+  },
+  "note": "This manifest lists changed source/test files and selected safe evidence. It intentionally excludes active config.ini, private summaries, and raw provider responses."
+}

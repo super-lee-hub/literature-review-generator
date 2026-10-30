@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
-import os
-from dataclasses import asdict, dataclass
+import json
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Mapping, Optional, cast
+from typing import Any, Mapping, Optional, Sequence, cast
 
 from runtime.source_intake import build_source_bundle_for_request
 from runtime.stage_contracts import SourceBundle
@@ -48,6 +49,18 @@ def resolve_stage1_reuse(action: str, raw_value: Any) -> bool:
     return True if requested_value is None else requested_value
 
 
+def _normalize_provider_budget(raw_value: Any) -> dict[str, Any] | None:
+    """Validate an optional finite V2 budget before constructing the runtime."""
+
+    if raw_value is None:
+        return None
+    if not isinstance(raw_value, Mapping):
+        raise TypeError("provider_budget must be a strict V2 budget object")
+    from runtime.provider_runtime import ProviderAggregateBudgetV2
+
+    return ProviderAggregateBudgetV2.from_mapping(raw_value).to_dict()
+
+
 @dataclass(frozen=True)
 class JobRunRequest:
     config: str
@@ -84,6 +97,103 @@ class JobRunRequest:
     allow_unvalidated_when_validation_optional: bool | None = None
     allow_partial_source_quarantine: bool = False
     derived_summary_source: bool = False
+    provider_budget: Mapping[str, Any] | None = None
+    runtime_spec_payload: Mapping[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        # Normalize to the strict V2 wire shape, including real zero limits.
+        # Malformed budgets fail before JobRunner can enter the provider runtime.
+        object.__setattr__(
+            self,
+            "provider_budget",
+            _normalize_provider_budget(self.provider_budget),
+        )
+        if self.runtime_spec_payload is None:
+            return
+        if not isinstance(self.runtime_spec_payload, Mapping):
+            raise TypeError("runtime_spec_payload must be a strict RuntimeJobSpec object")
+        from runtime.job_spec import RuntimeJobSpec, resolve_stage1_reuse
+
+        strict_spec = RuntimeJobSpec.from_mapping(
+            copy.deepcopy(dict(self.runtime_spec_payload))
+        )
+        strict_spec.validate()
+        metadata = strict_spec.metadata
+        requested_raw = metadata.get("requested_stages")
+        expected_requested_stages = (
+            tuple(dict.fromkeys(str(item) for item in requested_raw))
+            if requested_raw is not None
+            else None
+        )
+        expected_provider_budget = _normalize_provider_budget(
+            metadata.get("provider_budget")
+        )
+        expected_values = {
+            "config": strict_spec.config,
+            "project_name": strict_spec.project_name,
+            "pdf_folder": strict_spec.source.pdf_folder or None,
+            "action": strict_spec.action,
+            "job_id": strict_spec.job_id or None,
+            "summary_file": strict_spec.summary_file or None,
+            "summary_sources": tuple(
+                item for item in strict_spec.summary_sources if str(item).strip()
+            ),
+            "reuse_stage1": resolve_stage1_reuse(
+                strict_spec.action, strict_spec.reuse_stage1
+            ),
+            "reuse_summary_files": tuple(
+                item for item in strict_spec.reuse_summary_files if str(item).strip()
+            ),
+            "run_all": strict_spec.action == "run_all",
+            "analyze_only": strict_spec.action == "analyze",
+            "generate_outline": strict_spec.action == "generate_outline",
+            "generate_review": strict_spec.action == "generate_review",
+            "generate_section": (
+                strict_spec.generate_section
+                if strict_spec.action == "generate_section"
+                else None
+            ),
+            "validate_review": strict_spec.action == "validate_review",
+            "retry_failed": strict_spec.action == "retry_failed",
+            "retry_review_failed": strict_spec.action == "retry_review_failed",
+            "free_mode_profile": strict_spec.free_mode_profile or None,
+            "free_mode_idea": strict_spec.free_mode_idea or None,
+            "source_mode": strict_spec.source.mode,
+            "zotero_report": strict_spec.source.zotero_report or None,
+            "library_path": strict_spec.source.library_path or None,
+            "queue_file": strict_spec.queue_file,
+            "workspace_path": strict_spec.workspace_path or None,
+            "requested_stages": expected_requested_stages,
+            "validation_required": metadata.get("validation_required"),
+            "require_clean_validation": metadata.get("require_clean_validation"),
+            "allow_unvalidated_when_validation_optional": metadata.get(
+                "allow_unvalidated_when_validation_optional"
+            ),
+            "allow_partial_source_quarantine": bool(
+                metadata.get("allow_partial_source_quarantine", False)
+            ),
+            "derived_summary_source": bool(metadata.get("review_batch_spec")),
+            "provider_budget": expected_provider_budget,
+        }
+        conflicts = [
+            field_name
+            for field_name, expected in expected_values.items()
+            if getattr(self, field_name) != expected
+        ]
+        if self.concept is not None:
+            conflicts.append("concept")
+        if self.gui:
+            conflicts.append("gui")
+        if conflicts:
+            raise ValueError(
+                "JobRunRequest compatibility projection conflicts with its strict "
+                "RuntimeJobSpec payload: " + ", ".join(sorted(set(conflicts)))
+            )
+        object.__setattr__(
+            self,
+            "runtime_spec_payload",
+            copy.deepcopy(strict_spec.to_dict()),
+        )
 
 
 @dataclass(frozen=True)
@@ -118,6 +228,24 @@ def _normalize_string_list(raw_value: Any) -> tuple[str, ...]:
     if isinstance(raw_value, str):
         return tuple(item.strip() for item in raw_value.splitlines() if item.strip())
     return tuple(str(item).strip() for item in raw_value or () if str(item).strip())
+
+
+def _typed_reuse_manifest_mode(paths: Sequence[str]) -> bool:
+    """Return whether an explicit reuse source starts the typed-manifest path.
+
+    Legacy summary files remain supported when PDF-backed reuse is requested;
+    only the portable ``stage1_reusable_summary_manifest/v1`` and explicit
+    owner-corrected ``v2`` contracts are
+    allowed to take the zero-preprocessing fast path.
+    """
+
+    if not paths:
+        return False
+    try:
+        payload = json.loads(Path(paths[0]).expanduser().read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    return isinstance(payload, Mapping) and payload.get("artifact_type") == "stage1_reusable_summary_manifest" and payload.get("artifact_version") in {"v1", "v2"}
 
 
 def build_job_request_from_mapping(params: Mapping[str, Any]) -> JobRunRequest:
@@ -181,6 +309,7 @@ def build_job_request_from_mapping(params: Mapping[str, Any]) -> JobRunRequest:
             params.get("allow_partial_source_quarantine", False)
         ),
         derived_summary_source=bool(params.get("derived_summary_source", False)),
+        provider_budget=params.get("provider_budget"),
     )
 
 
@@ -208,6 +337,10 @@ def validate_job_request_options(request: Any) -> Optional[str]:
     reuse_stage1 = bool(getattr(request, "reuse_stage1", False))
     reuse_summary_files = getattr(request, "reuse_summary_files", ()) or ()
     action = str(getattr(request, "action", "analyze") or "analyze")
+    try:
+        _normalize_provider_budget(getattr(request, "provider_budget", None))
+    except (TypeError, ValueError) as exc:
+        return str(exc)
     downstream_actions = {"generate_outline", "generate_review", "generate_section", "validate_review"}
     if summary_file and action not in downstream_actions:
         return "--summary-file can only be used with a downstream review action"
@@ -272,14 +405,32 @@ class JobRunner:
         summary_paths = tuple(
             dict.fromkeys(
                 str(item)
-                for item in (*request.summary_sources, *request.reuse_summary_files)
+                for item in (
+                    request.summary_file or "", *request.summary_sources,
+                    *request.reuse_summary_files,
+                )
                 if str(item).strip()
             )
         )
         diagnostics: list[SourceInventoryDiagnosticV1] = []
         degradation: list[str] = []
         bundle: SourceBundle | None = None
-        if request.source_mode == "direct" and request.pdf_folder and not summary_paths:
+        # Explicit reusable manifests are already the Stage 1 authority. Do
+        # not resolve a source bundle before their authority is checked: a
+        # Zotero bundle can otherwise start PDF preprocessing even when the
+        # job contract requests source transport ``never``.
+        reuse_only_stage1 = bool(
+            _typed_reuse_manifest_mode(
+                [str(item) for item in request.reuse_summary_files]
+            )
+            and not str(request.pdf_folder or "").strip()
+        )
+        if (
+            request.source_mode == "direct"
+            and request.pdf_folder
+            and not summary_paths
+            and not reuse_only_stage1
+        ):
             try:
                 bundle = build_source_bundle_for_request(request, project_name=project_name)
             except Exception as exc:
@@ -293,7 +444,12 @@ class JobRunner:
                     )
                 )
                 degradation.append(f"source_intake_error:{type(exc).__name__}")
-        elif request.source_mode == "zotero" and request.zotero_report and request.library_path:
+        elif (
+            request.source_mode == "zotero"
+            and request.zotero_report
+            and request.library_path
+            and not reuse_only_stage1
+        ):
             try:
                 bundle = build_source_bundle_for_request(request, project_name=project_name)
             except Exception as exc:
@@ -344,7 +500,9 @@ class JobRunner:
             # normal PDF-backed identity gate when PDFs are present, but let
             # the runtime's summary-only branch reach its explicit zero-call
             # closure contract when the external source is the only input.
-            summary_only_stage1 = bool(summary_paths and not ready_pdfs)
+            summary_only_stage1 = bool(
+                reuse_only_stage1 or (summary_paths and not ready_pdfs)
+            )
             if summary_only_stage1:
                 canonical_ready = bool(
                     not errors and ready_summaries == len(summary_paths)
@@ -404,6 +562,14 @@ class JobRunner:
         payload = asdict(request)
         payload.pop("progress_tracker", None)
         payload.pop("publication_context", None)
+        # The strict spec payload is a queue execution bridge, not additional
+        # source content. QueueService fingerprints that payload separately;
+        # keeping it out of this request fingerprint preserves Stage 1 source
+        # reuse when only run metadata (goal, budget, or acknowledgement) changes.
+        payload.pop("runtime_spec_payload", None)
+        # Preserve legacy snapshot hashes when the optional V2 field is absent.
+        if request.provider_budget is None:
+            payload.pop("provider_budget", None)
         profile_path = str(request.free_mode_profile or "").strip()
         resolved_profile = str(Path(profile_path).expanduser().resolve()) if profile_path else ""
         payload["free_mode_profile"] = resolved_profile
@@ -483,16 +649,74 @@ class JobRunner:
             job_outcome_path=str(execution.job_outcome_path),
         )
 
+    @staticmethod
+    def _resolved_spec_path(value: str | None) -> str:
+        return str(Path(value).expanduser().resolve()) if value else ""
+
+    def _runtime_spec_from_payload(self, request: JobRunRequest):
+        """Rehydrate the strict frozen spec instead of rebuilding a lossy one.
+
+        QueueRunner supplies this payload only after queue snapshot verification.
+        Legacy CLI/adapter requests have no payload and continue through the
+        compatibility reconstruction below.
+        """
+
+        from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
+
+        # Reconstruct once to rerun strict metadata and compatibility-field
+        # validation if a nested mapping was mutated after request creation.
+        request = replace(request)
+        payload = request.runtime_spec_payload
+        if not isinstance(payload, Mapping):
+            raise ValueError("strict RuntimeJobSpec payload is missing or invalid")
+        spec = RuntimeJobSpec.from_mapping(copy.deepcopy(dict(payload)))
+        spec.validate()
+        resolved_source = RuntimeSourceSpec(
+            mode=spec.source.mode,
+            pdf_folder=self._resolved_spec_path(spec.source.pdf_folder),
+            zotero_report=self._resolved_spec_path(spec.source.zotero_report),
+            library_path=self._resolved_spec_path(spec.source.library_path),
+        )
+        return replace(
+            spec,
+            project_name=self._resolve_project_name(request),
+            job_id=request.job_id or spec.job_id,
+            config=self._resolved_spec_path(spec.config),
+            source=resolved_source,
+            free_mode_profile=self._resolved_spec_path(spec.free_mode_profile),
+            summary_file=self._resolved_spec_path(spec.summary_file),
+            summary_sources=tuple(
+                self._resolved_spec_path(item) for item in spec.summary_sources
+            ),
+            reuse_summary_files=tuple(
+                self._resolved_spec_path(item) for item in spec.reuse_summary_files
+            ),
+            queue_file=self._resolved_spec_path(spec.queue_file),
+            workspace_path=self._resolved_spec_path(spec.workspace_path),
+            metadata={
+                key: copy.deepcopy(value)
+                for key, value in spec.metadata.items()
+                if not (key == "provider_budget" and value is None)
+            },
+        )
+
     def _runtime_spec(self, request: JobRunRequest):
+        if request.runtime_spec_payload is not None:
+            return self._runtime_spec_from_payload(request)
         from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
 
         project_name = self._resolve_project_name(request)
+        provider_budget = _normalize_provider_budget(
+            getattr(request, "provider_budget", None)
+        )
         metadata: dict[str, Any] = {
             "requested_stages": list(request.requested_stages) if request.requested_stages is not None else None,
             "validation_required": request.validation_required,
             "require_clean_validation": request.require_clean_validation,
             "allow_unvalidated_when_validation_optional": request.allow_unvalidated_when_validation_optional,
         }
+        if provider_budget is not None:
+            metadata["provider_budget"] = provider_budget
         return RuntimeJobSpec(
             project_name=project_name,
             source=RuntimeSourceSpec(
@@ -538,4 +762,21 @@ class JobRunner:
             cancel_token=token,
             publication_context=request.publication_context,
         ).run()
+        return self._result_from_execution(execution)
+
+    def resume(
+        self, request: JobRunRequest, cancel_token: CancelToken | None = None,
+        *, resume_intent: Mapping[str, Any],
+    ) -> JobRunResult:
+        error = validate_job_request_options(request)
+        if error:
+            raise ValueError(error)
+        from runtime.runner import AgentRuntimeRunner
+
+        execution = AgentRuntimeRunner(
+            self._runtime_spec(request),
+            cancel_token=cancel_token,
+            publication_context=request.publication_context,
+            queue_resume_intent=resume_intent,
+        ).resume()
         return self._result_from_execution(execution)

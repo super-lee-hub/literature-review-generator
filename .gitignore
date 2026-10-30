@@ -173,6 +173,8 @@ nul
 *_citation_manifest.json
 
 # Local F1 acceptance inputs and run outputs (source PDFs are never committed)
+# Historical private acceptance evidence is preserved locally outside source snapshots.
+/acceptance_artifacts/f1_20260915/
 acceptance_artifacts/f1_*/source_corpus/
 acceptance_artifacts/f1_*/C_source_corpus/
 acceptance_artifacts/f1_*/D_source_corpus/

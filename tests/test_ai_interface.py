@@ -74,6 +74,27 @@ class TestAIIinterface:
         assert "summary" in result
 
     @patch('ai_interface.requests.post')
+    def test_provider_redirect_is_not_followed_or_retried(self, mock_post):
+        response = Mock()
+        response.status_code = 307
+        response.headers = {"Location": "https://other.example/provider"}
+        mock_post.return_value = response
+
+        with patch('ai_interface.load_config', return_value=_runtime_config(retries="3")):
+            result = self.ai_interface._call_ai_api_detailed(
+                "test prompt",
+                {"api_key": "test_key", "model": "test_model"},
+                "system prompt",
+            )
+
+        assert result["status"] == "failed"
+        assert result["error_kind"] == "outcome_unknown"
+        assert result["http_status"] == 307
+        assert mock_post.call_count == 1
+        assert mock_post.call_args.kwargs["allow_redirects"] is False
+        response.close.assert_called_once()
+
+    @patch('ai_interface.requests.post')
     def test_call_ai_api_rate_limit(self, mock_post):
         """测试API调用遇到速率限制"""
         # 模拟429错误
@@ -656,6 +677,7 @@ class TestAIIinterface:
         assert result == {"summary": "ok"}
         assert session.trust_env is False
         assert len(session.calls) == 1
+        assert session.calls[0][1]["allow_redirects"] is False
         mock_post.assert_not_called()
 
 

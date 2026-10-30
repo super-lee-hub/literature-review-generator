@@ -3,16 +3,14 @@ repair, external-reference protection (P0-4 / P0-5 / P0-3e).
 
 Drives the real OutlineV3Executor with a stub provider that violates the
 candidate contract (outside-corpus paper keys, invented identities) exactly
-like the F1 `problem_evidence_synthesis` candidate did, then verifies the
-single bounded repair removes illegal IDs or the run fails closed.
+like the F1 `problem_evidence_synthesis` candidate did, then verifies that
+one bounded repair per transported candidate removes illegal IDs or fails closed.
 """
 from __future__ import annotations
 
 import json
 from pathlib import Path
 from typing import Any, Mapping
-
-import pytest
 
 from outline.evidence_alias import (
     alias_structural,
@@ -155,14 +153,35 @@ def test_candidate_semantic_repair_removes_illegal_ids(tmp_path: Path) -> None:
     result = executor.run()
     assert result.ok is True, result.diagnostics
     repairs = [
-        t for _n, t in holder["requests"]
-        if json.loads(t).get("task") == "semantic_repair_of_outline_candidate"
+        (node, text) for node, text in holder["requests"]
+        if json.loads(text).get("task") == "semantic_repair_of_outline_candidate"
     ]
-    assert len(repairs) == 1
+    # The primary and reversed-order stability candidate are distinct
+    # transported plans, each with at most one bounded repair.
+    assert sorted(node for node, _text in repairs) == [
+        "candidate_2_provider_generation",
+        "candidate_2_semantic_repair",
+    ]
+    assert len({text for _node, text in repairs}) == 2
     final_text = _flat_json_text(_final_payload(executor))
     assert FAKE_DOI not in final_text
     assert FAKE_SMITH not in final_text
     assert PAPER_A in final_text
+
+
+def test_enabled_semantic_repair_reserves_extra_calls_before_transport(tmp_path: Path) -> None:
+    executor = _executor(tmp_path, semantic_repair_enabled=True, candidate_count=2)
+
+    executor._preflight_stability_budget()
+    preflight = executor.stability_preflight
+    static_calls = sum(
+        bool(row.transport_expected) for row in executor.provider_call_plans
+    )
+
+    assert preflight["semantic_repair_calls_reserved"] == 4
+    assert preflight["semantic_repair_physical_attempts_upper_bound"] == 4
+    assert preflight["estimated_provider_calls"] >= static_calls + 4
+    assert preflight["estimated_provider_physical_attempts_upper_bound"] >= static_calls + 4
 
 
 def test_candidate_semantic_repair_is_bounded_once_and_fails_closed(tmp_path: Path) -> None:

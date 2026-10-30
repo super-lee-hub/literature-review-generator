@@ -38,10 +38,13 @@ def provider_output_token_limit(
     """Return an explicit or known provider output ceiling, if available."""
 
     config = dict(provider_config or {})
+    explicit_limits: list[int] = []
     for key in ("provider_max_output_tokens", "max_output_tokens_limit"):
         value = _positive_int(config.get(key), 0)
         if value > 0:
-            return value
+            explicit_limits.append(value)
+    if explicit_limits:
+        return min(explicit_limits)
     capability = resolve_model_capability(cast(APIConfig, config))
     return capability.max_output_tokens
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, Mapping, MutableMapping
 
+from runtime.provider_runtime import DEFAULT_PROVIDER_CALL_BUDGET
 from services.config_values import normalize_stage1_config_sections
 from services.model_capabilities import resolve_model_capability
 from services.repair_policy import DEFAULT_REPAIR_POLICY, parse_repair_policy
@@ -216,6 +217,9 @@ API_KEYS = frozenset(
         "read_timeout_seconds",
         "total_timeout_seconds",
         "first_token_timeout_seconds",
+        "first_body_timeout_seconds",
+        "provider_stream",
+        "provider_stream_include_usage",
         "transport_retries",
         "reasoning_reserve_tokens",
         "safety_margin_tokens",
@@ -277,6 +281,7 @@ CONFIG_KEYS: Dict[str, frozenset[str]] = {
             "evidence_critique_enabled",
             "require_explicit_adoption",
             "technical_shard_target_tokens",
+            "semantic_output_max_tokens",
             "allow_bibliometric_provider",
         }
     ),
@@ -520,11 +525,26 @@ class OutlineSettings:
     evidence_critique_enabled: bool = True
     require_explicit_adoption: bool = True
     technical_shard_target_tokens: int = 0
+    semantic_output_max_tokens: int = 0
     allow_bibliometric_provider: bool = False
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> "OutlineSettings":
         section = _section(config, "Outline")
+        raw_semantic_output = section.get("semantic_output_max_tokens")
+        if raw_semantic_output is None or str(raw_semantic_output).strip() == "":
+            semantic_output_max_tokens = 0
+        else:
+            if isinstance(raw_semantic_output, bool):
+                raise ValueError("Outline.semantic_output_max_tokens must be a non-negative integer (0 uses the route target)")
+            try:
+                semantic_output_max_tokens = int(str(raw_semantic_output).strip())
+            except ValueError as exc:
+                raise ValueError(
+                    "Outline.semantic_output_max_tokens must be a non-negative integer (0 uses the route target)"
+                ) from exc
+            if semantic_output_max_tokens < 0:
+                raise ValueError("Outline.semantic_output_max_tokens must be a non-negative integer (0 uses the route target)")
         return cls(
             candidate_count=_int(section.get("candidate_count"), 5),
             relation_adjudication_enabled=_bool(section.get("relation_adjudication_enabled"), True),
@@ -533,6 +553,7 @@ class OutlineSettings:
             evidence_critique_enabled=_bool(section.get("evidence_critique_enabled"), True),
             require_explicit_adoption=_bool(section.get("require_explicit_adoption"), True),
             technical_shard_target_tokens=_int(section.get("technical_shard_target_tokens"), 0),
+            semantic_output_max_tokens=semantic_output_max_tokens,
             allow_bibliometric_provider=_bool(section.get("allow_bibliometric_provider"), False),
         )
 
@@ -540,7 +561,7 @@ class OutlineSettings:
 @dataclass(frozen=True)
 class OutlineStabilitySettings:
     mode: str = "smoke"
-    max_provider_calls: int = 24
+    max_provider_calls: int = DEFAULT_PROVIDER_CALL_BUDGET
     max_estimated_cost: float | None = None
     max_estimated_total_tokens: int = 5_000_000
     pricing_source: str = ""
@@ -560,12 +581,27 @@ class OutlineStabilitySettings:
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> "OutlineStabilitySettings":
         section = _section(config, "OutlineStability")
+        raw_source_target = section.get("max_source_prompt_tokens")
+        if raw_source_target is None or str(raw_source_target).strip() == "":
+            source_target = 0
+        else:
+            if isinstance(raw_source_target, bool):
+                raise ValueError("OutlineStability.max_source_prompt_tokens must be a non-negative integer")
+            try:
+                source_target = int(str(raw_source_target).strip())
+            except ValueError as exc:
+                raise ValueError("OutlineStability.max_source_prompt_tokens must be a non-negative integer") from exc
+            if source_target < 0:
+                raise ValueError("OutlineStability.max_source_prompt_tokens must be a non-negative integer")
         mode = str(section.get("mode") or "smoke").strip().lower()
         if mode not in {"off", "smoke", "full"}:
             mode = "smoke"
         return cls(
             mode=mode,
-            max_provider_calls=max(0, _int(section.get("max_provider_calls"), 24)),
+            max_provider_calls=max(
+                0,
+                _int(section.get("max_provider_calls"), DEFAULT_PROVIDER_CALL_BUDGET),
+            ),
             max_estimated_cost=_optional_float(section.get("max_estimated_cost")),
             max_estimated_total_tokens=max(
                 0, _int(section.get("max_estimated_total_tokens"), 5_000_000)
@@ -582,7 +618,7 @@ class OutlineStabilitySettings:
             cache_read_cost_per_1k_tokens=_optional_float(section.get("cache_read_cost_per_1k_tokens")),
             cache_write_cost_per_1k_tokens=_optional_float(section.get("cache_write_cost_per_1k_tokens")),
             max_smoke_overhead_ratio=max(1.0, _float(section.get("max_smoke_overhead_ratio"), 2.0)),
-            max_source_prompt_tokens=max(0, _int(section.get("max_source_prompt_tokens"), 0)),
+            max_source_prompt_tokens=source_target,
         )
 
 

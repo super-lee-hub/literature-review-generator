@@ -57,12 +57,12 @@ exception。视觉模型失败时会明确记录 fallback，而不会把纯文�
 ```text
 Stage 1 summaries
        ↓
-Claude Opus 5：生成主候选大纲
+Claude Opus 5.5：生成主候选大纲
        ↓
 GPT-5.6-sol：结构 / 证据 critique
 DeepSeek V4 Pro：关系 / coverage critique
        ↓
-Claude Opus 5：综合 peer critiques 做最终仲裁
+Claude Opus 5.5：综合 peer critiques 做最终仲裁
        ↓
 reviewed outline
 ```
@@ -213,7 +213,7 @@ python -m reviewctl validation-status --job <job_id>
 | Stage 1 主阅读                         | DeepSeek V4 Flash Vision | DeepSeek 官方                   |
 | Stage 1 fallback                    | DeepSeek V4 Flash        | DeepSeek 官方                   |
 | Free Mode                           | DeepSeek V4 Pro          | DeepSeek 官方                   |
-| Outline 主生成 / 最终仲裁                  | Claude Opus 5            | `chat.178266.xyz` 第三方 gateway |
+| Outline 主生成 / 最终仲裁                  | Claude Opus 5.5          | `chat.178266.xyz` 第三方 gateway |
 | Outline structure/evidence critique | GPT-5.6-sol              | `ai.saigou.work` 第三方 gateway  |
 | Outline relation/coverage critique  | DeepSeek V4 Pro          | DeepSeek 官方                   |
 | Review Writer                       | GPT-5.6-sol              | `ai.saigou.work` 第三方 gateway  |

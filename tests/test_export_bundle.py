@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
-import zipfile
 
 import runtime.export_bundle as export_bundle_module
 from runtime.export_bundle import ExportBundleService, ForensicAttestationService
@@ -52,7 +50,7 @@ def test_export_registration_failure_is_untrusted_and_removes_bundle(
     monkeypatch.setattr(
         export_bundle_module,
         "_derive_current_evidence",
-        lambda workspace, registry: {
+        lambda workspace, registry, *, records_snapshot, expected_snapshot_revision, records_snapshot_error: {
             "completion": {"completion_status": "complete", "canonical_ready": True},
             "closure": {"status": "clean"},
             "receipt_closure": {"status": "clean", "complete": True},

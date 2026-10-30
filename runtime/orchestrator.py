@@ -5,9 +5,12 @@ import json
 import logging
 from pathlib import Path
 import re
-from typing import Any, Callable, Dict, Iterable, Mapping, Sequence, cast
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Mapping, Sequence, cast
 
-from config_loader import load_config
+if TYPE_CHECKING:
+    from runtime.stage1_publication_recovery import Stage1PartialRecoveryContext
+
+from config_loader import ConfigDict, load_config
 from free_mode.intent_input import (
     FREE_MODE_INTENT_INPUT_ARTIFACT_ID,
     FREE_MODE_INTENT_INPUT_ARTIFACT_TYPE,
@@ -26,9 +29,20 @@ from runtime.architecture_gates import ArchitectureGateScope, collect_scannable_
 from runtime.lifecycle import BootstrappedRuntimeContext, bootstrap_job_runtime, finalize_job_runtime
 from runtime.job_spec import RuntimeJobSpec
 from runtime.provider_context import ProviderContextProfile
-from runtime.provider_runtime import hash_json
+from runtime.provider_runtime import (
+    RuntimeControlIdentityV1,
+    acceptance_execution_context_from_environment,
+    bind_runtime_control_context,
+    current_acceptance_execution_context,
+    current_runtime_control_context,
+    hash_json,
+)
 from runtime.reconcile import ReconcileValidationError, validate_canonical_ai_summary
-from runtime.source_intake import build_source_bundle_for_request
+from runtime.source_intake import (
+    build_source_bundle_for_request,
+    stage1_paper_work_item_basis,
+)
+from runtime.source_revision_response_capture import build_source_revision_response_sink
 from runtime.stage_contracts import SourceBundle, StageArtifactRef, StageResult
 from runtime.subagent_policy import ExecutionMode, build_runtime_stage_trace_entry, stage_policy_for
 from validation.execution_service import ValidationExecutionService
@@ -43,10 +57,16 @@ from services.settings import ApplicationSettings
 from services.artifact_registry import (
     ArtifactDependencyRefV2,
     ArtifactRecord,
+    ArtifactRegistry,
     RegistryError,
     file_sha256,
 )
-from services.job_runner import JobRunRequest, JobRunner, validate_job_request_options
+from services.job_runner import (
+    JobRunRequest,
+    JobRunner,
+    _typed_reuse_manifest_mode,
+    validate_job_request_options,
+)
 from services.job_workspace import (
     JobWorkspace,
     publish_bytes_artifact,
@@ -56,6 +76,96 @@ from services.job_workspace import (
 from services.progress_state import Stage1ProgressSnapshot
 from services.queue_service import CancelToken
 from services.stage1_analysis_service import Stage1AnalysisService
+from services.stage1_reuse import (
+    Stage1ReusableSummaryBindingV1,
+    Stage1TypedManifestAuthorityV2,
+    verify_stage1_typed_manifest_authority,
+)
+
+
+def _selected_v2_reuse_source_paths(
+    *,
+    candidate: Mapping[str, Any],
+    candidate_path: str,
+    candidate_record: ArtifactRecord,
+    candidate_registry: ArtifactRegistry,
+    owner_metadata: Mapping[str, Any],
+    external_registry_resolver: Callable[[str], ArtifactRegistry | None],
+) -> tuple[str, str] | None:
+    """Return exact V2 and origin V1 paths after rechecking both owners."""
+
+    from validation.source_binding import _canonical_path
+
+    source_manifest_refs = owner_metadata.get("validation_source_manifests")
+    if not isinstance(source_manifest_refs, list) or len(source_manifest_refs) != 2:
+        return None
+    primary_ref, prior_ref = source_manifest_refs
+    if not isinstance(primary_ref, Mapping) or not isinstance(prior_ref, Mapping):
+        return None
+    reuse_payload = candidate.get("stage1_reuse")
+    binding = reuse_payload.get("binding") if isinstance(reuse_payload, Mapping) else None
+    if not isinstance(binding, Mapping):
+        return None
+    authority, _reason = verify_stage1_typed_manifest_authority(
+        candidate,
+        Stage1ReusableSummaryBindingV1.from_mapping(binding),
+        external_registry_resolver=external_registry_resolver,
+    )
+    if not isinstance(authority, Stage1TypedManifestAuthorityV2):
+        return None
+
+    origin_manifest = authority.manifest.owner_correction_authority.get(
+        "origin_prior_manifest"
+    )
+    origin_manifest = origin_manifest if isinstance(origin_manifest, Mapping) else {}
+    prior_job_id = str(origin_manifest.get("job_id") or "")
+    prior_artifact_id = str(origin_manifest.get("artifact_id") or "")
+    prior_hash = str(origin_manifest.get("content_hash") or "")
+    prior_path = str(Path(authority.owner_correction_prior_manifest_path).resolve())
+    if (
+        str(primary_ref.get("manifest_artifact_version") or "") != "v2"
+        or str(primary_ref.get("owner_job_id") or "") != candidate_record.job_id
+        or str(primary_ref.get("owner_registry_id") or "")
+        != f"artifact-registry:{candidate_record.job_id}"
+        or _canonical_path(primary_ref.get("owner_registry_path"))
+        != _canonical_path(candidate_registry.registry_path)
+        or str(primary_ref.get("manifest_artifact_id") or "") != candidate_record.artifact_id
+        or str(primary_ref.get("manifest_artifact_hash") or "") != candidate_record.content_hash
+        or _canonical_path(primary_ref.get("manifest_path")) != _canonical_path(candidate_path)
+        or str(prior_ref.get("manifest_artifact_version") or "") != "v1"
+        or str(prior_ref.get("owner_job_id") or "") != prior_job_id
+        or str(prior_ref.get("owner_registry_id") or "")
+        != f"artifact-registry:{prior_job_id}"
+        or str(prior_ref.get("manifest_artifact_id") or "") != prior_artifact_id
+        or str(prior_ref.get("manifest_artifact_hash") or "") != prior_hash
+        or _canonical_path(prior_ref.get("manifest_path")) != _canonical_path(prior_path)
+    ):
+        return None
+
+    prior_registry = external_registry_resolver(prior_job_id)
+    if prior_registry is None:
+        return None
+    prior_registry.reload()
+    prior_record = prior_registry.get(prior_artifact_id)
+    if (
+        not str(prior_ref.get("owner_registry_path") or "").strip()
+        or _canonical_path(prior_ref.get("owner_registry_path"))
+        != _canonical_path(prior_registry.registry_path)
+        or prior_record is None
+        or prior_record.job_id != prior_job_id
+        or prior_record.status != "ready"
+        or prior_record.artifact_type != "stage1_reusable_summary_manifest"
+        or prior_record.artifact_version != "v1"
+        or prior_record.content_hash != prior_hash
+        or _canonical_path(prior_record.path) != _canonical_path(prior_path)
+        or file_sha256(prior_record.path) != prior_hash
+    ):
+        return None
+    prior_registry.verify_ready_artifact_closure(
+        prior_record,
+        external_registry_resolver=external_registry_resolver,
+    )
+    return candidate_path, prior_path
 
 
 class _OutlineProviderTransportAdapter:
@@ -98,10 +208,40 @@ class _OutlineProviderTransportAdapter:
         attempt_limit: int,
         output_tokens: int | None = None,
         runtime: Any | None = None,
+        primary_raw_response_retention_callback: Any | None = None,
+        primary_provider_attempt_started_callback: Any | None = None,
     ) -> Any:
         from ai_interface import _call_ai_api_detailed_uninstrumented
 
         config = dict(self.api_config)
+        requested_output_tokens = int(
+            self.profile.max_output_tokens if output_tokens is None else output_tokens
+        )
+        if requested_output_tokens <= 0:
+            raise ValueError("Outline provider output allowance must be positive")
+        if requested_output_tokens > self.profile.max_output_tokens:
+            raise ValueError("Outline provider output allowance exceeds the route ceiling")
+        # The formal Anthropic, Chat Completions, and Responses payload builders
+        # can prefer route-configured token fields over the max_tokens argument.
+        # Keep the physical wire ceiling equal to the admitted reservation.
+        for field in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
+            config[field] = requested_output_tokens
+        if str(config.get("model") or "").strip():
+            from services.model_capabilities import resolve_model_capability
+
+            capability = resolve_model_capability(cast(Any, config))
+            if (
+                capability.endpoint_type == "anthropic"
+                and capability.anthropic_thinking_mode == "manual"
+            ):
+                try:
+                    thinking_budget = int(str(config.get("thinking_budget_tokens") or "0"))
+                except ValueError:
+                    thinking_budget = 0
+                if thinking_budget >= requested_output_tokens:
+                    raise ValueError(
+                        "Outline manual thinking budget exceeds the admitted output allowance"
+                    )
         if runtime is not None:
             config.setdefault(
                 "operation_id",
@@ -113,8 +253,22 @@ class _OutlineProviderTransportAdapter:
                 str(getattr(runtime, "logical_attempt_identity", "") or ""),
             )
             config.setdefault("provider_route", str(getattr(runtime, "route", "") or ""))
+            aggregate_wall_deadline = getattr(
+                runtime, "aggregate_wall_deadline_epoch", None
+            )
+            if aggregate_wall_deadline is not None:
+                config["provider_aggregate_wall_deadline_epoch"] = str(
+                    aggregate_wall_deadline
+                )
             ledger_path = getattr(getattr(runtime, "ledger", None), "path", None)
-            if ledger_path and not str(config.get("raw_response_dir") or "").strip():
+            primary_journal = getattr(runtime, "primary_repair_response_journal", None)
+            if primary_raw_response_retention_callback is not None:
+                if primary_journal is None:
+                    raise ValueError(
+                        "PRIMARY raw-response retention has no bound response journal"
+                    )
+                config["raw_response_dir"] = str(primary_journal.raw_spool_root)
+            elif ledger_path and not str(config.get("raw_response_dir") or "").strip():
                 config["raw_response_dir"] = str(Path(str(ledger_path)).resolve().parent / "raw_responses")
         return _call_ai_api_detailed_uninstrumented(
             json.dumps(
@@ -124,13 +278,19 @@ class _OutlineProviderTransportAdapter:
             ),
             cast(Any, config),
             self.system_prompt,
-            max_tokens=int(output_tokens or self.profile.max_output_tokens),
+            max_tokens=requested_output_tokens,
             temperature=0.0,
             response_format="json",
             logger=self.logger,
             retry_attempts=max(1, int(attempt_limit)),
             max_retries_per_call=max(0, int(attempt_limit) - 1),
             attempt_limit=max(1, int(attempt_limit)),
+            primary_raw_response_retention_callback=(
+                primary_raw_response_retention_callback
+            ),
+            primary_provider_attempt_started_callback=(
+                primary_provider_attempt_started_callback
+            ),
         )
 
     def __call__(self, node_id: str, request: Mapping[str, Any]) -> Any:
@@ -148,6 +308,8 @@ class _OutlineProviderTransportAdapter:
         runtime: Any,
         attempt_limit: int,
         output_tokens: int | None = None,
+        primary_raw_response_retention_callback: Any | None = None,
+        primary_provider_attempt_started_callback: Any | None = None,
     ) -> Any:
         return self._call(
             node_id,
@@ -155,6 +317,12 @@ class _OutlineProviderTransportAdapter:
             attempt_limit=attempt_limit,
             output_tokens=output_tokens,
             runtime=runtime,
+            primary_raw_response_retention_callback=(
+                primary_raw_response_retention_callback
+            ),
+            primary_provider_attempt_started_callback=(
+                primary_provider_attempt_started_callback
+            ),
         )
 
 
@@ -187,15 +355,30 @@ class _RuntimeStageHost:
         from runtime.test_dependencies import current_runtime_test_dependencies
 
         test_dependencies = current_runtime_test_dependencies()
-        self.config = load_config(
-            request.config,
-            action=request.action,
-            requested_stages=request.requested_stages,
-            free_mode_enabled=bool(request.free_mode_profile or request.free_mode_idea),
-            allow_template_credentials=bool(
-                test_dependencies and test_dependencies.allow_template_credentials
-            ),
+        strict_spec = (
+            RuntimeJobSpec.from_mapping(request.runtime_spec_payload)
+            if request.runtime_spec_payload is not None else None
         )
+        if strict_spec is not None and strict_spec.metadata.get("stage1_summary_input_mode") == "explicit_typed_import":
+            from runtime.explicit_stage1_scope import load_explicit_stage1_scope
+
+            scope = load_explicit_stage1_scope(
+                strict_spec,
+                allow_template_credentials=bool(
+                    test_dependencies and test_dependencies.allow_template_credentials
+                ),
+            )
+            self.config = cast(ConfigDict, scope.config)
+        else:
+            self.config = load_config(
+                request.config,
+                action=request.action,
+                requested_stages=request.requested_stages,
+                free_mode_enabled=bool(request.free_mode_profile or request.free_mode_idea),
+                allow_template_credentials=bool(
+                    test_dependencies and test_dependencies.allow_template_credentials
+                ),
+            )
         if request.source_mode == "direct":
             # A direct job owns its source mode; configured Zotero defaults
             # must not silently override it during source-inventory planning.
@@ -229,10 +412,14 @@ class _RuntimeStageHost:
         self.current_validation_source_binding_id = ""
         self.current_validation_source_binding_hash = ""
         self.current_validation_source_binding_content_hash = ""
+        self.arbitration_work_policy_record: ArtifactRecord | None = None
         self._checkpoint_processed_papers: set[str] = set()
         self._checkpoint_failed_papers: set[str] = set()
 
     def check_cancelled(self) -> None:
+        context = current_runtime_control_context()
+        if context is not None and context.cancellation_store.is_requested():
+            self.cancel_token.request_cancel()
         self.cancel_token.check_cancelled()
 
     def bind_job_workspace(
@@ -299,7 +486,26 @@ class _RuntimeStageHost:
         file_id = self._paper_artifact_id(paper).replace(":", "_")
         return workspace.artifact_path(f"paper_artifacts/{file_id}.json")
 
-    def _persist_paper_artifact(self, result: Mapping[str, Any]) -> bool:
+    @staticmethod
+    def _dependency_records_by_path(
+        records: Iterable[ArtifactRecord],
+    ) -> dict[str, tuple[tuple[int, ArtifactRecord], ...]]:
+        records_by_path: dict[str, list[tuple[int, ArtifactRecord]]] = {}
+        for ordinal, record in enumerate(records):
+            if record.status != "ready" or not record.path:
+                continue
+            resolved_path = str(Path(record.path).resolve())
+            records_by_path.setdefault(resolved_path, []).append((ordinal, record))
+        return {path: tuple(rows) for path, rows in records_by_path.items()}
+
+    def _persist_paper_artifact(
+        self,
+        result: Mapping[str, Any],
+        *,
+        dependency_records_by_path: Mapping[
+            str, Sequence[tuple[int, ArtifactRecord]]
+        ] | None = None,
+    ) -> bool:
         _workspace, registry = self._require_workspace()
         paper = result.get("paper_info")
         if not isinstance(paper, Mapping):
@@ -335,16 +541,25 @@ class _RuntimeStageHost:
                 for item in (stage1_input.get("selected_visual_refs") or [])
                 if isinstance(item, Mapping)
             )
+        records_by_path = dependency_records_by_path
+        if records_by_path is None:
+            records_by_path = self._dependency_records_by_path(registry.list_records())
+        resolved_dependency_paths = {
+            str(Path(value).expanduser().resolve())
+            for value in dependency_paths
+            if value
+        }
+        matching_records = sorted(
+            (
+                (ordinal, record)
+                for resolved_path in resolved_dependency_paths
+                for ordinal, record in records_by_path.get(resolved_path, ())
+                if record.status == "ready" and record.path
+            ),
+            key=lambda item: item[0],
+        )
         dependencies: list[ArtifactDependencyRefV2] = []
-        for record in registry.list_records():
-            if record.status != "ready" or not record.path:
-                continue
-            if str(Path(record.path).resolve()) not in {
-                str(Path(value).expanduser().resolve())
-                for value in dependency_paths
-                if value
-            }:
-                continue
+        for _ordinal, record in matching_records:
             dependencies.append(
                 ArtifactDependencyRefV2(
                     dependency_kind="local_job",
@@ -502,6 +717,170 @@ class _RuntimeStageHost:
     def _stage2_validation_enabled(self) -> bool:
         return self.settings.review_validation_enabled()
 
+    @staticmethod
+    def _read_ready_artifact_payload(record: Any, label: str) -> dict[str, Any]:
+        if record is None or str(getattr(record, "status", "")) != "ready":
+            raise RuntimeError(f"{label} is not a ready registered artifact")
+        path = Path(str(getattr(record, "path", "") or ""))
+        if not path.is_file():
+            raise RuntimeError(f"{label} artifact file is missing")
+        try:
+            if file_sha256(path) != str(getattr(record, "content_hash", "") or ""):
+                raise RuntimeError(f"{label} artifact bytes do not match its Registry hash")
+            value: Any = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"{label} artifact cannot be read") from exc
+        # publish_json_artifact adds an envelope, while some typed artifacts
+        # have their own nested payload object inside that envelope.
+        for _ in range(3):
+            if not isinstance(value, Mapping) or not isinstance(value.get("payload"), Mapping):
+                break
+            value = value["payload"]
+        if not isinstance(value, Mapping):
+            raise RuntimeError(f"{label} artifact payload is not an object")
+        return dict(value)
+
+    def _outline_v3_review_lineage(
+        self,
+        *,
+        outline_file: str,
+        review_sections: Sequence[Mapping[str, Any]],
+    ) -> tuple[Any, Any, Any, Any, list[Any], list[dict[str, str]], str]:
+        _workspace, registry = self._require_workspace()
+        outline_record = registry.get("outline-v3:final_outline")
+        if outline_record is None or outline_record.status != "ready":
+            raise RuntimeError("Outline v3 review requires a ready final outline")
+        if Path(outline_file).resolve() != Path(outline_record.path).resolve():
+            raise RuntimeError("Outline v3 review input path does not identify the current final outline")
+        outline_payload = self._read_ready_artifact_payload(outline_record, "final outline")
+        outline_sections = outline_payload.get("sections")
+        if not isinstance(outline_sections, list) or not outline_sections:
+            raise RuntimeError("current final outline has no sections")
+        outline_section_ids = [
+            str(section.get("section_id") or "").strip()
+            for section in outline_sections
+            if isinstance(section, Mapping)
+        ]
+        if (
+            len(outline_section_ids) != len(outline_sections)
+            or any(not section_id for section_id in outline_section_ids)
+            or len(set(outline_section_ids)) != len(outline_section_ids)
+        ):
+            raise RuntimeError("current final outline has missing or duplicate section identities")
+
+        adoption_record = current_adoption_record(registry)
+        if adoption_record is None or adoption_record.status != "ready":
+            raise RuntimeError("Outline v3 review requires a ready current adoption")
+        if (
+            adoption_record.artifact_type != "adopted_outline"
+            or adoption_record.artifact_version != "v3"
+        ):
+            raise RuntimeError("current adoption has an unsupported artifact identity")
+        adoption_payload = self._read_ready_artifact_payload(adoption_record, "current adoption")
+        if str(adoption_payload.get("final_outline_hash") or "") != outline_record.content_hash:
+            raise RuntimeError("current adoption is bound to a different final outline")
+        adoption_pointer = registry.get("outline-v3:adoption:current")
+        if (
+            adoption_pointer is None
+            or adoption_pointer.status != "ready"
+            or adoption_pointer.artifact_type != "outline_adoption_pointer"
+            or adoption_pointer.artifact_version != "v1"
+        ):
+            raise RuntimeError("current Outline v3 adoption pointer is not ready")
+        adoption_pointer_payload = self._read_ready_artifact_payload(
+            adoption_pointer,
+            "current adoption pointer",
+        )
+        if (
+            str(adoption_pointer_payload.get("current_adoption_artifact_id") or "")
+            != adoption_record.artifact_id
+            or str(adoption_pointer_payload.get("current_adoption_hash") or "")
+            != adoption_record.content_hash
+        ):
+            raise RuntimeError("current adoption pointer selects a different adoption artifact")
+
+        if len(review_sections) != len(outline_section_ids):
+            raise RuntimeError("Writer section count does not match the current final outline")
+        writer_section_ids = [
+            str(section.get("evidence_packet_id") or "").strip()
+            for section in review_sections
+            if isinstance(section, Mapping)
+        ]
+        if (
+            len(writer_section_ids) != len(review_sections)
+            or writer_section_ids != outline_section_ids
+        ):
+            raise RuntimeError("Writer sections do not match the current final outline section order")
+
+        immutable_records: list[Any] = []
+        section_artifact_refs: list[dict[str, str]] = []
+        for section_id, provided_section in zip(writer_section_ids, review_sections):
+            pointer = registry.get(f"review-section:{section_id}")
+            if (
+                pointer is None
+                or pointer.status != "ready"
+                or pointer.artifact_type != "review_section"
+                or pointer.artifact_version != "v3"
+                or str(pointer.metadata.get("pointer_role") or "") != "current"
+            ):
+                raise RuntimeError(f"Writer section {section_id} has no ready current Registry pointer")
+            pointer_payload = self._read_ready_artifact_payload(
+                pointer,
+                f"Writer section {section_id} current pointer",
+            )
+            immutable_id = str(pointer.metadata.get("current_version_artifact_id") or "").strip()
+            immutable_record = registry.get(immutable_id) if immutable_id else None
+            if (
+                immutable_record is None
+                or immutable_record.status != "ready"
+                or immutable_record.artifact_type != "review_section"
+                or immutable_record.artifact_version != "v3"
+                or not bool(immutable_record.metadata.get("immutable"))
+            ):
+                raise RuntimeError(f"Writer section {section_id} has no ready immutable Registry artifact")
+            if not any(
+                dependency.artifact_id == immutable_record.artifact_id
+                and dependency.content_hash == immutable_record.content_hash
+                for dependency in pointer.depends_on
+            ):
+                raise RuntimeError(f"Writer section {section_id} current pointer does not bind its immutable artifact")
+            section_payload = self._read_ready_artifact_payload(
+                immutable_record,
+                f"Writer section {section_id}",
+            )
+            persisted_section = section_payload.get("section")
+            if (
+                str(pointer_payload.get("section_id") or "") != section_id
+                or str(pointer_payload.get("content_hash") or "")
+                != str(section_payload.get("content_hash") or "")
+                or section_payload.get("artifact_type") != "review_section"
+                or section_payload.get("artifact_version") != "v3"
+                or str(section_payload.get("section_id") or "") != section_id
+                or not isinstance(persisted_section, Mapping)
+                or hash_json(dict(persisted_section)) != hash_json(dict(provided_section))
+                or str(section_payload.get("content_hash") or "")
+                != hash_json(dict(provided_section))
+            ):
+                raise RuntimeError(f"Writer section {section_id} bytes do not match the supplied review section")
+            immutable_records.append(immutable_record)
+            section_artifact_refs.append({
+                "artifact_id": str(immutable_record.artifact_id),
+                "content_hash": str(immutable_record.content_hash),
+            })
+
+        catalog_record = registry.get("citation_ref_catalog")
+        if catalog_record is None or catalog_record.status != "ready":
+            raise RuntimeError("Outline v3 review requires a ready citation reference catalog")
+        return (
+            outline_record,
+            adoption_record,
+            adoption_pointer,
+            catalog_record,
+            immutable_records,
+            section_artifact_refs,
+            str(outline_payload.get("title") or "").strip(),
+        )
+
     def _persist_review_draft(
         self,
         *,
@@ -517,10 +896,29 @@ class _RuntimeStageHost:
         from services.review_draft import build_review_draft
 
         _workspace, registry = self._require_workspace()
+        outline_record = adoption_record = adoption_pointer = None
+        catalog_record = registry.get("citation_ref_catalog")
+        immutable_section_records: list[Any] = []
+        writer_section_artifacts: list[dict[str, str]] = []
+        outline_title = ""
+        if generation_mode == "outline_v3":
+            (
+                outline_record,
+                adoption_record,
+                adoption_pointer,
+                catalog_record,
+                immutable_section_records,
+                writer_section_artifacts,
+                outline_title,
+            ) = self._outline_v3_review_lineage(
+                outline_file=outline_file,
+                review_sections=review_sections,
+            )
         draft = build_review_draft(
             job_id=registry.job_id,
             project_name=self.project_name,
             draft_id="review_draft",
+            title=outline_title,
             outline_artifact_id="outline-v3:final_outline",
             outline_source_path=outline_file,
             summary_file=self.summary_file,
@@ -532,21 +930,25 @@ class _RuntimeStageHost:
             citation_ref_catalog=citation_ref_catalog,
             citation_ref_catalog_path=citation_ref_catalog_path,
             citation_ref_catalog_hash=citation_ref_catalog_hash,
+            outline_artifact_hash=(str(outline_record.content_hash) if outline_record else ""),
+            adoption_artifact_id=(str(adoption_record.artifact_id) if adoption_record else ""),
+            adoption_artifact_hash=(str(adoption_record.content_hash) if adoption_record else ""),
+            writer_section_artifacts=writer_section_artifacts,
         )
         path = self._review_draft_path()
         dependencies: list[ArtifactDependencyRefV2] = []
-        catalog_record = registry.get("citation_ref_catalog")
         if catalog_record is not None and catalog_record.status == "ready":
-            dependencies.append(
-                ArtifactDependencyRefV2(
-                    dependency_kind="local_job",
-                    job_id=catalog_record.job_id,
-                    artifact_id=catalog_record.artifact_id,
-                    artifact_type=catalog_record.artifact_type,
-                    path=catalog_record.path,
-                    content_hash=catalog_record.content_hash,
-                )
-            )
+            dependencies.append(ArtifactDependencyRefV2.from_record(catalog_record))
+        if outline_record is not None and adoption_record is not None and adoption_pointer is not None:
+            dependencies.extend((
+                ArtifactDependencyRefV2.from_record(outline_record),
+                ArtifactDependencyRefV2.from_record(adoption_record),
+                ArtifactDependencyRefV2.from_record(adoption_pointer),
+                *(
+                    ArtifactDependencyRefV2.from_record(record)
+                    for record in immutable_section_records
+                ),
+            ))
         publish_json_artifact(
             self._publication_context(registry),
             registry,
@@ -667,8 +1069,27 @@ class InternalStageExecutorRegistry:
             raise RuntimeError(f"cannot load canonical summary source: {target}") from exc
         if (
             isinstance(payload, Mapping)
+            and payload.get("artifact_type") == "summary_source_manifest"
+        ):
+            from runtime.reconcile import load_summary_source_manifest
+
+            try:
+                _manifest, materialized_path, _materialized_rows = (
+                    load_summary_source_manifest(target)
+                )
+            except (OSError, UnicodeError, TypeError, ValueError, RuntimeError) as exc:
+                raise RuntimeError(
+                    f"cannot validate summary source manifest: {target}"
+                ) from exc
+            if materialized_path == target:
+                raise RuntimeError("summary source manifest cannot materialize itself")
+            return InternalStageExecutorRegistry._summary_payloads_from_file(
+                materialized_path
+            )
+        if (
+            isinstance(payload, Mapping)
             and payload.get("artifact_type") == "stage1_reusable_summary_manifest"
-            and payload.get("artifact_version") == "v1"
+            and payload.get("artifact_version") in {"v1", "v2"}
         ):
             summary_payload = payload.get("summary_payload")
             binding = payload.get("binding")
@@ -748,9 +1169,16 @@ class InternalStageExecutorRegistry:
         self,
         session: AgentRuntimeSession,
         results: Mapping[str, StageResult],
+        external_registry_resolver: Callable[[str], Any | None] | None = None,
     ) -> list[dict[str, Any]]:
         if session.stage_host.summaries:
-            return [dict(item) for item in session.stage_host.summaries]
+            summaries = [dict(item) for item in session.stage_host.summaries]
+            if (
+                isinstance(self.bridge.job_spec.metadata.get("outline_pilot"), Mapping)
+                and self.bridge.job_spec.summary_sources
+            ):
+                self._verify_typed_reuse_summaries(summaries, external_registry_resolver=external_registry_resolver)
+            return summaries
 
         paths: list[str] = []
         for value in (
@@ -770,6 +1198,14 @@ class InternalStageExecutorRegistry:
         summaries: list[dict[str, Any]] = []
         for path in dict.fromkeys(paths):
             summaries.extend(self._summary_payloads_from_file(path))
+        if (
+            isinstance(self.bridge.job_spec.metadata.get("outline_pilot"), Mapping)
+            and self.bridge.job_spec.summary_sources
+        ):
+            # A topic-only downstream run may consume Stage 1 typed manifests
+            # as summary_sources because reuse_stage1 is reserved for Stage 1
+            # actions. Preserve the typed authority check on that path.
+            self._verify_typed_reuse_summaries(summaries, external_registry_resolver=external_registry_resolver)
         return summaries
 
     def _build_outline_evidence_pack(
@@ -807,17 +1243,66 @@ class InternalStageExecutorRegistry:
                 source_sha = file_sha256(source_file)
             except (OSError, UnicodeError):
                 source_sha = ""
-        pack = build_pack(
-            summaries,
+        # A resume can expose both the imported Stage1 source and the local
+        # summary_file artifact.  They are allowed to point to the same paper,
+        # but the provider-facing pack must contain exactly one canonical
+        # entry per paper.  Identical duplicates are a read-side merge; a
+        # conflicting duplicate stays fail-closed.
+        deduplicated: list[Mapping[str, Any]] = []
+        seen_entries: dict[str, str] = {}
+        for summary in summaries:
+            paper_info = summary.get("paper_info") if isinstance(summary, Mapping) else None
+            paper_key = str(
+                (paper_info.get("canonical_paper_key") if isinstance(paper_info, Mapping) else "")
+                or (paper_info.get("doi") if isinstance(paper_info, Mapping) else "")
+                or (paper_info.get("title") if isinstance(paper_info, Mapping) else "")
+                or ""
+            ).strip()
+            summary_hash = hash_json(summary)
+            if paper_key and paper_key in seen_entries:
+                if seen_entries[paper_key] != summary_hash:
+                    raise ValueError(
+                        f"outline evidence pack has conflicting duplicate paper identity: {paper_key}"
+                    )
+                continue
+            if paper_key:
+                seen_entries[paper_key] = summary_hash
+            deduplicated.append(summary)
+        pack_builder = build_pack
+        pack_kwargs: dict[str, Any] = {}
+        source_bundle_record = None
+        if self.bridge.job_spec.metadata.get("provider_semantic_contract_version") == "source-closed-provider/v2":
+            from outline.evidence_projection import build_source_closed_pack_v2
+
+            source_bundle_record = session.context.registry.get("source_bundle")
+            if source_bundle_record is None or source_bundle_record.status != "ready":
+                raise RuntimeError("source-closed projection requires the current SourceBundle")
+            session.context.registry.verify_ready_artifact_closure(source_bundle_record)
+            bundle = SourceBundle.from_dict(json.loads(Path(source_bundle_record.path).read_bytes()))
+            pins = {}
+            for item in bundle.paper_work_items:
+                digest = file_sha256(item.source_pdf)
+                if digest != item.source_descriptor.get("source_pdf_fingerprint"):
+                    raise RuntimeError("source PDF changed before source-closed projection")
+                pins[item.canonical_paper_key] = {
+                    "source_pdf": item.source_pdf, "source_pdf_sha256": digest,
+                }
+            pack_kwargs["source_pins"] = pins
+            pack_builder = build_source_closed_pack_v2
+        pack = pack_builder(
+            deduplicated,
             source_ref=source_ref,
             source_ref_sha256=source_sha,
             job_id=session.context.workspace.job_id,
+            **pack_kwargs,
         )
         validate_pack(pack)
         payload_hash = str(pack.get("pack_payload_sha256") or "")
         workspace = session.context.workspace
         path = workspace.artifact_path(f"outline_evidence_pack_{payload_hash[:24]}.json")
         dependencies: list[ArtifactDependencyRefV2] = []
+        if source_bundle_record is not None:
+            dependencies.append(ArtifactDependencyRefV2.from_record(source_bundle_record))
         summary_record = session.context.registry.get("summary_file")
         if summary_record is not None and summary_record.status == "ready":
             dependencies.append(
@@ -846,7 +1331,7 @@ class InternalStageExecutorRegistry:
             pack,
             artifact_role="outline_evidence",
             artifact_type="outline_evidence_pack",
-            artifact_version="v1",
+            artifact_version=pack["artifact_version"],
             producer="runtime.orchestrator._RuntimeStageHost",
             artifact_id=f"outline_evidence_pack:{payload_hash[:24]}",
             depends_on=dependencies,
@@ -924,8 +1409,73 @@ class InternalStageExecutorRegistry:
         attempt_id: str,
         external_registry_resolver: Callable[[str], Any | None] | None = None,
     ) -> tuple[StageResult, int]:
-        summaries = self._load_summary_payloads(session, results)
+        partial_recovery_context = getattr(
+            self.bridge, "stage1_partial_recovery_context", None
+        )
+        summaries = (
+            []
+            if partial_recovery_context is not None
+            else self._load_summary_payloads(
+                session, results, external_registry_resolver=external_registry_resolver,
+            )
+        )
+        explicit_imports = None
+        if self.bridge.job_spec.metadata.get("stage1_summary_input_mode") == "explicit_typed_import":
+            if partial_recovery_context is not None:
+                raise RuntimeError("partial Stage 1 recovery cannot be combined with typed summary imports")
+            if not bundle.paper_work_items:
+                raise RuntimeError("explicit typed Stage 1 import requires the current PDF source bundle")
+            explicit_imports = [
+                row
+                for path in session.request.reuse_summary_files
+                for row in self._summary_payloads_from_file(path)
+            ]
+            imported_keys = {
+                str((row.get("paper_info") or {}).get("canonical_paper_key") or "")
+                for row in explicit_imports
+                if isinstance(row.get("paper_info"), Mapping)
+            }
+            # Checkpoint results for genuinely pending work remain cache
+            # candidates. Explicit input files get a separate authority path.
+            summaries = [
+                row for row in summaries
+                if str((row.get("paper_info") or {}).get("canonical_paper_key") or "") not in imported_keys
+            ]
+        automatic_reuse_plan = None
+        explicit_summary_paths = tuple(
+            str(value).strip()
+            for value in (
+                session.request.summary_file,
+                *session.request.summary_sources,
+                *session.request.reuse_summary_files,
+            )
+            if value is not None and str(value).strip()
+        )
+        if partial_recovery_context is not None and explicit_summary_paths:
+            raise RuntimeError("partial Stage 1 recovery cannot be combined with summary-file inputs")
+        if (
+            partial_recovery_context is None
+            and bundle.paper_work_items
+            and session.request.reuse_stage1
+            and not explicit_summary_paths
+            and not summaries
+        ):
+            from services.automatic_stage1_reuse import discover_automatic_stage1_reuse
+
+            workspace = session.context.workspace
+            automatic_reuse_plan = discover_automatic_stage1_reuse(
+                base_output_dir=workspace.base_output_dir,
+                current_workspace_dir=workspace.root_dir,
+                current_job_id=workspace.job_id,
+                paper_work_items=bundle.paper_work_items,
+                summary_payloads_from_file=self._summary_payloads_from_file,
+                external_registry_resolver=external_registry_resolver,
+            )
+            summaries.extend(automatic_reuse_plan.summaries)
         if bundle.paper_work_items:
+            generation_service_kwargs = {}
+            if partial_recovery_context is not None:
+                generation_service_kwargs["partial_recovery_context"] = partial_recovery_context
             generation_service = Stage1AnalysisService(
                 job_id=session.context.workspace.job_id,
                 attempt_id=attempt_id,
@@ -937,9 +1487,57 @@ class InternalStageExecutorRegistry:
                 external_registry_resolver=external_registry_resolver,
                 publication_context=session.context.publication_context,
                 logger=session.stage_host.logger,
+                response_snapshot_sink=build_source_revision_response_sink(
+                    self.bridge.job_spec.metadata, session.context.workspace,
+                    session.context.registry, session.context.publication_context,
+                ),
+                **generation_service_kwargs,
             )
-            generation = generation_service.run(bundle, existing_summaries=summaries)
+            generation = (
+                generation_service.run(
+                    bundle, existing_summaries=summaries,
+                    explicit_typed_imports=explicit_imports,
+                )
+                if explicit_imports is not None
+                else generation_service.run(bundle, existing_summaries=summaries)
+            )
             normalized = self._validate_summary_identity(generation.summaries, bundle)
+            source_items = [dict(item) for item in generation.source_items]
+            rejected_candidates = (
+                list(automatic_reuse_plan.rejected_candidates)
+                if automatic_reuse_plan is not None
+                else []
+            )
+            if automatic_reuse_plan is not None:
+                normalized_by_key = {
+                    str(
+                        (summary.get("paper_info") or {}).get("canonical_paper_key") or ""
+                    ): summary
+                    for summary in normalized
+                    if isinstance(summary.get("paper_info"), Mapping)
+                }
+                for source_item in source_items:
+                    key = str(source_item.get("canonical_paper_key") or "").strip()
+                    candidate = automatic_reuse_plan.candidates_by_key.get(key)
+                    if candidate is None:
+                        continue
+                    if str(source_item.get("disposition") or "") == "reused":
+                        source_item["automatic_stage1_reuse_owner"] = candidate.source_item_metadata()
+                        continue
+                    summary = normalized_by_key.get(key, {})
+                    reuse_evidence = summary.get("stage1_reuse")
+                    reuse_evidence = reuse_evidence if isinstance(reuse_evidence, Mapping) else {}
+                    rejected_candidates.append(
+                        {
+                            "canonical_paper_key": key,
+                            "owner_job_id": candidate.owner_job_id,
+                            "manifest_artifact_id": candidate.manifest_record_id,
+                            "manifest_artifact_hash": candidate.manifest_record_hash,
+                            "reason": "automatic_reuse_candidate_rejected_by_stage1_binding",
+                            "stage1_reuse_decision": str(reuse_evidence.get("decision") or ""),
+                            "stage1_reuse_reason": str(reuse_evidence.get("reason") or ""),
+                        }
+                    )
             return (
                 self.bridge.persist_stage1_results(
                     session,
@@ -949,16 +1547,31 @@ class InternalStageExecutorRegistry:
                         if generation.generated_count
                         else "runtime_summary_source"
                     ),
-                    source_items=[dict(item) for item in generation.source_items],
+                    source_items=source_items,
+                    rejected_candidates=rejected_candidates,
                     provider_receipt_ids=list(generation.receipt_ids),
                     generated_count=generation.generated_count,
                     reused_count=generation.reused_count,
                     stage1_generation=generation_service,
+                    external_registry_resolver=external_registry_resolver,
                 ),
                 len(generation.receipt_ids),
             )
         if not summaries:
             raise RuntimeError("Stage 1 requires a source work item or a canonical summary source")
+        if session.request.reuse_summary_files:
+            typed_flags = [
+                isinstance(item.get("stage1_reuse"), Mapping)
+                and str(item["stage1_reuse"].get("authority_kind") or "").strip()
+                == "typed_manifest"
+                for item in summaries
+            ]
+            if any(typed_flags):
+                if not all(typed_flags):
+                    raise RuntimeError(
+                        "reuse_summary_files mixed typed and legacy Stage 1 authorities"
+                    )
+                self._verify_typed_reuse_summaries(summaries, external_registry_resolver=external_registry_resolver)
         normalized = self._validate_summary_identity(summaries, bundle)
         generation_service = Stage1AnalysisService(
             job_id=session.context.workspace.job_id,
@@ -971,6 +1584,10 @@ class InternalStageExecutorRegistry:
             external_registry_resolver=external_registry_resolver,
             publication_context=session.context.publication_context,
             logger=session.stage_host.logger,
+            response_snapshot_sink=build_source_revision_response_sink(
+                self.bridge.job_spec.metadata, session.context.workspace,
+                session.context.registry, session.context.publication_context,
+            ),
         )
         generation_service.prepare_empty_provider_receipt_closure(bundle)
         return (
@@ -979,9 +1596,44 @@ class InternalStageExecutorRegistry:
                 normalized,
                 source_kind="runtime_summary_source",
                 stage1_generation=generation_service,
+                external_registry_resolver=external_registry_resolver,
             ),
             0,
         )
+
+    @staticmethod
+    def _verify_typed_reuse_summaries(
+        summaries: Sequence[Mapping[str, Any]],
+        *,
+        external_registry_resolver: Callable[[str], Any | None] | None = None,
+    ) -> None:
+        """Verify reusable Stage 1 authorities before accepting zero transport."""
+
+        from services.stage1_reuse import _TypedManifestVerificationScope
+
+        with _TypedManifestVerificationScope() as verification_scope:
+            for index, summary in enumerate(summaries):
+                metadata = summary.get("stage1_reuse")
+                if not isinstance(metadata, Mapping) or str(
+                    metadata.get("authority_kind") or ""
+                ).strip() != "typed_manifest":
+                    raise RuntimeError(
+                        f"reuse_summary_files[{index}] is not a typed Stage 1 manifest authority"
+                    )
+                raw_binding = metadata.get("binding")
+                binding = Stage1ReusableSummaryBindingV1.from_mapping(
+                    raw_binding if isinstance(raw_binding, Mapping) else None
+                )
+                authority, reason = verify_stage1_typed_manifest_authority(
+                    summary,
+                    binding,
+                    external_registry_resolver=external_registry_resolver,
+                    _verification_scope=verification_scope,
+                )
+                if authority is None:
+                    raise RuntimeError(
+                        f"reuse_summary_files[{index}] typed Stage 1 authority rejected: {reason}"
+                    )
 
     @staticmethod
     def _positive_int(value: Any, default: int) -> int:
@@ -1041,21 +1693,34 @@ class InternalStageExecutorRegistry:
         if not model:
             return None
         capability = resolve_model_capability(api_config)
-        model_context_limit = self._positive_int(api_config.get("max_context_tokens"), 128_000)
         max_output_tokens = self._positive_int(api_config.get("max_output_tokens"), 4_096)
-        profile = ProviderContextProfile.conservative(
-            provider=capability.provider_family,
-            model=model,
-            endpoint_type=capability.endpoint_type,
-            model_context_limit=model_context_limit,
+        # Evidence critique receives the largest request in the current v3
+        # graph because it sees all candidate outputs.  Keep the generator
+        # budget at the configured 32k, but cap this critique role at 16k:
+        # observed evidence critiques are only a few thousand tokens, while
+        # the lower reserve materially reduces gateway pre-charge and timeout
+        # risk without changing the evidence input or contract.
+        if role == "evidence_critique":
+            max_output_tokens = min(max_output_tokens, 16_000)
+        profile = ProviderContextProfile.from_api_config(
+            api_config,
+            default_provider=capability.provider_family,
+            default_model=model,
+            default_endpoint_type=capability.endpoint_type,
             max_output_tokens=max_output_tokens,
             # Admission knobs are read from the role's own section. Left to the
             # conservative defaults, every role would silently inherit the
             # Outline model's headroom, which is wrong for a cheaper critic or a
             # larger-context generator.
-            reasoning_reserve=self._nonnegative_int(api_config.get("reasoning_reserve_tokens"), 2_048),
-            safety_margin=self._nonnegative_int(api_config.get("safety_margin_tokens"), 1_024),
+            default_reasoning_reserve=2_048,
+            default_safety_margin=1_024,
         )
+        route_config = dict(api_config)
+        if str(route_config.get("transport_retries") or "").strip() == "":
+            route_config["transport_retries"] = self._nonnegative_int(
+                None,
+                session.stage_host.settings.runtime.transport_retries,
+            )
         return OutlineRoleRoute(
             role=role,
             config_section=str(section_name).strip(),
@@ -1063,11 +1728,11 @@ class InternalStageExecutorRegistry:
             model=model,
             endpoint_type=capability.endpoint_type,
             profile=profile,
-            transport=self._outline_provider(session, profile, api_config),
+            transport=self._outline_provider(session, profile, route_config),
             # The route stores only an allow-listed, secret-free identity. The
             # closure still retains the private config for the actual transport.
             api_base=str(api_config.get("api_base") or "").strip(),
-            config_identity=dict(api_config),
+            config_identity=route_config,
         )
 
     def _execute_outline(
@@ -1111,17 +1776,18 @@ class InternalStageExecutorRegistry:
                 "sections are no longer completed by inheriting part of another provider."
             )
         capability = resolve_model_capability(api_config)
-        model_context_limit = self._positive_int(api_config.get("max_context_tokens"), 128_000)
         max_output_tokens = self._positive_int(
             api_config.get("max_output_tokens"),
             4_096,
         )
-        profile = ProviderContextProfile.conservative(
-            provider=capability.provider_family,
-            model=model,
-            endpoint_type=capability.endpoint_type,
-            model_context_limit=model_context_limit,
+        profile = ProviderContextProfile.from_api_config(
+            api_config,
+            default_provider=capability.provider_family,
+            default_model=model,
+            default_endpoint_type=capability.endpoint_type,
             max_output_tokens=max_output_tokens,
+            default_reasoning_reserve=2_048,
+            default_safety_margin=1_024,
         )
         provider = self._outline_provider(session, profile, api_config)
         provider_router = build_outline_provider_router(
@@ -1148,6 +1814,11 @@ class InternalStageExecutorRegistry:
         for diagnostic in provider_router.diagnostics:
             session.stage_host.logger.warning("outline routing: %s", diagnostic)
         stability = settings.outline_stability_settings()
+        from runtime.run_budget_binding import resolve_run_provider_budget
+
+        run_provider_budget, _ = resolve_run_provider_budget(
+            self.bridge.job_spec.metadata, session.stage_host.config,
+        )
         outline_stability_config = dict(session.stage_host.config.get("OutlineStability") or {})
         semantic_repair_enabled = str(
             outline_stability_config.get("semantic_repair_enabled") or ""
@@ -1155,10 +1826,28 @@ class InternalStageExecutorRegistry:
         opaque_alias_enabled = str(
             outline_stability_config.get("opaque_alias_enabled") or ""
         ).strip().lower() in {"1", "true", "yes", "on"}
-        free_mode_review_intent: Mapping[str, Any] | None = None
+        direct_review_intent = self.bridge.job_spec.metadata.get("review_intent")
+        if direct_review_intent is not None and not isinstance(direct_review_intent, Mapping):
+            raise ValueError("runtime review_intent must be an object")
+        free_mode_review_intent: Mapping[str, Any] | None = direct_review_intent
         if self.bridge.free_mode_envelope is not None:
             self.bridge.persist_free_mode_review_intent_projection(session)
-            free_mode_review_intent = dict(self.bridge.free_mode_envelope["review_intent"])
+            projected_intent = dict(self.bridge.free_mode_envelope["review_intent"])
+            if direct_review_intent is not None:
+                from outline.v3_evidence import build_review_intent
+
+                if build_review_intent(direct_review_intent).content_hash != build_review_intent(projected_intent).content_hash:
+                    raise ValueError("runtime review_intent conflicts with the adopted Free Mode intent")
+            free_mode_review_intent = projected_intent
+        runtime_spec_binding = None
+        spec_record = session.context.registry.get("runtime_job_spec")
+        if spec_record is not None and "config_snapshot_binding" in spec_record.metadata:
+            from runtime.runtime_spec_binding import read_runtime_spec_binding_v1
+
+            runtime_spec_binding = read_runtime_spec_binding_v1(
+                session.context.registry,
+                expected_effective_config_sha256=str(session.context.fingerprint_bundle["config_hash"]),
+            )
         executor = OutlineV3Executor(
             job_id=session.context.workspace.job_id,
             summaries=summaries,
@@ -1174,10 +1863,18 @@ class InternalStageExecutorRegistry:
             review_intent=free_mode_review_intent,
             cancellation_checker=session.stage_host.check_cancelled,
             publication_context=self.bridge.publication_context,
+            runtime_spec_binding=runtime_spec_binding,
+            arbitration_work_policy_record=getattr(session.stage_host, "arbitration_work_policy_record", None),
+            provider_semantic_contract_version=self.bridge.job_spec.metadata.get("provider_semantic_contract_version"),
+            source_revision_replay_context=self.bridge.source_revision_replay_context,
+            response_snapshot_sink=build_source_revision_response_sink(
+                self.bridge.job_spec.metadata, session.context.workspace,
+                session.context.registry, session.context.publication_context,
+            ),
             stability_mode=stability.mode,
             semantic_repair_enabled=semantic_repair_enabled,
             opaque_alias_enabled=opaque_alias_enabled,
-            max_provider_calls=stability.max_provider_calls,
+            max_provider_calls=run_provider_budget.max_provider_calls_total,
             max_estimated_cost=stability.max_estimated_cost,
             max_estimated_total_tokens=stability.max_estimated_total_tokens,
             pricing_source=stability.pricing_source,
@@ -1193,9 +1890,32 @@ class InternalStageExecutorRegistry:
             pricing_effective_date=stability.pricing_effective_date,
             max_smoke_overhead_ratio=stability.max_smoke_overhead_ratio,
             max_source_prompt_tokens=stability.max_source_prompt_tokens or None,
+            semantic_output_max_tokens=settings.outline.semantic_output_max_tokens,
             technical_shard_target_tokens=settings.outline.technical_shard_target_tokens,
+            outline_pilot=self.bridge.job_spec.metadata.get("outline_pilot"),
         )
         execution = executor.run()
+        if execution.status == "topic_pilot_complete":
+            checkpoint = executor.artifact_records.get("topic_pilot_checkpoint")
+            if checkpoint is None or checkpoint.status != "ready":
+                raise RuntimeError("topic pilot completed without a ready Registry checkpoint")
+            return (
+                StageResult(
+                    stage_name="outline_topic_pilot",
+                    success=True,
+                    artifacts=[self.bridge._artifact_ref_from_record(checkpoint)],
+                    metadata={
+                        "outline_mode": "v3",
+                        "outline_v3_status": execution.status,
+                        "pilot_checkpoint_complete": True,
+                        "pilot_checkpoint_artifact_id": checkpoint.artifact_id,
+                        "pilot_checkpoint_hash": checkpoint.content_hash,
+                        "receipt_ids": list(execution.receipt_ids),
+                        "canonical_ready": False,
+                    },
+                ),
+                len(execution.receipt_ids),
+            )
         if not execution.ok:
             detail = "; ".join(execution.diagnostics) or "Outline v3 execution is blocked"
             raise RuntimeError(detail)
@@ -1211,7 +1931,7 @@ class InternalStageExecutorRegistry:
         if not isinstance(final_payload, Mapping):
             raise RuntimeError("Outline v3 final outline payload is missing")
         artifact_refs: list[StageArtifactRef] = []
-        for node_id in ("final_outline", "coverage_audit", "stability_audit", "provider_receipt_closure", "stage_health"):
+        for node_id in ("outline_content_layers", "semantic_chunk_plan", "final_outline", "coverage_audit", "stability_audit", "provider_receipt_closure", "stage_health"):
             record = session.context.registry.get(f"outline-v3:{node_id}")
             if record is not None and record.status == "ready":
                 artifact_refs.append(self.bridge._artifact_ref_from_record(record))
@@ -1331,6 +2051,12 @@ class InternalStageExecutorRegistry:
             cancellation_checker=session.stage_host.check_cancelled,
             logger=session.stage_host.logger,
             publication_context=session.context.publication_context,
+            provider_semantic_contract_version=self.bridge.job_spec.metadata.get("provider_semantic_contract_version"),
+            source_revision_replay_context=self.bridge.source_revision_replay_context,
+            response_snapshot_sink=build_source_revision_response_sink(
+                self.bridge.job_spec.metadata, session.context.workspace,
+                session.context.registry, session.context.publication_context,
+            ),
         ).run(
             outline_payload=payload,
             evidence_packets=[dict(item) for item in packets if isinstance(item, Mapping)],
@@ -1401,13 +2127,36 @@ class InternalStageExecutorRegistry:
 class AgentRuntimeBridge:
     """Thin additive bridge used by the repo-local skill entrypoint."""
 
-    def __init__(self, job_spec: RuntimeJobSpec, publication_context: Any | None = None) -> None:
+    def __init__(
+        self,
+        job_spec: RuntimeJobSpec,
+        publication_context: Any | None = None,
+        *,
+        direct_validation_route_fingerprint: str = "",
+        direct_validation_host_acknowledgement: Mapping[str, Any] | None = None,
+        verified_source_revision_plan: Mapping[str, Any] | None = None,
+    ) -> None:
         job_spec.validate()
         self._job_id_was_omitted = not bool(str(job_spec.job_id or "").strip())
         resolved_job_id = job_spec.job_id or JobWorkspace.generate_job_id()
         job_spec = replace(job_spec, job_id=resolved_job_id)
         self.job_spec = job_spec
+        self.source_revision_plan = verified_source_revision_plan
+        self.source_revision_replay_context = None
+        self.stage1_partial_recovery_context: Stage1PartialRecoveryContext | None = None
+        if "source_revision_plan" in job_spec.metadata and verified_source_revision_plan is None:
+            from runtime.source_revision_admission import verify_source_revision_plan_v1
+
+            self.source_revision_plan = verify_source_revision_plan_v1(job_spec)
         self.publication_context = publication_context
+        self._direct_validation_route_fingerprint = str(
+            direct_validation_route_fingerprint or ""
+        )
+        self._direct_validation_host_acknowledgement = (
+            dict(direct_validation_host_acknowledgement)
+            if direct_validation_host_acknowledgement is not None
+            else None
+        )
         self._admit_external_hosts()
         metadata = dict(job_spec.metadata or {})
         frozen_envelope = metadata.get("free_mode_input")
@@ -1422,6 +2171,49 @@ class AgentRuntimeBridge:
         else:
             self.free_mode_envelope = None
 
+    def bind_source_revision_replay(self, session: AgentRuntimeSession, resolver: Any) -> None:
+        if self.source_revision_plan is None:
+            return
+        from runtime.source_revision_binding import bind_source_revision_replay
+
+        self.source_revision_replay_context = bind_source_revision_replay(
+            plan_body=self.source_revision_plan, workspace=session.context.workspace,
+            registry=session.context.registry,
+            publication_context=session.context.publication_context,
+            external_registry_resolver=resolver,
+        )
+
+    @staticmethod
+    def _control_scope(session: AgentRuntimeSession):
+        """Bind one workspace's durable controls for direct bridge entrypoints."""
+
+        workspace = session.context.workspace
+        active = current_runtime_control_context()
+        if (
+            active is not None
+            and active.identity.job_id == workspace.job_id
+            and active.identity.workspace_path == str(Path(workspace.root_dir).resolve())
+        ):
+            identity = active.identity
+        else:
+            acceptance = (
+                current_acceptance_execution_context()
+                or acceptance_execution_context_from_environment()
+            )
+            identity = RuntimeControlIdentityV1(
+                job_id=workspace.job_id,
+                workspace_path=str(workspace.root_dir),
+                acceptance_run_id=acceptance.acceptance_run_id if acceptance else "",
+                provider_budget_started=bool(
+                    acceptance and acceptance.provider_budget_state_started
+                ),
+            )
+        return bind_runtime_control_context(
+            identity,
+            workspace=workspace,
+            registry=session.context.registry,
+        )
+
     def _admit_external_hosts(self) -> None:
         """Apply the same pre-transport admission used by run/resume."""
 
@@ -1429,13 +2221,30 @@ class AgentRuntimeBridge:
         from runtime.provider_routes import build_reachable_provider_route_plan
         from runtime.test_dependencies import current_runtime_test_dependencies
         from runtime.trust_admission import (
-            build_external_host_policy,
+            build_runtime_external_host_policy,
             validate_external_host_acknowledgement,
         )
 
         test_dependencies = current_runtime_test_dependencies()
         if test_dependencies is not None:
             test_dependencies.validate()
+        if self._direct_validation_route_fingerprint:
+            config = load_config(
+                str(self.job_spec.config),
+                action="validate_review",
+                requested_stages=["validate"],
+                free_mode_enabled=bool(
+                    self.job_spec.free_mode_profile
+                    or self.job_spec.free_mode_idea
+                    or self.job_spec.metadata.get("free_mode_input")
+                ),
+                allow_template_credentials=bool(
+                    test_dependencies and test_dependencies.allow_template_credentials
+                ),
+            )
+            self.verify_direct_validation_route(config)
+            return
+        if test_dependencies is not None:
             # The pytest-only adapter is the explicit zero-external-transport
             # dependency boundary.  It is intentionally process-local and is
             # never selected from an ordinary environment variable.
@@ -1445,9 +2254,13 @@ class AgentRuntimeBridge:
             or self.job_spec.free_mode_idea
             or self.job_spec.metadata.get("free_mode_input")
         )
-        config = load_config(
-            str(self.job_spec.config),
-            action=self.job_spec.action,
+        explicit_scope = None
+        if self.job_spec.metadata.get("stage1_summary_input_mode") == "explicit_typed_import":
+            from runtime.explicit_stage1_scope import load_explicit_stage1_scope
+
+            explicit_scope = load_explicit_stage1_scope(self.job_spec)
+        config = explicit_scope.config if explicit_scope is not None else load_config(
+            str(self.job_spec.config), action=self.job_spec.action,
             requested_stages=self.job_spec.metadata.get("requested_stages"),
             free_mode_enabled=free_mode_enabled,
             allow_template_credentials=bool(
@@ -1468,30 +2281,61 @@ class AgentRuntimeBridge:
             free_mode_enabled=free_mode_enabled,
             stage_plan=stage_plan,
         )
-        policy = build_external_host_policy(config, route_plan)
+        if explicit_scope is not None:
+            route_plan = explicit_scope.provider_route_plan
+        policy = build_runtime_external_host_policy(
+            config,
+            route_plan,
+            requested_stages=(route_plan.stage_plan.requested_stages if explicit_scope is not None else self.job_spec.metadata.get("requested_stages")),
+            outline_pilot=self.job_spec.metadata.get("outline_pilot"),
+        )
         if test_dependencies is None:
             validate_external_host_acknowledgement(
                 policy,
                 self.job_spec.metadata.get("external_host_acknowledgement"),
             )
 
+    def verify_direct_validation_route(
+        self,
+        runtime_config: Mapping[str, Mapping[str, Any]],
+    ) -> None:
+        """Check that the runtime will use the admitted Validator route."""
+
+        if not self._direct_validation_route_fingerprint:
+            return
+        from runtime.trust_admission import (
+            build_external_host_policy,
+            validate_external_host_acknowledgement,
+        )
+
+        route_plan = build_reachable_provider_route_plan(
+            runtime_config,
+            action="validate_review",
+            requested_stages=["validate"],
+        )
+        if not any(
+            route.semantic_role == "validator" and route.enabled and route.resolved
+            for route in route_plan.routes
+        ):
+            raise ValueError("direct validation has no reachable Validator route")
+        policy = build_external_host_policy(
+            runtime_config,
+            route_plan,
+            provider_sections={"Validator_API"},
+            include_mineru=False,
+        )
+        if policy.route_fingerprint != self._direct_validation_route_fingerprint:
+            raise ValueError("direct validation route changed after admission")
+        validate_external_host_acknowledgement(
+            policy,
+            self._direct_validation_host_acknowledgement,
+        )
+
     def build_job_request(self) -> JobRunRequest:
         request = self.job_spec.to_job_request()
-        if request.summary_file and request.summary_file not in request.summary_sources:
-            request = replace(
-                request,
-                summary_sources=(request.summary_file, *request.summary_sources),
-            )
-        if (
-            request.action not in {"analyze", "run_all", "retry_failed"}
-            and request.summary_sources
-            and not isinstance(
-                self.job_spec.metadata.get("f1_corpus_binding"), Mapping
-            )
-        ):
-            # Downstream stages consume a verified summary source.  Do not
-            # make their inventory readiness depend on re-running PDF intake.
-            request = replace(request, pdf_folder=None)
+        # Keep the compatibility view identical to its strict RuntimeJobSpec.
+        # Source preparation and build_source_bundle select summary-only work
+        # without rewriting the caller's paths or duplicated summary fields.
         error = validate_job_request_options(request)
         if error:
             raise ValueError(error)
@@ -1596,6 +2440,27 @@ class AgentRuntimeBridge:
             self.job_spec.metadata.get("f1_corpus_binding"), Mapping
         )
         if (
+            _typed_reuse_manifest_mode(list(request.reuse_summary_files))
+            and not str(request.pdf_folder or "").strip()
+            and not has_f1_corpus_binding
+        ):
+            # A reusable manifest is already the Stage 1 source authority.
+            # Building a Zotero/direct bundle here would make the reuse
+            # contract ineffective and may start PDF preprocessing before
+            # typed-manifest verification. Keep this path zero-transport;
+            # _execute_analyze verifies every manifest before accepting it.
+            return SourceBundle(
+                source_mode=request.source_mode,
+                project_name=self.job_spec.project_name,
+                paper_work_items=[],
+                source_snapshot={
+                    "canonical_ready": True,
+                    "summary_only": True,
+                    "reuse_only_stage1": True,
+                    "summary_sources": list(summary_sources),
+                },
+            )
+        if (
             request.action not in {"analyze", "run_all", "retry_failed"}
             and summary_sources
             and not has_f1_corpus_binding
@@ -1657,15 +2522,16 @@ class AgentRuntimeBridge:
         attempt_id: str,
         external_registry_resolver: Callable[[str], Any | None] | None = None,
     ) -> tuple[StageResult, int]:
-        return self.stage_executor_registry().execute(
-            stage,
-            session=session,
-            spec=spec,
-            bundle=bundle,
-            results=results,
-            attempt_id=attempt_id,
-            external_registry_resolver=external_registry_resolver,
-        )
+        with self._control_scope(session):
+            return self.stage_executor_registry().execute(
+                stage,
+                session=session,
+                spec=spec,
+                bundle=bundle,
+                results=results,
+                attempt_id=attempt_id,
+                external_registry_resolver=external_registry_resolver,
+            )
 
     def stage_policies(self) -> Dict[str, Dict[str, Any]]:
         return {
@@ -1752,6 +2618,28 @@ class AgentRuntimeBridge:
             request=request,
             project_name=project_name,
         )
+        requested_stages = set(request.requested_stages or ())
+        summary_inputs = bool(
+            request.summary_file
+            or request.summary_sources
+            or request.reuse_summary_files
+        )
+        stage1_work_item_basis = None
+        if (
+            request.action in {"analyze", "run_all", "retry_failed"}
+            and not resume_requested
+            and (not requested_stages or "analyze" in requested_stages)
+            and request.source_mode == "direct"
+            and not summary_inputs
+            and not self.job_spec.metadata.get("f1_corpus_binding")
+            and not request.allow_partial_source_quarantine
+            and prepared_sources.canonical_ready
+            and prepared_sources.source_bundle is not None
+            and prepared_sources.source_bundle.paper_work_items
+        ):
+            stage1_work_item_basis = stage1_paper_work_item_basis(
+                prepared_sources.source_bundle
+            )
         request_snapshot = self._freeze_free_mode_snapshot(
             runner._request_snapshot(request)
         )
@@ -1766,6 +2654,7 @@ class AgentRuntimeBridge:
             source_inventory=prepared_sources.inventory,
             source_canonical_ready=prepared_sources.canonical_ready,
             source_degradation_reasons=prepared_sources.degradation_reasons,
+            stage1_work_item_basis=stage1_work_item_basis,
             claim_latest_pointer=claim_latest_pointer,
             resume_requested=resume_requested,
             resume_preflight=resume_preflight,
@@ -1783,18 +2672,24 @@ class AgentRuntimeBridge:
 
     def persist_source_bundle(self, session: AgentRuntimeSession, source_bundle: SourceBundle) -> StageArtifactRef:
         source_dependencies: list[ArtifactDependencyRefV2] = []
+        source_specs: list[dict[str, Any]] = []
         for item in source_bundle.paper_work_items:
             source_path = Path(item.source_pdf)
             if not source_path.is_file():
                 continue
-            source_record = session.context.registry.register_file(
-                artifact_role="source_pdf",
-                artifact_type="source_pdf",
-                artifact_version="v1",
-                path=source_path,
-                producer="runtime.orchestrator.AgentRuntimeBridge.persist_source_bundle",
-                artifact_id=f"source_pdf:{source_path.name}",
-            )
+            source_specs.append({
+                "artifact_role": "source_pdf",
+                "artifact_type": "source_pdf",
+                "artifact_version": "v1",
+                "path": source_path,
+                "producer": "runtime.orchestrator.AgentRuntimeBridge.persist_source_bundle",
+                "artifact_id": f"source_pdf:{source_path.name}",
+            })
+        source_records = (
+            session.context.registry.register_files_atomic(source_specs)
+            if source_specs else []
+        )
+        for source_record in source_records:
             source_dependencies.append(
                 ArtifactDependencyRefV2(
                     dependency_kind="local_job",
@@ -1853,6 +2748,12 @@ class AgentRuntimeBridge:
         reload_registry = getattr(registry, "reload", None)
         if callable(reload_registry):
             reload_registry()
+        if external_registry_resolver is None:
+            from runtime.runner import AgentRuntimeRunner
+
+            external_registry_resolver = AgentRuntimeRunner._external_registry_resolver(
+                session.context.workspace,
+            )
         paper_records = tuple(
             record
             for record in registry.list_records()
@@ -1890,7 +2791,370 @@ class AgentRuntimeBridge:
             validation_external_registry_resolver=external_registry_resolver,
             publication_context=session.context.publication_context,
             validation_source_binding_record=binding_record,
+            response_snapshot_sink=build_source_revision_response_sink(
+                self.job_spec.metadata, session.context.workspace,
+                registry, session.context.publication_context,
+            ),
         )
+
+    def _selected_stage1_v1_reuse_binding_sources(
+        self,
+        session: AgentRuntimeSession,
+        registry: Any,
+        *,
+        external_registry_resolver: Any | None,
+    ) -> tuple[tuple[str, ...], frozenset[str]] | None:
+        """Select only the exact V1 owners in the current Stage 1 closure."""
+
+        request = session.request
+        if (
+            request.summary_file
+            or request.summary_sources
+            or external_registry_resolver is None
+            or self.job_spec.metadata.get("stage1_summary_input_mode") == "explicit_typed_import"
+        ):
+            return None
+        automatic_mode = not bool(request.reuse_summary_files)
+        try:
+            from validation.closure import (
+                _provider_closure_entry,
+                _provider_record_for_stage,
+                _terminal_for_stage,
+            )
+            from validation.source_binding import (
+                _canonical_path,
+                _paper_key_of,
+                _registry_records,
+                discover_upstream_workspace,
+            )
+            selection_revision, selection_records = registry.capture_record_snapshot()
+            source_record = registry.get("summary_source_manifest")
+            if (
+                source_record is None
+                or source_record.job_id != registry.job_id
+                or source_record.status != "ready"
+                or source_record.artifact_type != "summary_source_manifest"
+                or source_record.artifact_version != "v2"
+                or file_sha256(source_record.path) != source_record.content_hash
+            ):
+                return None
+            source_payload = json.loads(Path(source_record.path).read_text(encoding="utf-8"))
+            items = source_payload.get("source_items") if isinstance(source_payload, Mapping) else None
+            if (
+                not isinstance(items, list)
+                or not items
+                or (source_payload.get("rejected_candidates") and not automatic_mode)
+                or source_payload.get("summary_count") != len(items)
+            ):
+                return None
+            by_key: dict[str, Mapping[str, Any]] = {}
+            for item in items:
+                if not isinstance(item, Mapping):
+                    return None
+                key = str(item.get("canonical_paper_key") or "").strip()
+                disposition = str(item.get("disposition") or "")
+                reuse_id = str(item.get("reuse_evidence_id") or "")
+                if not key or key in by_key or disposition not in {"reused", "provider_generated"}:
+                    return None
+                if (disposition == "reused") != bool(reuse_id):
+                    return None
+                by_key[key] = item
+
+            # Explicit pure reuse preserves its existing behavior. Automatic
+            # reuse binds only the exact reused keys; missing, changed, or
+            # conflicting keys remain backed by their current local carriers.
+            dispositions = {str(item.get("disposition")) for item in by_key.values()}
+            if dispositions == {"reused"}:
+                if not automatic_mode:
+                    return None
+            elif dispositions != {"reused", "provider_generated"}:
+                return None
+            analyze_terminal, analyze_terminal_payload = _terminal_for_stage(
+                "analyze", selection_records
+            )
+            analyze_record = _provider_record_for_stage("analyze", selection_records, None)
+            analyze, analyze_issues = _provider_closure_entry(
+                "analyze", analyze_record, analyze_terminal,
+                analyze_terminal_payload, registry,
+                external_registry_resolver=external_registry_resolver,
+                expected_registry_revision=selection_revision,
+            )
+            if analyze_issues or analyze.get("complete") is not True:
+                return None
+
+            rows: dict[str, Mapping[str, Any]] = {}
+            for row in session.stage_host.summaries:
+                paper = row.get("paper_info") if isinstance(row, Mapping) else None
+                key = str(
+                    (paper.get("canonical_paper_key") if isinstance(paper, Mapping) else "")
+                    or (paper.get("source_paper_id") if isinstance(paper, Mapping) else "")
+                    or ""
+                ).strip()
+                if not key or key in rows:
+                    return None
+                rows[key] = row
+            if set(rows) != set(by_key):
+                return None
+
+            candidates: dict[str, tuple[str, Mapping[str, Any], Any, str]] = {}
+            candidate_summaries: list[Mapping[str, Any]] = []
+            candidate_owner_metadata: dict[str, Mapping[str, Any]] = {}
+            if automatic_mode:
+                candidate_sources: list[tuple[str, Mapping[str, Any] | None]] = []
+                for key, item in by_key.items():
+                    if str(item.get("disposition") or "") != "reused":
+                        if item.get("automatic_stage1_reuse_owner"):
+                            return None
+                        continue
+                    owner_metadata = item.get("automatic_stage1_reuse_owner")
+                    if not isinstance(owner_metadata, Mapping):
+                        return None
+                    owner_path = str(owner_metadata.get("manifest_path") or "").strip()
+                    if not owner_path:
+                        return None
+                    candidate_sources.append((owner_path, owner_metadata))
+            else:
+                candidate_sources = [
+                    (str(raw_path), None) for raw_path in request.reuse_summary_files
+                ]
+            for raw_path, expected_owner_metadata in candidate_sources:
+                path = str(Path(str(raw_path)).expanduser().resolve())
+                payload = json.loads(Path(path).read_text(encoding="utf-8"))
+                manifest_version = (
+                    str(payload.get("artifact_version") or "")
+                    if isinstance(payload, Mapping)
+                    else ""
+                )
+                allowed_versions = {"v1", "v2"} if automatic_mode else {"v1"}
+                if (
+                    not isinstance(payload, Mapping)
+                    or payload.get("artifact_type") != "stage1_reusable_summary_manifest"
+                    or manifest_version not in allowed_versions
+                ):
+                    return None
+                parsed = InternalStageExecutorRegistry._summary_payloads_from_file(path)
+                if len(parsed) != 1:
+                    return None
+                reuse_meta = parsed[0].get("stage1_reuse")
+                binding = reuse_meta.get("binding") if isinstance(reuse_meta, Mapping) else None
+                key = str(
+                    (binding.get("canonical_paper_key") if isinstance(binding, Mapping) else "")
+                    or payload.get("canonical_paper_key")
+                    or ""
+                ).strip()
+                if not key or key not in by_key or key in candidates:
+                    return None
+                if expected_owner_metadata is not None:
+                    if (
+                        str(by_key[key].get("disposition") or "") != "reused"
+                        or str(expected_owner_metadata.get("owner_job_id") or "")
+                        != str(payload.get("job_id") or "")
+                        or _canonical_path(expected_owner_metadata.get("manifest_path"))
+                        != _canonical_path(path)
+                    ):
+                        return None
+                    candidate_owner_metadata[key] = expected_owner_metadata
+
+                workspace = discover_upstream_workspace(path)
+                if workspace is None:
+                    return None
+                disk_rows, owner_job_id = _registry_records(workspace)
+                digest = file_sha256(path)
+                matches = [
+                    row for row in disk_rows
+                    if str(row.get("status") or "") == "ready"
+                    and str(row.get("artifact_type") or "") == "stage1_reusable_summary_manifest"
+                    and str(row.get("artifact_version") or "") == manifest_version
+                    and _canonical_path(row.get("path")) == _canonical_path(path)
+                    and str(row.get("content_hash") or "") == digest
+                ]
+                if len(matches) != 1 or not owner_job_id:
+                    return None
+                owner = external_registry_resolver(owner_job_id)
+                if owner is None:
+                    return None
+                reload_owner = getattr(owner, "reload", None)
+                if callable(reload_owner):
+                    reload_owner()
+                disk_record = matches[0]
+                record = owner.get(str(disk_record.get("artifact_id") or ""))
+                if (
+                    record is None
+                    or record.job_id != owner_job_id
+                    or record.status != "ready"
+                    or record.artifact_type != "stage1_reusable_summary_manifest"
+                    or record.artifact_version != manifest_version
+                    or _canonical_path(record.path) != _canonical_path(path)
+                    or record.content_hash != digest
+                    or str(payload.get("job_id") or "") != owner_job_id
+                ):
+                    return None
+                expected_owner_metadata = candidate_owner_metadata.get(key)
+                if expected_owner_metadata is not None and (
+                    str(expected_owner_metadata.get("owner_job_id") or "") != owner_job_id
+                    or str(expected_owner_metadata.get("owner_registry_id") or "")
+                    != f"artifact-registry:{owner_job_id}"
+                    or _canonical_path(expected_owner_metadata.get("owner_registry_path"))
+                    != _canonical_path(getattr(owner, "registry_path", ""))
+                    or str(expected_owner_metadata.get("manifest_artifact_id") or "")
+                    != record.artifact_id
+                    or str(expected_owner_metadata.get("manifest_artifact_hash") or "")
+                    != record.content_hash
+                    or str(expected_owner_metadata.get("manifest_file_sha256") or "")
+                    != digest
+                    or str(expected_owner_metadata.get("manifest_artifact_version") or "")
+                    != manifest_version
+                ):
+                    return None
+                candidates[key] = (path, parsed[0], record, digest)
+                candidate_summaries.append(parsed[0])
+
+            reused_keys = {
+                key for key, item in by_key.items()
+                if str(item.get("disposition") or "") == "reused"
+            }
+            if not reused_keys.issubset(candidates):
+                return None
+            if candidate_summaries:
+                InternalStageExecutorRegistry._verify_typed_reuse_summaries(
+                    candidate_summaries,
+                    external_registry_resolver=external_registry_resolver,
+                )
+
+            terminal = registry.get(str(analyze.get("terminal_artifact_id") or ""))
+            if terminal is None or terminal.status != "ready" or file_sha256(terminal.path) != terminal.content_hash:
+                return None
+            terminal_payload = json.loads(Path(terminal.path).read_text(encoding="utf-8"))
+            if isinstance(terminal_payload, Mapping) and isinstance(terminal_payload.get("payload"), Mapping):
+                terminal_payload = terminal_payload["payload"]
+            output_refs = terminal_payload.get("output_artifact_refs") if isinstance(terminal_payload, Mapping) else None
+            output_owners = {
+                (str(ref.get("artifact_id") or ""), str(ref.get("content_hash") or ""))
+                for ref in output_refs or ()
+                if isinstance(ref, Mapping) and ref.get("artifact_type") == "paper_artifact"
+            }
+            current_records = registry.list_records()
+            selected_paths: list[str] = []
+            for key, item in by_key.items():
+                if str(item.get("disposition") or "") == "provider_generated":
+                    owners = []
+                    for record in current_records:
+                        if record.job_id != registry.job_id or record.status != "ready" or record.artifact_type != "paper_artifact":
+                            continue
+                        raw = json.loads(Path(record.path).read_text(encoding="utf-8"))
+                        body = raw.get("payload") if isinstance(raw, Mapping) else None
+                        body = body if isinstance(body, Mapping) else raw
+                        record_key = _paper_key_of(body) if isinstance(body, Mapping) else ""
+                        if record_key == key and file_sha256(record.path) == record.content_hash and (record.artifact_id, record.content_hash) in output_owners:
+                            owners.append(record)
+                    if len(owners) != 1:
+                        return None
+                    continue
+
+                reuse_id = str(item.get("reuse_evidence_id") or "")
+                row_metadata = rows[key].get("reuse_metadata")
+                if not isinstance(row_metadata, Mapping) or str(row_metadata.get("reuse_evidence_id") or "") != reuse_id:
+                    return None
+                evidence = registry.get(reuse_id)
+                if (
+                    evidence is None
+                    or evidence.job_id != registry.job_id
+                    or evidence.status != "ready"
+                    or evidence.artifact_type != "stage1_summary_reuse_record"
+                    or evidence.artifact_version != "v1"
+                    or file_sha256(evidence.path) != evidence.content_hash
+                ):
+                    return None
+                reuse_payload = json.loads(Path(evidence.path).read_text(encoding="utf-8"))
+                path, candidate, candidate_record, candidate_hash = candidates[key]
+                candidate_meta = candidate.get("stage1_reuse")
+                if not isinstance(candidate_meta, Mapping):
+                    return None
+                typed_id = str(reuse_payload.get("typed_manifest_artifact_id") or "")
+                typed_hash = str(reuse_payload.get("typed_manifest_artifact_hash") or "")
+                if (
+                    reuse_payload.get("artifact_type") != "stage1_summary_reuse_record"
+                    or reuse_payload.get("artifact_version") != "v1"
+                    or str(reuse_payload.get("source_bundle_paper_identity", {}).get("canonical_paper_key") or "") != key
+                    or str(reuse_payload.get("source_authority_job_id") or "") != candidate_record.job_id
+                    or not typed_id
+                    or typed_id != str(candidate_meta.get("typed_manifest_artifact_id") or "")
+                    or typed_hash != str(candidate_meta.get("typed_manifest_artifact_hash") or "")
+                    or typed_hash != candidate_hash
+                    or candidate_record.content_hash != candidate_hash
+                ):
+                    return None
+                portable_id = str(reuse_payload.get("source_summary_manifest_id") or "")
+                portable_hash = str(reuse_payload.get("source_summary_manifest_hash") or "")
+                portable = registry.get(portable_id) if portable_id else None
+                metadata = portable.metadata if portable is not None else {}
+                if (
+                    portable is None
+                    or portable.status != "ready"
+                    or portable.artifact_type != "stage1_portable_summary_manifest"
+                    or portable.artifact_version != "v1"
+                    or portable.content_hash != portable_hash
+                    or file_sha256(portable.path) != portable_hash
+                    or str(metadata.get("original_artifact_id") or "") != typed_id
+                    or str(metadata.get("original_artifact_hash") or "") != typed_hash
+                    or str(metadata.get("typed_manifest_artifact_id") or "") != typed_id
+                    or str(metadata.get("typed_manifest_artifact_hash") or "") != typed_hash
+                ):
+                    return None
+                if candidate_record.artifact_version == "v2":
+                    if not automatic_mode:
+                        return None
+                    owner_metadata = candidate_owner_metadata.get(key)
+                    if not isinstance(owner_metadata, Mapping):
+                        return None
+                    resolver = cast(
+                        Callable[[str], ArtifactRegistry | None],
+                        external_registry_resolver,
+                    )
+                    candidate_registry = resolver(candidate_record.job_id)
+                    if candidate_registry is None:
+                        return None
+                    v2_source_paths = _selected_v2_reuse_source_paths(
+                        candidate=candidate,
+                        candidate_path=path,
+                        candidate_record=candidate_record,
+                        candidate_registry=candidate_registry,
+                        owner_metadata=owner_metadata,
+                        external_registry_resolver=resolver,
+                    )
+                    if v2_source_paths is None:
+                        return None
+                    # Keep the corrected summary and the exact origin evidence
+                    # owner in the source-binding input set.
+                    selected_paths.extend(v2_source_paths)
+                else:
+                    if automatic_mode:
+                        owner_metadata = candidate_owner_metadata.get(key)
+                        source_manifest_refs = (
+                            owner_metadata.get("validation_source_manifests")
+                            if isinstance(owner_metadata, Mapping)
+                            else None
+                        )
+                        if (
+                            not isinstance(source_manifest_refs, list)
+                            or len(source_manifest_refs) != 1
+                            or not isinstance(source_manifest_refs[0], Mapping)
+                            or str(source_manifest_refs[0].get("manifest_artifact_version") or "") != "v1"
+                            or str(source_manifest_refs[0].get("manifest_artifact_id") or "") != candidate_record.artifact_id
+                            or str(source_manifest_refs[0].get("manifest_artifact_hash") or "") != candidate_record.content_hash
+                            or _canonical_path(source_manifest_refs[0].get("manifest_path")) != _canonical_path(path)
+                        ):
+                            return None
+                    selected_paths.append(path)
+
+            final_revision, final_records = registry.capture_record_snapshot()
+            if final_revision != selection_revision or {
+                record.artifact_id: record for record in final_records
+            } != {record.artifact_id: record for record in selection_records}:
+                return None
+            return tuple(selected_paths), frozenset(reused_keys)
+        except (OSError, UnicodeError, json.JSONDecodeError, RegistryError, AttributeError, TypeError, ValueError, RuntimeError):
+            return None
 
     def _ensure_validation_source_binding(
         self,
@@ -1929,12 +3193,20 @@ class AgentRuntimeBridge:
                 normalized = str(value).strip()
                 if normalized not in source_paths:
                     source_paths.append(normalized)
+        selected = self._selected_stage1_v1_reuse_binding_sources(
+            session, registry, external_registry_resolver=external_registry_resolver
+        )
+        selected_paper_keys: frozenset[str] | None = None
+        if selected is not None:
+            selected_paths, selected_paper_keys = selected
+            source_paths = list(selected_paths)
         if not source_paths:
             return None
         binding = build_validation_source_binding(
             summary_sources=source_paths,
             local_registry=registry,
             job_id=session.context.workspace.job_id,
+            include_paper_keys=selected_paper_keys,
         )
         papers = binding.get("papers")
         if not isinstance(papers, Mapping) or not papers:
@@ -2177,11 +3449,48 @@ class AgentRuntimeBridge:
         generated_count: int = 0,
         reused_count: int = 0,
         stage1_generation: Any | None = None,
+        external_registry_resolver: Callable[[str], Any | None] | None = None,
     ) -> StageResult:
         host = session.stage_host
         if write_excel_report:
             raise RuntimeError("excel report generation is not part of the built-in runtime stage registry")
         normalized_summaries = [dict(summary) for summary in summaries]
+        explicit_import_plan = None
+        if self.job_spec.metadata.get("stage1_summary_input_mode") == "explicit_typed_import":
+            if not isinstance(stage1_generation, Stage1AnalysisService):
+                raise RuntimeError("explicit typed Stage 1 publication requires the current analysis service")
+            stage1_generation.verify_explicit_imports_current()
+            explicit_import_plan = stage1_generation._explicit_import_plan
+            if explicit_import_plan is None:
+                raise RuntimeError("explicit typed Stage 1 publication has no verified input partition")
+            imported_by_key = {entry.paper_key: entry for entry in explicit_import_plan.imports}
+            actual_imports = [row for row in normalized_summaries
+                              if str((row.get("paper_info") or {}).get("canonical_paper_key") or "") in imported_by_key]
+            if (len(actual_imports) != len(imported_by_key) or any(
+                hash_json(row) != hash_json(imported_by_key[str(row["paper_info"]["canonical_paper_key"])].summary)
+                for row in actual_imports
+            )):
+                raise RuntimeError("explicit typed Stage 1 published summaries differ from verified inputs")
+            actual_sources = [row for row in source_items or [] if row.get("disposition") == "typed_imported"]
+            if hash_json(actual_sources) != hash_json(list(stage1_generation._explicit_import_source_items)):
+                raise RuntimeError("explicit typed Stage 1 publication source partition changed")
+            imported_typed_summaries = actual_imports
+        else:
+            imported_typed_summaries = [
+            summary for summary in normalized_summaries
+            if isinstance(summary.get("stage1_reuse"), Mapping)
+            and summary["stage1_reuse"].get("authority_kind") == "typed_manifest"
+            and not (
+                isinstance(summary.get("preprocess"), Mapping)
+                and summary["preprocess"].get("evidence_manifest_path")
+            )
+            ]
+        if imported_typed_summaries:
+            InternalStageExecutorRegistry._verify_typed_reuse_summaries(
+                imported_typed_summaries,
+                external_registry_resolver=external_registry_resolver,
+            )
+        imported_typed_row_ids = {id(summary) for summary in imported_typed_summaries}
         source_bundle_record = session.context.registry.get("source_bundle")
         if source_bundle_record is None:
             self.persist_source_bundle(session, self.build_source_bundle())
@@ -2209,6 +3518,12 @@ class AgentRuntimeBridge:
                     path=provider_record.path,
                     content_hash=provider_record.content_hash,
                 )
+            )
+        if explicit_import_plan is not None:
+            assert isinstance(stage1_generation, Stage1AnalysisService)
+            source_dependencies.extend(
+                ArtifactDependencyRefV2.from_record(record)
+                for record in stage1_generation._explicit_import_carriers
             )
         host.summaries = normalized_summaries
         host._checkpoint_processed_papers = set()
@@ -2285,8 +3600,31 @@ class AgentRuntimeBridge:
                 )
             )
 
+        dependency_records_by_path = None
+        if isinstance(host, _RuntimeStageHost) and any(
+            id(summary) not in imported_typed_row_ids
+            for summary in normalized_summaries
+        ):
+            dependency_records_by_path = host._dependency_records_by_path(
+                session.context.registry.list_records()
+            )
+
         for summary in normalized_summaries:
-            if not host._persist_paper_artifact(summary):
+            if id(summary) in imported_typed_row_ids:
+                # A portable summary is a projection of its original Stage 1
+                # authority. Rebuilding a local paper without preprocessing
+                # would shadow that authority with an empty evidence manifest.
+                # Validation instead follows the verified upstream binding.
+                continue
+            persisted = (
+                host._persist_paper_artifact(
+                    summary,
+                    dependency_records_by_path=dependency_records_by_path,
+                )
+                if isinstance(host, _RuntimeStageHost)
+                else host._persist_paper_artifact(summary)
+            )
+            if not persisted:
                 raise RuntimeError("paper artifact persistence failed")
             paper = summary.get("paper_info")
             if summary.get("status") != "success" or not isinstance(paper, Mapping):
@@ -2370,6 +3708,10 @@ class AgentRuntimeBridge:
                     if stage1_generation is not None
                     else ()
                 ),
+                **({
+                    "imported_count": len(explicit_import_plan.imports),
+                    "imported_authority_set_hash": explicit_import_plan.authority_set_hash,
+                } if explicit_import_plan is not None else {}),
             },
         )
 
@@ -2601,11 +3943,29 @@ class AgentRuntimeBridge:
         external_registry_resolver: Any | None = None,
         producer: str = "runtime.orchestrator.AgentRuntimeBridge.run_validation",
     ) -> StageResult:
+        with self._control_scope(session):
+            return self._run_validation_bound(
+                session,
+                attempt_id=attempt_id,
+                external_registry_resolver=external_registry_resolver,
+                producer=producer,
+            )
+
+    def _run_validation_bound(
+        self,
+        session: AgentRuntimeSession,
+        *,
+        attempt_id: str = "",
+        external_registry_resolver: Any | None = None,
+        producer: str = "runtime.orchestrator.AgentRuntimeBridge.run_validation",
+    ) -> StageResult:
+        self.verify_direct_validation_route(session.stage_host.config)
         validation_service = self.build_validation_service(
             session,
             attempt_id=attempt_id,
             external_registry_resolver=external_registry_resolver,
         )
+        external_registry_resolver = validation_service.validation_external_registry_resolver
         try:
             result = validation_service.run_review_validation()
         finally:
@@ -2845,9 +4205,15 @@ class AgentRuntimeBridge:
             artifact_refs.append(self._artifact_ref_from_record(record))
 
         if validation_success:
-            review_draft_record = session.context.registry.get("review_draft")
-            citation_manifest_record = session.context.registry.get("citation_manifest_v3")
-            review_docx_record = session.context.registry.get("review_docx")
+            # Validation reads the current repaired version when one has been
+            # promoted. Its publication must bind those same input artifacts;
+            # returning to the original IDs would silently undo a repair on
+            # resume while reporting the newer validation as clean.
+            review_draft_record = validation_service.review_draft_record
+            citation_manifest_record = validation_service.citation_manifest_record
+            review_docx_record = current_artifact_record(
+                session.context.registry, "review_docx"
+            )
             validation_closure_record = validation_provider_receipts.get("closure_record")
             if (
                 review_draft_record is None
@@ -2866,6 +4232,20 @@ class AgentRuntimeBridge:
                     "validation, and validation receipt closure artifacts"
                 )
             previous_set = session.context.registry.resolve_current_artifact_set()
+            if previous_set is not None and (
+                (review_draft_record.artifact_id, review_draft_record.content_hash)
+                != (previous_set.review_draft_artifact_id, previous_set.review_draft_artifact_hash)
+                or (citation_manifest_record.artifact_id, citation_manifest_record.content_hash)
+                != (
+                    previous_set.citation_manifest_artifact_id,
+                    previous_set.citation_manifest_artifact_hash,
+                )
+                or (review_docx_record.artifact_id, review_docx_record.content_hash)
+                != (previous_set.review_docx_artifact_id, previous_set.review_docx_artifact_hash)
+            ):
+                raise RuntimeError(
+                    "current artifact set changed during validation; refusing a stale promotion"
+                )
             promotion_id = f"runtime-validation:{validation_run_result.validation_run_id}"
             promotion = RepairPromotionTransaction(
                 transaction_id=promotion_id,
@@ -2946,19 +4326,17 @@ class AgentRuntimeBridge:
                 reason="validation completed and established the verified current artifact set",
                 previous_set_id=previous_set.set_id if previous_set is not None else "",
             )
-            current_set_pointer = session.context.registry.switch_current_artifact_set(
+            session.context.registry.switch_current_artifact_set(
                 current_set,
                 prepared_promotion_record=promotion_record,
             )
             current_set_record = session.context.registry.get(current_set.set_id)
             if current_set_record is None or current_set_record.status != "ready":
                 raise RuntimeError("current artifact set was not registered as ready")
-            artifact_refs.extend(
-                [
-                    self._artifact_ref_from_record(current_set_record),
-                    self._artifact_ref_from_record(current_set_pointer),
-                ]
-            )
+            # The pointer is a mutable latest-view alias. A durable stage
+            # terminal may depend on the immutable set record, never on the
+            # pointer whose path/hash must change after an approved repair.
+            artifact_refs.append(self._artifact_ref_from_record(current_set_record))
 
         self._append_stage_trace_entries(
             session,

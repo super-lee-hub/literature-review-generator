@@ -33,6 +33,16 @@ def _make_text_pdf(path: Path) -> None:
     doc.close()
 
 
+def test_mineru_zip_prefers_exact_page_index_json_over_generic_json() -> None:
+    manager = PreprocessManager(config={"Preprocess": {"enabled": "true"}}, logger=None)
+    raw_zip = io.BytesIO()
+    with zipfile.ZipFile(raw_zip, "w") as archive:
+        archive.writestr("page_index.json", json.dumps([{"page_number": 1, "text": "remote page"}]))
+        archive.writestr("normalized.md", "# normalized")
+    artifacts = manager._artifacts_from_zip_bytes(raw_zip.getvalue())
+    assert artifacts["page_index"] == [{"page_number": 1, "text": "remote page"}]
+
+
 def test_ocr_worker_normalizes_rapidocr_results() -> None:
     from preprocess.ocr_worker import _extract_rapidocr_text
 
@@ -54,6 +64,158 @@ def test_preprocess_manager_detects_locked_rapidocr_without_tesseract(monkeypatc
 
     assert manager._ocr_available() is True
     assert manager._should_try_ocr(True) is True
+
+
+def test_markdown_text_extraction_does_not_probe_or_select_an_ocr_engine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pymupdf4llm.helpers import document_layout
+
+    pdf_path = tmp_path / "text-only.pdf"
+    _make_text_pdf(pdf_path)
+    selected_engines: list[bool] = []
+
+    def forbidden_inline_ocr() -> None:
+        selected_engines.append(True)
+        raise AssertionError("Markdown extraction must use the managed page OCR path")
+
+    monkeypatch.setattr(document_layout, "select_ocr_function", forbidden_inline_ocr)
+    manager = PreprocessManager(config={"Preprocess": {"ocr_mode": "off"}})
+
+    text = manager._extract_with_pymupdf4llm(str(pdf_path))
+
+    assert "This is a test paper." in text
+    assert selected_engines == []
+
+
+@pytest.mark.parametrize("ocr_mode", ["off", "auto", "always"])
+def test_scanned_page_ocr_still_obeys_managed_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ocr_mode: str,
+) -> None:
+    pdf_path = tmp_path / "scanned.pdf"
+    document = fitz.open()
+    page = document.new_page()
+    pixmap = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 16, 16), False)
+    pixmap.clear_with(255)
+    page.insert_image(page.rect, pixmap=pixmap)
+    document.save(pdf_path)
+    document.close()
+    manager = PreprocessManager(config={"Preprocess": {"ocr_mode": ocr_mode}})
+    monkeypatch.setattr(manager, "_ocr_available", lambda: True)
+    page_calls: list[int] = []
+    recognized = "Text returned by the managed page OCR worker."
+
+    def managed_ocr(ocr_page: fitz.Page) -> str:
+        page_calls.append(ocr_page.number)
+        return recognized
+
+    monkeypatch.setattr(manager, "_ocr_page", managed_ocr)
+
+    text, diagnostics, _blocks = manager._extract_local_page_data(
+        str(pdf_path), allow_ocr=True,
+    )
+
+    assert diagnostics[0].scanned_candidate is True
+    if ocr_mode == "off":
+        assert page_calls == []
+        assert diagnostics[0].used_ocr is False
+        assert recognized not in text
+    else:
+        assert page_calls == [0]
+        assert diagnostics[0].used_ocr is True
+        assert recognized in text
+
+
+def test_previous_implementation_cache_is_rebuilt_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from preprocess import service as preprocess_service
+
+    monkeypatch.delenv("MINERU_API_TOKEN", raising=False)
+    pdf_path = tmp_path / "cached.pdf"
+    _make_text_pdf(pdf_path)
+    config = {
+        "Paths": {"output_path": str(tmp_path)},
+        "Preprocess": {
+            "cache_dir": str(tmp_path / "cache"),
+            "ocr_mode": "off", "extractor_profile": "fitz",
+        },
+    }
+    current_version = preprocess_service.PREPROCESS_IMPLEMENTATION_VERSION
+    legacy_version = "preprocess-service-20260915-v3"
+    assert current_version != legacy_version
+    with monkeypatch.context() as old_version:
+        old_version.setattr(preprocess_service, "PREPROCESS_IMPLEMENTATION_VERSION", legacy_version)
+        legacy = PreprocessManager(config=config).prepare_pdf(
+            str(pdf_path), lease_id="legacy-version-proof",
+            lease_job_id="legacy-job", lease_paper_key="legacy-paper",
+        )
+    assert legacy is not None
+    original_manifest = Path(legacy.manifest_path).read_bytes()
+
+    manager = PreprocessManager(config=config)
+    current = manager.prepare_pdf(str(pdf_path))
+    assert current is not None
+    assert current.manifest_path != legacy.manifest_path
+    assert json.loads(Path(current.manifest_path).read_text("utf-8"))[
+        "implementation_version"
+    ] == current_version
+    assert Path(legacy.manifest_path).read_bytes() == original_manifest
+    cached = manager.prepare_pdf(str(pdf_path))
+    assert cached is not None
+    assert cached.manifest_path == current.manifest_path
+
+
+def test_mixed_pdf_managed_ocr_condition_reaches_persisted_stage1_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MINERU_API_TOKEN", raising=False)
+    pdf_path = tmp_path / "mixed.pdf"
+    native = (
+        "This study tests how an intervention changes customer decisions in controlled settings.\n"
+    ) * 12
+    document = fitz.open()
+    page = document.new_page()
+    assert page.insert_textbox(fitz.Rect(72, 72, 523, 750), native, fontsize=10) >= 0
+    page = document.new_page()
+    pixmap = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 16, 16), False)
+    pixmap.clear_with(255)
+    page.insert_image(page.rect, pixmap=pixmap)
+    document.save(pdf_path)
+    document.close()
+    manager = PreprocessManager(config={
+        "Paths": {"output_path": str(tmp_path)},
+        "Preprocess": {
+            "cache_dir": str(tmp_path / "cache"),
+            "ocr_mode": "auto", "extractor_profile": "pymupdf4llm",
+        },
+    })
+    monkeypatch.setattr(manager, "_extract_with_pymupdf4llm", lambda _path: native)
+    monkeypatch.setattr(manager, "_extract_with_docling", lambda *args, **kwargs: None)
+    monkeypatch.setattr(manager, "_ocr_available", lambda: True)
+    condition = "The finding applies only under low pressure, not under high pressure."
+    pages: list[int] = []
+
+    def managed_ocr(ocr_page: fitz.Page) -> str:
+        pages.append(ocr_page.number)
+        manager._ocr_engines_used.add("rapidocr")
+        return condition
+
+    monkeypatch.setattr(manager, "_ocr_page", managed_ocr)
+
+    result = manager.prepare_pdf(str(pdf_path))
+
+    assert result is not None
+    assert pages == [1]
+    assert result.used_ocr is True
+    assert result.extractor_used == "fitz"
+    assert result.layout_fidelity == "page_text"
+    assert condition in result.stage1_input_text
+    assert condition in Path(result.stage1_input_path).read_text("utf-8")
+    assert condition in result.page_index[1]["text"]
+    diagnostics = json.loads(Path(result.ocr_diagnostics_path).read_text("utf-8"))
+    assert diagnostics["page_numbers"] == [2]
+    assert diagnostics["ocr_engine"] == "rapidocr"
 
 
 def test_preprocess_manager_generates_new_artifact_contract(tmp_path: Path, monkeypatch) -> None:
@@ -715,14 +877,17 @@ def test_preprocess_manager_sanitizes_bytes_before_writing_json(tmp_path: Path, 
         "Preprocess": {
             "enabled": "true",
             "cache_dir": str(cache_dir),
-            "parser_mode": "remote_first",
-            "primary_parser": "mineru_remote",
+            "parser_mode": "local",
+            "primary_parser": "local",
+            "fallback_parser": "local",
             "ocr_mode": "off",
             "force_rebuild": "true",
             "extractor_profile": "fitz",
         },
     }
     manager = PreprocessManager(config=config, logger=None)
+    # This test covers byte sanitization; Docling fallback behavior has dedicated tests.
+    monkeypatch.setattr(manager, "_extract_with_docling", lambda *_args, **_kwargs: None)
 
     class FakePage:
         number = 0
@@ -985,7 +1150,10 @@ def test_mineru_allowlist_accepts_exact_official_https_host_and_rejects_other_sc
 
 
 def test_mineru_upload_rejects_untrusted_presigned_url(monkeypatch, tmp_path: Path) -> None:
-    manager = PreprocessManager(config={"Preprocess": {"enabled": "true"}}, logger=None)
+    manager = PreprocessManager(
+        config={"Preprocess": {"enabled": "true", "cache_dir": str(tmp_path / "cache")}},
+        logger=None,
+    )
     manager.mineru_base_url = "https://mineru.example/api/v4"
     manager.mineru_api_token = "token"
     pdf_path = tmp_path / "paper.pdf"

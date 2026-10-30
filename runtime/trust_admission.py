@@ -406,6 +406,39 @@ def build_external_host_policy(
     )
 
 
+def build_runtime_external_host_policy(
+    config: Mapping[str, Mapping[str, Any]],
+    route_plan: ReachableProviderRoutePlan,
+    *,
+    requested_stages: Sequence[str] | None,
+    outline_pilot: Mapping[str, Any] | None,
+) -> ExternalHostPolicyV1:
+    """Use the exact topic route only for an Outline-only pilot."""
+
+    if not isinstance(outline_pilot, Mapping):
+        return build_external_host_policy(config, route_plan)
+    if (
+        route_plan.action != "generate_outline"
+        or tuple(requested_stages or ()) != ("outline",)
+        or tuple(route_plan.stage_plan.requested_stages) != ("outline",)
+    ):
+        return build_external_host_policy(config, route_plan)
+    try:
+        generation_route = route_plan.route_for_role("candidate_provider_generation")
+    except KeyError as exc:
+        raise ExternalHostAdmissionError(
+            "topic pilot generation route is unavailable"
+        ) from exc
+    if not generation_route.resolved:
+        raise ExternalHostAdmissionError("topic pilot generation route is unresolved")
+    return build_external_host_policy(
+        config,
+        route_plan,
+        provider_sections=(generation_route.section_name,),
+        include_mineru=False,
+    )
+
+
 def validate_external_host_acknowledgement(
     policy: ExternalHostPolicyV1,
     acknowledgement: Mapping[str, Any] | None,
@@ -520,5 +553,6 @@ __all__ = [
     "ExternalHostTargetV1",
     "acknowledgement_from_values",
     "build_external_host_policy",
+    "build_runtime_external_host_policy",
     "validate_external_host_acknowledgement",
 ]

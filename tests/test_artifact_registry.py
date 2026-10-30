@@ -1,4 +1,5 @@
 import json
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -300,6 +301,45 @@ def test_verify_ready_artifact_closure_rejects_transitive_tamper(tmp_path) -> No
 
     with pytest.raises(UnverifiedDependency, match="dependency content hash changed: leaf"):
         registry.verify_ready_artifact_closure(root)
+
+
+def test_verify_ready_artifact_closure_checks_shared_dag_nodes_once_per_snapshot(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = ArtifactRegistry(tmp_path / "artifact_registry.json", "job-shared-dag")
+
+    def register(name: str, parents=()):
+        path = tmp_path / f"{name}.json"
+        path.write_text(json.dumps({"node": name}), encoding="utf-8")
+        return registry.register_file(
+            artifact_id=name,
+            artifact_role="test",
+            artifact_type="test_node",
+            artifact_version="v1",
+            path=path,
+            producer="tests",
+            depends_on=[ArtifactDependencyRefV2.from_record(parent) for parent in parents],
+        )
+
+    records = [register("leaf")]
+    parents = records
+    for level in range(7):
+        parents = [register(f"level-{level}-{side}", parents) for side in ("a", "b")]
+        records.extend(parents)
+    root = register("root", parents)
+    records.append(root)
+
+    original_verify = ArtifactRegistry._verify_ready_artifact
+    verified_counts: Counter[str] = Counter()
+
+    def counted_verify(cls, record):
+        verified_counts[record.artifact_id] += 1
+        return original_verify(record)
+
+    monkeypatch.setattr(ArtifactRegistry, "_verify_ready_artifact", classmethod(counted_verify))
+    assert registry.verify_ready_artifact_closure(root).artifact_id == "root"
+    assert verified_counts == Counter({record.artifact_id: 2 for record in records})
 
 
 def test_verify_ready_artifact_closure_rejects_dependency_cycle(tmp_path) -> None:

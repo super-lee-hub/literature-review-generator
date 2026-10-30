@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry
+from services.artifact_registry import ArtifactDependencyRefV2
 from services.job_workspace import atomic_write_json
 from tests.test_validation_closure import _bundle
 from validation.repair_transaction import RepairTransactionService

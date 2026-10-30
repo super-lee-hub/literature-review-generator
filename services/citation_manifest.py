@@ -15,6 +15,7 @@ from services.citation_style import CitationStyleEngine
 from services.citation_ref_catalog import extract_ref_ids_from_token, resolve_ref_id
 from services.job_workspace import utc_now_iso
 from services.sentence_segmenter import segment_sentences
+from services.review_draft import iter_review_text_blocks, validate_review_section_writer_scope
 
 
 DEFAULT_RENDER_POLICY: Dict[str, str] = {
@@ -531,6 +532,7 @@ def _build_claim_unit(
     claim_text: str,
     sentence_occurrences: Sequence[CitationOccurrence],
     block_text: str,
+    writer_binding: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, Any]:
     raw_sentence = block_text[span_start:span_end]
     alignment_status, alignment_confidence = _alignment_for_sentence(
@@ -587,6 +589,8 @@ def _build_claim_unit(
     if alignment_status == "ambiguous":
         claim_unit["pooled_paper_ids"] = supporting_paper_ids
         claim_unit["pooled_occurrence_ids"] = supporting_occurrence_ids
+    if writer_binding:
+        claim_unit.update(writer_binding)
     return claim_unit
 
 
@@ -601,14 +605,39 @@ def _build_citation_set_bundles(
         occurrences_by_block.setdefault(occurrence.block_id, []).append(occurrence)
 
     bundles_by_key: Dict[str, Dict[str, Any]] = {}
+    seen_writer_units: set[tuple[str, str]] = set()
     for section in sections:
         section_number = int(section.get("section_number") or 0)
         section_title = str(section.get("section_title") or "")
-        for block in section.get("blocks", []):
+        for block in validate_review_section_writer_scope(section):
             block_id = str(block.get("block_id") or "")
             block_text = str(block.get("text") or "")
             block_occurrences = occurrences_by_block.get(block_id, [])
+            writer_binding = {
+                name: block.get(name, "")
+                for name in ("writer_task_id", "writer_output_unit_id", "writer_task_basis_hash")
+            }
+            if any(writer_binding.values()):
+                if (
+                    not all(isinstance(value, str) and value.strip() for value in writer_binding.values())
+                    or re.fullmatch(r"[0-9a-f]{64}", writer_binding["writer_task_basis_hash"]) is None
+                ):
+                    raise ValueError(f"Writer block {block_id} has an incomplete task binding")
+                unit_key = (writer_binding["writer_task_basis_hash"], writer_binding["writer_output_unit_id"])
+                if unit_key in seen_writer_units:
+                    raise ValueError(f"Writer output unit is duplicated: {writer_binding['writer_output_unit_id']}")
+                seen_writer_units.add(unit_key)
+                factual_spans = [
+                    span for span in segment_sentences(block_text)
+                    if _strip_citation_tokens(span.raw_text)
+                ]
+                if len(factual_spans) != 1:
+                    raise ValueError(f"Writer output unit {block_id} must contain one factual sentence")
+            else:
+                writer_binding = {}
             if not block_occurrences:
+                if writer_binding:
+                    raise ValueError(f"Writer output unit {block_id} has no citation occurrence")
                 continue
 
             for sentence_index, sentence_span in enumerate(segment_sentences(block_text), start=1):
@@ -677,8 +706,14 @@ def _build_citation_set_bundles(
                                 claim_text=cleaned_sentence,
                                 sentence_occurrences=sentence_occurrences,
                                 block_text=block_text,
+                                writer_binding=writer_binding,
                             )
                         )
+                        if writer_binding:
+                            unit = aggregate["claim_units"][-1]
+                            for field_name in ("required_source_context", "table_id", "row_id", "cell_id"):
+                                if field_name in block:
+                                    unit[field_name] = block[field_name]
                 for occurrence in sentence_occurrences:
                     if occurrence.citation_token not in aggregate["citation_tokens"]:
                         aggregate["citation_tokens"].append(occurrence.citation_token)
@@ -812,7 +847,7 @@ def build_citation_manifest_from_review_draft(
     for section in sections:
         section_number = int(section.get("section_number") or 0)
         section_title = str(section.get("section_title") or "")
-        for block in section.get("blocks", []):
+        for block in iter_review_text_blocks(section):
             block_id = str(block.get("block_id") or f"s{section_number}_b0")
             block_order = int(block.get("block_order") or 0)
             block_text = str(block.get("text") or "")

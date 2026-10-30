@@ -20,6 +20,7 @@ from services.artifact_registry import (
     UnverifiedDependency,
     RegistryLockTimeout,
     RegistryRevisionConflict,
+    RegistrySnapshotChanged,
     file_sha256,
 )
 from services.job_workspace import JobWorkspace
@@ -1034,6 +1035,124 @@ def test_lease_manifest_allows_live_pointer_to_advance_while_historical_bytes_re
         registry,
         schema_validators={"test_artifact": lambda _record, _path: None},
     ).validate_record(manifest)
+
+
+def test_lease_manifest_rechecks_live_target_after_shared_closure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _workspace, registry, manifest_id, target_id, current_path = _lease_manifest_fixture(
+        tmp_path,
+        target_type="current_artifact_pointer",
+    )
+    manifest = registry.get(manifest_id)
+    assert manifest is not None
+    original_closure = registry._verify_ready_dependency_closure
+    mutated = False
+
+    def mutate_after_closure(record, **kwargs):
+        nonlocal mutated
+        result = original_closure(record, **kwargs)
+        if record.artifact_id == target_id and not mutated:
+            current_path.write_bytes(current_path.read_bytes() + b"\n")
+            mutated = True
+        return result
+
+    monkeypatch.setattr(registry, "_verify_ready_dependency_closure", mutate_after_closure)
+    with pytest.raises(UnverifiedArtifact, match="content hash changed"):
+        registry.verify_ready_dependencies(manifest.depends_on, owner_record=manifest)
+    assert mutated is True
+
+
+def test_lease_manifest_rechecks_historical_target_after_closure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _workspace, registry, manifest_id, target_id, _current_path = _lease_manifest_fixture(
+        tmp_path,
+        target_type="current_artifact_pointer",
+    )
+    manifest = registry.get(manifest_id)
+    assert manifest is not None
+    historical_path = Path(manifest.depends_on[0].path)
+    original_closure = registry._verify_ready_dependency_closure
+    mutated = False
+
+    def mutate_after_closure(record, **kwargs):
+        nonlocal mutated
+        result = original_closure(record, **kwargs)
+        if record.artifact_id == target_id and not mutated:
+            historical_path.write_bytes(historical_path.read_bytes() + b"\n")
+            mutated = True
+        return result
+
+    monkeypatch.setattr(registry, "_verify_ready_dependency_closure", mutate_after_closure)
+    with pytest.raises(UnverifiedDependency, match="historical target content hash changed"):
+        registry.verify_ready_artifact_closure(manifest)
+    assert mutated is True
+
+
+def test_lease_manifest_direct_verification_rejects_changed_external_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _workspace, registry, manifest_id, target_id, _current_path = _lease_manifest_fixture(
+        tmp_path,
+        target_type="current_artifact_pointer",
+    )
+    remote_path = tmp_path / "remote" / "artifact_registry.json"
+    remote_path.parent.mkdir()
+    remote = ArtifactRegistry(remote_path, "job-remote")
+    remote_leaf = remote.register_file(
+        artifact_id="remote-leaf",
+        artifact_role="test",
+        artifact_type="test_artifact",
+        artifact_version="v1",
+        path=_write_artifact(tmp_path / "remote" / "leaf.json", "leaf"),
+        producer="tests",
+    )
+    external_ref = ArtifactDependencyRefV2(
+        dependency_kind="external_job",
+        job_id=remote.job_id,
+        artifact_id=remote_leaf.artifact_id,
+        artifact_type=remote_leaf.artifact_type,
+        path=remote_leaf.path,
+        content_hash=remote_leaf.content_hash,
+    )
+    _mutate_registry_record(
+        registry,
+        target_id,
+        lambda record, _payload: record["depends_on"].append(external_ref.to_dict()),
+    )
+    registry.reload()
+    manifest = registry.get(manifest_id)
+    assert manifest is not None
+    original_closure = registry._verify_ready_dependency_closure
+    mutated = False
+
+    def mutate_remote_after_closure(record, **kwargs):
+        nonlocal mutated
+        result = original_closure(record, **kwargs)
+        if record.artifact_id == target_id and not mutated:
+            remote.register_file(
+                artifact_id="remote-late",
+                artifact_role="test",
+                artifact_type="test_artifact",
+                artifact_version="v1",
+                path=_write_artifact(tmp_path / "remote" / "late.json", "late"),
+                producer="tests",
+            )
+            mutated = True
+        return result
+
+    monkeypatch.setattr(registry, "_verify_ready_dependency_closure", mutate_remote_after_closure)
+    with pytest.raises(RegistrySnapshotChanged, match="external Registry revision changed"):
+        registry.verify_ready_dependencies(
+            manifest.depends_on,
+            owner_record=manifest,
+            external_registry_resolver=lambda job_id: remote if job_id == remote.job_id else None,
+        )
+    assert mutated is True
 
 
 @pytest.mark.parametrize(

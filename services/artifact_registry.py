@@ -57,7 +57,16 @@ class UnverifiedDependency(RegistryError):
 
 
 class RegistrySnapshotChanged(UnverifiedDependency):
-    """Raised when an external Registry changes during closure verification."""
+    """Raised when a Registry snapshot changes during closure verification."""
+
+
+class ArtifactClosureBatchError(RegistryError):
+    """Carry the failing root for a multi-root closure attempt without partial results."""
+
+    def __init__(self, root_index: int | None, original_error: Exception) -> None:
+        self.root_index = root_index
+        self.original_error = original_error
+        super().__init__(str(original_error))
 
 
 class UnverifiedArtifact(RegistryError):
@@ -674,13 +683,18 @@ class ArtifactRegistry:
         cls,
         snapshots: Mapping[str, tuple["ArtifactRegistry", int, Mapping[str, ArtifactRecord]]],
     ) -> None:
-        for registry, expected_revision, _artifacts in snapshots.values():
+        for registry, expected_revision, expected_artifacts in snapshots.values():
             with registry._transaction_lock():
-                current_revision, _current_artifacts = registry._read_registry_unlocked()
+                current_revision, current_artifacts = registry._read_registry_unlocked()
             if current_revision != expected_revision:
                 raise RegistrySnapshotChanged(
                     f"external Registry revision changed during closure verification: "
                     f"{registry.job_id} {expected_revision}->{current_revision}"
+                )
+            if current_artifacts != expected_artifacts:
+                raise RegistrySnapshotChanged(
+                    f"external Registry record mapping changed during closure verification: "
+                    f"{registry.job_id}"
                 )
 
     def _normalize_dependencies(
@@ -694,9 +708,19 @@ class ArtifactRegistry:
         owner_record: ArtifactRecord | None = None,
         _dependency_stack: set[tuple[str, str]] | None = None,
         external_snapshots: dict[str, tuple["ArtifactRegistry", int, Dict[str, ArtifactRecord]]] | None = None,
+        _verified_nodes: dict[tuple[str, str, int], ArtifactRecord] | None = None,
+        _historical_targets: dict[str, str] | None = None,
     ) -> List[ArtifactDependencyRefV2]:
         if external_snapshots is None:
             external_snapshots = {}
+        owns_lease_context = bool(
+            owner_record is not None
+            and owner_record.artifact_type == "lease_publication_manifest"
+            and _verified_nodes is None
+        )
+        if owns_lease_context:
+            _verified_nodes = {}
+            _historical_targets = {}
         normalized: List[ArtifactDependencyRefV2] = []
         for dependency in dependencies:
             if isinstance(dependency, ArtifactDependencyRefV2):
@@ -780,6 +804,13 @@ class ArtifactRegistry:
                     raise UnverifiedDependency(
                         f"lease publication target content hash changed: {ref.artifact_id}"
                     )
+                if _historical_targets is not None:
+                    prior_hash = _historical_targets.get(historical_path)
+                    if prior_hash is not None and prior_hash != historical_hash:
+                        raise UnverifiedDependency(
+                            f"lease publication historical target identity conflicts: {ref.artifact_id}"
+                        )
+                    _historical_targets[historical_path] = historical_hash
                 dependency_stack = set(_dependency_stack or ())
                 owner_key = (owner_record.job_id, owner_record.artifact_id)
                 dependency_stack.add(owner_key)
@@ -789,6 +820,8 @@ class ArtifactRegistry:
                     external_registry_resolver=external_registry_resolver,
                     dependency_stack=dependency_stack,
                     external_snapshots=external_snapshots,
+                    verified_nodes=_verified_nodes,
+                    historical_targets=_historical_targets,
                 )
                 normalized.append(
                     ArtifactDependencyRefV2(
@@ -837,7 +870,23 @@ class ArtifactRegistry:
                     external_snapshots=external_snapshots,
                 )
             normalized.append(normalized_ref)
+        if owns_lease_context:
+            assert _verified_nodes is not None and _historical_targets is not None
+            for verified_record in _verified_nodes.values():
+                self._verify_ready_artifact(verified_record)
+            assert owner_record is not None
+            self._verify_ready_artifact(owner_record)
+            self._recheck_historical_targets(_historical_targets)
+            self._assert_external_snapshots_unchanged(external_snapshots)
         return normalized
+
+    @staticmethod
+    def _recheck_historical_targets(targets: Mapping[str, str]) -> None:
+        for path, expected_hash in targets.items():
+            if not os.path.isfile(path) or file_sha256(path) != expected_hash:
+                raise UnverifiedDependency(
+                    f"lease publication historical target content hash changed: {path}"
+                )
 
     def _verify_ready_dependency_closure(
         self,
@@ -847,14 +896,23 @@ class ArtifactRegistry:
         external_registry_resolver: Callable[[str], Optional["ArtifactRegistry"]] | None,
         dependency_stack: set[tuple[str, str]],
         external_snapshots: dict[str, tuple["ArtifactRegistry", int, Dict[str, ArtifactRecord]]] | None = None,
+        verified_nodes: dict[tuple[str, str, int], ArtifactRecord] | None = None,
+        historical_targets: dict[str, str] | None = None,
     ) -> None:
         if external_snapshots is None:
             external_snapshots = {}
+        if verified_nodes is None:
+            verified_nodes = {}
+        if historical_targets is None:
+            historical_targets = {}
         key = (record.job_id, record.artifact_id)
         if key in dependency_stack:
             raise UnverifiedDependency(
                 f"artifact dependency cycle detected at {record.artifact_id}"
             )
+        memo_key = (*key, id(artifacts))
+        if memo_key in verified_nodes:
+            return
         dependency_stack.add(key)
         try:
             self._verify_ready_artifact(record)
@@ -867,6 +925,8 @@ class ArtifactRegistry:
                 owner_record=record,
                 _dependency_stack=dependency_stack,
                 external_snapshots=external_snapshots,
+                _verified_nodes=verified_nodes,
+                _historical_targets=historical_targets,
             )
             for dependency in normalized:
                 if dependency.dependency_kind == "local_job":
@@ -902,7 +962,10 @@ class ArtifactRegistry:
                     external_registry_resolver=external_registry_resolver,
                     dependency_stack=dependency_stack,
                     external_snapshots=external_snapshots,
+                    verified_nodes=verified_nodes,
+                    historical_targets=historical_targets,
                 )
+            verified_nodes[memo_key] = record
         finally:
             dependency_stack.remove(key)
 
@@ -1154,6 +1217,16 @@ class ArtifactRegistry:
     def list_records(self) -> List[ArtifactRecord]:
         return [self._copy_record(record) for record in self._artifacts.values()]
 
+    def capture_record_snapshot(self) -> tuple[int, List[ArtifactRecord]]:
+        """Capture durable records and refresh this instance's read view."""
+
+        with self._transaction_lock():
+            revision, artifacts = self._read_registry_unlocked()
+            self._revision = revision
+            self._artifacts = artifacts
+            records = [self._copy_record(record) for record in artifacts.values()]
+        return revision, records
+
     def get(self, artifact_id: str) -> Optional[ArtifactRecord]:
         record = self._artifacts.get(artifact_id)
         return self._copy_record(record) if record is not None else None
@@ -1178,6 +1251,143 @@ class ArtifactRegistry:
                 owner_record=owner_record,
             )
 
+    def verify_ready_artifact_dependency_sets(
+        self,
+        owner_records: Iterable[ArtifactRecord],
+        *,
+        external_registry_resolver: Callable[[str], Optional["ArtifactRegistry"]] | None = None,
+        complete_ready_set_excluding: Iterable[str] | None = None,
+        expected_snapshot_revision: int | None = None,
+    ) -> Dict[str, Exception]:
+        """Verify direct dependencies against one fenced durable snapshot.
+
+        This remains shallow: it is not a recursive dependency-closure walk.
+        Owner byte/schema checks run without the Registry lock. Complete READY
+        sets share only recursive lease proofs, then recheck their union; other
+        owners and subset callers keep independent shallow normalization.
+        """
+        owners = tuple(owner_records)
+        owner_ids = [str(owner.artifact_id) for owner in owners]
+        if any(not artifact_id for artifact_id in owner_ids):
+            raise ValueError("dependency owner artifact IDs must be non-empty")
+        if len(owner_ids) != len(set(owner_ids)):
+            raise ValueError("dependency owner artifact IDs must be unique")
+        if expected_snapshot_revision is not None and (
+            isinstance(expected_snapshot_revision, bool)
+            or not isinstance(expected_snapshot_revision, int)
+            or expected_snapshot_revision < 0
+        ):
+            raise ValueError("expected snapshot revision must be a non-negative integer")
+        if (
+            not owners
+            and complete_ready_set_excluding is None
+            and expected_snapshot_revision is None
+        ):
+            return {}
+
+        excluded_types = (
+            None
+            if complete_ready_set_excluding is None
+            else {str(item) for item in complete_ready_set_excluding}
+        )
+        failures: Dict[str, Exception] = {}
+        with self._transaction_lock():
+            snapshot_revision, artifacts = self._read_registry_unlocked()
+            if (
+                expected_snapshot_revision is not None
+                and snapshot_revision != expected_snapshot_revision
+            ):
+                raise RegistrySnapshotChanged(
+                    "Registry snapshot changed before batched direct-dependency verification: "
+                    f"expected revision {expected_snapshot_revision}, found {snapshot_revision}"
+                )
+            if excluded_types is not None:
+                eligible_ready_ids = {
+                    record.artifact_id
+                    for record in artifacts.values()
+                    if record.status == "ready" and record.artifact_type not in excluded_types
+                }
+                if set(owner_ids) != eligible_ready_ids:
+                    omitted = sorted(eligible_ready_ids - set(owner_ids))
+                    unexpected = sorted(set(owner_ids) - eligible_ready_ids)
+                    raise UnverifiedDependency(
+                        "READY direct-dependency owner set does not match Registry snapshot: "
+                        f"omitted={omitted!r}, unexpected={unexpected!r}"
+                    )
+
+        # Hashing and schema validation run without the Registry lock so other
+        # Registry instances can publish. All dependency normalization uses
+        # the captured immutable local snapshot above.
+        lease_verified_nodes: dict[tuple[str, str, int], ArtifactRecord] = {}
+        lease_historical_targets: dict[str, str] = {}
+        lease_external_snapshots: dict[
+            str, tuple[ArtifactRegistry, int, Dict[str, ArtifactRecord]]
+        ] = {}
+        verified_lease_owners: list[ArtifactRecord] = []
+        for supplied_owner in owners:
+            owner = artifacts.get(supplied_owner.artifact_id)
+            if owner is None or owner != supplied_owner:
+                failures[supplied_owner.artifact_id] = UnverifiedDependency(
+                    "artifact owner changed in Registry snapshot: "
+                    f"{supplied_owner.artifact_id}"
+                )
+                continue
+            if owner.status != "ready" or owner.job_id != self.job_id:
+                failures[owner.artifact_id] = UnverifiedDependency(
+                    f"artifact owner is not READY and local: {owner.artifact_id}"
+                )
+                continue
+            try:
+                self._verify_ready_artifact(owner)
+                if excluded_types is not None and owner.artifact_type == "lease_publication_manifest":
+                    self._normalize_dependencies(
+                        owner.depends_on,
+                        artifacts,
+                        owner_job_id=self.job_id,
+                        require_ready=True,
+                        external_registry_resolver=external_registry_resolver,
+                        owner_record=owner,
+                        external_snapshots=lease_external_snapshots,
+                        _verified_nodes=lease_verified_nodes,
+                        _historical_targets=lease_historical_targets,
+                    )
+                    verified_lease_owners.append(owner)
+                else:
+                    self._normalize_dependencies(
+                        owner.depends_on,
+                        artifacts,
+                        owner_job_id=self.job_id,
+                        require_ready=True,
+                        external_registry_resolver=external_registry_resolver,
+                        owner_record=owner,
+                    )
+            except (OSError, RegistryError, ValueError, TypeError) as exc:
+                failures[owner.artifact_id] = exc
+
+        # Shared traversal replaces the per-lease final check, so fence the
+        # distinct node/owner union only after every owner has been examined.
+        # The context is local to this call and is never used by shallow owners.
+        lease_rechecks = dict(lease_verified_nodes)
+        for owner in verified_lease_owners:
+            lease_rechecks[(owner.job_id, owner.artifact_id, id(artifacts))] = owner
+        for record in lease_rechecks.values():
+            self._verify_ready_artifact(record)
+        if lease_historical_targets:
+            self._recheck_historical_targets(lease_historical_targets)
+        if lease_external_snapshots:
+            self._assert_external_snapshots_unchanged(lease_external_snapshots)
+
+        # Fence the unlocked validation against both normal revisioned writes
+        # and same-revision artifact identity changes before returning success.
+        with self._transaction_lock():
+            current_revision, current_artifacts = self._read_registry_unlocked()
+        if current_revision != snapshot_revision or current_artifacts != artifacts:
+            raise RegistrySnapshotChanged(
+                "Registry snapshot changed during batched direct-dependency verification: "
+                f"revision {snapshot_revision}->{current_revision}"
+            )
+        return failures
+
     def verify_ready_artifact_closure(
         self,
         root: ArtifactRecord | ArtifactDependencyRefV2 | Mapping[str, Any],
@@ -1194,55 +1404,239 @@ class ArtifactRegistry:
         every local and external dependency, including cycles.
         """
 
-        if isinstance(root, ArtifactRecord):
-            root_ref = ArtifactDependencyRefV2.from_record(root)
-        elif isinstance(root, ArtifactDependencyRefV2):
-            root_ref = ArtifactDependencyRefV2.from_dict(root.to_dict())
-        elif isinstance(root, Mapping):
-            root_ref = ArtifactDependencyRefV2.from_dict(root)
-        else:
-            raise TypeError(f"unsupported artifact closure root: {type(root).__name__}")
-        if root_ref.dependency_kind != "local_job":
-            raise UnverifiedDependency(
-                "artifact closure root must be local to this Registry: "
-                f"{root_ref.job_id}/{root_ref.artifact_id}"
+        try:
+            return self.verify_ready_artifact_closures(
+                (root,),
+                external_registry_resolver=external_registry_resolver,
+            )[0]
+        except ArtifactClosureBatchError as exc:
+            raise exc.original_error from None
+
+    def verify_ready_artifact_closures(
+        self,
+        roots: Iterable[ArtifactRecord | ArtifactDependencyRefV2 | Mapping[str, Any]],
+        *,
+        external_registry_resolver: Callable[[str], Optional["ArtifactRegistry"]] | None = None,
+        expected_record_snapshot: tuple[int, Mapping[str, ArtifactRecord]] | None = None,
+    ) -> List[ArtifactRecord]:
+        """Verify several ready roots against one fenced Registry snapshot.
+
+        Root identity is normalized independently for every input. Recursive
+        nodes, foreign Registry snapshots, and lease historical targets are
+        shared only within one attempt. No root copy is returned until the
+        entire union and its final fences have succeeded.
+        A supplied snapshot pins both its revision and full record map; it
+        cannot be rebased by the ordinary snapshot-drift retry loop.
+        """
+
+        root_values = tuple(roots)
+        if not root_values:
+            raise ValueError("artifact closure batch requires at least one root")
+
+        pinned_snapshot = None
+        if expected_record_snapshot is not None:
+            pinned_revision, pinned_records = expected_record_snapshot
+            if (isinstance(pinned_revision, bool) or not isinstance(pinned_revision, int)
+                    or pinned_revision < 0):
+                raise ValueError("expected snapshot revision must be a non-negative integer")
+            pinned_snapshot = (
+                pinned_revision,
+                {key: self._copy_record(value) for key, value in pinned_records.items()},
             )
 
+        root_refs: list[ArtifactDependencyRefV2] = []
+        for root in root_values:
+            if isinstance(root, ArtifactRecord):
+                root_ref = ArtifactDependencyRefV2.from_record(root)
+            elif isinstance(root, ArtifactDependencyRefV2):
+                root_ref = ArtifactDependencyRefV2.from_dict(root.to_dict())
+            elif isinstance(root, Mapping):
+                root_ref = ArtifactDependencyRefV2.from_dict(root)
+            else:
+                raise TypeError(f"unsupported artifact closure root: {type(root).__name__}")
+            if root_ref.dependency_kind != "local_job":
+                raise UnverifiedDependency(
+                    "artifact closure root must be local to this Registry: "
+                    f"{root_ref.job_id}/{root_ref.artifact_id}"
+                )
+            root_refs.append(root_ref)
+
         last_snapshot_error: RegistrySnapshotChanged | None = None
+        last_snapshot_root_index = 0
         for attempt in range(DEFAULT_EXTERNAL_SNAPSHOT_RETRY_LIMIT):
+            attempt_snapshot_root_index = 0
             try:
                 with self._transaction_lock():
-                    _revision, artifacts = self._read_registry_unlocked()
+                    revision, artifacts = self._read_registry_unlocked()
+                    if pinned_snapshot is not None and (revision, artifacts) != pinned_snapshot:
+                        raise ArtifactClosureBatchError(
+                            0, RegistrySnapshotChanged(
+                                "local Registry snapshot changed before pinned closure verification"
+                            ),
+                        )
                     external_snapshots: dict[
                         str, tuple[ArtifactRegistry, int, Dict[str, ArtifactRecord]]
                     ] = {}
-                    normalized_root = self._verify_ready_dependency(
-                        root_ref,
-                        artifacts=artifacts,
-                        owner_job_id=self.job_id,
-                        external_registry_resolver=external_registry_resolver,
-                        external_snapshots=external_snapshots,
-                    )
-                    target = artifacts.get(normalized_root.artifact_id)
-                    if target is None:
-                        raise UnverifiedDependency(
-                            f"dependency is not registered: {self.job_id}/{normalized_root.artifact_id}"
-                        )
-                    self._verify_ready_dependency_closure(
-                        target,
-                        artifacts=artifacts,
-                        external_registry_resolver=external_registry_resolver,
-                        dependency_stack=set(),
-                        external_snapshots=external_snapshots,
-                    )
-                    self._assert_external_snapshots_unchanged(external_snapshots)
-                    return self._copy_record(target)
+                    verified_nodes: dict[tuple[str, str, int], ArtifactRecord] = {}
+                    verified_node_roots: dict[tuple[str, str, int], int] = {}
+                    historical_targets: dict[str, str] = {}
+                    historical_target_roots: dict[str, int] = {}
+                    external_snapshot_roots: dict[str, int] = {}
+                    targets: list[ArtifactRecord] = []
+
+                    for root_index, root_ref in enumerate(root_refs):
+                        prior_nodes = set(verified_nodes)
+                        prior_history = set(historical_targets)
+                        prior_external = set(external_snapshots)
+                        try:
+                            normalized_root = self._verify_ready_dependency(
+                                root_ref,
+                                artifacts=artifacts,
+                                owner_job_id=self.job_id,
+                                external_registry_resolver=external_registry_resolver,
+                                external_snapshots=external_snapshots,
+                            )
+                            target = artifacts.get(normalized_root.artifact_id)
+                            if target is None:
+                                raise UnverifiedDependency(
+                                    f"dependency is not registered: "
+                                    f"{self.job_id}/{normalized_root.artifact_id}"
+                                )
+                            self._verify_ready_dependency_closure(
+                                target,
+                                artifacts=artifacts,
+                                external_registry_resolver=external_registry_resolver,
+                                dependency_stack=set(),
+                                external_snapshots=external_snapshots,
+                                verified_nodes=verified_nodes,
+                                historical_targets=historical_targets,
+                            )
+                        except RegistrySnapshotChanged as exc:
+                            message = str(exc)
+                            attempt_snapshot_root_index = next(
+                                (
+                                    external_snapshot_roots.get(snapshot_key, root_index)
+                                    for snapshot_key, (registry, _snapshot_revision, _snapshot_records)
+                                    in external_snapshots.items()
+                                    if registry.job_id and registry.job_id in message
+                                ),
+                                root_index,
+                            )
+                            raise
+                        except ArtifactClosureBatchError:
+                            raise
+                        except (
+                            OSError,
+                            UnicodeError,
+                            json.JSONDecodeError,
+                            RegistryError,
+                            TypeError,
+                            ValueError,
+                        ) as exc:
+                            raise ArtifactClosureBatchError(root_index, exc) from exc
+                        for node_key in verified_nodes.keys() - prior_nodes:
+                            verified_node_roots.setdefault(node_key, root_index)
+                        for path in historical_targets.keys() - prior_history:
+                            historical_target_roots.setdefault(path, root_index)
+                        for snapshot_key in external_snapshots.keys() - prior_external:
+                            external_snapshot_roots.setdefault(snapshot_key, root_index)
+                        targets.append(target)
+
+                    try:
+                        # Recheck each distinct union node only after every root
+                        # has traversed, preserving the late-byte-change fence.
+                        for node_key, verified_record in verified_nodes.items():
+                            try:
+                                self._verify_ready_artifact(verified_record)
+                            except RegistrySnapshotChanged:
+                                attempt_snapshot_root_index = verified_node_roots.get(node_key, 0)
+                                raise
+                            except (
+                                OSError,
+                                UnicodeError,
+                                json.JSONDecodeError,
+                                RegistryError,
+                                TypeError,
+                                ValueError,
+                            ) as exc:
+                                raise ArtifactClosureBatchError(
+                                    verified_node_roots.get(node_key, 0), exc
+                                ) from exc
+                        for path, expected_hash in historical_targets.items():
+                            root_index = historical_target_roots.get(path, 0)
+                            try:
+                                self._recheck_historical_targets({path: expected_hash})
+                            except RegistrySnapshotChanged:
+                                attempt_snapshot_root_index = root_index
+                                raise
+                            except (
+                                OSError,
+                                UnicodeError,
+                                json.JSONDecodeError,
+                                RegistryError,
+                                TypeError,
+                                ValueError,
+                            ) as exc:
+                                raise ArtifactClosureBatchError(root_index, exc) from exc
+                        for snapshot_key, snapshot in external_snapshots.items():
+                            root_index = external_snapshot_roots.get(snapshot_key, 0)
+                            try:
+                                self._assert_external_snapshots_unchanged(
+                                    {snapshot_key: snapshot}
+                                )
+                            except RegistrySnapshotChanged:
+                                attempt_snapshot_root_index = root_index
+                                raise
+                            except (
+                                OSError,
+                                UnicodeError,
+                                json.JSONDecodeError,
+                                RegistryError,
+                                TypeError,
+                                ValueError,
+                            ) as exc:
+                                raise ArtifactClosureBatchError(root_index, exc) from exc
+                        current_revision, current_artifacts = self._read_registry_unlocked()
+                        if current_revision != revision or current_artifacts != artifacts:
+                            attempt_snapshot_root_index = 0
+                            raise RegistrySnapshotChanged(
+                                "local Registry snapshot changed during closure verification: "
+                                f"revision {revision}->{current_revision}"
+                            )
+                    except RegistrySnapshotChanged:
+                        raise
+                    except ArtifactClosureBatchError:
+                        raise
+                    except (
+                        OSError,
+                        UnicodeError,
+                        json.JSONDecodeError,
+                        RegistryError,
+                        TypeError,
+                        ValueError,
+                    ) as exc:
+                        raise ArtifactClosureBatchError(0, exc) from exc
+
+                    return [self._copy_record(target) for target in targets]
+            except ArtifactClosureBatchError:
+                raise
             except RegistrySnapshotChanged as exc:
                 last_snapshot_error = exc
+                last_snapshot_root_index = attempt_snapshot_root_index
                 if attempt + 1 >= DEFAULT_EXTERNAL_SNAPSHOT_RETRY_LIMIT:
                     break
-        raise UnverifiedDependency(
-            "external Registry snapshot changed during dependency closure verification"
+
+        if last_snapshot_error is not None and str(last_snapshot_error).startswith(
+            "local Registry snapshot changed"
+        ):
+            message = "local Registry snapshot changed during closure verification"
+        else:
+            # Preserve the legacy singleton exhaustion message for external
+            # snapshot drift, including the strengthened Record-map comparison.
+            message = "external Registry snapshot changed during dependency closure verification"
+        raise ArtifactClosureBatchError(
+            last_snapshot_root_index,
+            UnverifiedDependency(message),
         ) from last_snapshot_error
 
     def register_file(

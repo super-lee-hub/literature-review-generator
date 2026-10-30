@@ -10,7 +10,7 @@ from docx import Document
 from runtime.control_plane import ReviewControlPlane
 from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec, save_runtime_job_spec
 from runtime.orchestrator import AgentRuntimeBridge
-from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry, file_sha256
+from services.artifact_registry import ArtifactDependencyRefV2, file_sha256
 from services.job_workspace import atomic_write_json
 from tests.test_current_runtime_full_e2e import _test_config, _write_pdf
 from validation.run_result import (

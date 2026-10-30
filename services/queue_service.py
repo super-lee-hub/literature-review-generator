@@ -11,6 +11,7 @@ import threading
 import tempfile
 import time
 import uuid
+from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -280,6 +281,7 @@ class QueueJobRuntime:
     revision: int = 0
     lease_generation: int = 0
     fence_token: str = ""
+    resume_intent: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -306,10 +308,13 @@ class QueueJobRuntime:
             "revision": self.revision,
             "lease_generation": self.lease_generation,
             "fence_token": self.fence_token,
+            "resume_intent": deepcopy(self.resume_intent),
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "QueueJobRuntime":
+        if data.get("resume_intent") is not None and not isinstance(data["resume_intent"], dict):
+            raise ValueError("queue resume intent must be an object")
         return cls(
             job_id=data["job_id"],
             state=QueueState(data["state"]),
@@ -334,6 +339,7 @@ class QueueJobRuntime:
             revision=max(0, int(data.get("revision") or 0)),
             lease_generation=max(0, int(data.get("lease_generation") or 0)),
             fence_token=str(data.get("fence_token") or ""),
+            resume_intent=deepcopy(data.get("resume_intent")),
         )
 
 
@@ -1420,6 +1426,29 @@ class PersistentQueueService:
             self._save()
             return True
 
+    def lease_is_current(
+        self,
+        job_id: str,
+        *,
+        lease_id: str,
+        worker_id: str,
+        lease_generation: int,
+        fence_token: str,
+    ) -> bool:
+        """Read-only check that a queue worker still owns its active lease."""
+
+        with self._store_lock():
+            runtime = self._runtimes.get(str(job_id))
+            return bool(
+                self._lease_owned(
+                    runtime,
+                    lease_id=lease_id,
+                    worker_id=worker_id,
+                    lease_generation=lease_generation,
+                    fence_token=fence_token,
+                )
+            )
+
     def update_job_stage_with_lease(
         self,
         job_id: str,
@@ -1706,7 +1735,8 @@ class PersistentQueueService:
             self._save()
             return self._runtimes[job_id].retry_count
 
-    def reset_job(self, job_id: str) -> bool:
+    def prepare_retry(self, job_id: str, *, increment_retry: bool = True) -> bool:
+        """Atomically publish retry intent before the job becomes runnable."""
         with self._store_lock():
             if job_id not in self._runtimes:
                 return False
@@ -1719,17 +1749,105 @@ class PersistentQueueService:
                 QueueState.CANCELLED,
             }:
                 return False
+            if previous.state == QueueState.PENDING:
+                # A second runner must not recapture a cancel that arrived
+                # after the explicit retry transition.
+                return True
+            job = self._jobs.get(job_id)
+            if job is None:
+                return False
+            prior_revision = previous.revision
+            prior_state = previous.state
+            prior_generation = previous.lease_generation
+            prior_workspace = job.workspace_path
+            prior_fingerprint = str(job.execution_snapshot.get("fingerprint") or "")
+            prior_input_fingerprint = job.input_fingerprint
+            frozen = deepcopy(job.execution_snapshot.get("runtime_spec"))
+
+        # Marker lock -> queue store -> Registry is the mutation lock order.
+        # Capture a verified snapshot outside the queue lock so a concurrent
+        # cancellation writer cannot deadlock with retry preparation.
+        intent = None
+        if prior_workspace:
+            root = Path(prior_workspace).expanduser().resolve()
+            started = (root / "logs/acceptance_budget_state_v1.json").is_file() or any(
+                (root / "artifacts").glob("runtime_job_spec_v1__*.json")
+            )
+            if started:
+                from runtime.cancellation import CancellationRequestStore
+                from runtime.provider_runtime import hash_json
+                from services.job_workspace import JobWorkspace
+
+                if not isinstance(frozen, Mapping) or not prior_fingerprint:
+                    raise QueueInputDriftError("retry has no frozen runtime input identity")
+                suffix = "__" + job_id
+                if not root.name.endswith(suffix):
+                    raise QueueInputDriftError("retry workspace does not match the job identity")
+                workspace = JobWorkspace(str(root.parent), root.name[:-len(suffix)], job_id)
+                registry = ArtifactRegistry(workspace.paths.registry_path, job_id)
+                _marker, expected_hash = CancellationRequestStore(workspace, registry).read_snapshot()
+                intent = {
+                    "schema_version": "queue-resume-intent-v1",
+                    "job_id": job_id,
+                    "workspace_path": str(root),
+                    "execution_fingerprint": prior_fingerprint,
+                    "runtime_spec_sha256": hash_json(frozen),
+                    "expected_cancel_marker_sha256": expected_hash,
+                }
+
+        with self._store_lock():
+            previous = self._runtimes.get(job_id)
+            job = self._jobs.get(job_id)
+            if (
+                previous is None or job is None or self._has_active_lease(previous)
+                or previous.revision != prior_revision or previous.state != prior_state
+                or previous.lease_generation != prior_generation
+                or job.workspace_path != prior_workspace
+                or job.input_fingerprint != prior_input_fingerprint
+                or str(job.execution_snapshot.get("fingerprint") or "") != prior_fingerprint
+                or job.execution_snapshot.get("runtime_spec") != frozen
+            ):
+                return False
             self._runtimes[job_id] = QueueJobRuntime(
                 job_id=job_id,
-                retry_count=previous.retry_count,
+                retry_count=previous.retry_count + int(increment_retry),
                 workspace_path=self._jobs[job_id].workspace_path if job_id in self._jobs else "",
                 canonical_output_root=(
                     self._jobs[job_id].canonical_output_root if job_id in self._jobs else ""
                 ),
                 log_path=self._jobs[job_id].log_path if job_id in self._jobs else "",
+                revision=previous.revision + 1,
+                lease_generation=previous.lease_generation,
+                resume_intent=intent,
             )
             self._save()
         return True
+
+    def reset_job(self, job_id: str) -> bool:
+        return self.prepare_retry(job_id, increment_retry=False)
+
+    def execution_resume_intent(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Recheck a retry against the exact frozen input and workspace."""
+        from runtime.provider_runtime import hash_json
+
+        with self._store_lock():
+            runtime = self._runtimes.get(job_id)
+            job = self._jobs.get(job_id)
+            intent = runtime.resume_intent if runtime is not None else None
+            if intent is None:
+                return None
+            frozen = (job.execution_snapshot or {}).get("runtime_spec") if job is not None else None
+            if (
+                job is None or not isinstance(frozen, Mapping)
+                or intent.get("schema_version") != "queue-resume-intent-v1"
+                or intent.get("job_id") != job_id
+                or intent.get("workspace_path") != str(Path(job.workspace_path).expanduser().resolve())
+                or intent.get("execution_fingerprint") != str(job.execution_snapshot.get("fingerprint") or "")
+                or intent.get("execution_fingerprint") != job.input_fingerprint
+                or intent.get("runtime_spec_sha256") != hash_json(frozen)
+            ):
+                raise QueueInputDriftError("queue resume intent no longer matches its frozen execution inputs")
+            return deepcopy(intent)
 
     def request_cancel(self, job_id: str, *, reason: str = "user_requested") -> bool:
         """Persist a cooperative cancellation request for a live job."""
@@ -1892,9 +2010,8 @@ class PersistentQueueService:
         failed_jobs = self.get_failed_jobs()
         retried_job_ids = []
         for job in failed_jobs:
-            self.reset_job(job.job_id)
-            self.increment_retry_count(job.job_id)
-            retried_job_ids.append(job.job_id)
+            if self.prepare_retry(job.job_id):
+                retried_job_ids.append(job.job_id)
         return retried_job_ids
 
     def save_queue(self, file_path: str | Path) -> None:
@@ -2415,6 +2532,7 @@ class QueuePublicationContext:
                     artifact_records = ArtifactRegistry.register_files_atomic(
                         registry,
                         [kwargs, manifest_kwargs],
+                        external_registry_resolver=kwargs.get("external_registry_resolver"),
                     )
                     artifact = artifact_records[0]
                 else:
@@ -2540,6 +2658,20 @@ class QueueOwnedArtifactRegistry(ArtifactRegistry):
         with self._queue_write_lock():
             return super().register_file(*args, **kwargs)
 
+    @contextmanager
+    def control_mutation_guard(self, *, clearing: bool = False):
+        """Fence marker bytes and their registration in the same short lease.
+
+        Cancellation holds its marker lock first. Registration uses the base
+        method here so it does not recursively acquire the queue-store lock.
+        The Registry publication guard still checks the current lease.
+        """
+        with self._queue_write_lock():
+            runtime = self._queue_service._runtimes.get(self._queue_lease.job_id)
+            if clearing and runtime is not None and runtime.cancel_requested:
+                raise JobCancelledError("current queue cancellation must not be cleared by retry")
+            yield lambda **kwargs: ArtifactRegistry.register_file(self, **kwargs)
+
     def register_files_atomic(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
         with self._queue_write_lock():
             return super().register_files_atomic(*args, **kwargs)
@@ -2614,25 +2746,6 @@ class QueueRunner:
             job_spec.job_id,
         )
         return CancellationRequestStore(workspace).is_requested()
-
-    @staticmethod
-    def _clear_external_cancel(job_spec: QueueJobSpec) -> None:
-        from runtime.cancellation import CancellationRequestStore
-        from services.job_workspace import JobWorkspace
-
-        runtime_workspace = str(job_spec.workspace_path or "").strip()
-        if not runtime_workspace:
-            return
-        workspace_path = Path(runtime_workspace).expanduser().resolve()
-        project_name = workspace_path.name.rsplit("__", 1)[0]
-        workspace = JobWorkspace(
-            str(workspace_path.parent),
-            project_name,
-            job_spec.job_id,
-        )
-        store = CancellationRequestStore(workspace)
-        if store.read() is not None:
-            store.clear(cleared_by="queue_runner", reason="retry")
 
     def _acknowledge_cancelled(self, job_id: str) -> None:
         runtime = self.queue_service.get_job_runtime(job_id)
@@ -2731,7 +2844,9 @@ class QueueRunner:
             self._cancel_tokens[job_spec.job_id] = cancel_token
 
         try:
-            if self._external_cancel_requested(job_spec):
+            pending_runtime = self.queue_service.get_job_runtime(job_spec.job_id)
+            pending_resume = pending_runtime is not None and pending_runtime.resume_intent is not None
+            if not pending_resume and self._external_cancel_requested(job_spec):
                 cancel_token.request_cancel()
                 self.queue_service.request_cancel(job_spec.job_id, reason="external_cancel_request")
                 self._acknowledge_cancelled(job_spec.job_id)
@@ -2775,7 +2890,7 @@ class QueueRunner:
                 # Pending or running dependency → keep this job waiting
                 if dep_runtime.state not in (QueueState.COMPLETED,):
                     return
-            
+
             # 更新任务状态为运行中
             lease = self.queue_service.claim_job(
                 job_spec.job_id,
@@ -2787,14 +2902,14 @@ class QueueRunner:
             with self._lock:
                 self._leases[job_spec.job_id] = lease
             self._start_heartbeat(job_spec.job_id, lease, cancel_token)
-            
+
             # 再次检查任务状态，确保没有被取消
             runtime = self.queue_service.get_job_runtime(job_spec.job_id)
             if runtime and (runtime.state == QueueState.CANCELLED or runtime.cancel_requested):
                 cancel_token.request_cancel()
                 self._acknowledge_cancelled(job_spec.job_id)
                 return
-            
+
             # Verify the frozen input receipt after the lease claim and before
             # any runtime/provider construction.  Mutable parameters are never
             # consulted here: execution is driven only by the strict spec that
@@ -2802,6 +2917,7 @@ class QueueRunner:
             self._update_job_stage(job_spec.job_id, "verifying_inputs")
             try:
                 runtime_spec = self.queue_service.execution_runtime_spec(job_spec.job_id)
+                resume_intent = self.queue_service.execution_resume_intent(job_spec.job_id)
             except QueueInputDriftError as exc:
                 reason = str(exc)
                 self._set_job_result(
@@ -2855,22 +2971,62 @@ class QueueRunner:
                 progress_tracker=progress_tracker,
                 publication_context=self.queue_service.publication_context(lease),
             )
-            
-            
+
+
             # 计算工作区路径（基于项目名称和任务ID）
             workspace_path = str(Path(job_spec.workspace_path).expanduser().resolve())
-            
+
             # 获取工作区锁
             workspace_lock = self._get_workspace_lock(workspace_path)
-            
+
             # 用工作区锁保护任务执行
             with workspace_lock:
                 # 更新当前阶段
                 self._update_job_stage(job_spec.job_id, "executing")
-                
+
                 # 执行任务，传入cancel_token
-                result = self.job_runner.run(request, cancel_token=cancel_token)
-            
+                from runtime.provider_runtime import (
+                    RuntimeControlIdentityV1,
+                    bind_runtime_control_context,
+                )
+                from services.artifact_registry import ArtifactRegistry
+                from services.job_workspace import JobWorkspace
+
+                workspace_obj = JobWorkspace(
+                    str(Path(workspace_path).parent),
+                    Path(workspace_path).name.rsplit("__", 1)[0],
+                    job_spec.job_id,
+                )
+                registry = ArtifactRegistry(
+                    workspace_obj.paths.registry_path,
+                    workspace_obj.job_id,
+                )
+                runtime_identity = RuntimeControlIdentityV1(
+                    job_id=job_spec.job_id,
+                    workspace_path=workspace_path,
+                    lease_id=lease.lease_id,
+                    lease_generation=lease.lease_generation,
+                )
+                with bind_runtime_control_context(
+                    runtime_identity,
+                    workspace=workspace_obj,
+                    registry=registry,
+                    lease_validator=lambda: self.queue_service.lease_is_current(
+                        job_spec.job_id,
+                        lease_id=lease.lease_id,
+                        worker_id=lease.worker_id,
+                        lease_generation=lease.lease_generation,
+                        fence_token=lease.fence_token,
+                    ),
+                    cancel_token=cancel_token,
+                ):
+                    if resume_intent is not None:
+                        result = self.job_runner.resume(
+                            request, cancel_token=cancel_token, resume_intent=resume_intent,
+                        )
+                    else:
+                        result = self.job_runner.run(request, cancel_token=cancel_token)
+
             # 最后检查一次任务状态
             if self._lease_is_lost(job_spec.job_id):
                 raise RuntimeError(f"queue lease lost for job {job_spec.job_id}")
@@ -2878,7 +3034,7 @@ class QueueRunner:
             if runtime and (runtime.state == QueueState.CANCELLED or runtime.cancel_requested):
                 self._acknowledge_cancelled(job_spec.job_id)
                 return
-            
+
             # 更新当前阶段
             self._update_job_stage(job_spec.job_id, "completing")
             self._update_job_runtime_info(job_spec.job_id, {
@@ -2887,7 +3043,7 @@ class QueueRunner:
                 "log_path": result.log_path if hasattr(result, 'log_path') else job_spec.log_path,
                 "produced_artifacts": result.produced_artifacts if hasattr(result, 'produced_artifacts') else [],
             })
-            
+
             job_status = str(getattr(result, "job_status", "failed") or "failed")
             raw_exit_code = getattr(result, "exit_code", None)
             try:
@@ -2959,7 +3115,7 @@ class QueueRunner:
                 if job_spec.job_id in self._cancel_tokens:
                     del self._cancel_tokens[job_spec.job_id]
                 self._leases.pop(job_spec.job_id, None)
-    
+
     def _update_job_stage(self, job_id: str, stage: str) -> None:
         """更新任务的当前阶段"""
         self._heartbeat(job_id)
@@ -3018,7 +3174,7 @@ class QueueRunner:
             error_message=error_message,
         ):
             raise RuntimeError(f"queue lease release lost for job {job_id}")
-    
+
     def _update_job_runtime_info(self, job_id: str, info: Dict[str, Any]) -> None:
         """更新任务的运行时信息"""
         self._heartbeat(job_id)
@@ -3127,10 +3283,10 @@ class QueueRunner:
 
     def cancel_job(self, job_id: str) -> bool:
         """取消指定的任务
-        
+
         Args:
             job_id: 要取消的任务ID
-            
+
         Returns:
             是否成功取消
         """
@@ -3139,28 +3295,26 @@ class QueueRunner:
             return False
 
         self.queue_service.request_cancel(job_id, reason="queue_runner_cancel")
-        
+
         # 如果任务正在运行，请求取消令牌
         with self._lock:
             if job_id in self._cancel_tokens:
                 self._cancel_tokens[job_id].request_cancel()
-        
+
         return True
 
     def run_single_job(self, job_id: str) -> bool:
         job = self.queue_service.get_job(job_id)
         if not job:
             return False
-        
+
         runtime = self.queue_service.get_job_runtime(job_id)
         if not runtime or runtime.state not in (QueueState.PENDING, QueueState.FAILED, QueueState.CANCELLED):
             return False
-        
+
         # 重置任务状态
-        if not self.queue_service.reset_job(job_id):
+        if runtime.state != QueueState.PENDING and not self.queue_service.prepare_retry(job_id):
             return False
-        self.queue_service.clear_cancel_request(job_id)
-        self._clear_external_cancel(job)
         self.queue_service.reject_invalid_pending_dependencies()
         runtime = self.queue_service.get_job_runtime(job_id)
         if runtime is None or runtime.state != QueueState.PENDING:

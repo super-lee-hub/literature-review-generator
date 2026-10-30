@@ -46,11 +46,12 @@ def test_executor_second_run_reuses_only_exact_binding_and_receipt_closure(tmp_p
     assert succeeded
     for node in succeeded:
         assert node.execution_binding["node_id"] == node.node_id
-        assert node.execution_binding["node_version"] == "v3"
+        assert node.execution_binding["node_version"] in {"v3", "v3-interpretation-v1"}
         assert node.execution_binding["schema_version"] == "outline-v3"
         assert "dependency_hashes" in node.execution_binding
         assert "current_summary_hashes" in node.execution_binding
         assert "quality_gate_hash" in node.execution_binding
+    assert dag.get("outline_content_layers").execution_binding["node_version"] == "v3-interpretation-v1"
 
 
 def test_executor_missing_receipt_invalidates_replay_before_reuse(tmp_path: Path) -> None:
@@ -237,6 +238,33 @@ def test_executor_provider_failure_persists_failed_node_and_resumes_only_descend
     assert not second.dag.failed_node_ids
 
 
+def test_executor_recovers_failed_provider_node_from_verified_artifact(
+    tmp_path: Path,
+) -> None:
+    first_calls: list[str] = []
+    first_executor = _counted_fixture_executor(tmp_path, first_calls)
+    first = first_executor.run()
+    assert first.ok is True
+
+    dag = OutlineNodeStore(first_executor.workspace, first_executor.registry).load()
+    assert dag is not None
+    OutlineNodeStore(first_executor.workspace, first_executor.registry).record_node(
+        "candidate_2_provider_generation",
+        status="failed",
+        diagnostics=["synthetic post-success failure marker"],
+    )
+
+    resumed_calls: list[str] = []
+    second_executor = _counted_fixture_executor(tmp_path, resumed_calls)
+    second = second_executor.run()
+    second_dag = OutlineNodeStore(second_executor.workspace, second_executor.registry).load()
+
+    assert second.ok is True
+    assert second_dag is not None
+    assert second_dag.get("candidate_2_provider_generation").status == "succeeded"
+    assert "candidate_2_provider_generation" not in resumed_calls
+
+
 def test_executor_coverage_critic_failure_preserves_prior_nodes_and_resumes_exact_descendants(
     tmp_path: Path,
 ) -> None:
@@ -266,7 +294,6 @@ def test_executor_coverage_critic_failure_preserves_prior_nodes_and_resumes_exac
 
     assert first.ok is False
     assert first_calls == [
-        "relation_adjudication",
         "candidate_1_provider_generation",
         "candidate_2_provider_generation",
         "structure_critique",
@@ -278,6 +305,13 @@ def test_executor_coverage_critic_failure_preserves_prior_nodes_and_resumes_exac
     assert first_dag.get("candidate_2_provider_generation").status == "succeeded"
     assert first_dag.get("structure_critique").status == "succeeded"
     assert first_dag.get("coverage_critique").status == "failed"
+    empty_relation_record = first_executor.registry.get("outline-v3:relation_adjudication")
+    assert empty_relation_record is not None and empty_relation_record.status == "ready"
+    empty_relation = json.loads(Path(empty_relation_record.path).read_text(encoding="utf-8"))["payload"]
+    assert empty_relation["selection_status"] == "explicit_empty"
+    assert empty_relation["confirmed_relation_ids"] == []
+    assert empty_relation["rejected_relations"] == []
+    assert empty_relation["relation_decisions"] == []
 
     preserved_nodes = {
         node_id: first_dag.get(node_id)

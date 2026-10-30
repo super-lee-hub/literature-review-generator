@@ -1,0 +1,17 @@
+{
+  "schema_version": "pr25-r4-arbitration-overflow-http-case/v1",
+  "source_count": 10,
+  "source_variant": "all_required_comparisons",
+  "candidate_count": 5,
+  "effective_input_cap": 24000,
+  "stability_mode": "off",
+  "provider_budget": {
+    "schema_version": "provider-aggregate-budget-contract-v2",
+    "max_provider_calls_total": 200,
+    "max_output_tokens_total": 2000000,
+    "max_retry_attempts_total": 0,
+    "max_wall_seconds": 1800
+  },
+  "arbitration_fixture_state": null,
+  "fault_injection": "throw once after the first provider_validated_result publish_json_artifact returns"
+}

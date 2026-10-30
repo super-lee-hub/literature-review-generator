@@ -34,6 +34,7 @@ from tests.test_current_stage1_generation import (
 )
 from tests.test_current_review_generation import _stage1_summary
 from tests.test_runtime_bridge_helpers import current_config
+from tests.writer_source_fixture import bind_production_writer_sources, scoped_writer_content
 
 
 def _profile_file(tmp_path: Path, *, research_goal: str = "Explain A to B") -> Path:
@@ -338,21 +339,23 @@ def _writer_run(
         writer=writer,
     )
     paper_key = summary["paper_info"]["canonical_paper_key"]
+    packets = [
+        {
+            "section_id": "section_1",
+            "section_goal": "Synthesize",
+            "planned_claims": ["The treatment improves the outcome."],
+            "paper_keys": [paper_key],
+            "source_summary_hashes": ["summary-hash"],
+            "retrieval_provenance": {"source": "stage1_summary", "paper_keys": [paper_key]},
+        }
+    ]
+    bind_production_writer_sources(service, packets)
     result = service.run(
         outline_payload={
             "title": "Free-mode review",
             "sections": [{"section_id": "section_1", "title": "Results", "goal": "Synthesize"}],
         },
-        evidence_packets=[
-            {
-                "section_id": "section_1",
-                "section_goal": "Synthesize",
-                "planned_claims": ["The treatment improves the outcome."],
-                "paper_keys": [paper_key],
-                "source_summary_hashes": ["summary-hash"],
-                "retrieval_provenance": {"source": "stage1_summary", "paper_keys": [paper_key]},
-            }
-        ],
+        evidence_packets=packets,
         free_mode_context=context,
     )
     return service, result
@@ -379,7 +382,10 @@ def test_free_mode_writer_context_appears_exactly_once_and_replay_invalidates(
         seen.append(kwargs)
         return {
             "status": "success",
-            "content": {"blocks": [{"text": "The result supports the claim [[cite_ref:R001]]."}]},
+            "content": scoped_writer_content(
+                str(kwargs.get("prompt_text") or ""),
+                "The result supports the claim [[cite_ref:R001]].",
+            ),
             "usage_status": "provider_not_supported",
         }
 
@@ -401,7 +407,10 @@ def test_free_mode_writer_context_appears_exactly_once_and_replay_invalidates(
         replay_calls.append(1)
         return {
             "status": "success",
-            "content": {"blocks": [{"text": "Replayed [[cite_ref:R001]]."}]},
+            "content": scoped_writer_content(
+                str(kwargs.get("prompt_text") or ""),
+                "Replayed [[cite_ref:R001]].",
+            ),
             "usage_status": "provider_not_supported",
         }
 
@@ -414,7 +423,10 @@ def test_free_mode_writer_context_appears_exactly_once_and_replay_invalidates(
         changed_calls.append(1)
         return {
             "status": "success",
-            "content": {"blocks": [{"text": "Changed constraints [[cite_ref:R001]]."}]},
+            "content": scoped_writer_content(
+                str(kwargs.get("prompt_text") or ""),
+                "Changed constraints [[cite_ref:R001]].",
+            ),
             "usage_status": "provider_not_supported",
         }
 
