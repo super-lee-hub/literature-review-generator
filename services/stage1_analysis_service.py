@@ -221,10 +221,21 @@ class Stage1AnalysisService:
         publication_context: Any | None = None,
         external_registry_resolver: Callable[[str], ArtifactRegistry | None] | None = None,
         response_snapshot_sink: ProviderResponseSnapshotSink | None = None,
+        partial_recovery_context: Any | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self.job_id = str(job_id)
-        self.attempt_id = str(attempt_id or "stage1")
+        self.partial_recovery_context = partial_recovery_context
+        if (
+            partial_recovery_context is not None
+            and str(partial_recovery_context.job_id or "") != self.job_id
+        ):
+            raise RuntimeError("partial Stage 1 recovery context belongs to another job")
+        self.attempt_id = str(
+            partial_recovery_context.logical_attempt_id
+            if partial_recovery_context is not None
+            else attempt_id or "stage1"
+        )
         self.workspace = workspace
         self.registry = artifact_registry
         # ConfigDict carries this provenance bit outside its mapping payload.
@@ -270,6 +281,8 @@ class Stage1AnalysisService:
         self._expected_source_bundle_hash = ""
         self._expected_runtime_spec_hash = ""
         self._expected_provider_config_hash = ""
+        self._partial_replay_consumed: set[str] = set()
+        self._partial_replay_variants: dict[str, tuple[str, int, int]] = {}
         self.receipt_closure_path = ""
         self.receipt_closure_hash = ""
         self.reuse_evidence_ids: list[str] = []
@@ -397,6 +410,17 @@ class Stage1AnalysisService:
             summaries = [by_key[key] for key in expected_keys]
             source_items = [sources_by_key[key] for key in expected_keys]
             self.verify_explicit_imports_current()
+
+        if self.partial_recovery_context is not None:
+            unused_replays = (
+                set(self.partial_recovery_context.replay_calls)
+                - self._partial_replay_consumed
+            )
+            if unused_replays:
+                raise RuntimeError(
+                    "partial Stage 1 recovery did not consume every verified response: "
+                    + ", ".join(sorted(unused_replays))
+                )
 
         if len(summaries) != len(bundle.paper_work_items):
             raise RuntimeError("Stage 1 did not produce one result for every source work item")
@@ -2347,6 +2371,55 @@ class Stage1AnalysisService:
                 "stage": "stage1_analyze",
             }
         )
+        partial_recovery = self.partial_recovery_context
+        if partial_recovery is not None:
+            if (
+                partial_recovery.source_bundle_hash != source_bundle_hash
+                or partial_recovery.runtime_spec_hash != runtime_spec_hash
+                or partial_recovery.job_id != self.job_id
+                or partial_recovery.logical_attempt_id != self.attempt_id
+            ):
+                raise RuntimeError("partial Stage 1 recovery source/spec/logical attempt changed")
+            if self._explicit_import_plan is not None or any(
+                declaration.previous is not None for declaration in declarations
+            ):
+                raise RuntimeError("partial Stage 1 recovery cannot skip calls through summary reuse")
+            declared_ids = [str(item.get("call_id") or "") for item in graph_seed]
+            frozen_ids = [call.call_id for call in partial_recovery.expected_calls]
+            if len(set(declared_ids)) != len(declared_ids) or declared_ids != frozen_ids:
+                raise RuntimeError("partial Stage 1 recovery expected-call order or ownership changed")
+            frozen_by_id = {call.call_id: call for call in partial_recovery.expected_calls}
+            for seed in graph_seed:
+                frozen = frozen_by_id.get(str(seed.get("call_id") or ""))
+                if frozen is None or any(
+                    str(seed.get(field) or "") != str(getattr(frozen, field) or "")
+                    for field in ("node_id", "prompt_id", "schema_hash", "artifact_path")
+                ) or int(seed.get("max_attempts") or 0) != frozen.max_attempts:
+                    raise RuntimeError(
+                        "partial Stage 1 recovery static expected-call identity changed"
+                    )
+            expected_epoch = compute_closure_epoch_id(
+                job_id=self.job_id,
+                stage_name="stage1_analyze",
+                logical_attempt_identity=self.attempt_id,
+                expected_call_graph_hash=partial_recovery.expected_call_graph_hash,
+                current_input_artifact_hashes={
+                    "source_bundle": source_bundle_hash,
+                    "runtime_spec": runtime_spec_hash,
+                },
+                provider_config_hash=config_hash,
+                schema_version=self._schema_hash(),
+            )
+            if expected_epoch != partial_recovery.closure_epoch_id:
+                raise RuntimeError("partial Stage 1 recovery provider configuration or epoch changed")
+            self._expected_provider_config_hash = config_hash
+            self.expected_call_graph_hash = partial_recovery.expected_call_graph_hash
+            self.closure_epoch_id = partial_recovery.closure_epoch_id
+            self._expected_source_bundle_hash = source_bundle_hash
+            self._expected_runtime_spec_hash = runtime_spec_hash
+            self.expected_calls = tuple(partial_recovery.expected_calls)
+            self.expected_call_graph_path = partial_recovery.expected_call_graph_path
+            return tuple(declarations)
         self._expected_provider_config_hash = config_hash
         epoch = compute_closure_epoch_id(
             job_id=self.job_id,
@@ -2869,13 +2942,12 @@ class Stage1AnalysisService:
         semantic_retry_limit = stage1_semantic_retry_max_attempts(
             prepared.stage1_input_settings
         )
-        synthesis_budget_count = len(
-            stage1_output_budget_sequence(
-                "synthesis",
-                prepared.stage1_input_settings,
-                provider_config=prepared.primary_config,
-            )
+        synthesis_budgets = stage1_output_budget_sequence(
+            "synthesis",
+            prepared.stage1_input_settings,
+            provider_config=prepared.primary_config,
         )
+        synthesis_budget_count = len(synthesis_budgets)
         primary_variants = self._stage1_request_variants(
             prompt=prompt,
             system_prompt=system_prompt,
@@ -2897,6 +2969,87 @@ class Stage1AnalysisService:
         primary_hash = primary_variants[0]["input_hash"]
         primary_config_hash = primary_variants[0]["config_hash"]
         request_variants = (*primary_variants, *backup_variants)
+        if self.partial_recovery_context is not None:
+            call_id = self._synthesis_call_id(paper_key)
+            frozen = next(
+                (call for call in self.expected_calls if call.call_id == call_id),
+                None,
+            )
+            expected_max_attempts = (
+                synthesis_budget_count + semantic_retry_limit + 1 + semantic_retry_limit
+            )
+            if (
+                frozen is None
+                or frozen.prompt_hash != hash_text(prompt)
+                or frozen.prompt_id != prepared.built_input.prompt_id
+                or frozen.prompt_version != prepared.built_input.prompt_version
+                or frozen.prompt_sha256 != prepared.built_input.prompt_sha256
+                or frozen.input_hash != primary_hash
+                or frozen.config_hash != primary_config_hash
+                or frozen.schema_hash != self._schema_hash()
+                or frozen.max_attempts != expected_max_attempts
+                or tuple(dict(item) for item in frozen.request_variants)
+                != tuple(dict(item) for item in request_variants)
+                or frozen.expected_call_graph_hash
+                != self.partial_recovery_context.expected_call_graph_hash
+                or frozen.closure_epoch_id != self.partial_recovery_context.closure_epoch_id
+            ):
+                raise RuntimeError(
+                    f"partial Stage 1 recovery request identity changed for {call_id}"
+                )
+            replay = self.partial_recovery_context.replay_calls.get(call_id)
+            if replay is None:
+                if call_id not in self.partial_recovery_context.pending_call_ids:
+                    raise RuntimeError(
+                        f"partial Stage 1 recovery has no decision for {call_id}"
+                    )
+            else:
+                receipt = replay.receipt
+                route_variants = (
+                    primary_variants
+                    if receipt.route == "Primary_Reader_API"
+                    else backup_variants
+                    if receipt.route == "Backup_Reader_API"
+                    else ()
+                )
+                matching_indexes = [
+                    index
+                    for index, variant in enumerate(route_variants)
+                    if variant.get("prompt_hash") == receipt.prompt_hash
+                    and variant.get("input_hash") == receipt.input_hash
+                    and variant.get("config_hash") == receipt.config_hash
+                ]
+                selected_config = (
+                    prepared.primary_config
+                    if receipt.route == "Primary_Reader_API"
+                    else prepared.backup_config
+                )
+                selected_transport = receipt.metadata.get("transport_config")
+                if (
+                    len(matching_indexes) != 1
+                    or matching_indexes[0] != 0
+                    or replay.requested_output_tokens != synthesis_budgets[0]
+                    or not isinstance(selected_transport, Mapping)
+                    or receipt.provider
+                    != str(selected_config.get("provider_family") or selected_config.get("provider") or "generic")
+                    or receipt.model != str(selected_config.get("model") or "")
+                    or receipt.endpoint != str(selected_config.get("api_base") or "")
+                    or receipt.endpoint_type
+                    != str(selected_config.get("endpoint_type") or "chat_completions")
+                    or str(selected_transport.get("provider_family") or "") != receipt.provider
+                    or str(selected_transport.get("model") or "") != receipt.model
+                    or str(selected_transport.get("api_base") or "") != receipt.endpoint
+                    or str(selected_transport.get("endpoint_type") or "") != receipt.endpoint_type
+                ):
+                    raise RuntimeError(
+                        f"partial Stage 1 recovery receipt route/request changed for {call_id}"
+                    )
+                self._partial_replay_variants[call_id] = (
+                    "backup" if receipt.route == "Backup_Reader_API" else "primary",
+                    matching_indexes[0],
+                    synthesis_budgets[0],
+                )
+            return
         self.expected_calls = tuple(
             replace(
                 expected,
@@ -6806,6 +6959,40 @@ class Stage1AnalysisService:
         stage1_input_settings: Mapping[str, Any],
         runtime: ProviderRuntime,
     ) -> Mapping[str, Any]:
+        if self.partial_recovery_context is not None:
+            call_id = str(runtime.call_id or "")
+            replay = self.partial_recovery_context.replay_calls.get(call_id)
+            if replay is not None:
+                if (
+                    call_id in self._partial_replay_consumed
+                    or call_id not in self._partial_replay_variants
+                    or runtime.closure_epoch_id != self.partial_recovery_context.closure_epoch_id
+                    or runtime.logical_attempt_identity
+                    != self.partial_recovery_context.logical_attempt_id
+                ):
+                    raise RuntimeError(
+                        f"partial Stage 1 replay lost its original call identity: {call_id}"
+                    )
+                route, retry_index, output_tokens = self._partial_replay_variants[call_id]
+                replayed = dict(replay.response)
+                self._canonical_substantive_summary(replayed)
+                self._partial_replay_consumed.add(call_id)
+                return {
+                    **replayed,
+                    "engine_type": route,
+                    "stage1_output_stage": "synthesis",
+                    "stage1_requested_output_budgets": [output_tokens],
+                    "stage1_length_retries": 0,
+                    "stage1_schema_retries": 0,
+                    "stage1_semantic_retries": 0,
+                    "stage1_terminal_output_tokens": output_tokens,
+                    "stage1_terminal_retry_index": retry_index,
+                    "stage1_terminal_semantic_retry_index": 0,
+                    "stage1_request_timeout_seconds": stage1_request_timeout_seconds(
+                        stage1_input_settings,
+                    ),
+                    "stage1_partial_replayed_receipt_id": replay.receipt.receipt_id,
+                }
         if self.reader is not None:
             value = self.reader(
                 prompt_text=built_input.prompt_text,
@@ -7156,6 +7343,15 @@ class Stage1AnalysisService:
         semantic_metadata: Mapping[str, Any] | None = None,
         force: bool = False,
     ) -> None:
+        if (
+            self.partial_recovery_context is not None
+            and runtime.call_id in self.partial_recovery_context.replay_calls
+        ):
+            if runtime.call_id not in self._partial_replay_consumed:
+                raise RuntimeError(
+                    f"Stage 1 cannot publish a replayed receipt before consuming its raw response: {runtime.call_id}"
+                )
+            return
         if runtime.receipts and not force:
             return
         try:

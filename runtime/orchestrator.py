@@ -5,7 +5,10 @@ import json
 import logging
 from pathlib import Path
 import re
-from typing import Any, Callable, Dict, Iterable, Mapping, Sequence, cast
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Mapping, Sequence, cast
+
+if TYPE_CHECKING:
+    from runtime.stage1_publication_recovery import Stage1PartialRecoveryContext
 
 from config_loader import ConfigDict, load_config
 from free_mode.intent_input import (
@@ -1406,9 +1409,20 @@ class InternalStageExecutorRegistry:
         attempt_id: str,
         external_registry_resolver: Callable[[str], Any | None] | None = None,
     ) -> tuple[StageResult, int]:
-        summaries = self._load_summary_payloads(session, results, external_registry_resolver=external_registry_resolver)
+        partial_recovery_context = getattr(
+            self.bridge, "stage1_partial_recovery_context", None
+        )
+        summaries = (
+            []
+            if partial_recovery_context is not None
+            else self._load_summary_payloads(
+                session, results, external_registry_resolver=external_registry_resolver,
+            )
+        )
         explicit_imports = None
         if self.bridge.job_spec.metadata.get("stage1_summary_input_mode") == "explicit_typed_import":
+            if partial_recovery_context is not None:
+                raise RuntimeError("partial Stage 1 recovery cannot be combined with typed summary imports")
             if not bundle.paper_work_items:
                 raise RuntimeError("explicit typed Stage 1 import requires the current PDF source bundle")
             explicit_imports = [
@@ -1437,8 +1451,11 @@ class InternalStageExecutorRegistry:
             )
             if value is not None and str(value).strip()
         )
+        if partial_recovery_context is not None and explicit_summary_paths:
+            raise RuntimeError("partial Stage 1 recovery cannot be combined with summary-file inputs")
         if (
-            bundle.paper_work_items
+            partial_recovery_context is None
+            and bundle.paper_work_items
             and session.request.reuse_stage1
             and not explicit_summary_paths
             and not summaries
@@ -1456,6 +1473,9 @@ class InternalStageExecutorRegistry:
             )
             summaries.extend(automatic_reuse_plan.summaries)
         if bundle.paper_work_items:
+            generation_service_kwargs = {}
+            if partial_recovery_context is not None:
+                generation_service_kwargs["partial_recovery_context"] = partial_recovery_context
             generation_service = Stage1AnalysisService(
                 job_id=session.context.workspace.job_id,
                 attempt_id=attempt_id,
@@ -1471,6 +1491,7 @@ class InternalStageExecutorRegistry:
                     self.bridge.job_spec.metadata, session.context.workspace,
                     session.context.registry, session.context.publication_context,
                 ),
+                **generation_service_kwargs,
             )
             generation = (
                 generation_service.run(
@@ -2122,6 +2143,7 @@ class AgentRuntimeBridge:
         self.job_spec = job_spec
         self.source_revision_plan = verified_source_revision_plan
         self.source_revision_replay_context = None
+        self.stage1_partial_recovery_context: Stage1PartialRecoveryContext | None = None
         if "source_revision_plan" in job_spec.metadata and verified_source_revision_plan is None:
             from runtime.source_revision_admission import verify_source_revision_plan_v1
 

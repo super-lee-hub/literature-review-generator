@@ -9,16 +9,31 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
+import time
+from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
 from runtime.reconcile import ProvenStageRecovery, RuntimeReconciler
+from runtime.provider_receipt_closure import ExpectedProviderCall
+from runtime.provider_runtime import (
+    ProviderBudgetController,
+    ProviderCallReceiptV1,
+    ProviderRuntimeLedger,
+    acceptance_execution_context_from_environment,
+    current_acceptance_execution_context,
+    current_runtime_control_context,
+    hash_json,
+)
 from services.artifact_registry import (
     ArtifactDependencyRefV2,
     ArtifactRecord,
     ArtifactRegistry,
     RegistryError,
+    file_sha256,
 )
 from services.job_workspace import JobWorkspace
 from validation.closure import _provider_closure_entry
@@ -31,6 +46,574 @@ class Stage1PublicationRecoveryBlocked(RuntimeError):
 def _blocked(reason: str) -> Stage1PublicationRecoveryBlocked:
     return Stage1PublicationRecoveryBlocked(
         "STAGE1_PUBLICATION_RECOVERY_BLOCKED: " + reason
+    )
+
+
+@dataclass(frozen=True)
+class Stage1PartialReplayCall:
+    receipt: ProviderCallReceiptV1
+    response: Mapping[str, Any]
+    requested_output_tokens: int
+
+
+@dataclass(frozen=True)
+class Stage1PartialRecoveryContext:
+    job_id: str
+    logical_attempt_id: str
+    closure_epoch_id: str
+    expected_call_graph_hash: str
+    source_bundle_hash: str
+    runtime_spec_hash: str
+    expected_call_graph_path: str
+    expected_calls: tuple[ExpectedProviderCall, ...]
+    replay_calls: Mapping[str, Stage1PartialReplayCall]
+    pending_call_ids: frozenset[str]
+    budget_state_path: str
+    budget_deadline_epoch: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "expected_calls", tuple(self.expected_calls))
+        object.__setattr__(self, "replay_calls", MappingProxyType(dict(self.replay_calls)))
+        object.__setattr__(self, "pending_call_ids", frozenset(self.pending_call_ids))
+
+
+def _partial_graph_hash(
+    *,
+    job_id: str,
+    attempt_id: str,
+    source_bundle_hash: str,
+    runtime_spec_hash: str,
+    calls: list[Mapping[str, Any]],
+) -> str:
+    return hash_json(
+        {
+            "identity_version": "stage1_expected_call_graph/v2",
+            "job_id": job_id,
+            "stage_name": "stage1_analyze",
+            "attempt_id": attempt_id,
+            "source_bundle_hash": source_bundle_hash,
+            "runtime_spec_hash": runtime_spec_hash,
+            "call_shapes": [
+                {
+                    "call_id": call.get("call_id"),
+                    "node_id": call.get("node_id"),
+                    "prompt_id": call.get("prompt_id"),
+                    "schema_hash": call.get("schema_hash"),
+                    "artifact_path": call.get("artifact_path"),
+                    "max_attempts": call.get("max_attempts"),
+                    "request_variants": list(call.get("request_variants") or ()),
+                }
+                for call in calls
+            ],
+        }
+    )
+
+
+def _partial_budget_proof(
+    workspace: JobWorkspace,
+    provider_budget_controller: Any | None,
+) -> tuple[dict[str, Any], str, float]:
+    if not isinstance(provider_budget_controller, ProviderBudgetController):
+        raise _blocked("partial Stage 1 recovery requires its job-bound durable provider budget")
+    try:
+        control = current_runtime_control_context()
+        if control is None:
+            raise _blocked("partial Stage 1 recovery has no active runtime-control identity")
+        identity = control.identity
+        acceptance = (
+            current_acceptance_execution_context()
+            or acceptance_execution_context_from_environment()
+        )
+        if identity.job_id != workspace.job_id or Path(identity.workspace_path).resolve() != Path(workspace.root_dir).resolve():
+            raise _blocked("partial Stage 1 recovery budget belongs to another workspace")
+        if acceptance is None:
+            expected_run_id = f"run:{workspace.job_id}"
+            expected_state_path = Path(
+                workspace.log_path("acceptance_budget_state_v1.json")
+            ).expanduser().resolve()
+        else:
+            if not acceptance.owner_authorized:
+                raise _blocked("partial Stage 1 recovery acceptance budget is not owner-authorized")
+            expected_run_id = acceptance.acceptance_run_id
+            expected_state_path = Path(
+                acceptance.provider_budget_state_path
+            ).expanduser().resolve()
+            if provider_budget_controller.budget != acceptance.provider_budget:
+                raise _blocked("partial Stage 1 recovery budget differs from its accepted contract")
+        if (
+            not expected_run_id
+            or identity.acceptance_run_id != expected_run_id
+            or provider_budget_controller.acceptance_run_id != expected_run_id
+            or not provider_budget_controller.state_started
+            or provider_budget_controller.state_path is None
+            or provider_budget_controller.state_path.expanduser().resolve() != expected_state_path
+        ):
+            raise _blocked("partial Stage 1 recovery budget identity is not job-bound")
+        provider_budget_controller.assert_state_integrity(
+            acceptance_run_id=expected_run_id,
+            state_started=True,
+        )
+        snapshot = provider_budget_controller.snapshot()
+        state_path = provider_budget_controller.state_path
+        assert state_path is not None
+        try:
+            state_payload = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise _blocked("partial Stage 1 recovery budget state is unreadable") from exc
+        if not isinstance(state_payload, Mapping):
+            raise _blocked("partial Stage 1 recovery budget state is not an object")
+        for name in (
+            "calls_used",
+            "output_tokens_used",
+            "retry_attempts_used",
+            "calls_reserved",
+            "output_tokens_reserved",
+            "retry_attempts_reserved",
+        ):
+            value = snapshot.get(name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise _blocked(f"partial Stage 1 recovery budget counter is invalid: {name}")
+            if state_payload.get(name) != value:
+                raise _blocked(f"partial Stage 1 recovery budget counter changed: {name}")
+        reservations = state_payload.get("reservations")
+        if not isinstance(reservations, list) or reservations:
+            raise _blocked("partial Stage 1 recovery has an outstanding provider reservation")
+        if (
+            snapshot.get("calls_reserved") != 0
+            or snapshot.get("output_tokens_reserved") != 0
+            or snapshot.get("retry_attempts_reserved") != 0
+            or getattr(provider_budget_controller, "_reservations", None)
+            or getattr(provider_budget_controller, "_ambiguous_reservation_ids", None)
+        ):
+            raise _blocked("partial Stage 1 recovery has started or unknown provider transport")
+        deadline = snapshot.get("absolute_deadline_epoch")
+        if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) or not math.isfinite(float(deadline)):
+            raise _blocked("partial Stage 1 recovery has no finite durable provider deadline")
+        deadline = float(deadline)
+        if deadline <= time.time():
+            raise _blocked("partial Stage 1 recovery provider deadline has expired")
+        if acceptance is not None and not math.isclose(
+            deadline,
+            float(acceptance.absolute_deadline_epoch),
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ):
+            raise _blocked("partial Stage 1 recovery provider deadline changed")
+        return dict(snapshot), str(state_path), deadline
+    except Stage1PublicationRecoveryBlocked:
+        raise
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise _blocked(f"partial Stage 1 recovery budget could not be verified: {exc}") from exc
+
+
+def prepare_partial_stage1_recovery(
+    workspace: JobWorkspace,
+    registry: ArtifactRegistry,
+    *,
+    expected_source_bundle_hash: str,
+    expected_runtime_spec_hash: str,
+    provider_budget_controller: Any | None,
+    external_registry_resolver: Callable[[str], ArtifactRegistry | None] | None = None,
+) -> Stage1PartialRecoveryContext | None:
+    """Reparse exact successful Stage 1 calls when the remaining graph is provably unstarted.
+
+    This deliberately supports only a frozen synthesis-only graph, one complete
+    HTTP 200 receipt per completed call, and a job-bound aggregate budget whose
+    entire usage is accounted for by that exact receipt ledger. Any started,
+    failed, retried, unknown, or unbound attempt remains on the existing
+    fail-closed recovery path.
+    """
+
+    if workspace.job_id != registry.job_id:
+        raise _blocked("workspace and Registry jobs differ")
+    graph_pointer = registry.get("stage1:provider_expected_call_graph")
+    if graph_pointer is None:
+        return None
+    # A complete publication stays on the existing terminal-reconstruction
+    # path. Partial response replay is only for the missing-closure/output case.
+    if registry.get("stage1:provider_receipt_closure") is not None or registry.get("stage1_provider_receipts") is not None:
+        return None
+    summary_pointer = registry.get("summary_file")
+    if summary_pointer is not None and summary_pointer.metadata.get("pointer_role") == "current":
+        return None
+    if any(
+        record.artifact_type == "runtime_stage_terminal"
+        and str(record.metadata.get("stage_name") or "") in {"analyze", "stage1_analyze"}
+        for record in registry.list_records()
+    ):
+        return None
+    if not expected_source_bundle_hash or not expected_runtime_spec_hash:
+        raise _blocked("current source-bundle or runtime-spec hash was not supplied")
+
+    try:
+        source_bundle = _record(
+            registry,
+            "source_bundle",
+            artifact_type="source_bundle",
+            artifact_version="v1",
+            external_registry_resolver=external_registry_resolver,
+        )
+        runtime_spec = _record(
+            registry,
+            "runtime_job_spec",
+            artifact_type="runtime_job_spec",
+            artifact_version="v1",
+            external_registry_resolver=external_registry_resolver,
+        )
+        graph = _record(
+            registry,
+            "stage1:provider_expected_call_graph",
+            artifact_type="provider_expected_call_graph",
+            artifact_version="v1",
+            external_registry_resolver=external_registry_resolver,
+        )
+    except Stage1PublicationRecoveryBlocked:
+        raise
+    if source_bundle.content_hash != expected_source_bundle_hash:
+        raise _blocked("current source bundle differs from the published Stage 1 source")
+    if runtime_spec.content_hash != expected_runtime_spec_hash:
+        raise _blocked("current RuntimeJobSpec differs from the published Stage 1 configuration")
+
+    source_document = _payload(_read_json(source_bundle.path, label="Stage 1 source bundle"))
+    runtime_document = _payload(_read_json(runtime_spec.path, label="Stage 1 RuntimeJobSpec"))
+    graph_document = _payload(_read_json(graph.path, label="Stage 1 expected-call graph"))
+    graph_hash = str(graph_document.get("expected_call_graph_hash") or "")
+    attempt_id = str(graph_document.get("attempt_id") or "")
+    epoch_id = str(graph_document.get("closure_epoch_id") or "")
+    expected_calls_raw = graph_document.get("expected_calls")
+    if (
+        str(graph_document.get("job_id") or "") != registry.job_id
+        or str(graph_document.get("stage_name") or "") != "stage1_analyze"
+        or str(graph_document.get("source_bundle_hash") or "") != expected_source_bundle_hash
+        or str(graph_document.get("runtime_spec_hash") or "") != expected_runtime_spec_hash
+        or graph.metadata.get("expected_call_graph_hash") != graph_hash
+        or not attempt_id
+        or not epoch_id
+        or not isinstance(expected_calls_raw, list)
+        or any(not isinstance(call, Mapping) for call in expected_calls_raw)
+    ):
+        raise _blocked("Stage 1 expected-call graph does not bind the current job/source/spec")
+    if not expected_calls_raw or any(
+        not str(call.get("call_id") or "").startswith("stage1_synthesis:")
+        for call in expected_calls_raw
+    ):
+        # Empty/all-reuse and visual/MinerU call graphs remain on their existing
+        # zero-transport or complete-publication paths.
+        return None
+    if _partial_graph_hash(
+        job_id=registry.job_id,
+        attempt_id=attempt_id,
+        source_bundle_hash=expected_source_bundle_hash,
+        runtime_spec_hash=expected_runtime_spec_hash,
+        calls=expected_calls_raw,
+    ) != graph_hash:
+        raise _blocked("Stage 1 expected-call graph bytes do not match its declared identity")
+
+    scope_pointer = registry.get("stage1_source_scope")
+    if scope_pointer is None:
+        raise _blocked("Stage 1 source scope is missing")
+    source_scope = _record(
+        registry,
+        scope_pointer.artifact_id,
+        artifact_type="stage1_source_scope",
+        artifact_version="v1",
+        external_registry_resolver=external_registry_resolver,
+    )
+    _requires_direct_ref(graph, source_scope, label="Stage 1 expected-call graph")
+    _requires_direct_ref(source_scope, source_bundle, label="Stage 1 source scope")
+    _requires_direct_ref(source_scope, runtime_spec, label="Stage 1 source scope")
+    scope_document = _payload(_read_json(source_scope.path, label="Stage 1 source scope"))
+    if (
+        str(scope_document.get("job_id") or "") != registry.job_id
+        or str(scope_document.get("source_bundle_hash") or "") != expected_source_bundle_hash
+        or str(scope_document.get("runtime_spec_hash") or "") != expected_runtime_spec_hash
+    ):
+        raise _blocked("Stage 1 source scope differs from the current source/spec")
+
+    work_items = source_document.get("paper_work_items")
+    if not isinstance(work_items, list) or not work_items:
+        if _pretransport_fallback_allowed(
+            workspace,
+            registry,
+            provider_budget_controller,
+            external_registry_resolver=external_registry_resolver,
+        ):
+            return None
+        raise _blocked("Stage 1 source bundle has no paper work items")
+    paper_keys = [
+        str(item.get("canonical_paper_key") or "")
+        for item in work_items
+        if isinstance(item, Mapping)
+    ]
+    if (
+        len(paper_keys) != len(work_items)
+        or any(not key for key in paper_keys)
+        or len(set(paper_keys)) != len(paper_keys)
+    ):
+        raise _blocked("Stage 1 source bundle paper identities are invalid")
+    scoped_papers_raw = scope_document.get("papers")
+    if not isinstance(scoped_papers_raw, list):
+        raise _blocked("Stage 1 source scope has no immutable PDF identity list")
+    scoped_papers = {
+        str(item.get("paper_key") or ""): item
+        for item in scoped_papers_raw
+        if isinstance(item, Mapping) and str(item.get("paper_key") or "")
+    }
+    if len(scoped_papers) != len(scoped_papers_raw) or set(scoped_papers) != set(paper_keys):
+        raise _blocked("Stage 1 source scope does not cover every source paper exactly once")
+    for work_item in work_items:
+        paper_key = str(work_item.get("canonical_paper_key") or "")
+        scoped = scoped_papers[paper_key]
+        source_pdf = str(work_item.get("source_pdf") or "").strip()
+        try:
+            resolved_pdf = Path(source_pdf).expanduser().resolve(strict=True)
+            if (
+                str(resolved_pdf) != str(Path(str(scoped.get("source_pdf") or "")).expanduser().resolve(strict=True))
+                or file_sha256(resolved_pdf) != str(scoped.get("source_pdf_sha256") or "")
+                or resolved_pdf.stat().st_size != int(scoped.get("size_bytes") or -1)
+            ):
+                raise _blocked(f"Stage 1 source PDF differs from its frozen scope: {paper_key}")
+        except Stage1PublicationRecoveryBlocked:
+            raise
+        except (OSError, TypeError, ValueError) as exc:
+            raise _blocked(f"Stage 1 source PDF cannot be verified: {paper_key}") from exc
+
+    expected_call_ids = {f"stage1_synthesis:{key}" for key in paper_keys}
+    call_by_id: dict[str, ExpectedProviderCall] = {}
+    for raw_call in expected_calls_raw:
+        try:
+            call = ExpectedProviderCall.from_mapping(raw_call)
+        except (TypeError, ValueError) as exc:
+            raise _blocked("Stage 1 expected-call graph contains an invalid call") from exc
+        if (
+            not call.call_id.startswith("stage1_synthesis:")
+            or call.job_id != registry.job_id
+            or call.attempt_id != attempt_id
+            or call.logical_attempt_identity != attempt_id
+            or call.stage_name != "stage1_analyze"
+            or call.closure_epoch_id != epoch_id
+            or call.expected_call_graph_hash != graph_hash
+            or not call.node_id
+            or not call.schema_hash
+            or not call.request_variants
+            or call.call_id in call_by_id
+        ):
+            raise _blocked("partial Stage 1 recovery requires one exact synthesis graph per source")
+        for variant in call.request_variants:
+            if not isinstance(variant, Mapping) or any(
+                not re.fullmatch(r"[0-9a-f]{64}", str(variant.get(name) or ""))
+                for name in ("prompt_hash", "input_hash", "config_hash")
+            ):
+                raise _blocked("Stage 1 expected-call graph has an incomplete request variant")
+        call_by_id[call.call_id] = call
+    if set(call_by_id) != expected_call_ids or len(expected_calls_raw) != len(expected_call_ids):
+        if _pretransport_fallback_allowed(
+            workspace,
+            registry,
+            provider_budget_controller,
+            external_registry_resolver=external_registry_resolver,
+        ):
+            return None
+        raise _blocked("partial Stage 1 recovery graph does not cover exactly the source synthesis calls")
+    if any(call_by_id[f"stage1_synthesis:{key}"].node_id != key for key in paper_keys):
+        raise _blocked("Stage 1 synthesis call ownership differs from the source paper identities")
+
+    safe_attempt = re.sub(r"[^A-Za-z0-9_.-]+", "_", attempt_id or "stage1")
+    staged_path = Path(
+        workspace.artifact_path(
+            f".publication-staging/provider-receipts/stage1/{safe_attempt}.jsonl"
+        )
+    ).expanduser().resolve()
+    stage1_staging_root = Path(
+        workspace.artifact_path(".publication-staging/provider-receipts/stage1")
+    ).expanduser().resolve()
+    if not staged_path.is_relative_to(stage1_staging_root):
+        raise _blocked("Stage 1 staged receipt ledger escapes its workspace")
+    if not staged_path.is_file():
+        if _pretransport_fallback_allowed(
+            workspace,
+            registry,
+            provider_budget_controller,
+            external_registry_resolver=external_registry_resolver,
+        ):
+            return None
+        raise _blocked("Stage 1 staged receipt ledger is missing while prior transport cannot be ruled out")
+    try:
+        ledger = ProviderRuntimeLedger(staged_path)
+        receipts = ledger.list_receipts()
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise _blocked(f"Stage 1 staged receipt ledger is invalid: {exc}") from exc
+    if not receipts:
+        if _pretransport_fallback_allowed(
+            workspace,
+            registry,
+            provider_budget_controller,
+            external_registry_resolver=external_registry_resolver,
+        ):
+            return None
+        raise _blocked("Stage 1 has no receipts but prior transport cannot be ruled out")
+
+    budget_snapshot, budget_state_path, budget_deadline = _partial_budget_proof(
+        workspace, provider_budget_controller,
+    )
+    replay_calls: dict[str, Stage1PartialReplayCall] = {}
+    replay_receipt_ids: set[str] = set()
+    from ai_interface import reparse_provider_response_spool
+
+    for receipt in receipts:
+        expected = call_by_id.get(receipt.call_id)
+        if (
+            expected is None
+            or receipt.call_id in replay_calls
+            or not receipt.receipt_id
+            or receipt.receipt_id in replay_receipt_ids
+        ):
+            raise _blocked("Stage 1 staged receipt has an unexpected or duplicate call identity")
+        if (
+            receipt.job_id != registry.job_id
+            or receipt.attempt_id != attempt_id
+            or receipt.logical_attempt_identity != attempt_id
+            or receipt.stage_name != "stage1_analyze"
+            or receipt.node_id != expected.node_id
+            or receipt.prompt_id != expected.prompt_id
+            or receipt.prompt_version != expected.prompt_version
+            or receipt.prompt_sha256 != expected.prompt_sha256
+            or receipt.closure_epoch_id != epoch_id
+            or receipt.schema_hash != expected.schema_hash
+            or receipt.status != "success"
+            or receipt.error_kind is not None
+            or receipt.http_status != 200
+            or receipt.attempts != 1
+            or receipt.finish_reason.strip().casefold() not in {"stop", "end_turn", "completed"}
+            or receipt.incomplete_reason
+            or receipt.timeout_kind
+            or receipt.fallback_or_payload_mutations
+            or receipt.test_only
+            or receipt.route not in {"Primary_Reader_API", "Backup_Reader_API"}
+            or receipt.response_hash is None
+            or receipt.input_tokens is None
+            or receipt.output_tokens is None
+            or receipt.total_tokens is None
+            or receipt.usage_status != "reported"
+        ):
+            raise _blocked(f"Stage 1 receipt is not a complete single-call success: {receipt.call_id}")
+        matching_variants = [
+            variant
+            for variant in expected.request_variants
+            if variant.get("prompt_hash") == receipt.prompt_hash
+            and variant.get("input_hash") == receipt.input_hash
+            and variant.get("config_hash") == receipt.config_hash
+        ]
+        if not matching_variants:
+            raise _blocked(f"Stage 1 receipt request identity differs from the expected graph: {receipt.call_id}")
+        metadata = receipt.metadata if isinstance(receipt.metadata, Mapping) else {}
+        transport = metadata.get("transport_config")
+        if not isinstance(transport, Mapping) or any(
+            str(transport.get(field) or "") != str(expected_value or "")
+            for field, expected_value in (
+                ("provider_family", receipt.provider),
+                ("model", receipt.model),
+                ("endpoint_type", receipt.endpoint_type),
+                ("api_base", receipt.endpoint),
+            )
+        ):
+            raise _blocked(f"Stage 1 receipt route identity is incomplete: {receipt.call_id}")
+        raw_path_values = [
+            str(metadata.get(key) or "").strip()
+            for key in ("raw_response_path", "raw_response_spool_path")
+            if str(metadata.get(key) or "").strip()
+        ]
+        if not raw_path_values or len(set(raw_path_values)) != 1:
+            raise _blocked(f"Stage 1 successful receipt has no unique retained raw response: {receipt.call_id}")
+        raw_path = Path(raw_path_values[0]).expanduser().resolve()
+        if not raw_path.is_relative_to(stage1_staging_root) or not raw_path.is_file():
+            raise _blocked(f"Stage 1 retained raw response is missing or outside its staging root: {receipt.call_id}")
+        raw_sha256 = str(metadata.get("raw_response_sha256") or "")
+        response_bytes = metadata.get("response_bytes")
+        response_protocol = str(metadata.get("response_protocol") or "").strip().casefold()
+        if (
+            not re.fullmatch(r"[0-9a-f]{64}", raw_sha256)
+            or isinstance(response_bytes, bool)
+            or not isinstance(response_bytes, int)
+            or response_bytes < 0
+            or response_protocol not in {"json", "sse"}
+            or metadata.get("response_complete") is not True
+            or (
+                "response_body_complete" in metadata
+                and metadata.get("response_body_complete") is not True
+            )
+        ):
+            raise _blocked(f"Stage 1 retained raw response binding is incomplete: {receipt.call_id}")
+        requested_output_tokens = metadata.get("requested_output_tokens_per_attempt")
+        if (
+            isinstance(requested_output_tokens, bool)
+            or not isinstance(requested_output_tokens, int)
+            or requested_output_tokens <= 0
+        ):
+            raise _blocked(f"Stage 1 receipt lacks its exact requested output-token count: {receipt.call_id}")
+        try:
+            # Content-Type was not retained in the receipt. An empty value makes
+            # the parser infer JSON/SSE from the raw bytes rather than forcing a
+            # protocol based on the receipt's claim.
+            response = reparse_provider_response_spool(
+                raw_path,
+                raw_sha256,
+                response_bytes,
+                "",
+                response_protocol,
+                receipt.endpoint_type,
+                receipt.model,
+                "json",
+                receipt.http_status,
+                True,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise _blocked(f"Stage 1 raw response could not be independently reparsed: {receipt.call_id}") from exc
+        if (
+            response.get("status") != "success"
+            or response.get("response_complete") is not True
+            or response.get("response_body_complete") is not True
+            or response.get("finish_reason") != receipt.finish_reason
+            or hash_json(response.get("content")) != receipt.response_hash
+            or response.get("input_tokens") != receipt.input_tokens
+            or response.get("output_tokens") != receipt.output_tokens
+            or response.get("total_tokens") != receipt.total_tokens
+        ):
+            raise _blocked(f"Stage 1 raw response differs from its successful receipt: {receipt.call_id}")
+        replay_calls[receipt.call_id] = Stage1PartialReplayCall(
+            receipt=receipt,
+            response=MappingProxyType(dict(response)),
+            requested_output_tokens=requested_output_tokens,
+        )
+        replay_receipt_ids.add(receipt.receipt_id)
+
+    usage = ledger.usage_summary()
+    if (
+        usage.get("receipt_count") != len(receipts)
+        or usage.get("physical_calls_used") != budget_snapshot.get("calls_used")
+        or usage.get("output_tokens_reported") != budget_snapshot.get("output_tokens_used")
+        or usage.get("unreported_output_receipts") != 0
+        or usage.get("retry_attempts_used") != budget_snapshot.get("retry_attempts_used")
+        or budget_snapshot.get("retry_attempts_used") != 0
+    ):
+        raise _blocked("Stage 1 receipt usage does not reconcile exactly to the durable provider budget")
+
+    return Stage1PartialRecoveryContext(
+        job_id=registry.job_id,
+        logical_attempt_id=attempt_id,
+        closure_epoch_id=epoch_id,
+        expected_call_graph_hash=graph_hash,
+        source_bundle_hash=expected_source_bundle_hash,
+        runtime_spec_hash=expected_runtime_spec_hash,
+        expected_call_graph_path=graph.path,
+        expected_calls=tuple(
+            call_by_id[str(raw_call.get("call_id") or "")]
+            for raw_call in expected_calls_raw
+        ),
+        replay_calls=replay_calls,
+        pending_call_ids=frozenset(set(call_by_id) - set(replay_calls)),
+        budget_state_path=budget_state_path,
+        budget_deadline_epoch=budget_deadline,
     )
 
 
@@ -1241,5 +1824,8 @@ def try_recover_registered_stage1_publication(
 
 __all__ = [
     "Stage1PublicationRecoveryBlocked",
+    "Stage1PartialReplayCall",
+    "Stage1PartialRecoveryContext",
+    "prepare_partial_stage1_recovery",
     "try_recover_registered_stage1_publication",
 ]

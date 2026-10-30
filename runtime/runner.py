@@ -2203,6 +2203,7 @@ class AgentRuntimeRunner:
                     if recovered_result is None and stage == "analyze":
                         from runtime.stage1_publication_recovery import (
                             Stage1PublicationRecoveryBlocked,
+                            prepare_partial_stage1_recovery,
                             try_recover_registered_stage1_publication,
                         )
                         from runtime.provider_runtime import (
@@ -2212,27 +2213,44 @@ class AgentRuntimeRunner:
                         source_bundle_record = session.context.registry.get("source_bundle")
                         runtime_spec_record = session.context.registry.get("runtime_job_spec")
                         try:
-                            recovery_proposal = try_recover_registered_stage1_publication(
+                            expected_source_bundle_hash = (
+                                source_bundle_record.content_hash
+                                if source_bundle_record is not None
+                                and source_bundle_record.status == "ready"
+                                else ""
+                            )
+                            expected_runtime_spec_hash = (
+                                runtime_spec_record.content_hash
+                                if runtime_spec_record is not None
+                                and runtime_spec_record.status == "ready"
+                                else ""
+                            )
+                            provider_budget_controller = provider_budget_controller_from_environment()
+                            partial_recovery = prepare_partial_stage1_recovery(
                                 session.context.workspace,
                                 session.context.registry,
-                                expected_source_bundle_hash=(
-                                    source_bundle_record.content_hash
-                                    if source_bundle_record is not None
-                                    and source_bundle_record.status == "ready"
-                                    else ""
-                                ),
-                                expected_runtime_spec_hash=(
-                                    runtime_spec_record.content_hash
-                                    if runtime_spec_record is not None
-                                    and runtime_spec_record.status == "ready"
-                                    else ""
-                                ),
-                                provider_budget_controller=(
-                                    provider_budget_controller_from_environment()
-                                ),
+                                expected_source_bundle_hash=expected_source_bundle_hash,
+                                expected_runtime_spec_hash=expected_runtime_spec_hash,
+                                provider_budget_controller=provider_budget_controller,
                                 external_registry_resolver=external_registry_resolver,
-                                schema_validators=self._schema_validators(),
                             )
+                            if partial_recovery is not None:
+                                bridge.stage1_partial_recovery_context = partial_recovery
+                                recovery_proposal = None
+                            else:
+                                recovery_proposal = try_recover_registered_stage1_publication(
+                                    session.context.workspace,
+                                    session.context.registry,
+                                    expected_source_bundle_hash=(
+                                        expected_source_bundle_hash
+                                    ),
+                                    expected_runtime_spec_hash=(
+                                        expected_runtime_spec_hash
+                                    ),
+                                    provider_budget_controller=provider_budget_controller,
+                                    external_registry_resolver=external_registry_resolver,
+                                    schema_validators=self._schema_validators(),
+                                )
                         except Stage1PublicationRecoveryBlocked as exc:
                             raise RuntimeRunnerError(str(exc)) from exc
                         if recovery_proposal is not None:
@@ -2258,16 +2276,20 @@ class AgentRuntimeRunner:
                         completed.append(stage)
                         continue
                 started_at = utc_now_iso()
-                result, model_calls = self._execute_stage(
-                    stage,
-                    bridge=bridge,
-                    session=session,
-                    spec=spec,
-                    bundle=bundle,
-                    results=results,
-                    attempt_id=running_attempt.attempt_id,
-                    external_registry_resolver=external_registry_resolver,
-                )
+                try:
+                    result, model_calls = self._execute_stage(
+                        stage,
+                        bridge=bridge,
+                        session=session,
+                        spec=spec,
+                        bundle=bundle,
+                        results=results,
+                        attempt_id=running_attempt.attempt_id,
+                        external_registry_resolver=external_registry_resolver,
+                    )
+                finally:
+                    if stage == "analyze":
+                        bridge.stage1_partial_recovery_context = None
                 if stage == "analyze" and result.success:
                     external_registry_resolver = self._external_registry_resolver(
                         session.context.workspace, registry_paths=external_registry_paths,
