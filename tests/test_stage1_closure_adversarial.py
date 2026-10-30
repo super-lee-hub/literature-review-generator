@@ -604,6 +604,7 @@ def test_stage1_typed_manifest_portable_authority_closes_and_tampering_blocks(
         bundle: Any,
         *,
         existing_summaries: Any = (),
+        explicit_typed_imports: Any = None,
         _verification_scope: Any,
     ) -> Stage1AnalysisResult:
         before = source_proof_evaluations
@@ -611,6 +612,7 @@ def test_stage1_typed_manifest_portable_authority_closes_and_tampering_blocks(
             self,
             bundle,
             existing_summaries=existing_summaries,
+            explicit_typed_imports=explicit_typed_imports,
             _verification_scope=_verification_scope,
         )
         run_scope_evaluations.append(source_proof_evaluations - before)

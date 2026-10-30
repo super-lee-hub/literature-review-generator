@@ -31,6 +31,8 @@ from runtime.provider_runtime import (
 from runtime.stage_planning import build_stage_plan
 from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry
 from services.job_workspace import JobWorkspace
+from services.queue_service import LocalPublicationContext
+from services.settings import ApplicationSettings
 
 _API_CONFIG = {
     "api_key": "fixture-only",
@@ -284,6 +286,9 @@ def _run_fixture(
     context = SimpleNamespace(
         workspace=workspace,
         registry=registry,
+        settings=ApplicationSettings(),
+        publication_context=LocalPublicationContext(),
+        stage1_work_item_basis=None,
         required_stages=stage_plan.required_stages,
         fingerprint_bundle={"config_hash": config_hash, "source_hash": source_hash},
         readiness_policy_snapshot={"stage_plan": stage_plan.to_dict()},
