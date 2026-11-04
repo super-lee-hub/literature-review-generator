@@ -5337,6 +5337,34 @@ class ProviderRuntime:
 
         return max(1, requested)
 
+    def _assert_prior_provider_outcome_resolved(self, request_hash: str = "") -> None:
+        """Never turn a finalized unknown logical call into a fresh POST."""
+
+        if self.ledger is None or not all((
+            self.job_id, self.stage_name, self.node_id, self.call_id,
+            self.logical_attempt_identity,
+        )):
+            return
+        for receipt in self.ledger.list_receipts():
+            if (
+                receipt.status != "blocked"
+                and receipt.error_kind == "outcome_unknown"
+                and receipt.job_id == self.job_id
+                and receipt.stage_name == self.stage_name
+                and receipt.node_id == self.node_id
+                and receipt.call_id == self.call_id
+                and (
+                    (receipt.logical_attempt_identity or receipt.attempt_id)
+                    == self.logical_attempt_identity
+                    or (bool(request_hash) and receipt.input_hash == request_hash)
+                )
+            ):
+                raise ProviderRuntimeContractError(
+                    f"provider outcome_unknown remains for logical call {self.call_id}; "
+                    f"reconciliation of receipt {receipt.receipt_id} is required before "
+                    "a new provider request; the original receipt and consumption are retained"
+                )
+
     def admit(
         self,
         *,
@@ -5347,6 +5375,7 @@ class ProviderRuntime:
         request_hash: str = "",
     ) -> ProviderCallAdmissionV1:
         self._assert_pause_state_before_admission()
+        self._assert_prior_provider_outcome_resolved(request_hash)
         estimated = max(0, int(estimated_tokens))
         output = max(0, int(requested_output_tokens))
         retries = max(0, int(requested_retry_attempts))

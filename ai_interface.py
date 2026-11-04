@@ -37,6 +37,7 @@ from runtime.provider_runtime import (
     ProviderRuntime,
     ProviderRuntimeLedger,
     canonical_provider_request_payload,
+    hash_json,
 )
 from summary_schema import (
     default_ai_summary,
@@ -4232,6 +4233,7 @@ def _call_ai_api_detailed(
             estimated_tokens=estimated_tokens,
             requested_output_tokens=max(0, int(max_tokens)) * max(1, effective_attempts),
             requested_retry_attempts=max(0, effective_attempts - 1),
+            request_hash=hash_json(request_payload),
         )
     except ProviderBudgetExceeded as exc:
         receipt = provider_runtime.blocked_receipt(
