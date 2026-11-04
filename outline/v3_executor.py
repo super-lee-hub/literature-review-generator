@@ -3173,6 +3173,7 @@ class OutlineV3Executor:
                     *list(getattr(topic, "bridge_paper_ids", []) or []),
                 )
             )
+            paper_evidence_ids = set(getattr(dossier, "evidence_ids", []) or [])
             required_evidence_ids = sorted(
                 {
                     str(value)
@@ -3183,7 +3184,7 @@ class OutlineV3Executor:
                         *list(getattr(topic, "bridge_paper_ids", []) or []),
                     )
                     for value in (getattr(topic, "supporting_evidence_ids", []) or [])
-                    if str(value) in set(getattr(dossier, "evidence_ids", []) or [])
+                    if str(value) in paper_evidence_ids
                 }
             )
             filter_indexes: set[int] = set()
