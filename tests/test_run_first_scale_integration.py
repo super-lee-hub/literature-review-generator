@@ -5487,3 +5487,505 @@ def test_run_first_scale_local_http_full_chain(
         server.shutdown()
         thread.join(timeout=5)
         server.server_close()
+
+
+@pytest.mark.optional
+@pytest.mark.integration
+@pytest.mark.slow
+def test_runtime_gui_writer_cancel_resume_preserves_persistent_budget(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cancel a durable Writer checkpoint and resume through the real GUI control plane."""
+
+    import configparser
+    import copy
+    import hashlib
+    import json
+    from pathlib import Path
+    import re
+    import socket
+    import threading
+    import time
+    import unicodedata
+    from typing import Any
+
+    import pytest
+
+    from gui.app import API_ENV_MAPPING, WorkspaceController
+    from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
+    from runtime.runner import AgentRuntimeRunner
+    from runtime.cancellation import CancellationRequestStore
+    from services.job_outcome import load_canonical_job_outcome
+    from services.review_generation_service import ReviewGenerationService
+    from tests import test_run_first_scale_integration as scale_fixture
+
+
+    _PROVIDER_BUDGET = {
+        "schema_version": "provider-aggregate-budget-contract-v2",
+        "max_provider_calls_total": 200,
+        "max_output_tokens_total": 5_000_000,
+        "max_retry_attempts_total": 0,
+        "max_wall_seconds": 3_600,
+    }
+
+
+    def _provider_calls(server: Any) -> list[dict[str, Any]]:
+        with server.lock:
+            return list(server.calls)
+
+
+    def _writer_posts(server: Any) -> list[dict[str, Any]]:
+        return [
+            row for row in _provider_calls(server)
+            if row.get("stage") == "stage3_writer" and row.get("model") == "rfs-writer-local"
+        ]
+
+
+    def _replay_rows(registry: Any) -> tuple[Any, list[dict[str, Any]]]:
+        record = registry.get("review_replay")
+        assert record is not None and record.status == "ready"
+        rows = [
+            json.loads(line)
+            for line in Path(record.path).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        return record, rows
+
+
+    def _budget_state_path(output_root: Path) -> Path:
+        candidates = [
+            path
+            for name in ("provider_budget_state_v1.json", "acceptance_budget_state_v1.json")
+            for path in output_root.rglob(name)
+        ]
+        assert len(candidates) == 1, [str(path) for path in candidates]
+        return candidates[0]
+
+
+    def _source_bound_writer_response_with_catalog_anchors(
+        envelope: dict[str, Any],
+        fixture_trace: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any] | None:
+        """Adapt multi-source fixture prose using only the decoded Writer request.
+
+        The production wire projection carries canonical source bundles and the
+        citation catalog, but its integrated planned claim intentionally does not
+        repeat bibliography titles. Anchor each exact empirical source claim to its
+        own catalog title in a response-only copy; keep the actual wire scope and
+        planned claim unchanged for production validation.
+        """
+
+        from runtime.provider_runtime import hash_json
+        from tests.test_current_runtime_full_e2e import _source_bound_writer_response
+
+        wire_scope = envelope.get("writer_task_scope")
+        if not isinstance(wire_scope, dict):
+            return _source_bound_writer_response(envelope, fixture_trace)
+        wire_scope_hash = hash_json(wire_scope)
+        response_envelope = copy.deepcopy(envelope)
+        response_scope = response_envelope["writer_task_scope"]
+        evidence_store = response_scope.get("evidence_store")
+        if not isinstance(evidence_store, dict):
+            raise AssertionError("decoded Writer request lacks its canonical evidence_store")
+        catalog = [
+            row for row in response_envelope.get("citation_ref_catalog") or ()
+            if isinstance(row, dict)
+        ]
+        for task in response_scope.get("tasks") or ():
+            if not isinstance(task, dict):
+                raise AssertionError("decoded Writer request has a malformed task")
+            paper_keys = [str(value) for value in task.get("paper_keys") or () if str(value)]
+            if len(paper_keys) < 2:
+                continue
+            planned_claim = str(task.get("planned_claim") or "")
+            if not planned_claim:
+                raise AssertionError("decoded multi-source task lacks its planned claim")
+            allowed_refs = {str(value) for value in task.get("allowed_ref_ids") or () if str(value)}
+            primary_text_by_paper: dict[str, str] = {}
+            for bundle in task.get("canonical_source_bundle_refs") or ():
+                if not isinstance(bundle, dict):
+                    raise AssertionError("decoded Writer request has a malformed canonical bundle ref")
+                paper_key = str(bundle.get("paper_key") or "")
+                if paper_key not in paper_keys:
+                    raise AssertionError("canonical source bundle is outside the task paper set")
+                primary_claims = []
+                for ref in bundle.get("source_claims_refs") or ():
+                    row = evidence_store.get(str(ref))
+                    value = row.get("value") if isinstance(row, dict) else None
+                    if isinstance(value, dict) and value.get("claim_type") == "empirical_finding":
+                        primary_claims.append(value)
+                if len(primary_claims) != 1:
+                    raise AssertionError(
+                        f"task {task.get('writer_task_id')} needs one request-visible empirical claim for {paper_key}"
+                    )
+                source_text = str(primary_claims[0].get("text") or "").strip()
+                if not source_text:
+                    raise AssertionError(f"canonical empirical claim is empty for {paper_key}")
+                primary_text_by_paper[paper_key] = source_text
+
+            if set(primary_text_by_paper) != set(paper_keys):
+                raise AssertionError("canonical empirical claim map differs from the task paper keys")
+            if len(paper_keys) != 2:
+                raise AssertionError("prototype title anchoring requires a uniquely pairwise task")
+
+            whereas = list(re.finditer(r"\bwhereas\b", planned_claim, flags=re.IGNORECASE))
+            if len(whereas) != 1:
+                raise AssertionError("pairwise planned claim has no unique whereas boundary")
+            boundary = whereas[0]
+            sides = {
+                "left": planned_claim[:boundary.start()],
+                "right": planned_claim[boundary.end():],
+            }
+            def content_tokens(value: str) -> tuple[str, ...]:
+                # Normalize punctuation only; keep complete words, negation,
+                # signed numbers, decimals and percentages in their source order.
+                return tuple(re.findall(
+                    r"[+-]?\d+(?:\.\d+)?%?|[^\W\d_]+",
+                    unicodedata.normalize("NFKC", value).casefold(),
+                ))
+
+            side_by_paper: dict[str, str] = {}
+            for paper_key, finding in primary_text_by_paper.items():
+                needle = content_tokens(finding)
+                matches = {}
+                for side, side_text in sides.items():
+                    tokens = content_tokens(side_text)
+                    matches[side] = sum(
+                        tokens[index:index + len(needle)] == needle
+                        for index in range(len(tokens) - len(needle) + 1)
+                    ) if needle else 0
+                if sorted(matches.values()) != [0, 1]:
+                    raise AssertionError(
+                        f"task {task.get('writer_task_id')} has no unique complete source finding on one side: "
+                        f"paper={paper_key}, matches={matches}"
+                    )
+                side_by_paper[paper_key] = next(side for side, count in matches.items() if count == 1)
+            if set(side_by_paper.values()) != {"left", "right"}:
+                raise AssertionError(
+                    f"task {task.get('writer_task_id')} source finding anchors do not cover both claim sides: "
+                    f"{side_by_paper}"
+                )
+
+            prefix_match = re.search(r"\breport\s*:\s*", sides["left"], flags=re.IGNORECASE)
+            if prefix_match is None:
+                raise AssertionError("pairwise planned claim lacks the source-comparison introduction anchor")
+            side_start = {
+                "left": prefix_match.end(),
+                "right": len(sides["left"]) + boundary.end() - boundary.start()
+                + len(sides["right"]) - len(sides["right"].lstrip()),
+            }
+            anchors: list[tuple[int, str, str]] = []
+            folded_claim = planned_claim.casefold()
+            for paper_key, side in side_by_paper.items():
+                catalog_rows = [
+                    row for row in catalog
+                    if row.get("status") == "active"
+                    and str(row.get("canonical_paper_key") or "") == paper_key
+                    and str(row.get("ref_id") or "") in allowed_refs
+                ]
+                if len(catalog_rows) != 1:
+                    raise AssertionError(
+                        f"task {task.get('writer_task_id')} lacks one canonical catalog row for {paper_key}"
+                    )
+                title = str(catalog_rows[0].get("title") or "").strip()
+                if not title:
+                    raise AssertionError(f"canonical catalog title is empty for {paper_key}")
+                title_occurrences = folded_claim.count(title.casefold())
+                if title_occurrences == 1:
+                    continue
+                if title_occurrences != 0:
+                    raise AssertionError(
+                        f"planned claim has ambiguous catalog-title occurrences for {paper_key}"
+                    )
+                offset = side_start[side]
+                anchors.append((offset, f"{title} reports ", title))
+            for offset, anchor, _title in sorted(anchors, reverse=True):
+                planned_claim = planned_claim[:offset] + anchor + planned_claim[offset:]
+            restored_claim = planned_claim
+            for _offset, _anchor, title in sorted(anchors, reverse=True):
+                restored_claim = restored_claim.replace(f"{title} reports ", "", 1)
+            if restored_claim != str(task.get("planned_claim") or ""):
+                raise AssertionError("fixture title anchors changed the original planned claim text")
+            task["planned_claim"] = planned_claim
+
+        response = _source_bound_writer_response(response_envelope, fixture_trace)
+        if response is None:
+            return None
+        # The provider sees the wire projection, not the host's full logical scope.
+        # The saved-request check and the real ReviewGenerationService validate the
+        # response against the unchanged, production-built logical scope.
+        assert hash_json(wire_scope) == wire_scope_hash
+        assert envelope.get("writer_task_scope") == wire_scope
+        return response
+
+
+    papers = scale_fixture._scale_papers(4)
+    pdf_dir = tmp_path / "papers"
+    pdf_dir.mkdir()
+    for paper in papers:
+        scale_fixture._write_scale_pdf(pdf_dir / f"{paper.stem}.pdf", paper)
+
+    server, server_thread, api_base = scale_fixture._start_scale_server(papers)
+    writer_section_requests: list[str] = []
+
+    def response_with_request_identity(envelope: Any, fixture_trace: Any = None) -> Any:
+        section_id = str(envelope.get("section", {}).get("section_id") or "")
+        wire_section_id = str(envelope.get("writer_task_scope", {}).get("section_id") or "")
+        assert section_id and section_id == wire_section_id
+        writer_section_requests.append(section_id)
+        return _source_bound_writer_response_with_catalog_anchors(envelope, fixture_trace)
+
+    monkeypatch.setattr(
+        scale_fixture,
+        "_source_bound_writer_response",
+        response_with_request_identity,
+    )
+    output_root = tmp_path / "output"
+    config_path = scale_fixture._local_config(tmp_path, api_base)
+    project_name = "gui-writer-cancel-resume"
+    job_id = "writer-cancel-resume-local-http"
+    spec = RuntimeJobSpec(
+        project_name=project_name,
+        source=RuntimeSourceSpec(mode="direct", pdf_folder=str(pdf_dir)),
+        job_id=job_id,
+        config=str(config_path),
+        action="run_all",
+        queue_file=str(tmp_path / "queue.json"),
+        metadata={"provider_budget": dict(_PROVIDER_BUDGET)},
+    )
+
+    # Keep GUI credential resolution and every provider destination inside this
+    # prototype. The socket guard is installed before the first runtime provider
+    # request, independently of the configuration assertions below.
+    monkeypatch.setenv("AUTO_GENERATE_ENV_PATH", str(tmp_path / "no-private-env-file"))
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
+    for environment_name in API_ENV_MAPPING.values():
+        monkeypatch.delenv(environment_name, raising=False)
+    allowed_destination = ("127.0.0.1", int(server.server_address[1]))
+    socket_connect = socket.socket.connect
+    socket_connect_ex = socket.socket.connect_ex
+
+    def guarded_connect(sock: socket.socket, address: Any) -> Any:
+        if not isinstance(address, tuple) or tuple(address[:2]) != allowed_destination:
+            raise AssertionError(f"provider socket destination is outside this test server: {address!r}")
+        return socket_connect(sock, address)
+
+    def guarded_connect_ex(sock: socket.socket, address: Any) -> int:
+        if not isinstance(address, tuple) or tuple(address[:2]) != allowed_destination:
+            raise AssertionError(f"provider socket destination is outside this test server: {address!r}")
+        return socket_connect_ex(sock, address)
+
+    monkeypatch.setattr(socket.socket, "connect", guarded_connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", guarded_connect_ex)
+
+    config = configparser.ConfigParser(interpolation=None)
+    config.read(config_path, encoding="utf-8")
+    route_sections = (
+        "Primary_Reader_API", "Backup_Reader_API", "Outline_API",
+        "Free_Mode_API", "Writer_API", "Validator_API",
+    )
+    assert all(config[section]["api_base"] == api_base for section in route_sections)
+    assert all(config[section]["transport_retries"] == "0" for section in route_sections)
+
+    controller = WorkspaceController(str(config_path))
+    assert controller.config_path == str(config_path.resolve())
+    assert controller.state["paths"]["output_path"] == str(output_root.resolve())
+    controller.state["workflow"]["project_name"] = project_name
+    controller.lifecycle_actor = "gui-writer-cancel-resume-prototype"
+    controller.lifecycle_reason = "exercise persisted section replay after a user cancel"
+
+    barrier_entered = threading.Event()
+    release_barrier = threading.Event()
+    barrier_rows: dict[str, Any] = {}
+    original_persist_replay = ReviewGenerationService._persist_review_replay
+
+    def persist_replay_then_barrier(self: ReviewGenerationService, **kwargs: Any) -> None:
+        original_persist_replay(self, **kwargs)
+        if barrier_entered.is_set():
+            return
+        replay_record, rows = _replay_rows(self.registry)
+        section_id = str(kwargs["section_id"])
+        row = next((item for item in rows if item.get("section_id") == section_id), None)
+        assert row is not None, "first Writer replay row was not durable before the cancel barrier"
+        section_record = self.registry.get(str(row["artifact_id"]))
+        receipt_snapshot = self.registry.get(str(row["receipt_snapshot_artifact_id"]))
+        assert section_record is not None and section_record.status == "ready"
+        assert receipt_snapshot is not None and receipt_snapshot.status == "ready"
+        self.registry.verify_ready_artifact_closure(replay_record)
+        barrier_rows.update({
+            "section_id": section_id,
+            "replay_rows": rows,
+            "replay_record": replay_record,
+            "section_record": section_record,
+            "receipt_snapshot": receipt_snapshot,
+        })
+        barrier_entered.set()
+        if not release_barrier.wait(timeout=120):
+            raise TimeoutError("test cancel barrier was not released")
+
+    monkeypatch.setattr(
+        ReviewGenerationService,
+        "_persist_review_replay",
+        persist_replay_then_barrier,
+    )
+
+    resume_results: list[dict[str, Any]] = []
+    resume_errors: list[BaseException] = []
+
+    def resume_via_real_gui_controller() -> None:
+        try:
+            resume_results.append(controller.resume_current_workspace())
+        except BaseException as exc:  # propagate worker failure to the pytest thread
+            resume_errors.append(exc)
+
+    resume_thread: threading.Thread | None = None
+    try:
+        first = AgentRuntimeRunner(spec).run()
+        assert first.job_status == "completed", first
+        assert first.job_disposition == "needs_review", first
+        assert first.completed_stages == ("source_intake", "analyze", "outline"), first
+        assert first.failed_stage is None, first
+        assert controller._latest_control_plane_workspace() == first.workspace_path
+
+        adoption = controller.adopt_current_outline()
+        assert adoption["status"] == "succeeded", adoption
+        assert adoption["mutation_performed"] is True
+
+        budget_path = _budget_state_path(output_root)
+        initial_budget_state = json.loads(budget_path.read_text(encoding="utf-8"))
+        assert initial_budget_state["budget"]["max_provider_calls_total"] == 200
+        assert initial_budget_state["budget"]["max_output_tokens_total"] == 5_000_000
+        assert initial_budget_state["budget"]["max_retry_attempts_total"] == 0
+        assert initial_budget_state["budget"]["max_wall_seconds"] == 3_600
+        original_started = float(initial_budget_state["first_started_epoch"])
+        original_deadline = float(initial_budget_state["absolute_deadline_epoch"])
+        budget_identity = budget_path.with_name(budget_path.name + ".identity.json")
+        original_budget_identity_hash = hashlib.sha256(budget_identity.read_bytes()).hexdigest()
+        assert original_deadline == pytest.approx(original_started + 3_600)
+
+        resume_thread = threading.Thread(
+            target=resume_via_real_gui_controller,
+            name="real-gui-control-plane-resume",
+            daemon=True,
+        )
+        resume_thread.start()
+        assert barrier_entered.wait(timeout=180), {
+            "calls": _provider_calls(server),
+            "errors": list(server.errors),
+        }
+        assert len(barrier_rows["replay_rows"]) == 1
+        assert len(_writer_posts(server)) == 1
+        assert writer_section_requests == [barrier_rows["section_id"]]
+        assert barrier_rows["replay_rows"][0]["section_id"] == barrier_rows["section_id"]
+
+        cancel = controller.cancel_current_workspace()
+        assert cancel["status"] == "requested", cancel
+        assert cancel["mutation_performed"] is True, cancel
+        cancel_workspace, cancel_registry = AgentRuntimeRunner._open_workspace(first.workspace_path)
+        marker = CancellationRequestStore(cancel_workspace, cancel_registry).read()
+        assert marker is not None and marker.active
+        assert marker.job_id == cancel_workspace.job_id
+        assert marker.requested_by == "gui"
+        assert marker.reason == "user_requested_from_gui"
+        release_barrier.set()
+        resume_thread.join(timeout=180)
+        assert not resume_thread.is_alive(), "cancelled control-plane resume did not return"
+        assert not resume_errors, [repr(error) for error in resume_errors]
+        assert len(resume_results) == 1
+
+        cancellation_result = resume_results[0]
+        assert cancellation_result.get("job_status") == "cancelled", cancellation_result
+        cancelled_outcome, _ = load_canonical_job_outcome(cancel_registry)
+        assert cancelled_outcome.job_status == "cancelled"
+        assert cancelled_outcome.job_id == cancel_workspace.job_id
+        assert len(_writer_posts(server)) == 1
+        cancelled_budget_state = json.loads(budget_path.read_text(encoding="utf-8"))
+        assert cancelled_budget_state["first_started_epoch"] == original_started
+        assert cancelled_budget_state["absolute_deadline_epoch"] == original_deadline
+        assert time.time() < original_deadline
+        assert cancelled_budget_state["retry_attempts_used"] == 0
+        assert cancelled_budget_state["retry_attempts_reserved"] == 0
+        assert cancelled_budget_state["calls_reserved"] == 0
+        assert cancelled_budget_state["output_tokens_reserved"] == 0
+        assert cancelled_budget_state["reservations"] == []
+
+        monkeypatch.setattr(
+            ReviewGenerationService,
+            "_persist_review_replay",
+            original_persist_replay,
+        )
+        final_resume = controller.resume_current_workspace()
+        assert final_resume.get("completion_status") == "complete", final_resume
+        assert final_resume.get("canonical_ready") is True, final_resume
+        assert len(_writer_posts(server)) > 1
+
+        _, registry = AgentRuntimeRunner._open_workspace(first.workspace_path)
+        final_replay_record, replay_rows = _replay_rows(registry)
+        replay_section_ids = [str(row["section_id"]) for row in replay_rows]
+        assert replay_section_ids[0] == barrier_rows["section_id"]
+        assert len(replay_section_ids) > 1
+        assert all(registry.get(str(row["artifact_id"])).status == "ready" for row in replay_rows)
+        assert all(
+            registry.get(str(row["receipt_snapshot_artifact_id"])).status == "ready"
+            for row in replay_rows
+        )
+
+        final_budget_state = json.loads(budget_path.read_text(encoding="utf-8"))
+        assert final_budget_state["budget"] == initial_budget_state["budget"]
+        assert final_budget_state["acceptance_run_id"] == initial_budget_state["acceptance_run_id"]
+        assert hashlib.sha256(budget_identity.read_bytes()).hexdigest() == original_budget_identity_hash
+        assert final_budget_state["first_started_epoch"] == original_started
+        assert final_budget_state["absolute_deadline_epoch"] == original_deadline
+        assert final_budget_state["retry_attempts_used"] == 0
+        assert final_budget_state["retry_attempts_reserved"] == 0
+        assert final_budget_state["calls_reserved"] == 0
+        assert final_budget_state["output_tokens_reserved"] == 0
+        assert final_budget_state["reservations"] == []
+        for original_record in (barrier_rows["section_record"], barrier_rows["receipt_snapshot"]):
+            restored_record = registry.get(original_record.artifact_id)
+            assert restored_record is not None and restored_record.status == "ready"
+            assert restored_record.content_hash == original_record.content_hash
+        assert final_budget_state["calls_used"] == len(_provider_calls(server))
+        assert final_budget_state["calls_used"] <= _PROVIDER_BUDGET["max_provider_calls_total"]
+        assert final_budget_state["output_tokens_used"] <= _PROVIDER_BUDGET["max_output_tokens_total"]
+
+        closure = registry.get("review:provider_receipt_closure")
+        assert closure is not None and closure.status == "ready"
+        closure_payload = json.loads(Path(closure.path).read_text(encoding="utf-8"))["payload"]
+        assert closure_payload["complete"] is True
+        for field in (
+            "duplicate_expected_call_ids", "missing_call_ids", "stale_call_ids",
+            "failed_call_ids", "incomplete_call_ids", "unexpected_receipts",
+            "out_of_scope_receipts", "out_of_epoch_receipts", "retry_exceeded_call_ids",
+            "usage_incomplete_call_ids",
+        ):
+            assert closure_payload[field] == [], (field, closure_payload[field])
+        assert closure_payload["hash_mismatches"] == {}
+        expected_call_ids = set(closure_payload["expected_call_ids"])
+        observed_call_ids = set(closure_payload["observed_call_ids"])
+        reused_call_ids = set(closure_payload["verified_reuse_call_ids"])
+        assert expected_call_ids == observed_call_ids | reused_call_ids
+        assert closure_payload["verified_reuse_call_ids"] == [
+            f"review:{barrier_rows['section_id']}"
+        ]
+        assert len(_writer_posts(server)) == len(replay_rows)
+        assert sorted(writer_section_requests) == sorted(replay_section_ids)
+        assert writer_section_requests.count(barrier_rows["section_id"]) == 1
+
+        lifecycle = controller.refresh_lifecycle(notify_user=False)
+        inspection = lifecycle["inspection"]
+        assert inspection["status"]["job_status"] == "completed", inspection
+        assert lifecycle["validation_status"]["status"] == "clean", lifecycle["validation_status"]
+        exported = controller.export_current_workspace()
+        assert exported["status"] == "canonical_verified", exported
+        assert Path(exported["bundle_path"]).is_file()
+
+        scale_fixture._assert_local_only(server)
+        assert all(row["status"] == 200 for row in _provider_calls(server))
+        assert len(_provider_calls(server)) == final_budget_state["calls_used"]
+    finally:
+        release_barrier.set()
+        if resume_thread is not None and resume_thread.is_alive():
+            resume_thread.join(timeout=180)
+        server.shutdown()
+        server_thread.join(timeout=5)
+        server.server_close()
