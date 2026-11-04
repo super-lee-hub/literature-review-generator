@@ -25,6 +25,9 @@ RUN_FIRST_SCALE_VARIANT defaults to the unchanged baseline. Opt-in adversarial
 profiles select null, reverse, distant cross-shard, or one combined four-comparison profile.
 RUN_FIRST_SCALE_OUTLINE_OUTPUT_TOKENS optionally sets this loopback experiment's
 Outline output allowance; omission preserves the shipped route setting.
+RUN_FIRST_SCALE_OUTLINE_CONTEXT_TOKENS optionally sets its declared Outline
+working window; omission preserves the shipped route setting. Neither option
+verifies any external model or gateway capability.
 The opt-in identity-quarantine case also fixtures the report parser and PDF
 lookup; production PDF identity checks must isolate the mismatched extra source.
 """
@@ -1494,6 +1497,7 @@ def _local_config(
     admission_overrides: Mapping[str, int] | None = None,
     technical_shard_target_tokens: int = 0,
     outline_output_tokens: int | None = None,
+    outline_context_tokens: int | None = None,
 ) -> Path:
     if (
         type(technical_shard_target_tokens) is not int
@@ -1505,6 +1509,10 @@ def _local_config(
         type(outline_output_tokens) is not int or outline_output_tokens <= 0
     ):
         raise AssertionError("local Outline output allowance must be a positive integer")
+    if outline_context_tokens is not None and (
+        type(outline_context_tokens) is not int or outline_context_tokens <= 0
+    ):
+        raise AssertionError("local Outline declared context must be a positive integer")
     parser = configparser.ConfigParser(interpolation=None)
     parser.read(Path(__file__).resolve().parents[1] / "config.ini.example", encoding="utf-8")
     parser["Paths"]["output_path"] = str(tmp_path / "output")
@@ -1545,6 +1553,10 @@ def _local_config(
         # An explicit loopback experiment setting, not a product default or
         # evidence of any external gateway's output capability.
         parser["Outline_API"]["max_output_tokens"] = str(outline_output_tokens)
+    if outline_context_tokens is not None:
+        # This is an isolated transport/configuration experiment declaration,
+        # not a measured real-model context limit or a product default.
+        parser["Outline_API"]["max_context_tokens"] = str(outline_context_tokens)
     parser["Outline"]["require_explicit_adoption"] = "true"
     parser["Outline"]["technical_shard_target_tokens"] = str(technical_shard_target_tokens)
     parser["OutlineStability"]["mode"] = "off"
@@ -4029,6 +4041,11 @@ def test_run_first_scale_local_http_full_chain(
                 if os.environ.get("RUN_FIRST_SCALE_OUTLINE_OUTPUT_TOKENS", "").strip()
                 else None
             ),
+            outline_context_tokens=(
+                int(os.environ["RUN_FIRST_SCALE_OUTLINE_CONTEXT_TOKENS"])
+                if os.environ.get("RUN_FIRST_SCALE_OUTLINE_CONTEXT_TOKENS", "").strip()
+                else None
+            ),
         )
         if candidate_layout_variant_enabled:
             import requests
@@ -5487,6 +5504,36 @@ def test_run_first_scale_local_http_full_chain(
         server.shutdown()
         thread.join(timeout=5)
         server.server_close()
+
+
+@pytest.mark.parametrize("context_tokens", [128_000, 200_000, 1_000_000])
+def test_scale_outline_context_override_preserves_other_routes(tmp_path: Path, context_tokens: int) -> None:
+    from runtime.provider_context import ProviderContextProfile
+
+    path = _local_config(tmp_path, "http://127.0.0.1:7891/v1", outline_output_tokens=32_000)
+    baseline = path.read_bytes()
+    _local_config(tmp_path, "http://127.0.0.1:7891/v1", outline_output_tokens=32_000,
+                  outline_context_tokens=None)
+    assert path.read_bytes() == baseline
+    before = configparser.ConfigParser(interpolation=None)
+    before.read_string(baseline.decode("utf-8"))
+    _local_config(tmp_path, "http://127.0.0.1:7891/v1", outline_output_tokens=32_000,
+                  outline_context_tokens=context_tokens)
+    after = configparser.ConfigParser(interpolation=None)
+    after.read(path, encoding="utf-8")
+    assert after["Outline_API"]["max_context_tokens"] == str(context_tokens)
+    profile = ProviderContextProfile.from_api_config(dict(after["Outline_API"]), max_output_tokens=32_000)
+    assert profile.model_context_limit == context_tokens
+    assert profile.input_budget == int(context_tokens * 0.8) - 32_000 - 4_096 - 2_048
+    after["Outline_API"]["max_context_tokens"] = before["Outline_API"]["max_context_tokens"]
+    assert {s: dict(after[s]) for s in after.sections()} == {s: dict(before[s]) for s in before.sections()}
+
+
+@pytest.mark.parametrize("context_tokens", [0, -1, True, 1.5, "1000000"])
+def test_scale_outline_context_override_rejects_invalid_values(tmp_path: Path, context_tokens: Any) -> None:
+    with pytest.raises(AssertionError, match="declared context must be a positive integer"):
+        _local_config(tmp_path, "http://127.0.0.1:7891/v1", outline_context_tokens=context_tokens)
+    assert not (tmp_path / "local-http-only.ini").exists()
 
 
 @pytest.mark.optional
