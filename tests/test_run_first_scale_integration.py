@@ -2304,6 +2304,105 @@ def _scale_fragment_membership_signature(
     )
 
 
+def _scale_axis_independent_organization_preferred_indices(
+    request: Mapping[str, Any], *, preferred_indices: Sequence[int] = (),
+) -> tuple[int, ...]:
+    """Choose deterministic source-rich paper witnesses from this request's cards.
+
+    This is local provider-fixture behavior for the same-bank layout experiment.
+    It reads only the request-visible materialized cards and keeps required IDs
+    untouched; claim text length is a repeatable fixture priority, not a quality
+    or scientific-completeness judgment.
+    """
+
+    raw_cards = request.get("fragment_cards") or ()
+    text_pool = request.get("text_pool") or ()
+    paper_keys = request.get("paper_keys") or ()
+    if (
+        not isinstance(raw_cards, Sequence) or isinstance(raw_cards, (str, bytes))
+        or not isinstance(text_pool, Sequence) or isinstance(text_pool, (str, bytes))
+        or not isinstance(paper_keys, Sequence) or isinstance(paper_keys, (str, bytes))
+    ):
+        raise AssertionError("organization fixture request has malformed card/text/paper tables")
+
+    cards: dict[int, list[Any]] = {}
+    card_papers: dict[int, set[int]] = {}
+    materialized: set[int] = set()
+    for raw in raw_cards:
+        if not isinstance(raw, (list, tuple)) or len(raw) < 5 or type(raw[0]) is not int:
+            raise AssertionError("organization fixture request has a malformed fragment card")
+        index = int(raw[0])
+        if index in cards:
+            raise AssertionError("organization fixture request repeats a fragment card index")
+        papers_raw = raw[2]
+        if not isinstance(papers_raw, Sequence) or isinstance(papers_raw, (str, bytes)):
+            raise AssertionError("organization fixture fragment card has malformed paper indices")
+        papers = {int(value) for value in papers_raw if type(value) is int}
+        if len(papers) != len(papers_raw) or any(not 0 <= value < len(paper_keys) for value in papers):
+            raise AssertionError("organization fixture fragment card has an invalid paper index")
+        cards[index] = list(raw)
+        card_papers[index] = papers
+        if str(raw[3]) == "materialized":
+            materialized.add(index)
+
+    required_groups_raw = request.get("required_group_indices") or ()
+    required_papers_raw = request.get("required_paper_indices") or ()
+    if (
+        not isinstance(required_groups_raw, Sequence) or isinstance(required_groups_raw, (str, bytes))
+        or not isinstance(required_papers_raw, Sequence) or isinstance(required_papers_raw, (str, bytes))
+    ):
+        raise AssertionError("organization fixture request has malformed required index tables")
+    required_groups = {int(value) for value in required_groups_raw if type(value) is int}
+    required_papers = {int(value) for value in required_papers_raw if type(value) is int}
+    if (
+        len(required_groups) != len(required_groups_raw)
+        or len(required_papers) != len(required_papers_raw)
+        or any(index not in materialized for index in required_groups)
+        or any(not 0 <= index < len(paper_keys) for index in required_papers)
+    ):
+        raise AssertionError("organization fixture request has invalid required group/paper indices")
+
+    if not isinstance(preferred_indices, Sequence) or isinstance(preferred_indices, (str, bytes)):
+        raise AssertionError("organization fixture preferred indices must be an array")
+    caller_preferred = {int(value) for value in preferred_indices if type(value) is int}
+    if (
+        len(caller_preferred) != len(preferred_indices)
+        or any(index not in materialized for index in caller_preferred)
+    ):
+        raise AssertionError("organization fixture preferred indices are invalid or not materialized")
+
+    selected = required_groups | caller_preferred
+    covered = set().union(*(card_papers[index] for index in selected)) if selected else set()
+    missing = required_papers - covered
+    text_cache: dict[int, str] = {}
+    while missing:
+        candidates: list[tuple[tuple[Any, ...], int]] = []
+        for index in materialized:
+            new_papers = card_papers[index] & missing
+            if not new_papers:
+                continue
+            text_index = cards[index][1]
+            if type(text_index) is not int or not 0 <= text_index < len(text_pool):
+                raise AssertionError("organization fixture card references invalid claim text")
+            text = text_cache.setdefault(text_index, str(text_pool[text_index]))
+            rank = (
+                -len(new_papers),
+                len(card_papers[index] - new_papers),
+                -len(text),
+                hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                index,
+            )
+            candidates.append((rank, index))
+        if not candidates:
+            raise AssertionError("organization fixture has no materialized witness for a required paper")
+        selected_index = min(candidates)[1]
+        selected.add(selected_index)
+        covered.update(card_papers[selected_index])
+        missing = required_papers - covered
+
+    return tuple(sorted(selected - required_groups))
+
+
 def _scale_organization_section_from_fragments(
     request: Mapping[str, Any], *, section_index: int, metadata_index: int,
     fragment_indices: Sequence[int],
@@ -2749,6 +2848,108 @@ def test_scale_candidate_organization_layout_roundtrip_preserves_source_closure(
         assert {str(row["paper_key"]) for row in rows} == set(bank_test.PAPER_KEYS)
         assert all(row["source_claim_ids"] and row["evidence_ids"] and row["source_field_ids"]
                    for row in rows)
+
+
+@pytest.mark.parametrize("paper_count", [200, 600])
+def test_scale_axis_independent_organization_selection_matches_200_and_600_shapes(paper_count: int) -> None:
+    categories = ("context", "construct", "mechanism", "theory", "design", "boundary")
+    category_texts = (
+        "The treatment increased the primary outcome by 1 points in the observed controlled sample "
+        "(n=24); results apply only to the observed controlled sample and the 30-day follow-up; they do "
+        "not establish a longer-term effect. Design scope remains the stated experimental conditions, "
+        "observed sample, and 30-day follow-up.",
+        "treatment.",
+        "The source reports its measured mechanism under the observed conditions.",
+        "The source reports a theory-level interpretation for its measured result.",
+        "The source used a randomized parallel-group experiment.",
+        "The source reports one observed sample and a bounded follow-up period.",
+        "The required comparison preserves both source sides and their recorded qualifiers.",
+    )
+    task_refs = [f"topic_synthesis:{category}" for category in categories]
+    topic_refs = [f"topic:{category}" for category in categories]
+    task_refs.append("cross_group_comparison:required")
+    topic_refs.append("topic:required-comparison")
+    paper_keys = [f"paper-{index:04d}" for index in range(paper_count)]
+    cards: list[list[Any]] = []
+    context_indices: dict[int, int] = {}
+    concept_indices: dict[int, int] = {}
+    for paper_index in range(paper_count):
+        included_categories = categories[:-1] if 15 <= paper_index < 29 else categories
+        for category_index, category in enumerate(included_categories):
+            fragment_index = len(cards)
+            if category == "context":
+                context_indices[paper_index] = fragment_index
+            if category == "construct":
+                concept_indices[paper_index] = fragment_index
+            cards.append([
+                fragment_index,
+                categories.index(category),
+                [paper_index],
+                "materialized",
+                category_index,
+                category_index,
+            ])
+
+    required_group_indices: list[int] = []
+    required_pairs = ((0, 1), (1, 2), (3, 4), (4, 5), (6, 7), (7, 8), (9, 10), (11, 12), (13, 14))
+    for left, right in required_pairs:
+        fragment_index = len(cards)
+        required_group_indices.append(fragment_index)
+        cards.append([
+            fragment_index,
+            len(category_texts) - 1,
+            [left, right],
+            "materialized",
+            len(task_refs) - 1,
+            len(topic_refs) - 1,
+        ])
+
+    base_request = {
+        "paper_keys": paper_keys,
+        "fragment_cards": cards,
+        "text_pool": list(category_texts),
+        "task_refs": task_refs,
+        "topic_refs": topic_refs,
+        "required_group_indices": required_group_indices,
+        "required_paper_indices": list(range(paper_count)),
+    }
+    candidate_one = {
+        **base_request,
+        "candidate_id": "candidate_1",
+        "axis_payload": {"preferred_dimensions": ["development", "theory", "year"]},
+    }
+    candidate_two = {
+        **base_request,
+        "candidate_id": "candidate_2",
+        "axis_payload": {"preferred_dimensions": ["construct", "context", "mechanism"]},
+    }
+    before = json.dumps(base_request, ensure_ascii=False, sort_keys=True)
+    preferred_one = _scale_axis_independent_organization_preferred_indices(candidate_one)
+    preferred_two = _scale_axis_independent_organization_preferred_indices(candidate_two)
+    seeded_group = concept_indices[15]
+    seeded_request_preference = (seeded_group,)
+    seeded_preferred_one = _scale_axis_independent_organization_preferred_indices(
+        candidate_one, preferred_indices=seeded_request_preference,
+    )
+    seeded_preferred_two = _scale_axis_independent_organization_preferred_indices(
+        candidate_two, preferred_indices=seeded_request_preference,
+    )
+    expected = {
+        context_indices[index] for index in range(15, paper_count)
+    }
+    seeded_expected = {
+        seeded_group,
+        *(context_indices[index] for index in range(16, paper_count)),
+    }
+
+    assert len(cards) == 6 * paper_count - 5
+    assert preferred_one == preferred_two
+    assert set(preferred_one) == expected
+    assert seeded_preferred_one == seeded_preferred_two
+    assert set(seeded_preferred_one) == seeded_expected
+    assert category_texts[cards[seeded_group][1]] != category_texts[cards[context_indices[15]][1]]
+    assert not set(required_group_indices).intersection(preferred_one)
+    assert json.dumps(base_request, ensure_ascii=False, sort_keys=True) == before
 
 
 def test_scale_partition_layout_aggregation_and_hierarchical_leaf_capture() -> None:
@@ -3459,15 +3660,22 @@ def test_run_first_scale_local_http_full_chain(
                 key: value for key, value in raw_request.items()
                 if key != "_prompt_authority"
             }
+            candidate_id = str(request.get("candidate_id") or "")
+            fixture_preferred_indices = preferred_indices
+            if candidate_id in {"candidate_1", "candidate_2"}:
+                # Internal fixture choice only: the actual request, axis,
+                # required IDs, and bank remain unchanged on the wire.
+                fixture_preferred_indices = _scale_axis_independent_organization_preferred_indices(
+                    request, preferred_indices=preferred_indices,
+                )
             base_map = original_organization_response(
-                request, preferred_indices=preferred_indices,
+                request, preferred_indices=fixture_preferred_indices,
             )
             variant_map = _scale_merge_noncomparison_organization_fragments(
                 request, base_map, validator=validate_candidate_organization_map_for_request_v1,
             )
             axis = request.get("axis_payload")
             axis = axis if isinstance(axis, Mapping) else {}
-            candidate_id = str(request.get("candidate_id") or "")
             provider_call_id = current_organization_node.get()
             expected_node_prefix = f"candidate_organization_provider:{candidate_id}"
             if not (
