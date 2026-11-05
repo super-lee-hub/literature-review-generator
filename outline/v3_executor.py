@@ -129,6 +129,7 @@ from runtime.provider_runtime import (
     ProviderAggregateBudgetV2,
     ProviderBudgetV1,
     ProviderBudgetController,
+    ProviderCancellationRequested,
     ProviderResponseSnapshotSink,
     ProviderCallReceiptV1,
     ProviderRuntime,
@@ -17627,6 +17628,8 @@ class OutlineV3Executor:
                 execution_binding=binding,
             )
             return persisted
+        except ProviderCancellationRequested:
+            raise
         except Exception as exc:
             # A provider crash or a rejected critic result must remain visible in
             # the durable DAG.  Resume/retry then reruns this node and its
@@ -23013,6 +23016,8 @@ class OutlineV3Executor:
             else:
                 status = "ready_for_adoption"
             return OutlineV3ExecutionResult(self.job_id, status, False, dict(self.artifact_paths), tuple(node.node_id for node in self._dag.nodes if node.status == "succeeded"), tuple(self.receipts), tuple([*self.diagnostics, *self.replay_diagnostics]), self._dag)
+        except ProviderCancellationRequested:
+            raise
         except Exception as exc:
             self.diagnostics.append(str(exc))
             try:
