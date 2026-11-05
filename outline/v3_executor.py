@@ -3107,6 +3107,7 @@ class OutlineV3Executor:
         content_layers_model: Any,
         batch_index: int,
         content_layers_hash: str | None = None,
+        materialization_cache: dict[tuple[Any, ...], list[dict[str, Any]]] | None = None,
     ) -> dict[str, Any]:
         paper_ids = sorted(
             {
@@ -3201,14 +3202,28 @@ class OutlineV3Executor:
                     f"topic fragments for paper {paper_id} use conflicting evidence chunk plans"
                 )
             chunk_target_tokens = next(iter(chunk_targets), None)
-            all_units = self._complete_topic_evidence_units(
-                view_by_paper[paper_id],
-                dossier,
-                fields=paper_fields,
-                chunk_target_tokens=chunk_target_tokens,
-                required_evidence_ids=required_evidence_ids,
-                include_unbound_claims=include_unbound_claims,
+            # Only immutable planning snapshots supply this operation-local
+            # memo. This call uses the default chunk selector and estimator;
+            # other materialization callers and final requests stay uncached.
+            cache_key = (
+                id(view_by_paper[paper_id]), id(dossier), paper_id,
+                tuple(paper_fields), chunk_target_tokens,
+                tuple(required_evidence_ids), include_unbound_claims,
             )
+            unit_cache = materialization_cache if type(self) is OutlineV3Executor else None
+            if unit_cache is not None and cache_key in unit_cache:
+                all_units = copy.deepcopy(unit_cache[cache_key])
+            else:
+                all_units = self._complete_topic_evidence_units(
+                    view_by_paper[paper_id],
+                    dossier,
+                    fields=paper_fields,
+                    chunk_target_tokens=chunk_target_tokens,
+                    required_evidence_ids=required_evidence_ids,
+                    include_unbound_claims=include_unbound_claims,
+                )
+                if unit_cache is not None:
+                    unit_cache[cache_key] = copy.deepcopy(all_units)
             available_indexes = {int(unit["chunk_index"]) for unit in all_units}
             for topic in batch:
                 topic_papers = {
@@ -3520,6 +3535,9 @@ class OutlineV3Executor:
                     topic_plan, topic_routes=topic_routes,
                     evidence_model=snapshot.evidence_model,
                     content_layers_model=snapshot.content_layers_model, profile=profile,
+                    materialization_cache=(
+                        {} if snapshot.cached and type(self) is OutlineV3Executor else None
+                    ),
                 )
         except TopicMaterializationSourceChanged as exc:
             raise OutlineV3ExecutionError(f"topic planning source models changed: {exc}") from exc
@@ -3532,6 +3550,7 @@ class OutlineV3Executor:
         evidence_model: Any,
         content_layers_model: Any,
         profile: ProviderContextProfile,
+        materialization_cache: dict[tuple[Any, ...], list[dict[str, Any]]] | None = None,
     ) -> tuple[list[TopicSynthesis], list[list[TopicSynthesis]], list[dict[str, Any]]]:
         """Build the same serialized topic batches used by preflight and run."""
 
@@ -3545,6 +3564,7 @@ class OutlineV3Executor:
             profile=profile,
             input_limit=input_limit,
             content_layers_hash=content_layers_hash,
+            materialization_cache=materialization_cache,
         )
         # Keep tasks with the same paper ownership together so the wire
         # serializer can union overlapping complete dossier units inside one
@@ -3570,6 +3590,7 @@ class OutlineV3Executor:
                 content_layers_model=content_layers_model,
                 batch_index=batch_index,
                 content_layers_hash=content_layers_hash,
+                materialization_cache=materialization_cache,
             )
             node_id = self._topic_provider_node_id(request, batch_index)
             budget = profile.estimate_request(self._attach_prompt_authority(node_id, request))
@@ -3984,6 +4005,7 @@ class OutlineV3Executor:
         profile: ProviderContextProfile,
         input_limit: int,
         content_layers_hash: str,
+        materialization_cache: dict[tuple[Any, ...], list[dict[str, Any]]] | None = None,
     ) -> list[TopicSynthesis]:
         """Split oversized topic routes only at paper/evidence-unit boundaries."""
 
@@ -4069,6 +4091,7 @@ class OutlineV3Executor:
                 content_layers_model=content_layers_model,
                 batch_index=len(expanded) + 1,
                 content_layers_hash=content_layers_hash,
+                materialization_cache=materialization_cache,
             )
             full_budget = profile.estimate_request(
                 self._attach_prompt_authority(
@@ -4128,6 +4151,7 @@ class OutlineV3Executor:
                     content_layers_model=content_layers_model,
                     batch_index=len(expanded) + 1,
                     content_layers_hash=content_layers_hash,
+                    materialization_cache=materialization_cache,
                 )
                 trial_budget = profile.estimate_request(
                     self._attach_prompt_authority(
@@ -4152,6 +4176,7 @@ class OutlineV3Executor:
                         content_layers_model=content_layers_model,
                         batch_index=len(expanded) + 1,
                         content_layers_hash=content_layers_hash,
+                        materialization_cache=materialization_cache,
                     )
                     one_budget = profile.estimate_request(
                         self._attach_prompt_authority(
