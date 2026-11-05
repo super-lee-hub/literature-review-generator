@@ -63,7 +63,7 @@ if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
 }
 $PythonVersion = (& $Python --version 2>&1 | Out-String).Trim()
 if ($PythonVersion -notmatch '^Python 3\.11\.') { throw "需要 Python 3.11；当前为 $PythonVersion" }
-& $Python -m pip install -r (Join-Path $RepoRoot 'requirements-py311-windows-prod.lock')
+& $Python -m pip install --require-hashes -r (Join-Path $RepoRoot 'requirements-py311-windows-prod.lock')
 if ($LASTEXITCODE -ne 0) { throw '生产依赖锁安装失败。' }
 & $Python -m reviewctl --help
 if ($LASTEXITCODE -ne 0) { throw '固定环境中的 reviewctl CLI 不可用。' }

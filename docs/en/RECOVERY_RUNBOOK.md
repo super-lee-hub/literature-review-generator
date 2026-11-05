@@ -26,7 +26,7 @@ if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
 }
 $PythonVersion = (& $Python --version 2>&1 | Out-String).Trim()
 if ($PythonVersion -notmatch '^Python 3\.11\.') { throw "Expected Python 3.11; found $PythonVersion" }
-& $Python -m pip install -r (Join-Path $RepoRoot 'requirements-py311-windows-prod.lock')
+& $Python -m pip install --require-hashes -r (Join-Path $RepoRoot 'requirements-py311-windows-prod.lock')
 if ($LASTEXITCODE -ne 0) { throw 'Production lock install failed.' }
 $Workspace = (Resolve-Path -LiteralPath '<existing workspace path>').Path
 ```
