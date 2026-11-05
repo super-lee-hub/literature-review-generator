@@ -86,6 +86,7 @@ from services.artifact_registry import (
     RegistryError,
     file_sha256,
 )
+from services.job_outcome import load_canonical_job_outcome
 from services.model_capabilities import resolve_model_capability
 from services.settings import ApplicationSettings, mineru_remote_requested
 from services.stage1_output_budget import stage1_output_budget_sequence, provider_output_token_limit
@@ -7944,17 +7945,23 @@ class ReviewControlPlane:
         requested_by: str = "reviewctl",
         reason: str = "user_requested",
     ) -> dict[str, Any]:
-        inspection = self.inspect(job_id=job_id, workspace=workspace)
-        current_status = str((inspection.get("status") or {}).get("job_status") or "")
+        resolved = self.resolve_workspace(job_id=job_id, workspace=workspace)
+        workspace_obj, registry = AgentRuntimeRunner._open_workspace(resolved)
+        try:
+            outcome, _ = load_canonical_job_outcome(registry)
+            current_status = outcome.job_status
+        except (OSError, ValueError, RegistryError, TypeError):
+            # Stopping work must remain possible when its completion evidence
+            # is missing or invalid; cancellation does not publish that work.
+            current_status = "unknown"
         if current_status in {"completed", "failed", "cancelled"}:
             return {
                 "status": "blocked",
-                "job_id": inspection["job_id"],
+                "job_id": workspace_obj.job_id,
                 "reason": f"job is already terminal: {current_status}",
                 "mutation_performed": False,
                 "read_only": True,
             }
-        workspace_obj, registry = AgentRuntimeRunner._open_workspace(inspection["workspace_path"])
         try:
             request = CancellationRequestStore(workspace_obj, registry).request(
                 requested_by=requested_by,
@@ -7964,7 +7971,7 @@ class ReviewControlPlane:
             raise ControlPlaneError(f"cannot persist cancellation request: {exc}") from exc
         return {
             "status": "requested",
-            "job_id": inspection["job_id"],
+            "job_id": workspace_obj.job_id,
             "request": request.to_dict(),
             "mutation_performed": True,
             "read_only": False,
