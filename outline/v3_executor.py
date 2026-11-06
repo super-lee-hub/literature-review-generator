@@ -20,7 +20,7 @@ import tempfile
 import time
 import unicodedata
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, MutableMapping, Sequence
 
 from outline.v3_artifacts import (
     ArbitrationDecision,
@@ -5580,6 +5580,7 @@ class OutlineV3Executor:
         variant_name: str,
         candidate_id: str | None = None,
         shared_semantic_context: Mapping[str, Any] | None = None,
+        preflight_context: MutableMapping[str, Any] | None = None,
     ) -> tuple[int, int]:
         """Reserve candidate requests, using source-closed groups when available.
 
@@ -5599,6 +5600,7 @@ class OutlineV3Executor:
                     summaries, profile, variant_name=variant_name,
                     candidate_id=f"candidate_{index}",
                     shared_semantic_context=shared_semantic_context,
+                    preflight_context=preflight_context,
                 )
                 for index in range(1, self.candidate_count + 1)
             ]
@@ -5620,20 +5622,39 @@ class OutlineV3Executor:
         axis = axes[int(candidate_id.removeprefix("candidate_")) - 1]
         generation_node_id = f"{candidate_id}_provider_generation"
 
-        evidence = build_outline_evidence_views(summaries, self.job_id)
-        ledger = build_global_corpus_ledger(evidence)
-        matrix = build_multi_view_matrix(evidence)
-        candidates = build_global_relation_map(
-            evidence, matrix, ledger,
-            required_comparisons=build_review_intent(self.review_intent_input).required_comparisons,
-        )
-        content_layers = build_paper_content_layers(summaries, evidence, job_id=self.job_id)
-        semantic_plan = build_semantic_chunk_plan(
-            content_layers,
-            candidates,
-            candidate_count=self.candidate_count,
-            physical_call_limit=authorized_provider_call_limit(self.max_provider_calls),
-        )
+        context = preflight_context if preflight_context is not None else {}
+        evidence = context.get("evidence")
+        if evidence is None:
+            evidence = build_outline_evidence_views(summaries, self.job_id)
+            context["evidence"] = evidence
+        ledger = context.get("ledger")
+        if ledger is None:
+            ledger = build_global_corpus_ledger(evidence)
+            context["ledger"] = ledger
+        matrix = context.get("matrix")
+        if matrix is None:
+            matrix = build_multi_view_matrix(evidence)
+            context["matrix"] = matrix
+        candidates = context.get("candidates")
+        if candidates is None:
+            candidates = build_global_relation_map(
+                evidence, matrix, ledger,
+                required_comparisons=build_review_intent(self.review_intent_input).required_comparisons,
+            )
+            context["candidates"] = candidates
+        content_layers = context.get("content_layers")
+        if content_layers is None:
+            content_layers = build_paper_content_layers(summaries, evidence, job_id=self.job_id)
+            context["content_layers"] = content_layers
+        semantic_plan = context.get("semantic_plan")
+        if semantic_plan is None:
+            semantic_plan = build_semantic_chunk_plan(
+                content_layers,
+                candidates,
+                candidate_count=self.candidate_count,
+                physical_call_limit=authorized_provider_call_limit(self.max_provider_calls),
+            )
+            context["semantic_plan"] = semantic_plan
         paper_keys = [str(view.paper_key) for view in evidence.views if str(view.paper_key)]
         selected_relation_ids = {
             str(item)
@@ -5878,6 +5899,10 @@ class OutlineV3Executor:
         for variant_name, variant_summaries, transport_expected in self._provider_call_plan_variants():
             variant_evidence = build_outline_evidence_views(variant_summaries, self.job_id)
             variant_layers = build_paper_content_layers(variant_summaries, variant_evidence, job_id=self.job_id)
+            variant_preflight_context = {
+                "evidence": variant_evidence,
+                "content_layers": variant_layers,
+            }
             candidate_projections: dict[tuple[str, str], tuple[int, int]] = {}
 
             def planned_candidate_projection(profile: ProviderContextProfile, candidate_id: str | None = None) -> tuple[int, int]:
@@ -5893,6 +5918,7 @@ class OutlineV3Executor:
                 if key not in candidate_projections:
                     candidate_projections[key] = self._candidate_hierarchical_preflight(
                         variant_summaries, profile, variant_name=variant_name, candidate_id=candidate_id,
+                        preflight_context=variant_preflight_context,
                     )
                 return candidate_projections[key]
 
