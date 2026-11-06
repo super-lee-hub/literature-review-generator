@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from contextlib import nullcontext
 import json
+import uuid
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -38,6 +39,7 @@ class PauseStateV1:
     reason: str = ""
     checkpoint: str = "provider_admission"
     in_flight_policy: str = "retain_as_in_flight_or_unknown"
+    request_token: str = ""
 
     @property
     def paused(self) -> bool:
@@ -60,6 +62,7 @@ class PauseStateV1:
             reason=str(payload.get("reason") or ""),
             checkpoint=str(payload.get("checkpoint") or "provider_admission"),
             in_flight_policy=str(payload.get("in_flight_policy") or "retain_as_in_flight_or_unknown"),
+            request_token=str(payload.get("request_token") or ""),
         )
 
 
@@ -154,6 +157,7 @@ class PauseStateStore:
             requested_by=requested_by,
             reason=reason,
             checkpoint=checkpoint,
+            request_token=uuid.uuid4().hex,
         )
         with interprocess_file_lock(self.path):
             self._persist(state, producer="runtime.pause_state.request")
@@ -180,6 +184,7 @@ class PauseStateStore:
             requested_by=cleared_by,
             reason=reason,
             checkpoint="provider_admission",
+            request_token=uuid.uuid4().hex,
         )
         with (nullcontext() if _lock_held else interprocess_file_lock(self.path)):
             if expected_hash is not None:

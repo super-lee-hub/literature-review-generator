@@ -101,9 +101,10 @@ def test_pause_clear_cas_preserves_a_newer_pause_request(tmp_path: Path) -> None
         resume_requested=False, claim_latest_pointer=False, publish_running_state=False,
     )
     store = PauseStateStore(session.context.workspace, session.context.registry)
-    store.request(requested_by="tests.first")
+    first = store.request(requested_by="tests.first", reason="same clock")
     _state, old_hash = store.read_snapshot()
-    store.request(requested_by="tests.concurrent")
+    second = store.request(requested_by="tests.concurrent", reason="same clock")
+    assert first.request_token and second.request_token != first.request_token
     with pytest.raises(Exception, match="changed after resume"):
         store.clear(expected_hash=old_hash)
     current, current_hash = store.read_snapshot()
