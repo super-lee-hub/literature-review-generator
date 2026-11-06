@@ -2264,10 +2264,23 @@ class ReviewGenerationService:
             or not row.request_estimate.within_context_budget
         ]
         if over_context:
-            call_id_hashes = ", ".join(row.request_key_hash for row in over_context)
+            diagnostics = []
+            for row in over_context:
+                estimate = row.request_estimate.to_dict()
+                diagnostics.append(json.dumps({
+                    "request_id": row.request_key_hash,
+                    "request_hash": estimate.get("request_hash"),
+                    "estimated_input_tokens": estimate.get("estimated_input_tokens"),
+                    "input_budget": estimate.get("input_budget"),
+                    "requested_output_tokens": estimate.get("requested_output_tokens"),
+                    "reasoning_reserve_tokens": estimate.get("reasoning_reserve_tokens"),
+                    "safety_margin_tokens": estimate.get("safety_margin_tokens"),
+                    "estimated_total_tokens": estimate.get("estimated_total_tokens"),
+                    "verified_context_limit": estimate.get("verified_context_limit"),
+                }, sort_keys=True, separators=(",", ":")))
             raise ProviderBudgetExceeded(
                 "Writer stage preflight exceeds the provider request context budget: "
-                + call_id_hashes
+                + ";".join(diagnostics)
             )
 
         controller = provider_budget_controller_from_environment()

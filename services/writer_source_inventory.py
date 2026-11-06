@@ -656,7 +656,7 @@ def _build_inventory_papers(
     return tuple(sorted(papers, key=lambda item: item.paper_key))
 
 
-def load_writer_source_inventory_v1(
+def _load_writer_source_inventory_v1_uncached(
     registry: ArtifactRegistry,
     *,
     external_registry_resolver: Callable[[str], ArtifactRegistry | None] | None = None,
@@ -827,3 +827,23 @@ def load_writer_source_inventory_v1(
         papers=papers,
         _seal=_VERIFIED_SEAL,
     )
+
+
+def load_writer_source_inventory_v1(
+    registry: ArtifactRegistry,
+    *,
+    external_registry_resolver: Callable[[str], ArtifactRegistry | None] | None = None,
+) -> VerifiedWriterSourceInventoryV1:
+    """Load the current source inventory within one receipt-parse scope.
+
+    The scope is operation-local and resets on exit; it caches only bounded
+    receipt decoding keyed by content hash. All Registry closure, file-byte,
+    schema, and source-lineage checks remain fresh on every call.
+    """
+    from runtime.artifact_validators import receipt_parse_scope
+
+    with receipt_parse_scope():
+        return _load_writer_source_inventory_v1_uncached(
+            registry,
+            external_registry_resolver=external_registry_resolver,
+        )

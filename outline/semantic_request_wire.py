@@ -19,6 +19,10 @@ WIRE_KEY = "semantic_source_wire"
 WIRE_VERSION = "semantic-source-tables-and-strings/v1"
 _MULTI_SOURCE_VERSION = "semantic-source-tables-and-strings/v2"
 _TABLE_KEYS = {"fields", "dependencies", "bridge_claims"}
+_WRITER_TABLE_KEYS = _TABLE_KEYS | {
+    "tasks", "output_units", "source_claims", "evidence", "source_fields",
+    "interpretation_dependencies", "research_units",
+}
 _TABLE_MARKER = "semantic_row_table_v1"
 _CONTRACT = (
     "semantic-source-tables-and-strings/v1: in topic_synthesis only, an object "
@@ -48,13 +52,13 @@ def _strings(value: Any) -> list[str]:
     return []
 
 
-def _pack_rows(value: Any) -> Any:
+def _pack_rows(value: Any, *, table_keys: set[str] = _TABLE_KEYS) -> Any:
     if isinstance(value, Mapping):
         if _TABLE_MARKER in value:
             raise SemanticRequestWireError("source data collides with the row-table marker")
         result = {}
         for key, item in value.items():
-            if key in _TABLE_KEYS and isinstance(item, list) and item and all(isinstance(row, Mapping) for row in item):
+            if key in table_keys and isinstance(item, list) and item and all(isinstance(row, Mapping) for row in item):
                 layouts: list[list[str]] = []
                 rows = []
                 for row in item:
@@ -63,17 +67,17 @@ def _pack_rows(value: Any) -> Any:
                     columns = sorted(row)
                     if columns not in layouts:
                         layouts.append(columns)
-                    rows.append([layouts.index(columns), [_pack_rows(row[name]) for name in columns]])
+                    rows.append([layouts.index(columns), [_pack_rows(row[name], table_keys=table_keys) for name in columns]])
                 result[key] = {_TABLE_MARKER: {"columns": layouts, "rows": rows}}
             else:
-                result[key] = _pack_rows(item)
+                result[key] = _pack_rows(item, table_keys=table_keys)
         return result
     if isinstance(value, list):
-        return [_pack_rows(item) for item in value]
+        return [_pack_rows(item, table_keys=table_keys) for item in value]
     return copy.deepcopy(value)
 
 
-def _expand_rows(value: Any, *, table_allowed: bool = False) -> Any:
+def _expand_rows(value: Any, *, table_allowed: bool = False, table_keys: set[str] = _TABLE_KEYS) -> Any:
     if isinstance(value, Mapping):
         if _TABLE_MARKER in value:
             if not table_allowed or set(value) != {_TABLE_MARKER}:
@@ -99,13 +103,13 @@ def _expand_rows(value: Any, *, table_allowed: bool = False) -> Any:
                 if not 0 <= index < len(layouts) or not isinstance(values, list) or len(values) != len(layouts[index]):
                     raise SemanticRequestWireError("row-table row has invalid index or width")
                 used.add(index)
-                result.append({key: _expand_rows(item) for key, item in zip(layouts[index], values, strict=True)})
+                result.append({key: _expand_rows(item, table_keys=table_keys) for key, item in zip(layouts[index], values, strict=True)})
             if used != set(range(len(layouts))):
                 raise SemanticRequestWireError("row table contains an unused column layout")
             return result
-        return {key: _expand_rows(item, table_allowed=key in _TABLE_KEYS) for key, item in value.items()}
+        return {key: _expand_rows(item, table_allowed=key in table_keys, table_keys=table_keys) for key, item in value.items()}
     if isinstance(value, list):
-        return [_expand_rows(item) for item in value]
+        return [_expand_rows(item, table_keys=table_keys) for item in value]
     return copy.deepcopy(value)
 
 
@@ -124,8 +128,9 @@ def pack_semantic_request_wire(
         if (key not in request or not isinstance(request[key], list if key == "topic_synthesis" else Mapping)):
             raise SemanticRequestWireError("semantic source field is missing or malformed")
     packed = copy.deepcopy(dict(request))
+    table_keys = _WRITER_TABLE_KEYS if "writer_task_scope" in source_keys else _TABLE_KEYS
     for key in source_keys:
-        packed[key] = _pack_rows(request[key])
+        packed[key] = _pack_rows(request[key], table_keys=table_keys)
     present_strings = {value for key in source_keys for value in _strings(packed[key])}
     # Keys stay literal. Count only value occurrences before choosing strings.
     repeated: Counter[str] = Counter()
@@ -142,10 +147,22 @@ def pack_semantic_request_wire(
 
     for key in source_keys:
         count_values(packed[key])
-    strings = sorted(value for value, count in repeated.items() if count > 1 and len(value.encode("utf-8")) >= 32)
+    min_string_bytes = 8 if "writer_task_scope" in source_keys else 32
     prefix = "$S"
     while any(value.startswith(prefix) for value in present_strings):
         prefix += "_"
+    max_ref_bytes = len(prefix) + len(str(max(1, len(repeated) - 1)))
+    strings = sorted(
+        value
+        for value, count in repeated.items()
+        if count > 1
+        and len(value.encode("utf-8")) >= min_string_bytes
+        and (
+            "writer_task_scope" not in source_keys
+            or count * (len(value.encode("utf-8")) - max_ref_bytes)
+            > len(value.encode("utf-8")) + 3
+        )
+    )
     indices = {value: index for index, value in enumerate(strings)}
 
     def replace(value: Any) -> Any:
@@ -218,7 +235,8 @@ def expand_semantic_request_wire(request: Mapping[str, Any]) -> dict[str, Any]:
         source = result.get(key)
         if not isinstance(source, list if key == "topic_synthesis" else Mapping):
             raise SemanticRequestWireError(f"semantic source wire lost {key}")
-        result[key] = _expand_rows(restore(source))
+        table_keys = _WRITER_TABLE_KEYS if "writer_task_scope" in source_keys else _TABLE_KEYS
+        result[key] = _expand_rows(restore(source), table_keys=table_keys)
     if used != set(range(len(strings))):
         raise SemanticRequestWireError("semantic string catalog contains unused entries")
     if hash_json(result) != metadata["expanded_request_hash"]:

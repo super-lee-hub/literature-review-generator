@@ -373,6 +373,35 @@ def test_registry_file_tampering_is_rejected_by_ready_closure(tmp_path: Path) ->
         load_writer_source_inventory_v1(registry)
 
 
+def test_writer_inventory_reuses_receipt_decoding_within_one_operation_scope(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from runtime import artifact_validators
+
+    registry, _, _, _, _ = _registry_with_inventory(tmp_path)
+    calls = 0
+    original = artifact_validators._decode_receipt_lines
+
+    def counted(lines, *, digest):
+        nonlocal calls
+        calls += 1
+        return original(lines, digest=digest)
+
+    monkeypatch.setattr(artifact_validators, "_decode_receipt_lines", counted)
+    from runtime.artifact_validators import receipt_parse_scope
+
+    with receipt_parse_scope():
+        first = load_writer_source_inventory_v1(registry)
+        second = load_writer_source_inventory_v1(registry)
+        artifact_validators._decode_receipt_lines([], digest="0" * 64)
+        artifact_validators._decode_receipt_lines([], digest="0" * 64)
+        assert len(artifact_validators._RECEIPT_PARSE_SCOPE.get() or {}) == 1
+    assert first.content_hash == second.content_hash
+    assert calls == 2
+
+    load_writer_source_inventory_v1(registry)
+    artifact_validators._decode_receipt_lines([], digest="0" * 64)
+    assert calls == 3
+
+
 def test_quarantined_content_layers_are_not_an_authority(tmp_path: Path) -> None:
     registry, _, _, record, _ = _registry_with_inventory(tmp_path)
     registry.update_record(record.artifact_id, status="quarantined")

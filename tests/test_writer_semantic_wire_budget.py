@@ -38,6 +38,27 @@ def test_writer_scope_wire_keeps_request_identity_and_does_not_mutate_source(tmp
     assert wire["semantic_source_wire"]["expanded_request_hash"]
 
 
+def test_writer_scope_wire_leaves_other_source_fields_unpacked(tmp_path):
+    scope = project_writer_scope_for_provider_v1(_scope_with_shared_sources(tmp_path))
+    request = {
+        "writer_task_scope": scope,
+        "topic_synthesis": [{"paper_key": "topic", "text": "topic source"}],
+    }
+    wire = pack_semantic_request_wire(request, source_keys=("writer_task_scope",))
+    assert wire["topic_synthesis"] == request["topic_synthesis"]
+    assert expand_semantic_request_wire(wire) == request
+
+
+def test_writer_string_codec_requires_conservative_net_gain():
+    short = "12345678"
+    strong = "long-source-identity-" * 4
+    request = {"writer_task_scope": {"tasks": [{"short": short, "strong": strong}, {"short": short, "strong": strong}]}}
+    wire = pack_semantic_request_wire(request, source_keys=("writer_task_scope",))
+    assert short not in wire["semantic_source_wire"]["strings"]
+    assert strong in wire["semantic_source_wire"]["strings"]
+    assert expand_semantic_request_wire(wire) == request
+
+
 def test_writer_prompt_applies_wire_only_when_plain_request_exceeds_profile(tmp_path):
     scope = _scope_with_shared_sources(tmp_path)
     service = object.__new__(ReviewGenerationService)
