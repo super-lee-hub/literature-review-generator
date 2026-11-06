@@ -65,6 +65,34 @@ class OutlineArtifact:
         )
 
 
+@dataclass(frozen=True)
+class CandidateProviderResult(OutlineArtifact):
+    """An actual provider response and its exact source-bearing request."""
+
+    provider_request: Mapping[str, Any] = field(default_factory=dict)
+
+    def canonical_payload(self) -> dict[str, Any]:
+        return {**super().canonical_payload(), "provider_request": self.provider_request}
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "CandidateProviderResult":
+        base = OutlineArtifact.from_dict(value)
+        return cls(
+            job_id=base.job_id, dependency_hashes=base.dependency_hashes,
+            payload=base.payload, blocking_diagnostics=base.blocking_diagnostics,
+            provider_request=(dict(value["provider_request"])
+                              if isinstance(value.get("provider_request"), Mapping) else {}),
+        )
+
+
+class CandidateOrganizationMapResult(CandidateProviderResult):
+    artifact_type: ClassVar[str] = "candidate_organization_map_result"
+
+
+class CandidateComparisonFragmentsResult(CandidateProviderResult):
+    artifact_type: ClassVar[str] = "candidate_comparison_fragments_result"
+
+
 def _typed_artifact(name: str, artifact_type: str) -> type[OutlineArtifact]:
     return type(
         name,
@@ -93,6 +121,9 @@ AdoptedOutline = _typed_artifact("AdoptedOutline", "adopted_outline")
 
 __all__ = [
     "OutlineArtifact",
+    "CandidateProviderResult",
+    "CandidateOrganizationMapResult",
+    "CandidateComparisonFragmentsResult",
     "RelationAdjudicationResult",
     "ConfirmedGlobalRelationMap",
     "OutlineCandidate",

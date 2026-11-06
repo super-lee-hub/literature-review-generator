@@ -1,0 +1,2946 @@
+{
+  "schema_version": "run-first-current82-full-scope-semantic-replay/v1",
+  "provenance": {
+    "job_id": "job_fe6ee69f00b4",
+    "failed_node_id": "candidate_1_provider_generation:local:candidate_group_2c33c21b94a5e358",
+    "failed_payload_sha256": "226019cc23f452b9497ef883407308394fe5d693ea3bb7302a4b52674d60c916",
+    "failed_http_status": 500,
+    "failed_request_serialized_bytes": 83202,
+    "failed_slot_id": "candidate-relation-comparison-slot:v1:3a8f30e9a75849b862be0669",
+    "candidate_output_scope_content_hash": "0888716f8af35fb5a7f90f102dba14ee5510605a8593cc59349c84234c8de9a5",
+    "candidate_output_scope_file_sha256": "0069527f3ed0115f85abe860dd1777b30f1d1d593186761d22e1ce93b518cd2d",
+    "outline_content_layers_content_hash": "8dfa13cad5b069a755c5eb168f8f6284a631da5a7b7478538b4e04494bd90bed",
+    "outline_content_layers_file_sha256": "b7fa3f386a1a445aa4d7b402d364899d7086c98cb2fa0a47ebb5439980907ada",
+    "outline_evidence_pack_file_sha256": "9b95029d9b9e1cc3795e8de2ca92c280f8895b961dd86439ae60d2e1ad56509f",
+    "raw_error_response_file_sha256": "10892a378ba223f1dc7725e623789e5013144c389e3223b80c72bcbf76657677",
+    "source_pdf_text_fingerprint": {
+      "algorithm": "sha256(NFKC + collapsed whitespace + UTF-8 extracted page text)",
+      "by_paper_key": {
+        "studya_unknown_author": "c4013f7e077a6407dfe26ac29c4785cb2c5d4fd9ed09b1592d3c1d6f943a4c4b",
+        "studyb_unknown_author": "699a573005e4ecbcc0526f26315e688c47f595a0e7d1277f1bd2124b06289de7",
+        "studyc_unknown_author": "0fa3c129c965bff3329eae7ace416a3457655b6be6f34faca8476715eb140c4f",
+        "studyd_unknown_author": "bd1ac895b338377c8f30520905b50bf4b771bb203b0f4c8471ce633c8ceec9c7"
+      }
+    },
+    "group_count": 38,
+    "slot_count": 50,
+    "source_claim_count": 36,
+    "source_field_count": 32,
+    "dependency_count": 4,
+    "evidence_text_count": 36,
+    "exact_last_wire_body_retained": false,
+    "replay_boundary": "Full persisted 38-group/50-slot candidate scope and source projection reconstructed from Registry artifacts. The request audit retained only the payload hash/size and packed shard ID, not the serialized wire body or group assignment; this is a whole-scope semantic replay, not a byte-exact replay of that shard."
+  },
+  "request": {
+    "candidate_id": "candidate_1",
+    "organizing_logic": "source evidence",
+    "paper_keys": [
+      "studya_unknown_author",
+      "studyb_unknown_author",
+      "studyc_unknown_author",
+      "studyd_unknown_author"
+    ],
+    "evidence": [
+      {
+        "paper_key": "studya_unknown_author",
+        "title": "study-a"
+      },
+      {
+        "paper_key": "studyb_unknown_author",
+        "title": "study-b"
+      },
+      {
+        "paper_key": "studyc_unknown_author",
+        "title": "study-c"
+      },
+      {
+        "paper_key": "studyd_unknown_author",
+        "title": "study-d"
+      }
+    ],
+    "candidate_output_scope": {
+      "schema_version": "outline-candidate-output-scope-wire/v1",
+      "content_hash": "0888716f8af35fb5a7f90f102dba14ee5510605a8593cc59349c84234c8de9a5",
+      "parent_content_hash": "0888716f8af35fb5a7f90f102dba14ee5510605a8593cc59349c84234c8de9a5",
+      "task_ids": [
+        "cross_group_comparison",
+        "global_synthesis",
+        "relation_comparison:relation-27a0d897d2d43df12076e937",
+        "relation_comparison:relation-3298b831d27cd01155a2fa34",
+        "relation_comparison:relation-3f588bf83ca93b3de000bfda",
+        "relation_comparison:relation-5611303719c0a2d9060e555f",
+        "relation_comparison:relation-63efb78ed6ee58adad0055c8",
+        "relation_comparison:relation-6fb77241cb144bac87f6e1c9",
+        "relation_comparison:relation-6fd897a8db0bf1ad7fdc9e8c",
+        "relation_comparison:relation-7d141f1dc6d74d97bddaf272",
+        "relation_comparison:relation-8067ff8d23a22e0f6238a90c",
+        "relation_comparison:relation-980c3f1422ced97bf6f3573e",
+        "relation_comparison:relation-9db65e110be20c9a94aa7789",
+        "relation_comparison:relation-bc17f103785530eb050bea9b",
+        "topic_synthesis:construct:0026426da412",
+        "topic_synthesis:construct:60c411b2baec",
+        "topic_synthesis:construct:e654d060f563",
+        "topic_synthesis:construct:ed606af0981c",
+        "topic_synthesis:context:40af6a74b0f5",
+        "topic_synthesis:context:426e732d555f",
+        "topic_synthesis:method:0026426da412",
+        "topic_synthesis:method:b303b3636a5a",
+        "topic_synthesis:method:f96a6464e2fc"
+      ],
+      "claim_group_ids": [
+        "candidate-claim-group:v1:00c41aa0eec9a7d31c6b507d",
+        "candidate-claim-group:v1:02519410ac4a6c5f34988c08",
+        "candidate-claim-group:v1:06b5bd82fc7cf82404344119",
+        "candidate-claim-group:v1:21c93c3847d20385a2516674",
+        "candidate-claim-group:v1:37a0f7abe5bf2efd2009d201",
+        "candidate-claim-group:v1:388da033a1a59851acb6727c",
+        "candidate-claim-group:v1:3efe598e30a57a9a10ca750e",
+        "candidate-claim-group:v1:56b6aebe6f24c922434aa0c7",
+        "candidate-claim-group:v1:6b4990c15080930f7f16bc4c",
+        "candidate-claim-group:v1:7ed094b2df15fa8b3e7be459",
+        "candidate-claim-group:v1:8c01e8cfa4266d9364ad4b4f",
+        "candidate-claim-group:v1:939c6f05a8c1b3f8428f7772",
+        "candidate-claim-group:v1:955fef65b435281298552ce2",
+        "candidate-claim-group:v1:9bb13be62bfe12c51243b679",
+        "candidate-claim-group:v1:a2e2f47026d98a3a4fbd8706",
+        "candidate-claim-group:v1:a445be37939bf0f18bce54c3",
+        "candidate-claim-group:v1:a7a1d9e1fb37d28555b8e916",
+        "candidate-claim-group:v1:ab1c1437bf171d0c49c43751",
+        "candidate-claim-group:v1:acaed6238fe769b5f9e5507e",
+        "candidate-claim-group:v1:c347af14985dcb0f718da2b1",
+        "candidate-claim-group:v1:c949c6ad3a8049342a8a6bb3",
+        "candidate-claim-group:v1:e52e4e8f642db32e4c6e7579",
+        "candidate-claim-group:v1:e943631d569cecb714d9803e",
+        "candidate-claim-group:v1:ef029f91fcefc1a15928eda1",
+        "candidate-claim-group:v1:f2bc016d3db322088cb841a0",
+        "candidate-claim-group:v1:f515ecab8b2d3af9c3f701e4",
+        "candidate-relation-comparison-group:v1:094242d0f55c165926e0a974",
+        "candidate-relation-comparison-group:v1:2a422367a4e50a2514d34d80",
+        "candidate-relation-comparison-group:v1:5cbf75b0a3e405c116dbcb34",
+        "candidate-relation-comparison-group:v1:80dc4c3c571a73789677c02a",
+        "candidate-relation-comparison-group:v1:95edba6facc3853318d9ee99",
+        "candidate-relation-comparison-group:v1:a9a1205d7ea688e5b3c1df12",
+        "candidate-relation-comparison-group:v1:aea1de9b5f8d71f452b72906",
+        "candidate-relation-comparison-group:v1:b9f2871f411c303b1dbbacc6",
+        "candidate-relation-comparison-group:v1:bb2205ba0283b0d05c8d1f74",
+        "candidate-relation-comparison-group:v1:cbb064f260f1069a5d0aa14e",
+        "candidate-relation-comparison-group:v1:cc07584b1b4fad9dbb2da3a5",
+        "candidate-relation-comparison-group:v1:d5678dd39ce2c5d4979047c4"
+      ],
+      "claim_slots": [
+        {
+          "claim_group_index": 20,
+          "claim_slot_id": "candidate-claim-slot:v1:0bca79f4b7a361c4e6c64b3e",
+          "task_id": "topic_synthesis:construct:ed606af0981c",
+          "synthesis_claim_id": "synthesis:topic_synthesis:fixture-2d0f5c575a57fe6e1978",
+          "paper_key": "studyb_unknown_author",
+          "primary_claim_id": "claim:studyb_unknown_author:operationalizations:eafa2c457e93d9a0",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyb_unknown_author:operationalizations:eafa2c457e93d9a0"
+          ],
+          "evidence_ids": [
+            "evidence:studyb_unknown_author:operationalizations:f8264683eedc044e"
+          ],
+          "source_field_ids": [],
+          "relation_ids": []
+        },
+        {
+          "claim_group_index": 11,
+          "claim_slot_id": "candidate-claim-slot:v1:1df5f0328a8bc8e4395b1478",
+          "task_id": "topic_synthesis:construct:e654d060f563",
+          "synthesis_claim_id": "synthesis:topic_synthesis:fixture-f2c47c2decd0416480c0",
+          "paper_key": "studyb_unknown_author",
+          "primary_claim_id": "claim:studyb_unknown_author:operationalizations:d22e13af34a0bd66",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyb_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studyb_unknown_author:operationalizations:cf3935e1126d456e"
+          ],
+          "source_field_ids": [],
+          "relation_ids": []
+        },
+        {
+          "claim_group_index": 17,
+          "claim_slot_id": "candidate-claim-slot:v1:2ad7271a346a3a6f40841294",
+          "task_id": "topic_synthesis:construct:e654d060f563",
+          "synthesis_claim_id": "synthesis:topic_synthesis:fixture-27604de18b6739ccb436",
+          "paper_key": "studyd_unknown_author",
+          "primary_claim_id": "claim:studyd_unknown_author:operationalizations:d22e13af34a0bd66",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyd_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studyd_unknown_author:operationalizations:f8c120fddb6ab0a8"
+          ],
+          "source_field_ids": [],
+          "relation_ids": []
+        },
+        {
+          "claim_group_index": 10,
+          "claim_slot_id": "candidate-claim-slot:v1:364ebfbe67722637c2a769d5",
+          "task_id": "topic_synthesis:context:426e732d555f",
+          "synthesis_claim_id": "synthesis:topic_synthesis:fixture-7eac7621bcc874ea3ba8",
+          "paper_key": "studyb_unknown_author",
+          "primary_claim_id": "claim:studyb_unknown_author:operationalizations:eafa2c457e93d9a0",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyb_unknown_author:operationalizations:eafa2c457e93d9a0"
+          ],
+          "evidence_ids": [
+            "evidence:studyb_unknown_author:operationalizations:f8264683eedc044e"
+          ],
+          "source_field_ids": [],
+          "relation_ids": []
+        },
+        {
+          "claim_group_index": 12,
+          "claim_slot_id": "candidate-claim-slot:v1:383978b3241492d408953004",
+          "task_id": "topic_synthesis:construct:60c411b2baec",
+          "synthesis_claim_id": "synthesis:topic_synthesis:fixture-c4741d86c129cacfc9f5",
+          "paper_key": "studya_unknown_author",
+          "primary_claim_id": "claim:studya_unknown_author:concept_definitions:e654d060f563f868",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studya_unknown_author:concept_definitions:e654d060f563f868"
+          ],
+          "evidence_ids": [
+            "evidence:studya_unknown_author:concept_definitions:88e289bca6e1668f"
+          ],
+          "source_field_ids": [],
+          "relation_ids": []
+        },
+        {
+          "claim_group_index": 21,
+          "claim_slot_id": "candidate-claim-slot:v1:4e0721c0810dd97365f63366",
+          "task_id": "topic_synthesis:construct:ed606af0981c",
+          "synthesis_claim_id": "synthesis:topic_synthesis:fixture-962cc225c235584b71cb",
+          "paper_key": "studya_unknown_author",
+          "primary_claim_id": "claim:studya_unknown_author:operationalizations:eafa2c457e93d9a0",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studya_unknown_author:operationalizations:eafa2c457e93d9a0"
+          ],
+          "evidence_ids": [
+            "evidence:studya_unknown_author:operationalizations:1813b51ce68e92c1"
+          ],
+          "source_field_ids": [],
+          "relation_ids": []
+        },
+        {
+          "claim_group_index": 15,
+          "claim_slot_id": "candidate-claim-slot:v1:50e265009e8c772b19e3f703",
+          "task_id": "topic_synthesis:construct:0026426da412",
+          "synthesis_claim_id": "synthesis:topic_synthesis:fixture-8d8298a1ee23f0023031",
+          "paper_key": "studyd_unknown_author",
+          "primary_claim_id": "claim:studyd_unknown_author:concept_definitions:60c411b2baec2ab5",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyd_unknown_author:concept_definitions:60c411b2baec2ab5"
+          ],
+          "evidence_ids": [
+            "evidence:studyd_unknown_author:concept_definitions:5dc445bf67fcbc42"
+          ],
+          "source_field_ids": [],
+          "relation_ids": []
+        },
+        {
+          "claim_group_index": 13,
+          "claim_slot_id": "candidate-claim-slot:v1:60894fcf60e3a314a1662767",
+          "task_id": "topic_synthesis:construct:e654d060f563",
+          "synthesis_claim_id": "synthesis:topic_synthesis:fixture-9051777b3fc5b35293bc",
+          "paper_key": "studyc_unknown_author",
+          "primary_claim_id": "claim:studyc_unknown_author:operationalizations:d22e13af34a0bd66",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyc_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studyc_unknown_author:operationalizations:97bef31557c9f1a0"
+          ],
+          "source_field_ids": [],
+          "relation_ids": []
+        },
+        {
+          "claim_group_index": 3,
+          "claim_slot_id": "candidate-claim-slot:v1:6c4d55ecaaee22eaa0f1ac90",
+          "task_id": "topic_synthesis:context:40af6a74b0f5",
+          "synthesis_claim_id": "synthesis:topic_synthesis:fixture-f651161bea3f5bb106d6",
+          "paper_key": "studyb_unknown_author",
+          "primary_claim_id": "claim:studyb_unknown_author:findings:f6586c2423a1dbe7",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyb_unknown_author:findings:f6586c2423a1dbe7",
+            "claim:studyb_unknown_author:limitations:933b43bbef72c19a",
+            "claim:studyb_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim:studyb_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim:studyb_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim:studyb_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studyb_unknown_author:findings:52601d9730101e05",
+            "evidence:studyb_unknown_author:limitations:2c912bc444e571bd",
+            "evidence:studyb_unknown_author:moderators_boundaries:2992a90e640ce393",
+            "evidence:studyb_unknown_author:moderators_boundaries:2f6da8d2a5ce047d",
+            "evidence:studyb_unknown_author:moderators_boundaries:e0eab51ceb6f51ed",
+            "evidence:studyb_unknown_author:operationalizations:cf3935e1126d456e"
+          ],
+          "source_field_ids": [
+            "source-field:3c2c5ffd33610496099fa52da71370d896b660c1aa881f2fa39cb65688f9df51",
+            "source-field:554fad9090d958900bd2004087696a8b99de2e6d00b21baf7b057dfd34611f45",
+            "source-field:cda079fd63f4aa8fa90194d3fc2afc1ff2fff13f942725165bb91cafe998aa43"
+          ],
+          "relation_ids": []
+        },
+        {
+          "claim_group_index": 18,
+          "claim_slot_id": "candidate-claim-slot:v1:6cb8e5b50bea592c9a9ca6a1",
+          "task_id": "topic_synthesis:construct:60c411b2baec",
+          "synthesis_claim_id": "synthesis:topic_synthesis:fixture-4229291e973d5e7f1af8",
+          "paper_key": "studyc_unknown_author",
+          "primary_claim_id": "claim:studyc_unknown_author:concept_definitions:e654d060f563f868",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyc_unknown_author:concept_definitions:e654d060f563f868"
+          ],
+          "evidence_ids": [
+            "evidence:studyc_unknown_author:concept_definitions:731b8ff82c2b58f1"
+          ],
+          "source_field_ids": [],
+          "relation_ids": []
+        },
+        {
+          "claim_group_index": 6,
+          "claim_slot_id": "candidate-claim-slot:v1:785ed701f11865aacd31580c",
+          "task_id": "topic_synthesis:construct:e654d060f563",
+          "synthesis_claim_id": "synthesis:topic_synthesis:fixture-7b83388bd1224a113c29",
+          "paper_key": "studya_unknown_author",
+          "primary_claim_id": "claim:studya_unknown_author:operationalizations:d22e13af34a0bd66",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studya_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studya_unknown_author:operationalizations:065529d9d60ce0f9"
+          ],
+          "source_field_ids": [],
+          "relation_ids": []
+        },
+        {
+          "claim_group_index": 23,
+          "claim_slot_id": "candidate-claim-slot:v1:7a2b1168ad07195e000df745",
+          "task_id": "global_synthesis",
+          "synthesis_claim_id": "synthesis:global_synthesis:fixture-9dfa24a3101e04d3",
+          "paper_key": "studya_unknown_author",
+          "primary_claim_id": "claim:studya_unknown_author:findings:9cf0c5c01ec2d03e",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studya_unknown_author:findings:9cf0c5c01ec2d03e",
+            "claim:studya_unknown_author:limitations:933b43bbef72c19a",
+            "claim:studya_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim:studya_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim:studya_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim:studya_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studya_unknown_author:findings:2f6000aae38dc919",
+            "evidence:studya_unknown_author:limitations:d89d7f798241b1a0",
+            "evidence:studya_unknown_author:moderators_boundaries:5c2a9a2cec67e801",
+            "evidence:studya_unknown_author:moderators_boundaries:baabedd159b28a4f",
+            "evidence:studya_unknown_author:moderators_boundaries:c2e229c13c68cdfa",
+            "evidence:studya_unknown_author:operationalizations:065529d9d60ce0f9"
+          ],
+          "source_field_ids": [
+            "source-field:72512e5861bdb687d3213137ca3b99fb4404b176eaaacc8fa29b7f2ebe9cf963",
+            "source-field:812e5a3c6f9fbf7b7837872871b256cf7297261a7a37dd1fe03927ace44a3c8b",
+            "source-field:f8fcf0b3cf9aa4999b7654470be89ae3963c241f80c37534b70d3651dc5e3ba7"
+          ],
+          "relation_ids": []
+        },
+        {
+          "claim_group_index": 22,
+          "claim_slot_id": "candidate-claim-slot:v1:8868b8cfc9605ffd47b6ce39",
+          "task_id": "topic_synthesis:construct:60c411b2baec",
+          "synthesis_claim_id": "synthesis:topic_synthesis:fixture-e92b7959272a5ab31bd0",
+          "paper_key": "studyd_unknown_author",
+          "primary_claim_id": "claim:studyd_unknown_author:concept_definitions:e654d060f563f868",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyd_unknown_author:concept_definitions:e654d060f563f868"
+          ],
+          "evidence_ids": [
+            "evidence:studyd_unknown_author:concept_definitions:065a9dc91c37f33f"
+          ],
+          "source_field_ids": [],
+          "relation_ids": []
+        },
+        {
+          "claim_group_index": 2,
+          "claim_slot_id": "candidate-claim-slot:v1:94acb44342c1ee147a359473",
+          "task_id": "topic_synthesis:construct:60c411b2baec",
+          "synthesis_claim_id": "synthesis:topic_synthesis:fixture-49ade6c4dad981e1b58a",
+          "paper_key": "studyb_unknown_author",
+          "primary_claim_id": "claim:studyb_unknown_author:concept_definitions:e654d060f563f868",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyb_unknown_author:concept_definitions:e654d060f563f868"
+          ],
+          "evidence_ids": [
+            "evidence:studyb_unknown_author:concept_definitions:9020e40fa1c63911"
+          ],
+          "source_field_ids": [],
+          "relation_ids": []
+        },
+        {
+          "claim_group_index": 25,
+          "claim_slot_id": "candidate-claim-slot:v1:988aa49d7945f5c0ff786b72",
+          "task_id": "topic_synthesis:context:426e732d555f",
+          "synthesis_claim_id": "synthesis:topic_synthesis:fixture-fa46f79b97db66126fca",
+          "paper_key": "studya_unknown_author",
+          "primary_claim_id": "claim:studya_unknown_author:operationalizations:eafa2c457e93d9a0",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studya_unknown_author:operationalizations:eafa2c457e93d9a0"
+          ],
+          "evidence_ids": [
+            "evidence:studya_unknown_author:operationalizations:1813b51ce68e92c1"
+          ],
+          "source_field_ids": [],
+          "relation_ids": []
+        },
+        {
+          "claim_group_index": 14,
+          "claim_slot_id": "candidate-claim-slot:v1:98d34890ec447bd867cc6bce",
+          "task_id": "topic_synthesis:construct:ed606af0981c",
+          "synthesis_claim_id": "synthesis:topic_synthesis:fixture-67488a9af650546e6b68",
+          "paper_key": "studyd_unknown_author",
+          "primary_claim_id": "claim:studyd_unknown_author:operationalizations:eafa2c457e93d9a0",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyd_unknown_author:operationalizations:eafa2c457e93d9a0"
+          ],
+          "evidence_ids": [
+            "evidence:studyd_unknown_author:operationalizations:d10413b5923a0d05"
+          ],
+          "source_field_ids": [],
+          "relation_ids": []
+        },
+        {
+          "claim_group_index": 0,
+          "claim_slot_id": "candidate-claim-slot:v1:998f36c28e8dc00124b708c9",
+          "task_id": "topic_synthesis:context:40af6a74b0f5",
+          "synthesis_claim_id": "synthesis:topic_synthesis:fixture-0fc0e14073fb877a370c",
+          "paper_key": "studyc_unknown_author",
+          "primary_claim_id": "claim:studyc_unknown_author:findings:20eb70c8f8b6fd23",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyc_unknown_author:findings:20eb70c8f8b6fd23",
+            "claim:studyc_unknown_author:limitations:933b43bbef72c19a",
+            "claim:studyc_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim:studyc_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim:studyc_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim:studyc_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studyc_unknown_author:findings:608c6188c257f7b5",
+            "evidence:studyc_unknown_author:limitations:16ad4860e65fe188",
+            "evidence:studyc_unknown_author:moderators_boundaries:6e3aecdc675fd35e",
+            "evidence:studyc_unknown_author:moderators_boundaries:cb931f242fa8df29",
+            "evidence:studyc_unknown_author:moderators_boundaries:f0c4d984587f4b98",
+            "evidence:studyc_unknown_author:operationalizations:97bef31557c9f1a0"
+          ],
+          "source_field_ids": [
+            "source-field:1b78aed2a146c2cf5eb13970587f4924503592a59ceab0adece1d2f827cf2c8e",
+            "source-field:52201e5ecf49031509fa77800481588966a771814337065fae2b4c7f1efc30b0",
+            "source-field:f9607c6c28a8e4bbd2692b3acc626435b9b83a92f9ba08799221d107c0267892"
+          ],
+          "relation_ids": []
+        },
+        {
+          "claim_group_index": 7,
+          "claim_slot_id": "candidate-claim-slot:v1:9f4321f044759eed7196a63a",
+          "task_id": "topic_synthesis:construct:ed606af0981c",
+          "synthesis_claim_id": "synthesis:topic_synthesis:fixture-31095d37b6fcbf2a8411",
+          "paper_key": "studyc_unknown_author",
+          "primary_claim_id": "claim:studyc_unknown_author:operationalizations:eafa2c457e93d9a0",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyc_unknown_author:operationalizations:eafa2c457e93d9a0"
+          ],
+          "evidence_ids": [
+            "evidence:studyc_unknown_author:operationalizations:99e365d237eb06cc"
+          ],
+          "source_field_ids": [],
+          "relation_ids": []
+        },
+        {
+          "claim_group_index": 4,
+          "claim_slot_id": "candidate-claim-slot:v1:a2cc15f0947e9d55e4d886d0",
+          "task_id": "topic_synthesis:construct:0026426da412",
+          "synthesis_claim_id": "synthesis:topic_synthesis:fixture-8a22ba213d371e5a4f52",
+          "paper_key": "studya_unknown_author",
+          "primary_claim_id": "claim:studya_unknown_author:concept_definitions:60c411b2baec2ab5",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studya_unknown_author:concept_definitions:60c411b2baec2ab5"
+          ],
+          "evidence_ids": [
+            "evidence:studya_unknown_author:concept_definitions:02ae745044c2e633"
+          ],
+          "source_field_ids": [],
+          "relation_ids": []
+        },
+        {
+          "claim_group_index": 24,
+          "claim_slot_id": "candidate-claim-slot:v1:a8916dcedbd51b3ed4b20531",
+          "task_id": "topic_synthesis:context:40af6a74b0f5",
+          "synthesis_claim_id": "synthesis:topic_synthesis:fixture-08d8b66da66c83f7dbc7",
+          "paper_key": "studyd_unknown_author",
+          "primary_claim_id": "claim:studyd_unknown_author:findings:497ca5821dde33f8",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyd_unknown_author:findings:497ca5821dde33f8",
+            "claim:studyd_unknown_author:limitations:933b43bbef72c19a",
+            "claim:studyd_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim:studyd_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim:studyd_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim:studyd_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studyd_unknown_author:findings:ad5ca9c914a25e7a",
+            "evidence:studyd_unknown_author:limitations:6e1b52eb71b790b4",
+            "evidence:studyd_unknown_author:moderators_boundaries:a07c49a87a2f69c2",
+            "evidence:studyd_unknown_author:moderators_boundaries:c291b89701c99831",
+            "evidence:studyd_unknown_author:moderators_boundaries:f24dfc6f83cf30b2",
+            "evidence:studyd_unknown_author:operationalizations:f8c120fddb6ab0a8"
+          ],
+          "source_field_ids": [
+            "source-field:b34e06b5d63c24326c980753d17a8733204b20a6b5e6243d664b66c3c505aea9",
+            "source-field:cf1416ddc8af94154d002eb35af41e93cb1c468c8e9390a2dc406b15eba47e7f",
+            "source-field:f54f0f6a1d01bee45c5e365ccd4a46705a61f4085d754f029ea37bc26a0df50c"
+          ],
+          "relation_ids": []
+        },
+        {
+          "claim_group_index": 16,
+          "claim_slot_id": "candidate-claim-slot:v1:aefa4d7439f3bf469075c6d1",
+          "task_id": "cross_group_comparison",
+          "synthesis_claim_id": "synthesis:cross_group_comparison:fixture-029cf07fbe3e8db4",
+          "paper_key": "studya_unknown_author",
+          "primary_claim_id": "claim:studya_unknown_author:findings:9cf0c5c01ec2d03e",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studya_unknown_author:findings:9cf0c5c01ec2d03e",
+            "claim:studya_unknown_author:limitations:933b43bbef72c19a",
+            "claim:studya_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim:studya_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim:studya_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim:studya_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studya_unknown_author:findings:2f6000aae38dc919",
+            "evidence:studya_unknown_author:limitations:d89d7f798241b1a0",
+            "evidence:studya_unknown_author:moderators_boundaries:5c2a9a2cec67e801",
+            "evidence:studya_unknown_author:moderators_boundaries:baabedd159b28a4f",
+            "evidence:studya_unknown_author:moderators_boundaries:c2e229c13c68cdfa",
+            "evidence:studya_unknown_author:operationalizations:065529d9d60ce0f9"
+          ],
+          "source_field_ids": [
+            "source-field:72512e5861bdb687d3213137ca3b99fb4404b176eaaacc8fa29b7f2ebe9cf963",
+            "source-field:812e5a3c6f9fbf7b7837872871b256cf7297261a7a37dd1fe03927ace44a3c8b",
+            "source-field:f8fcf0b3cf9aa4999b7654470be89ae3963c241f80c37534b70d3651dc5e3ba7"
+          ],
+          "relation_ids": []
+        },
+        {
+          "claim_group_index": 19,
+          "claim_slot_id": "candidate-claim-slot:v1:b8ca0ea0865d6044f71a2ed3",
+          "task_id": "topic_synthesis:context:40af6a74b0f5",
+          "synthesis_claim_id": "synthesis:topic_synthesis:fixture-839ce1f9fe82e3c77a22",
+          "paper_key": "studya_unknown_author",
+          "primary_claim_id": "claim:studya_unknown_author:findings:9cf0c5c01ec2d03e",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studya_unknown_author:findings:9cf0c5c01ec2d03e",
+            "claim:studya_unknown_author:limitations:933b43bbef72c19a",
+            "claim:studya_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim:studya_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim:studya_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim:studya_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studya_unknown_author:findings:2f6000aae38dc919",
+            "evidence:studya_unknown_author:limitations:d89d7f798241b1a0",
+            "evidence:studya_unknown_author:moderators_boundaries:5c2a9a2cec67e801",
+            "evidence:studya_unknown_author:moderators_boundaries:baabedd159b28a4f",
+            "evidence:studya_unknown_author:moderators_boundaries:c2e229c13c68cdfa",
+            "evidence:studya_unknown_author:operationalizations:065529d9d60ce0f9"
+          ],
+          "source_field_ids": [
+            "source-field:72512e5861bdb687d3213137ca3b99fb4404b176eaaacc8fa29b7f2ebe9cf963",
+            "source-field:812e5a3c6f9fbf7b7837872871b256cf7297261a7a37dd1fe03927ace44a3c8b",
+            "source-field:f8fcf0b3cf9aa4999b7654470be89ae3963c241f80c37534b70d3651dc5e3ba7"
+          ],
+          "relation_ids": []
+        },
+        {
+          "claim_group_index": 9,
+          "claim_slot_id": "candidate-claim-slot:v1:d14976a1521dca55d4ccd188",
+          "task_id": "topic_synthesis:context:426e732d555f",
+          "synthesis_claim_id": "synthesis:topic_synthesis:fixture-16363b045e42cd3c77ad",
+          "paper_key": "studyc_unknown_author",
+          "primary_claim_id": "claim:studyc_unknown_author:operationalizations:eafa2c457e93d9a0",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyc_unknown_author:operationalizations:eafa2c457e93d9a0"
+          ],
+          "evidence_ids": [
+            "evidence:studyc_unknown_author:operationalizations:99e365d237eb06cc"
+          ],
+          "source_field_ids": [],
+          "relation_ids": []
+        },
+        {
+          "claim_group_index": 1,
+          "claim_slot_id": "candidate-claim-slot:v1:dbe77b8e450e1a911db2de1a",
+          "task_id": "topic_synthesis:construct:0026426da412",
+          "synthesis_claim_id": "synthesis:topic_synthesis:fixture-04e5d297be13f9902f1a",
+          "paper_key": "studyb_unknown_author",
+          "primary_claim_id": "claim:studyb_unknown_author:concept_definitions:60c411b2baec2ab5",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyb_unknown_author:concept_definitions:60c411b2baec2ab5"
+          ],
+          "evidence_ids": [
+            "evidence:studyb_unknown_author:concept_definitions:da6da30984c50c17"
+          ],
+          "source_field_ids": [],
+          "relation_ids": []
+        },
+        {
+          "claim_group_index": 8,
+          "claim_slot_id": "candidate-claim-slot:v1:fe02df82b091ddb7e5d3a00c",
+          "task_id": "topic_synthesis:context:426e732d555f",
+          "synthesis_claim_id": "synthesis:topic_synthesis:fixture-79a5d7f78423d354b1da",
+          "paper_key": "studyd_unknown_author",
+          "primary_claim_id": "claim:studyd_unknown_author:operationalizations:eafa2c457e93d9a0",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyd_unknown_author:operationalizations:eafa2c457e93d9a0"
+          ],
+          "evidence_ids": [
+            "evidence:studyd_unknown_author:operationalizations:d10413b5923a0d05"
+          ],
+          "source_field_ids": [],
+          "relation_ids": []
+        },
+        {
+          "claim_group_index": 5,
+          "claim_slot_id": "candidate-claim-slot:v1:fecb641c2aad65ed36758bae",
+          "task_id": "topic_synthesis:construct:0026426da412",
+          "synthesis_claim_id": "synthesis:topic_synthesis:fixture-685f189ace71898d1a92",
+          "paper_key": "studyc_unknown_author",
+          "primary_claim_id": "claim:studyc_unknown_author:concept_definitions:60c411b2baec2ab5",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyc_unknown_author:concept_definitions:60c411b2baec2ab5"
+          ],
+          "evidence_ids": [
+            "evidence:studyc_unknown_author:concept_definitions:dc955454a8df7a64"
+          ],
+          "source_field_ids": [],
+          "relation_ids": []
+        },
+        {
+          "claim_group_index": 26,
+          "claim_slot_id": "candidate-relation-comparison-slot:v1:08aef29bd594c4ab7564614d",
+          "task_id": "relation_comparison:relation-8067ff8d23a22e0f6238a90c",
+          "synthesis_claim_id": "synthesis:relation_comparison:094242d0f55c165926e0a974",
+          "paper_key": "studyc_unknown_author",
+          "primary_claim_id": "claim:studyc_unknown_author:findings:20eb70c8f8b6fd23",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyc_unknown_author:findings:20eb70c8f8b6fd23",
+            "claim:studyc_unknown_author:limitations:933b43bbef72c19a",
+            "claim:studyc_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim:studyc_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim:studyc_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim:studyc_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studyc_unknown_author:findings:608c6188c257f7b5",
+            "evidence:studyc_unknown_author:limitations:16ad4860e65fe188",
+            "evidence:studyc_unknown_author:moderators_boundaries:6e3aecdc675fd35e",
+            "evidence:studyc_unknown_author:moderators_boundaries:cb931f242fa8df29",
+            "evidence:studyc_unknown_author:moderators_boundaries:f0c4d984587f4b98",
+            "evidence:studyc_unknown_author:operationalizations:97bef31557c9f1a0"
+          ],
+          "source_field_ids": [
+            "source-field:02fd358d203b774b00494c919200bfdac3385609def5758b6515ba56a61619bf",
+            "source-field:1b78aed2a146c2cf5eb13970587f4924503592a59ceab0adece1d2f827cf2c8e",
+            "source-field:52201e5ecf49031509fa77800481588966a771814337065fae2b4c7f1efc30b0",
+            "source-field:b74f7b15e70374ff05abc9080dcb076236ab9e60958d4e6ced2265945cca760d",
+            "source-field:e30c7cdd9aad4ad9869d53066134765bf2dc9504f610108529fdb6b611c74a18",
+            "source-field:f840b7a392afab7f23a93915480fbe25968d1bde2a0cc124588e8f84d7eb0e8b",
+            "source-field:f9607c6c28a8e4bbd2692b3acc626435b9b83a92f9ba08799221d107c0267892",
+            "source-field:fbcd8e61e0c2d786a05bc714597385f9c94d88228280a31eab21d0e804b3f296"
+          ],
+          "relation_ids": [
+            "relation-8067ff8d23a22e0f6238a90c"
+          ]
+        },
+        {
+          "claim_group_index": 33,
+          "claim_slot_id": "candidate-relation-comparison-slot:v1:093472df95096f80f684cc22",
+          "task_id": "relation_comparison:relation-980c3f1422ced97bf6f3573e",
+          "synthesis_claim_id": "synthesis:relation_comparison:b9f2871f411c303b1dbbacc6",
+          "paper_key": "studyc_unknown_author",
+          "primary_claim_id": "claim:studyc_unknown_author:findings:20eb70c8f8b6fd23",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyc_unknown_author:findings:20eb70c8f8b6fd23",
+            "claim:studyc_unknown_author:limitations:933b43bbef72c19a",
+            "claim:studyc_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim:studyc_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim:studyc_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim:studyc_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studyc_unknown_author:findings:608c6188c257f7b5",
+            "evidence:studyc_unknown_author:limitations:16ad4860e65fe188",
+            "evidence:studyc_unknown_author:moderators_boundaries:6e3aecdc675fd35e",
+            "evidence:studyc_unknown_author:moderators_boundaries:cb931f242fa8df29",
+            "evidence:studyc_unknown_author:moderators_boundaries:f0c4d984587f4b98",
+            "evidence:studyc_unknown_author:operationalizations:97bef31557c9f1a0"
+          ],
+          "source_field_ids": [
+            "source-field:02fd358d203b774b00494c919200bfdac3385609def5758b6515ba56a61619bf",
+            "source-field:1b78aed2a146c2cf5eb13970587f4924503592a59ceab0adece1d2f827cf2c8e",
+            "source-field:52201e5ecf49031509fa77800481588966a771814337065fae2b4c7f1efc30b0",
+            "source-field:b74f7b15e70374ff05abc9080dcb076236ab9e60958d4e6ced2265945cca760d",
+            "source-field:e30c7cdd9aad4ad9869d53066134765bf2dc9504f610108529fdb6b611c74a18",
+            "source-field:f840b7a392afab7f23a93915480fbe25968d1bde2a0cc124588e8f84d7eb0e8b",
+            "source-field:f9607c6c28a8e4bbd2692b3acc626435b9b83a92f9ba08799221d107c0267892",
+            "source-field:fbcd8e61e0c2d786a05bc714597385f9c94d88228280a31eab21d0e804b3f296"
+          ],
+          "relation_ids": [
+            "relation-980c3f1422ced97bf6f3573e"
+          ]
+        },
+        {
+          "claim_group_index": 30,
+          "claim_slot_id": "candidate-relation-comparison-slot:v1:0ae6f1c4f4cfb1d511dea9df",
+          "task_id": "relation_comparison:relation-27a0d897d2d43df12076e937",
+          "synthesis_claim_id": "synthesis:relation_comparison:95edba6facc3853318d9ee99",
+          "paper_key": "studya_unknown_author",
+          "primary_claim_id": "claim:studya_unknown_author:findings:9cf0c5c01ec2d03e",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studya_unknown_author:findings:9cf0c5c01ec2d03e",
+            "claim:studya_unknown_author:limitations:933b43bbef72c19a",
+            "claim:studya_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim:studya_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim:studya_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim:studya_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studya_unknown_author:findings:2f6000aae38dc919",
+            "evidence:studya_unknown_author:limitations:d89d7f798241b1a0",
+            "evidence:studya_unknown_author:moderators_boundaries:5c2a9a2cec67e801",
+            "evidence:studya_unknown_author:moderators_boundaries:baabedd159b28a4f",
+            "evidence:studya_unknown_author:moderators_boundaries:c2e229c13c68cdfa",
+            "evidence:studya_unknown_author:operationalizations:065529d9d60ce0f9"
+          ],
+          "source_field_ids": [
+            "source-field:0fcad026d3818ef9840c7f9ea6d1d19ccc66ff9e7c50ad8762bd327e81c95f06",
+            "source-field:72512e5861bdb687d3213137ca3b99fb4404b176eaaacc8fa29b7f2ebe9cf963",
+            "source-field:812e5a3c6f9fbf7b7837872871b256cf7297261a7a37dd1fe03927ace44a3c8b",
+            "source-field:9020b5d1083af6fd1a69ca0447249a5858dea1b7a117e0b8a8b11758376edda4",
+            "source-field:9f9febd978450bd5b7b5736fa5a017fdf8a766ddba48a10d449d4ab792013094",
+            "source-field:dab7af42c3f68adfac819360ec29e8c53d2fcc6579bc7171f319b2d014b6d074",
+            "source-field:f189aad157394e0387607f93588b7af6fe25e75a30b8084ee1cbeb7f755e4607",
+            "source-field:f8fcf0b3cf9aa4999b7654470be89ae3963c241f80c37534b70d3651dc5e3ba7"
+          ],
+          "relation_ids": [
+            "relation-27a0d897d2d43df12076e937"
+          ]
+        },
+        {
+          "claim_group_index": 26,
+          "claim_slot_id": "candidate-relation-comparison-slot:v1:0d70a625f9145e21ee55c8b7",
+          "task_id": "relation_comparison:relation-8067ff8d23a22e0f6238a90c",
+          "synthesis_claim_id": "synthesis:relation_comparison:094242d0f55c165926e0a974",
+          "paper_key": "studyd_unknown_author",
+          "primary_claim_id": "claim:studyd_unknown_author:findings:497ca5821dde33f8",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyd_unknown_author:findings:497ca5821dde33f8",
+            "claim:studyd_unknown_author:limitations:933b43bbef72c19a",
+            "claim:studyd_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim:studyd_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim:studyd_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim:studyd_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studyd_unknown_author:findings:ad5ca9c914a25e7a",
+            "evidence:studyd_unknown_author:limitations:6e1b52eb71b790b4",
+            "evidence:studyd_unknown_author:moderators_boundaries:a07c49a87a2f69c2",
+            "evidence:studyd_unknown_author:moderators_boundaries:c291b89701c99831",
+            "evidence:studyd_unknown_author:moderators_boundaries:f24dfc6f83cf30b2",
+            "evidence:studyd_unknown_author:operationalizations:f8c120fddb6ab0a8"
+          ],
+          "source_field_ids": [
+            "source-field:41c9ef87295efcf897e03a2de7f4e20aac3cff8438d122038f6b92b5e29a7de9",
+            "source-field:4a6bdf80d020c148e56866ad8cbd6a1a999987fcc4e2c38948e8418eed49c124",
+            "source-field:64f18d4dd3410032d3ca558f755cb6996211f93de44046cd01a20c920405cfeb",
+            "source-field:81369469c58c04a18762918facf0f55be6000380aaee35142392667f89ea6a61",
+            "source-field:b34e06b5d63c24326c980753d17a8733204b20a6b5e6243d664b66c3c505aea9",
+            "source-field:ce94d0d6583cb6327ba294188667dcd8676f4a27bc2f89aca43831c171788aad",
+            "source-field:cf1416ddc8af94154d002eb35af41e93cb1c468c8e9390a2dc406b15eba47e7f",
+            "source-field:f54f0f6a1d01bee45c5e365ccd4a46705a61f4085d754f029ea37bc26a0df50c"
+          ],
+          "relation_ids": [
+            "relation-8067ff8d23a22e0f6238a90c"
+          ]
+        },
+        {
+          "claim_group_index": 31,
+          "claim_slot_id": "candidate-relation-comparison-slot:v1:0e6f646eb885e0a6648ab5b0",
+          "task_id": "relation_comparison:relation-63efb78ed6ee58adad0055c8",
+          "synthesis_claim_id": "synthesis:relation_comparison:a9a1205d7ea688e5b3c1df12",
+          "paper_key": "studyc_unknown_author",
+          "primary_claim_id": "claim:studyc_unknown_author:findings:20eb70c8f8b6fd23",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyc_unknown_author:findings:20eb70c8f8b6fd23",
+            "claim:studyc_unknown_author:limitations:933b43bbef72c19a",
+            "claim:studyc_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim:studyc_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim:studyc_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim:studyc_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studyc_unknown_author:findings:608c6188c257f7b5",
+            "evidence:studyc_unknown_author:limitations:16ad4860e65fe188",
+            "evidence:studyc_unknown_author:moderators_boundaries:6e3aecdc675fd35e",
+            "evidence:studyc_unknown_author:moderators_boundaries:cb931f242fa8df29",
+            "evidence:studyc_unknown_author:moderators_boundaries:f0c4d984587f4b98",
+            "evidence:studyc_unknown_author:operationalizations:97bef31557c9f1a0"
+          ],
+          "source_field_ids": [
+            "source-field:02fd358d203b774b00494c919200bfdac3385609def5758b6515ba56a61619bf",
+            "source-field:1b78aed2a146c2cf5eb13970587f4924503592a59ceab0adece1d2f827cf2c8e",
+            "source-field:52201e5ecf49031509fa77800481588966a771814337065fae2b4c7f1efc30b0",
+            "source-field:b74f7b15e70374ff05abc9080dcb076236ab9e60958d4e6ced2265945cca760d",
+            "source-field:e30c7cdd9aad4ad9869d53066134765bf2dc9504f610108529fdb6b611c74a18",
+            "source-field:f840b7a392afab7f23a93915480fbe25968d1bde2a0cc124588e8f84d7eb0e8b",
+            "source-field:f9607c6c28a8e4bbd2692b3acc626435b9b83a92f9ba08799221d107c0267892",
+            "source-field:fbcd8e61e0c2d786a05bc714597385f9c94d88228280a31eab21d0e804b3f296"
+          ],
+          "relation_ids": [
+            "relation-63efb78ed6ee58adad0055c8"
+          ]
+        },
+        {
+          "claim_group_index": 32,
+          "claim_slot_id": "candidate-relation-comparison-slot:v1:16e23b357e833cb2af9cb30c",
+          "task_id": "relation_comparison:relation-5611303719c0a2d9060e555f",
+          "synthesis_claim_id": "synthesis:relation_comparison:aea1de9b5f8d71f452b72906",
+          "paper_key": "studyb_unknown_author",
+          "primary_claim_id": "claim:studyb_unknown_author:findings:f6586c2423a1dbe7",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyb_unknown_author:findings:f6586c2423a1dbe7",
+            "claim:studyb_unknown_author:limitations:933b43bbef72c19a",
+            "claim:studyb_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim:studyb_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim:studyb_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim:studyb_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studyb_unknown_author:findings:52601d9730101e05",
+            "evidence:studyb_unknown_author:limitations:2c912bc444e571bd",
+            "evidence:studyb_unknown_author:moderators_boundaries:2992a90e640ce393",
+            "evidence:studyb_unknown_author:moderators_boundaries:2f6da8d2a5ce047d",
+            "evidence:studyb_unknown_author:moderators_boundaries:e0eab51ceb6f51ed",
+            "evidence:studyb_unknown_author:operationalizations:cf3935e1126d456e"
+          ],
+          "source_field_ids": [
+            "source-field:3b534b94b8a0026323c67bd09176020316f84e379c467a8f1711dac6faf63826",
+            "source-field:3c2c5ffd33610496099fa52da71370d896b660c1aa881f2fa39cb65688f9df51",
+            "source-field:554fad9090d958900bd2004087696a8b99de2e6d00b21baf7b057dfd34611f45",
+            "source-field:71851fc255044eddd9ec245617f515ffd48298122abeb0ed6566c537a0e0350b",
+            "source-field:792f8a7fabd20795e869900c6c71783297306263798af5e7427e9cc71984a810",
+            "source-field:b06f90b6330350c57ce9b9cab3b576d37fa1fa87d51d98539121379d43218b91",
+            "source-field:cda079fd63f4aa8fa90194d3fc2afc1ff2fff13f942725165bb91cafe998aa43",
+            "source-field:fd3cc5f67eb67b28bd5a9cbf9034504229c27a1e7db48e354284d634f3c44a2c"
+          ],
+          "relation_ids": [
+            "relation-5611303719c0a2d9060e555f"
+          ]
+        },
+        {
+          "claim_group_index": 27,
+          "claim_slot_id": "candidate-relation-comparison-slot:v1:1df6a67858e59347db93be84",
+          "task_id": "relation_comparison:relation-3f588bf83ca93b3de000bfda",
+          "synthesis_claim_id": "synthesis:relation_comparison:2a422367a4e50a2514d34d80",
+          "paper_key": "studya_unknown_author",
+          "primary_claim_id": "claim:studya_unknown_author:findings:9cf0c5c01ec2d03e",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studya_unknown_author:findings:9cf0c5c01ec2d03e",
+            "claim:studya_unknown_author:limitations:933b43bbef72c19a",
+            "claim:studya_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim:studya_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim:studya_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim:studya_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studya_unknown_author:findings:2f6000aae38dc919",
+            "evidence:studya_unknown_author:limitations:d89d7f798241b1a0",
+            "evidence:studya_unknown_author:moderators_boundaries:5c2a9a2cec67e801",
+            "evidence:studya_unknown_author:moderators_boundaries:baabedd159b28a4f",
+            "evidence:studya_unknown_author:moderators_boundaries:c2e229c13c68cdfa",
+            "evidence:studya_unknown_author:operationalizations:065529d9d60ce0f9"
+          ],
+          "source_field_ids": [
+            "source-field:0fcad026d3818ef9840c7f9ea6d1d19ccc66ff9e7c50ad8762bd327e81c95f06",
+            "source-field:72512e5861bdb687d3213137ca3b99fb4404b176eaaacc8fa29b7f2ebe9cf963",
+            "source-field:812e5a3c6f9fbf7b7837872871b256cf7297261a7a37dd1fe03927ace44a3c8b",
+            "source-field:9020b5d1083af6fd1a69ca0447249a5858dea1b7a117e0b8a8b11758376edda4",
+            "source-field:9f9febd978450bd5b7b5736fa5a017fdf8a766ddba48a10d449d4ab792013094",
+            "source-field:dab7af42c3f68adfac819360ec29e8c53d2fcc6579bc7171f319b2d014b6d074",
+            "source-field:f189aad157394e0387607f93588b7af6fe25e75a30b8084ee1cbeb7f755e4607",
+            "source-field:f8fcf0b3cf9aa4999b7654470be89ae3963c241f80c37534b70d3651dc5e3ba7"
+          ],
+          "relation_ids": [
+            "relation-3f588bf83ca93b3de000bfda"
+          ]
+        },
+        {
+          "claim_group_index": 30,
+          "claim_slot_id": "candidate-relation-comparison-slot:v1:2197e92c793f4042ebe65569",
+          "task_id": "relation_comparison:relation-27a0d897d2d43df12076e937",
+          "synthesis_claim_id": "synthesis:relation_comparison:95edba6facc3853318d9ee99",
+          "paper_key": "studyb_unknown_author",
+          "primary_claim_id": "claim:studyb_unknown_author:findings:f6586c2423a1dbe7",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyb_unknown_author:findings:f6586c2423a1dbe7",
+            "claim:studyb_unknown_author:limitations:933b43bbef72c19a",
+            "claim:studyb_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim:studyb_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim:studyb_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim:studyb_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studyb_unknown_author:findings:52601d9730101e05",
+            "evidence:studyb_unknown_author:limitations:2c912bc444e571bd",
+            "evidence:studyb_unknown_author:moderators_boundaries:2992a90e640ce393",
+            "evidence:studyb_unknown_author:moderators_boundaries:2f6da8d2a5ce047d",
+            "evidence:studyb_unknown_author:moderators_boundaries:e0eab51ceb6f51ed",
+            "evidence:studyb_unknown_author:operationalizations:cf3935e1126d456e"
+          ],
+          "source_field_ids": [
+            "source-field:3b534b94b8a0026323c67bd09176020316f84e379c467a8f1711dac6faf63826",
+            "source-field:3c2c5ffd33610496099fa52da71370d896b660c1aa881f2fa39cb65688f9df51",
+            "source-field:554fad9090d958900bd2004087696a8b99de2e6d00b21baf7b057dfd34611f45",
+            "source-field:71851fc255044eddd9ec245617f515ffd48298122abeb0ed6566c537a0e0350b",
+            "source-field:792f8a7fabd20795e869900c6c71783297306263798af5e7427e9cc71984a810",
+            "source-field:b06f90b6330350c57ce9b9cab3b576d37fa1fa87d51d98539121379d43218b91",
+            "source-field:cda079fd63f4aa8fa90194d3fc2afc1ff2fff13f942725165bb91cafe998aa43",
+            "source-field:fd3cc5f67eb67b28bd5a9cbf9034504229c27a1e7db48e354284d634f3c44a2c"
+          ],
+          "relation_ids": [
+            "relation-27a0d897d2d43df12076e937"
+          ]
+        },
+        {
+          "claim_group_index": 28,
+          "claim_slot_id": "candidate-relation-comparison-slot:v1:22cd62bc11636abf33d20790",
+          "task_id": "relation_comparison:relation-9db65e110be20c9a94aa7789",
+          "synthesis_claim_id": "synthesis:relation_comparison:5cbf75b0a3e405c116dbcb34",
+          "paper_key": "studyc_unknown_author",
+          "primary_claim_id": "claim:studyc_unknown_author:findings:20eb70c8f8b6fd23",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyc_unknown_author:findings:20eb70c8f8b6fd23",
+            "claim:studyc_unknown_author:limitations:933b43bbef72c19a",
+            "claim:studyc_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim:studyc_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim:studyc_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim:studyc_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studyc_unknown_author:findings:608c6188c257f7b5",
+            "evidence:studyc_unknown_author:limitations:16ad4860e65fe188",
+            "evidence:studyc_unknown_author:moderators_boundaries:6e3aecdc675fd35e",
+            "evidence:studyc_unknown_author:moderators_boundaries:cb931f242fa8df29",
+            "evidence:studyc_unknown_author:moderators_boundaries:f0c4d984587f4b98",
+            "evidence:studyc_unknown_author:operationalizations:97bef31557c9f1a0"
+          ],
+          "source_field_ids": [
+            "source-field:02fd358d203b774b00494c919200bfdac3385609def5758b6515ba56a61619bf",
+            "source-field:1b78aed2a146c2cf5eb13970587f4924503592a59ceab0adece1d2f827cf2c8e",
+            "source-field:52201e5ecf49031509fa77800481588966a771814337065fae2b4c7f1efc30b0",
+            "source-field:b74f7b15e70374ff05abc9080dcb076236ab9e60958d4e6ced2265945cca760d",
+            "source-field:e30c7cdd9aad4ad9869d53066134765bf2dc9504f610108529fdb6b611c74a18",
+            "source-field:f840b7a392afab7f23a93915480fbe25968d1bde2a0cc124588e8f84d7eb0e8b",
+            "source-field:f9607c6c28a8e4bbd2692b3acc626435b9b83a92f9ba08799221d107c0267892",
+            "source-field:fbcd8e61e0c2d786a05bc714597385f9c94d88228280a31eab21d0e804b3f296"
+          ],
+          "relation_ids": [
+            "relation-9db65e110be20c9a94aa7789"
+          ]
+        },
+        {
+          "claim_group_index": 37,
+          "claim_slot_id": "candidate-relation-comparison-slot:v1:37ab97ecd8ba9774904507e4",
+          "task_id": "relation_comparison:relation-7d141f1dc6d74d97bddaf272",
+          "synthesis_claim_id": "synthesis:relation_comparison:d5678dd39ce2c5d4979047c4",
+          "paper_key": "studyb_unknown_author",
+          "primary_claim_id": "claim:studyb_unknown_author:findings:f6586c2423a1dbe7",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyb_unknown_author:findings:f6586c2423a1dbe7",
+            "claim:studyb_unknown_author:limitations:933b43bbef72c19a",
+            "claim:studyb_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim:studyb_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim:studyb_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim:studyb_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studyb_unknown_author:findings:52601d9730101e05",
+            "evidence:studyb_unknown_author:limitations:2c912bc444e571bd",
+            "evidence:studyb_unknown_author:moderators_boundaries:2992a90e640ce393",
+            "evidence:studyb_unknown_author:moderators_boundaries:2f6da8d2a5ce047d",
+            "evidence:studyb_unknown_author:moderators_boundaries:e0eab51ceb6f51ed",
+            "evidence:studyb_unknown_author:operationalizations:cf3935e1126d456e"
+          ],
+          "source_field_ids": [
+            "source-field:3b534b94b8a0026323c67bd09176020316f84e379c467a8f1711dac6faf63826",
+            "source-field:3c2c5ffd33610496099fa52da71370d896b660c1aa881f2fa39cb65688f9df51",
+            "source-field:554fad9090d958900bd2004087696a8b99de2e6d00b21baf7b057dfd34611f45",
+            "source-field:71851fc255044eddd9ec245617f515ffd48298122abeb0ed6566c537a0e0350b",
+            "source-field:792f8a7fabd20795e869900c6c71783297306263798af5e7427e9cc71984a810",
+            "source-field:b06f90b6330350c57ce9b9cab3b576d37fa1fa87d51d98539121379d43218b91",
+            "source-field:cda079fd63f4aa8fa90194d3fc2afc1ff2fff13f942725165bb91cafe998aa43",
+            "source-field:fd3cc5f67eb67b28bd5a9cbf9034504229c27a1e7db48e354284d634f3c44a2c"
+          ],
+          "relation_ids": [
+            "relation-7d141f1dc6d74d97bddaf272"
+          ]
+        },
+        {
+          "claim_group_index": 37,
+          "claim_slot_id": "candidate-relation-comparison-slot:v1:3a8f30e9a75849b862be0669",
+          "task_id": "relation_comparison:relation-7d141f1dc6d74d97bddaf272",
+          "synthesis_claim_id": "synthesis:relation_comparison:d5678dd39ce2c5d4979047c4",
+          "paper_key": "studya_unknown_author",
+          "primary_claim_id": "claim:studya_unknown_author:findings:9cf0c5c01ec2d03e",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studya_unknown_author:findings:9cf0c5c01ec2d03e",
+            "claim:studya_unknown_author:limitations:933b43bbef72c19a",
+            "claim:studya_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim:studya_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim:studya_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim:studya_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studya_unknown_author:findings:2f6000aae38dc919",
+            "evidence:studya_unknown_author:limitations:d89d7f798241b1a0",
+            "evidence:studya_unknown_author:moderators_boundaries:5c2a9a2cec67e801",
+            "evidence:studya_unknown_author:moderators_boundaries:baabedd159b28a4f",
+            "evidence:studya_unknown_author:moderators_boundaries:c2e229c13c68cdfa",
+            "evidence:studya_unknown_author:operationalizations:065529d9d60ce0f9"
+          ],
+          "source_field_ids": [
+            "source-field:0fcad026d3818ef9840c7f9ea6d1d19ccc66ff9e7c50ad8762bd327e81c95f06",
+            "source-field:72512e5861bdb687d3213137ca3b99fb4404b176eaaacc8fa29b7f2ebe9cf963",
+            "source-field:812e5a3c6f9fbf7b7837872871b256cf7297261a7a37dd1fe03927ace44a3c8b",
+            "source-field:9020b5d1083af6fd1a69ca0447249a5858dea1b7a117e0b8a8b11758376edda4",
+            "source-field:9f9febd978450bd5b7b5736fa5a017fdf8a766ddba48a10d449d4ab792013094",
+            "source-field:dab7af42c3f68adfac819360ec29e8c53d2fcc6579bc7171f319b2d014b6d074",
+            "source-field:f189aad157394e0387607f93588b7af6fe25e75a30b8084ee1cbeb7f755e4607",
+            "source-field:f8fcf0b3cf9aa4999b7654470be89ae3963c241f80c37534b70d3651dc5e3ba7"
+          ],
+          "relation_ids": [
+            "relation-7d141f1dc6d74d97bddaf272"
+          ]
+        },
+        {
+          "claim_group_index": 28,
+          "claim_slot_id": "candidate-relation-comparison-slot:v1:48719d23c39835660ee32e75",
+          "task_id": "relation_comparison:relation-9db65e110be20c9a94aa7789",
+          "synthesis_claim_id": "synthesis:relation_comparison:5cbf75b0a3e405c116dbcb34",
+          "paper_key": "studyd_unknown_author",
+          "primary_claim_id": "claim:studyd_unknown_author:findings:497ca5821dde33f8",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyd_unknown_author:findings:497ca5821dde33f8",
+            "claim:studyd_unknown_author:limitations:933b43bbef72c19a",
+            "claim:studyd_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim:studyd_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim:studyd_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim:studyd_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studyd_unknown_author:findings:ad5ca9c914a25e7a",
+            "evidence:studyd_unknown_author:limitations:6e1b52eb71b790b4",
+            "evidence:studyd_unknown_author:moderators_boundaries:a07c49a87a2f69c2",
+            "evidence:studyd_unknown_author:moderators_boundaries:c291b89701c99831",
+            "evidence:studyd_unknown_author:moderators_boundaries:f24dfc6f83cf30b2",
+            "evidence:studyd_unknown_author:operationalizations:f8c120fddb6ab0a8"
+          ],
+          "source_field_ids": [
+            "source-field:41c9ef87295efcf897e03a2de7f4e20aac3cff8438d122038f6b92b5e29a7de9",
+            "source-field:4a6bdf80d020c148e56866ad8cbd6a1a999987fcc4e2c38948e8418eed49c124",
+            "source-field:64f18d4dd3410032d3ca558f755cb6996211f93de44046cd01a20c920405cfeb",
+            "source-field:81369469c58c04a18762918facf0f55be6000380aaee35142392667f89ea6a61",
+            "source-field:b34e06b5d63c24326c980753d17a8733204b20a6b5e6243d664b66c3c505aea9",
+            "source-field:ce94d0d6583cb6327ba294188667dcd8676f4a27bc2f89aca43831c171788aad",
+            "source-field:cf1416ddc8af94154d002eb35af41e93cb1c468c8e9390a2dc406b15eba47e7f",
+            "source-field:f54f0f6a1d01bee45c5e365ccd4a46705a61f4085d754f029ea37bc26a0df50c"
+          ],
+          "relation_ids": [
+            "relation-9db65e110be20c9a94aa7789"
+          ]
+        },
+        {
+          "claim_group_index": 29,
+          "claim_slot_id": "candidate-relation-comparison-slot:v1:526913f5a72af41ab5945d3f",
+          "task_id": "relation_comparison:relation-6fd897a8db0bf1ad7fdc9e8c",
+          "synthesis_claim_id": "synthesis:relation_comparison:80dc4c3c571a73789677c02a",
+          "paper_key": "studyb_unknown_author",
+          "primary_claim_id": "claim:studyb_unknown_author:findings:f6586c2423a1dbe7",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyb_unknown_author:findings:f6586c2423a1dbe7",
+            "claim:studyb_unknown_author:limitations:933b43bbef72c19a",
+            "claim:studyb_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim:studyb_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim:studyb_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim:studyb_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studyb_unknown_author:findings:52601d9730101e05",
+            "evidence:studyb_unknown_author:limitations:2c912bc444e571bd",
+            "evidence:studyb_unknown_author:moderators_boundaries:2992a90e640ce393",
+            "evidence:studyb_unknown_author:moderators_boundaries:2f6da8d2a5ce047d",
+            "evidence:studyb_unknown_author:moderators_boundaries:e0eab51ceb6f51ed",
+            "evidence:studyb_unknown_author:operationalizations:cf3935e1126d456e"
+          ],
+          "source_field_ids": [
+            "source-field:3b534b94b8a0026323c67bd09176020316f84e379c467a8f1711dac6faf63826",
+            "source-field:3c2c5ffd33610496099fa52da71370d896b660c1aa881f2fa39cb65688f9df51",
+            "source-field:554fad9090d958900bd2004087696a8b99de2e6d00b21baf7b057dfd34611f45",
+            "source-field:71851fc255044eddd9ec245617f515ffd48298122abeb0ed6566c537a0e0350b",
+            "source-field:792f8a7fabd20795e869900c6c71783297306263798af5e7427e9cc71984a810",
+            "source-field:b06f90b6330350c57ce9b9cab3b576d37fa1fa87d51d98539121379d43218b91",
+            "source-field:cda079fd63f4aa8fa90194d3fc2afc1ff2fff13f942725165bb91cafe998aa43",
+            "source-field:fd3cc5f67eb67b28bd5a9cbf9034504229c27a1e7db48e354284d634f3c44a2c"
+          ],
+          "relation_ids": [
+            "relation-6fd897a8db0bf1ad7fdc9e8c"
+          ]
+        },
+        {
+          "claim_group_index": 29,
+          "claim_slot_id": "candidate-relation-comparison-slot:v1:6002bae437bca0c84386a3d1",
+          "task_id": "relation_comparison:relation-6fd897a8db0bf1ad7fdc9e8c",
+          "synthesis_claim_id": "synthesis:relation_comparison:80dc4c3c571a73789677c02a",
+          "paper_key": "studyc_unknown_author",
+          "primary_claim_id": "claim:studyc_unknown_author:findings:20eb70c8f8b6fd23",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyc_unknown_author:findings:20eb70c8f8b6fd23",
+            "claim:studyc_unknown_author:limitations:933b43bbef72c19a",
+            "claim:studyc_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim:studyc_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim:studyc_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim:studyc_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studyc_unknown_author:findings:608c6188c257f7b5",
+            "evidence:studyc_unknown_author:limitations:16ad4860e65fe188",
+            "evidence:studyc_unknown_author:moderators_boundaries:6e3aecdc675fd35e",
+            "evidence:studyc_unknown_author:moderators_boundaries:cb931f242fa8df29",
+            "evidence:studyc_unknown_author:moderators_boundaries:f0c4d984587f4b98",
+            "evidence:studyc_unknown_author:operationalizations:97bef31557c9f1a0"
+          ],
+          "source_field_ids": [
+            "source-field:02fd358d203b774b00494c919200bfdac3385609def5758b6515ba56a61619bf",
+            "source-field:1b78aed2a146c2cf5eb13970587f4924503592a59ceab0adece1d2f827cf2c8e",
+            "source-field:52201e5ecf49031509fa77800481588966a771814337065fae2b4c7f1efc30b0",
+            "source-field:b74f7b15e70374ff05abc9080dcb076236ab9e60958d4e6ced2265945cca760d",
+            "source-field:e30c7cdd9aad4ad9869d53066134765bf2dc9504f610108529fdb6b611c74a18",
+            "source-field:f840b7a392afab7f23a93915480fbe25968d1bde2a0cc124588e8f84d7eb0e8b",
+            "source-field:f9607c6c28a8e4bbd2692b3acc626435b9b83a92f9ba08799221d107c0267892",
+            "source-field:fbcd8e61e0c2d786a05bc714597385f9c94d88228280a31eab21d0e804b3f296"
+          ],
+          "relation_ids": [
+            "relation-6fd897a8db0bf1ad7fdc9e8c"
+          ]
+        },
+        {
+          "claim_group_index": 35,
+          "claim_slot_id": "candidate-relation-comparison-slot:v1:66904d7d369b584835458698",
+          "task_id": "relation_comparison:relation-bc17f103785530eb050bea9b",
+          "synthesis_claim_id": "synthesis:relation_comparison:cbb064f260f1069a5d0aa14e",
+          "paper_key": "studyc_unknown_author",
+          "primary_claim_id": "claim:studyc_unknown_author:findings:20eb70c8f8b6fd23",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyc_unknown_author:findings:20eb70c8f8b6fd23",
+            "claim:studyc_unknown_author:limitations:933b43bbef72c19a",
+            "claim:studyc_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim:studyc_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim:studyc_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim:studyc_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studyc_unknown_author:findings:608c6188c257f7b5",
+            "evidence:studyc_unknown_author:limitations:16ad4860e65fe188",
+            "evidence:studyc_unknown_author:moderators_boundaries:6e3aecdc675fd35e",
+            "evidence:studyc_unknown_author:moderators_boundaries:cb931f242fa8df29",
+            "evidence:studyc_unknown_author:moderators_boundaries:f0c4d984587f4b98",
+            "evidence:studyc_unknown_author:operationalizations:97bef31557c9f1a0"
+          ],
+          "source_field_ids": [
+            "source-field:02fd358d203b774b00494c919200bfdac3385609def5758b6515ba56a61619bf",
+            "source-field:1b78aed2a146c2cf5eb13970587f4924503592a59ceab0adece1d2f827cf2c8e",
+            "source-field:52201e5ecf49031509fa77800481588966a771814337065fae2b4c7f1efc30b0",
+            "source-field:b74f7b15e70374ff05abc9080dcb076236ab9e60958d4e6ced2265945cca760d",
+            "source-field:e30c7cdd9aad4ad9869d53066134765bf2dc9504f610108529fdb6b611c74a18",
+            "source-field:f840b7a392afab7f23a93915480fbe25968d1bde2a0cc124588e8f84d7eb0e8b",
+            "source-field:f9607c6c28a8e4bbd2692b3acc626435b9b83a92f9ba08799221d107c0267892",
+            "source-field:fbcd8e61e0c2d786a05bc714597385f9c94d88228280a31eab21d0e804b3f296"
+          ],
+          "relation_ids": [
+            "relation-bc17f103785530eb050bea9b"
+          ]
+        },
+        {
+          "claim_group_index": 34,
+          "claim_slot_id": "candidate-relation-comparison-slot:v1:96fc721d5c989a59e7f00b1e",
+          "task_id": "relation_comparison:relation-3298b831d27cd01155a2fa34",
+          "synthesis_claim_id": "synthesis:relation_comparison:bb2205ba0283b0d05c8d1f74",
+          "paper_key": "studyb_unknown_author",
+          "primary_claim_id": "claim:studyb_unknown_author:findings:f6586c2423a1dbe7",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyb_unknown_author:findings:f6586c2423a1dbe7",
+            "claim:studyb_unknown_author:limitations:933b43bbef72c19a",
+            "claim:studyb_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim:studyb_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim:studyb_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim:studyb_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studyb_unknown_author:findings:52601d9730101e05",
+            "evidence:studyb_unknown_author:limitations:2c912bc444e571bd",
+            "evidence:studyb_unknown_author:moderators_boundaries:2992a90e640ce393",
+            "evidence:studyb_unknown_author:moderators_boundaries:2f6da8d2a5ce047d",
+            "evidence:studyb_unknown_author:moderators_boundaries:e0eab51ceb6f51ed",
+            "evidence:studyb_unknown_author:operationalizations:cf3935e1126d456e"
+          ],
+          "source_field_ids": [
+            "source-field:3b534b94b8a0026323c67bd09176020316f84e379c467a8f1711dac6faf63826",
+            "source-field:3c2c5ffd33610496099fa52da71370d896b660c1aa881f2fa39cb65688f9df51",
+            "source-field:554fad9090d958900bd2004087696a8b99de2e6d00b21baf7b057dfd34611f45",
+            "source-field:71851fc255044eddd9ec245617f515ffd48298122abeb0ed6566c537a0e0350b",
+            "source-field:792f8a7fabd20795e869900c6c71783297306263798af5e7427e9cc71984a810",
+            "source-field:b06f90b6330350c57ce9b9cab3b576d37fa1fa87d51d98539121379d43218b91",
+            "source-field:cda079fd63f4aa8fa90194d3fc2afc1ff2fff13f942725165bb91cafe998aa43",
+            "source-field:fd3cc5f67eb67b28bd5a9cbf9034504229c27a1e7db48e354284d634f3c44a2c"
+          ],
+          "relation_ids": [
+            "relation-3298b831d27cd01155a2fa34"
+          ]
+        },
+        {
+          "claim_group_index": 27,
+          "claim_slot_id": "candidate-relation-comparison-slot:v1:ad7d60d78f32bc7b54e927b4",
+          "task_id": "relation_comparison:relation-3f588bf83ca93b3de000bfda",
+          "synthesis_claim_id": "synthesis:relation_comparison:2a422367a4e50a2514d34d80",
+          "paper_key": "studyb_unknown_author",
+          "primary_claim_id": "claim:studyb_unknown_author:findings:f6586c2423a1dbe7",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyb_unknown_author:findings:f6586c2423a1dbe7",
+            "claim:studyb_unknown_author:limitations:933b43bbef72c19a",
+            "claim:studyb_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim:studyb_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim:studyb_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim:studyb_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studyb_unknown_author:findings:52601d9730101e05",
+            "evidence:studyb_unknown_author:limitations:2c912bc444e571bd",
+            "evidence:studyb_unknown_author:moderators_boundaries:2992a90e640ce393",
+            "evidence:studyb_unknown_author:moderators_boundaries:2f6da8d2a5ce047d",
+            "evidence:studyb_unknown_author:moderators_boundaries:e0eab51ceb6f51ed",
+            "evidence:studyb_unknown_author:operationalizations:cf3935e1126d456e"
+          ],
+          "source_field_ids": [
+            "source-field:3b534b94b8a0026323c67bd09176020316f84e379c467a8f1711dac6faf63826",
+            "source-field:3c2c5ffd33610496099fa52da71370d896b660c1aa881f2fa39cb65688f9df51",
+            "source-field:554fad9090d958900bd2004087696a8b99de2e6d00b21baf7b057dfd34611f45",
+            "source-field:71851fc255044eddd9ec245617f515ffd48298122abeb0ed6566c537a0e0350b",
+            "source-field:792f8a7fabd20795e869900c6c71783297306263798af5e7427e9cc71984a810",
+            "source-field:b06f90b6330350c57ce9b9cab3b576d37fa1fa87d51d98539121379d43218b91",
+            "source-field:cda079fd63f4aa8fa90194d3fc2afc1ff2fff13f942725165bb91cafe998aa43",
+            "source-field:fd3cc5f67eb67b28bd5a9cbf9034504229c27a1e7db48e354284d634f3c44a2c"
+          ],
+          "relation_ids": [
+            "relation-3f588bf83ca93b3de000bfda"
+          ]
+        },
+        {
+          "claim_group_index": 36,
+          "claim_slot_id": "candidate-relation-comparison-slot:v1:baa9ae9ca225c3f936a841ab",
+          "task_id": "relation_comparison:relation-6fb77241cb144bac87f6e1c9",
+          "synthesis_claim_id": "synthesis:relation_comparison:cc07584b1b4fad9dbb2da3a5",
+          "paper_key": "studya_unknown_author",
+          "primary_claim_id": "claim:studya_unknown_author:findings:9cf0c5c01ec2d03e",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studya_unknown_author:findings:9cf0c5c01ec2d03e",
+            "claim:studya_unknown_author:limitations:933b43bbef72c19a",
+            "claim:studya_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim:studya_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim:studya_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim:studya_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studya_unknown_author:findings:2f6000aae38dc919",
+            "evidence:studya_unknown_author:limitations:d89d7f798241b1a0",
+            "evidence:studya_unknown_author:moderators_boundaries:5c2a9a2cec67e801",
+            "evidence:studya_unknown_author:moderators_boundaries:baabedd159b28a4f",
+            "evidence:studya_unknown_author:moderators_boundaries:c2e229c13c68cdfa",
+            "evidence:studya_unknown_author:operationalizations:065529d9d60ce0f9"
+          ],
+          "source_field_ids": [
+            "source-field:0fcad026d3818ef9840c7f9ea6d1d19ccc66ff9e7c50ad8762bd327e81c95f06",
+            "source-field:72512e5861bdb687d3213137ca3b99fb4404b176eaaacc8fa29b7f2ebe9cf963",
+            "source-field:812e5a3c6f9fbf7b7837872871b256cf7297261a7a37dd1fe03927ace44a3c8b",
+            "source-field:9020b5d1083af6fd1a69ca0447249a5858dea1b7a117e0b8a8b11758376edda4",
+            "source-field:9f9febd978450bd5b7b5736fa5a017fdf8a766ddba48a10d449d4ab792013094",
+            "source-field:dab7af42c3f68adfac819360ec29e8c53d2fcc6579bc7171f319b2d014b6d074",
+            "source-field:f189aad157394e0387607f93588b7af6fe25e75a30b8084ee1cbeb7f755e4607",
+            "source-field:f8fcf0b3cf9aa4999b7654470be89ae3963c241f80c37534b70d3651dc5e3ba7"
+          ],
+          "relation_ids": [
+            "relation-6fb77241cb144bac87f6e1c9"
+          ]
+        },
+        {
+          "claim_group_index": 31,
+          "claim_slot_id": "candidate-relation-comparison-slot:v1:cdadac3956d122b5e7ba6558",
+          "task_id": "relation_comparison:relation-63efb78ed6ee58adad0055c8",
+          "synthesis_claim_id": "synthesis:relation_comparison:a9a1205d7ea688e5b3c1df12",
+          "paper_key": "studyd_unknown_author",
+          "primary_claim_id": "claim:studyd_unknown_author:findings:497ca5821dde33f8",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyd_unknown_author:findings:497ca5821dde33f8",
+            "claim:studyd_unknown_author:limitations:933b43bbef72c19a",
+            "claim:studyd_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim:studyd_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim:studyd_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim:studyd_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studyd_unknown_author:findings:ad5ca9c914a25e7a",
+            "evidence:studyd_unknown_author:limitations:6e1b52eb71b790b4",
+            "evidence:studyd_unknown_author:moderators_boundaries:a07c49a87a2f69c2",
+            "evidence:studyd_unknown_author:moderators_boundaries:c291b89701c99831",
+            "evidence:studyd_unknown_author:moderators_boundaries:f24dfc6f83cf30b2",
+            "evidence:studyd_unknown_author:operationalizations:f8c120fddb6ab0a8"
+          ],
+          "source_field_ids": [
+            "source-field:41c9ef87295efcf897e03a2de7f4e20aac3cff8438d122038f6b92b5e29a7de9",
+            "source-field:4a6bdf80d020c148e56866ad8cbd6a1a999987fcc4e2c38948e8418eed49c124",
+            "source-field:64f18d4dd3410032d3ca558f755cb6996211f93de44046cd01a20c920405cfeb",
+            "source-field:81369469c58c04a18762918facf0f55be6000380aaee35142392667f89ea6a61",
+            "source-field:b34e06b5d63c24326c980753d17a8733204b20a6b5e6243d664b66c3c505aea9",
+            "source-field:ce94d0d6583cb6327ba294188667dcd8676f4a27bc2f89aca43831c171788aad",
+            "source-field:cf1416ddc8af94154d002eb35af41e93cb1c468c8e9390a2dc406b15eba47e7f",
+            "source-field:f54f0f6a1d01bee45c5e365ccd4a46705a61f4085d754f029ea37bc26a0df50c"
+          ],
+          "relation_ids": [
+            "relation-63efb78ed6ee58adad0055c8"
+          ]
+        },
+        {
+          "claim_group_index": 33,
+          "claim_slot_id": "candidate-relation-comparison-slot:v1:d3fd68ded016ce105cfa952d",
+          "task_id": "relation_comparison:relation-980c3f1422ced97bf6f3573e",
+          "synthesis_claim_id": "synthesis:relation_comparison:b9f2871f411c303b1dbbacc6",
+          "paper_key": "studyd_unknown_author",
+          "primary_claim_id": "claim:studyd_unknown_author:findings:497ca5821dde33f8",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyd_unknown_author:findings:497ca5821dde33f8",
+            "claim:studyd_unknown_author:limitations:933b43bbef72c19a",
+            "claim:studyd_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim:studyd_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim:studyd_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim:studyd_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studyd_unknown_author:findings:ad5ca9c914a25e7a",
+            "evidence:studyd_unknown_author:limitations:6e1b52eb71b790b4",
+            "evidence:studyd_unknown_author:moderators_boundaries:a07c49a87a2f69c2",
+            "evidence:studyd_unknown_author:moderators_boundaries:c291b89701c99831",
+            "evidence:studyd_unknown_author:moderators_boundaries:f24dfc6f83cf30b2",
+            "evidence:studyd_unknown_author:operationalizations:f8c120fddb6ab0a8"
+          ],
+          "source_field_ids": [
+            "source-field:41c9ef87295efcf897e03a2de7f4e20aac3cff8438d122038f6b92b5e29a7de9",
+            "source-field:4a6bdf80d020c148e56866ad8cbd6a1a999987fcc4e2c38948e8418eed49c124",
+            "source-field:64f18d4dd3410032d3ca558f755cb6996211f93de44046cd01a20c920405cfeb",
+            "source-field:81369469c58c04a18762918facf0f55be6000380aaee35142392667f89ea6a61",
+            "source-field:b34e06b5d63c24326c980753d17a8733204b20a6b5e6243d664b66c3c505aea9",
+            "source-field:ce94d0d6583cb6327ba294188667dcd8676f4a27bc2f89aca43831c171788aad",
+            "source-field:cf1416ddc8af94154d002eb35af41e93cb1c468c8e9390a2dc406b15eba47e7f",
+            "source-field:f54f0f6a1d01bee45c5e365ccd4a46705a61f4085d754f029ea37bc26a0df50c"
+          ],
+          "relation_ids": [
+            "relation-980c3f1422ced97bf6f3573e"
+          ]
+        },
+        {
+          "claim_group_index": 36,
+          "claim_slot_id": "candidate-relation-comparison-slot:v1:dc1695c24f321909ef52d06c",
+          "task_id": "relation_comparison:relation-6fb77241cb144bac87f6e1c9",
+          "synthesis_claim_id": "synthesis:relation_comparison:cc07584b1b4fad9dbb2da3a5",
+          "paper_key": "studyb_unknown_author",
+          "primary_claim_id": "claim:studyb_unknown_author:findings:f6586c2423a1dbe7",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyb_unknown_author:findings:f6586c2423a1dbe7",
+            "claim:studyb_unknown_author:limitations:933b43bbef72c19a",
+            "claim:studyb_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim:studyb_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim:studyb_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim:studyb_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studyb_unknown_author:findings:52601d9730101e05",
+            "evidence:studyb_unknown_author:limitations:2c912bc444e571bd",
+            "evidence:studyb_unknown_author:moderators_boundaries:2992a90e640ce393",
+            "evidence:studyb_unknown_author:moderators_boundaries:2f6da8d2a5ce047d",
+            "evidence:studyb_unknown_author:moderators_boundaries:e0eab51ceb6f51ed",
+            "evidence:studyb_unknown_author:operationalizations:cf3935e1126d456e"
+          ],
+          "source_field_ids": [
+            "source-field:3b534b94b8a0026323c67bd09176020316f84e379c467a8f1711dac6faf63826",
+            "source-field:3c2c5ffd33610496099fa52da71370d896b660c1aa881f2fa39cb65688f9df51",
+            "source-field:554fad9090d958900bd2004087696a8b99de2e6d00b21baf7b057dfd34611f45",
+            "source-field:71851fc255044eddd9ec245617f515ffd48298122abeb0ed6566c537a0e0350b",
+            "source-field:792f8a7fabd20795e869900c6c71783297306263798af5e7427e9cc71984a810",
+            "source-field:b06f90b6330350c57ce9b9cab3b576d37fa1fa87d51d98539121379d43218b91",
+            "source-field:cda079fd63f4aa8fa90194d3fc2afc1ff2fff13f942725165bb91cafe998aa43",
+            "source-field:fd3cc5f67eb67b28bd5a9cbf9034504229c27a1e7db48e354284d634f3c44a2c"
+          ],
+          "relation_ids": [
+            "relation-6fb77241cb144bac87f6e1c9"
+          ]
+        },
+        {
+          "claim_group_index": 32,
+          "claim_slot_id": "candidate-relation-comparison-slot:v1:deb75eac6e44aa8dd3e239d1",
+          "task_id": "relation_comparison:relation-5611303719c0a2d9060e555f",
+          "synthesis_claim_id": "synthesis:relation_comparison:aea1de9b5f8d71f452b72906",
+          "paper_key": "studyc_unknown_author",
+          "primary_claim_id": "claim:studyc_unknown_author:findings:20eb70c8f8b6fd23",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyc_unknown_author:findings:20eb70c8f8b6fd23",
+            "claim:studyc_unknown_author:limitations:933b43bbef72c19a",
+            "claim:studyc_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim:studyc_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim:studyc_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim:studyc_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studyc_unknown_author:findings:608c6188c257f7b5",
+            "evidence:studyc_unknown_author:limitations:16ad4860e65fe188",
+            "evidence:studyc_unknown_author:moderators_boundaries:6e3aecdc675fd35e",
+            "evidence:studyc_unknown_author:moderators_boundaries:cb931f242fa8df29",
+            "evidence:studyc_unknown_author:moderators_boundaries:f0c4d984587f4b98",
+            "evidence:studyc_unknown_author:operationalizations:97bef31557c9f1a0"
+          ],
+          "source_field_ids": [
+            "source-field:02fd358d203b774b00494c919200bfdac3385609def5758b6515ba56a61619bf",
+            "source-field:1b78aed2a146c2cf5eb13970587f4924503592a59ceab0adece1d2f827cf2c8e",
+            "source-field:52201e5ecf49031509fa77800481588966a771814337065fae2b4c7f1efc30b0",
+            "source-field:b74f7b15e70374ff05abc9080dcb076236ab9e60958d4e6ced2265945cca760d",
+            "source-field:e30c7cdd9aad4ad9869d53066134765bf2dc9504f610108529fdb6b611c74a18",
+            "source-field:f840b7a392afab7f23a93915480fbe25968d1bde2a0cc124588e8f84d7eb0e8b",
+            "source-field:f9607c6c28a8e4bbd2692b3acc626435b9b83a92f9ba08799221d107c0267892",
+            "source-field:fbcd8e61e0c2d786a05bc714597385f9c94d88228280a31eab21d0e804b3f296"
+          ],
+          "relation_ids": [
+            "relation-5611303719c0a2d9060e555f"
+          ]
+        },
+        {
+          "claim_group_index": 34,
+          "claim_slot_id": "candidate-relation-comparison-slot:v1:e346f4936fa1e224b4c29cae",
+          "task_id": "relation_comparison:relation-3298b831d27cd01155a2fa34",
+          "synthesis_claim_id": "synthesis:relation_comparison:bb2205ba0283b0d05c8d1f74",
+          "paper_key": "studyc_unknown_author",
+          "primary_claim_id": "claim:studyc_unknown_author:findings:20eb70c8f8b6fd23",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyc_unknown_author:findings:20eb70c8f8b6fd23",
+            "claim:studyc_unknown_author:limitations:933b43bbef72c19a",
+            "claim:studyc_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim:studyc_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim:studyc_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim:studyc_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studyc_unknown_author:findings:608c6188c257f7b5",
+            "evidence:studyc_unknown_author:limitations:16ad4860e65fe188",
+            "evidence:studyc_unknown_author:moderators_boundaries:6e3aecdc675fd35e",
+            "evidence:studyc_unknown_author:moderators_boundaries:cb931f242fa8df29",
+            "evidence:studyc_unknown_author:moderators_boundaries:f0c4d984587f4b98",
+            "evidence:studyc_unknown_author:operationalizations:97bef31557c9f1a0"
+          ],
+          "source_field_ids": [
+            "source-field:02fd358d203b774b00494c919200bfdac3385609def5758b6515ba56a61619bf",
+            "source-field:1b78aed2a146c2cf5eb13970587f4924503592a59ceab0adece1d2f827cf2c8e",
+            "source-field:52201e5ecf49031509fa77800481588966a771814337065fae2b4c7f1efc30b0",
+            "source-field:b74f7b15e70374ff05abc9080dcb076236ab9e60958d4e6ced2265945cca760d",
+            "source-field:e30c7cdd9aad4ad9869d53066134765bf2dc9504f610108529fdb6b611c74a18",
+            "source-field:f840b7a392afab7f23a93915480fbe25968d1bde2a0cc124588e8f84d7eb0e8b",
+            "source-field:f9607c6c28a8e4bbd2692b3acc626435b9b83a92f9ba08799221d107c0267892",
+            "source-field:fbcd8e61e0c2d786a05bc714597385f9c94d88228280a31eab21d0e804b3f296"
+          ],
+          "relation_ids": [
+            "relation-3298b831d27cd01155a2fa34"
+          ]
+        },
+        {
+          "claim_group_index": 35,
+          "claim_slot_id": "candidate-relation-comparison-slot:v1:ee44ddf003aaddf4d7605c5e",
+          "task_id": "relation_comparison:relation-bc17f103785530eb050bea9b",
+          "synthesis_claim_id": "synthesis:relation_comparison:cbb064f260f1069a5d0aa14e",
+          "paper_key": "studyb_unknown_author",
+          "primary_claim_id": "claim:studyb_unknown_author:findings:f6586c2423a1dbe7",
+          "study_id": "",
+          "source_claim_ids": [
+            "claim:studyb_unknown_author:findings:f6586c2423a1dbe7",
+            "claim:studyb_unknown_author:limitations:933b43bbef72c19a",
+            "claim:studyb_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim:studyb_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim:studyb_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim:studyb_unknown_author:operationalizations:d22e13af34a0bd66"
+          ],
+          "evidence_ids": [
+            "evidence:studyb_unknown_author:findings:52601d9730101e05",
+            "evidence:studyb_unknown_author:limitations:2c912bc444e571bd",
+            "evidence:studyb_unknown_author:moderators_boundaries:2992a90e640ce393",
+            "evidence:studyb_unknown_author:moderators_boundaries:2f6da8d2a5ce047d",
+            "evidence:studyb_unknown_author:moderators_boundaries:e0eab51ceb6f51ed",
+            "evidence:studyb_unknown_author:operationalizations:cf3935e1126d456e"
+          ],
+          "source_field_ids": [
+            "source-field:3b534b94b8a0026323c67bd09176020316f84e379c467a8f1711dac6faf63826",
+            "source-field:3c2c5ffd33610496099fa52da71370d896b660c1aa881f2fa39cb65688f9df51",
+            "source-field:554fad9090d958900bd2004087696a8b99de2e6d00b21baf7b057dfd34611f45",
+            "source-field:71851fc255044eddd9ec245617f515ffd48298122abeb0ed6566c537a0e0350b",
+            "source-field:792f8a7fabd20795e869900c6c71783297306263798af5e7427e9cc71984a810",
+            "source-field:b06f90b6330350c57ce9b9cab3b576d37fa1fa87d51d98539121379d43218b91",
+            "source-field:cda079fd63f4aa8fa90194d3fc2afc1ff2fff13f942725165bb91cafe998aa43",
+            "source-field:fd3cc5f67eb67b28bd5a9cbf9034504229c27a1e7db48e354284d634f3c44a2c"
+          ],
+          "relation_ids": [
+            "relation-bc17f103785530eb050bea9b"
+          ]
+        }
+      ],
+      "organization_tasks": [
+        {
+          "claim_group_index": 26,
+          "claim_group_id": "candidate-relation-comparison-group:v1:094242d0f55c165926e0a974",
+          "task_id": "relation_comparison:relation-8067ff8d23a22e0f6238a90c",
+          "synthesis_claim_id": "synthesis:relation_comparison:094242d0f55c165926e0a974",
+          "claim_kind": "model_authored_relation_comparison_slot",
+          "claim_seed": true,
+          "paper_keys": [
+            "studyc_unknown_author",
+            "studyd_unknown_author"
+          ],
+          "support_slot_ids": [
+            "candidate-relation-comparison-slot:v1:08aef29bd594c4ab7564614d",
+            "candidate-relation-comparison-slot:v1:0d70a625f9145e21ee55c8b7"
+          ],
+          "task_contract": {
+            "comparison_question": "Can the recorded bridge_between_topics relation be compared for studyc_unknown_author, studyd_unknown_author without ignoring findings or boundaries?",
+            "output_semantics": "model_authored_comparison_using_both_source_sides_and_their_qualifiers",
+            "relation_id": "relation-8067ff8d23a22e0f6238a90c",
+            "relation_id_is_not_a_conclusion": true,
+            "relation_type": "bridge_between_topics",
+            "schema_version": "relation-comparison-task/v1",
+            "task_id": "relation_comparison:relation-8067ff8d23a22e0f6238a90c"
+          }
+        },
+        {
+          "claim_group_index": 27,
+          "claim_group_id": "candidate-relation-comparison-group:v1:2a422367a4e50a2514d34d80",
+          "task_id": "relation_comparison:relation-3f588bf83ca93b3de000bfda",
+          "synthesis_claim_id": "synthesis:relation_comparison:2a422367a4e50a2514d34d80",
+          "claim_kind": "model_authored_relation_comparison_slot",
+          "claim_seed": true,
+          "paper_keys": [
+            "studya_unknown_author",
+            "studyb_unknown_author"
+          ],
+          "support_slot_ids": [
+            "candidate-relation-comparison-slot:v1:1df6a67858e59347db93be84",
+            "candidate-relation-comparison-slot:v1:ad7d60d78f32bc7b54e927b4"
+          ],
+          "task_contract": {
+            "comparison_question": "Can the recorded studies_same_construct relation be compared for studya_unknown_author, studyb_unknown_author without ignoring findings or boundaries?",
+            "output_semantics": "model_authored_comparison_using_both_source_sides_and_their_qualifiers",
+            "relation_id": "relation-3f588bf83ca93b3de000bfda",
+            "relation_id_is_not_a_conclusion": true,
+            "relation_type": "studies_same_construct",
+            "schema_version": "relation-comparison-task/v1",
+            "task_id": "relation_comparison:relation-3f588bf83ca93b3de000bfda"
+          }
+        },
+        {
+          "claim_group_index": 28,
+          "claim_group_id": "candidate-relation-comparison-group:v1:5cbf75b0a3e405c116dbcb34",
+          "task_id": "relation_comparison:relation-9db65e110be20c9a94aa7789",
+          "synthesis_claim_id": "synthesis:relation_comparison:5cbf75b0a3e405c116dbcb34",
+          "claim_kind": "model_authored_relation_comparison_slot",
+          "claim_seed": true,
+          "paper_keys": [
+            "studyc_unknown_author",
+            "studyd_unknown_author"
+          ],
+          "support_slot_ids": [
+            "candidate-relation-comparison-slot:v1:22cd62bc11636abf33d20790",
+            "candidate-relation-comparison-slot:v1:48719d23c39835660ee32e75"
+          ],
+          "task_contract": {
+            "comparison_question": "Can the recorded qualifies relation be compared for studyc_unknown_author, studyd_unknown_author without ignoring findings or boundaries?",
+            "output_semantics": "model_authored_comparison_using_both_source_sides_and_their_qualifiers",
+            "relation_id": "relation-9db65e110be20c9a94aa7789",
+            "relation_id_is_not_a_conclusion": true,
+            "relation_type": "qualifies",
+            "schema_version": "relation-comparison-task/v1",
+            "task_id": "relation_comparison:relation-9db65e110be20c9a94aa7789"
+          }
+        },
+        {
+          "claim_group_index": 29,
+          "claim_group_id": "candidate-relation-comparison-group:v1:80dc4c3c571a73789677c02a",
+          "task_id": "relation_comparison:relation-6fd897a8db0bf1ad7fdc9e8c",
+          "synthesis_claim_id": "synthesis:relation_comparison:80dc4c3c571a73789677c02a",
+          "claim_kind": "model_authored_relation_comparison_slot",
+          "claim_seed": true,
+          "paper_keys": [
+            "studyb_unknown_author",
+            "studyc_unknown_author"
+          ],
+          "support_slot_ids": [
+            "candidate-relation-comparison-slot:v1:526913f5a72af41ab5945d3f",
+            "candidate-relation-comparison-slot:v1:6002bae437bca0c84386a3d1"
+          ],
+          "task_contract": {
+            "comparison_question": "Can the recorded reported_magnitude_contrast relation be compared for studyb_unknown_author, studyc_unknown_author without ignoring findings or boundaries?",
+            "output_semantics": "model_authored_comparison_using_both_source_sides_and_their_qualifiers",
+            "relation_id": "relation-6fd897a8db0bf1ad7fdc9e8c",
+            "relation_id_is_not_a_conclusion": true,
+            "relation_type": "reported_magnitude_contrast",
+            "schema_version": "relation-comparison-task/v1",
+            "task_id": "relation_comparison:relation-6fd897a8db0bf1ad7fdc9e8c"
+          }
+        },
+        {
+          "claim_group_index": 30,
+          "claim_group_id": "candidate-relation-comparison-group:v1:95edba6facc3853318d9ee99",
+          "task_id": "relation_comparison:relation-27a0d897d2d43df12076e937",
+          "synthesis_claim_id": "synthesis:relation_comparison:95edba6facc3853318d9ee99",
+          "claim_kind": "model_authored_relation_comparison_slot",
+          "claim_seed": true,
+          "paper_keys": [
+            "studya_unknown_author",
+            "studyb_unknown_author"
+          ],
+          "support_slot_ids": [
+            "candidate-relation-comparison-slot:v1:0ae6f1c4f4cfb1d511dea9df",
+            "candidate-relation-comparison-slot:v1:2197e92c793f4042ebe65569"
+          ],
+          "task_contract": {
+            "comparison_question": "Can the recorded bridge_between_topics relation be compared for studya_unknown_author, studyb_unknown_author without ignoring findings or boundaries?",
+            "output_semantics": "model_authored_comparison_using_both_source_sides_and_their_qualifiers",
+            "relation_id": "relation-27a0d897d2d43df12076e937",
+            "relation_id_is_not_a_conclusion": true,
+            "relation_type": "bridge_between_topics",
+            "schema_version": "relation-comparison-task/v1",
+            "task_id": "relation_comparison:relation-27a0d897d2d43df12076e937"
+          }
+        },
+        {
+          "claim_group_index": 31,
+          "claim_group_id": "candidate-relation-comparison-group:v1:a9a1205d7ea688e5b3c1df12",
+          "task_id": "relation_comparison:relation-63efb78ed6ee58adad0055c8",
+          "synthesis_claim_id": "synthesis:relation_comparison:a9a1205d7ea688e5b3c1df12",
+          "claim_kind": "model_authored_relation_comparison_slot",
+          "claim_seed": true,
+          "paper_keys": [
+            "studyc_unknown_author",
+            "studyd_unknown_author"
+          ],
+          "support_slot_ids": [
+            "candidate-relation-comparison-slot:v1:0e6f646eb885e0a6648ab5b0",
+            "candidate-relation-comparison-slot:v1:cdadac3956d122b5e7ba6558"
+          ],
+          "task_contract": {
+            "comparison_question": "Can the recorded reported_magnitude_contrast relation be compared for studyc_unknown_author, studyd_unknown_author without ignoring findings or boundaries?",
+            "output_semantics": "model_authored_comparison_using_both_source_sides_and_their_qualifiers",
+            "relation_id": "relation-63efb78ed6ee58adad0055c8",
+            "relation_id_is_not_a_conclusion": true,
+            "relation_type": "reported_magnitude_contrast",
+            "schema_version": "relation-comparison-task/v1",
+            "task_id": "relation_comparison:relation-63efb78ed6ee58adad0055c8"
+          }
+        },
+        {
+          "claim_group_index": 32,
+          "claim_group_id": "candidate-relation-comparison-group:v1:aea1de9b5f8d71f452b72906",
+          "task_id": "relation_comparison:relation-5611303719c0a2d9060e555f",
+          "synthesis_claim_id": "synthesis:relation_comparison:aea1de9b5f8d71f452b72906",
+          "claim_kind": "model_authored_relation_comparison_slot",
+          "claim_seed": true,
+          "paper_keys": [
+            "studyb_unknown_author",
+            "studyc_unknown_author"
+          ],
+          "support_slot_ids": [
+            "candidate-relation-comparison-slot:v1:16e23b357e833cb2af9cb30c",
+            "candidate-relation-comparison-slot:v1:deb75eac6e44aa8dd3e239d1"
+          ],
+          "task_contract": {
+            "comparison_question": "Can the recorded bridge_between_topics relation be compared for studyb_unknown_author, studyc_unknown_author without ignoring findings or boundaries?",
+            "output_semantics": "model_authored_comparison_using_both_source_sides_and_their_qualifiers",
+            "relation_id": "relation-5611303719c0a2d9060e555f",
+            "relation_id_is_not_a_conclusion": true,
+            "relation_type": "bridge_between_topics",
+            "schema_version": "relation-comparison-task/v1",
+            "task_id": "relation_comparison:relation-5611303719c0a2d9060e555f"
+          }
+        },
+        {
+          "claim_group_index": 33,
+          "claim_group_id": "candidate-relation-comparison-group:v1:b9f2871f411c303b1dbbacc6",
+          "task_id": "relation_comparison:relation-980c3f1422ced97bf6f3573e",
+          "synthesis_claim_id": "synthesis:relation_comparison:b9f2871f411c303b1dbbacc6",
+          "claim_kind": "model_authored_relation_comparison_slot",
+          "claim_seed": true,
+          "paper_keys": [
+            "studyc_unknown_author",
+            "studyd_unknown_author"
+          ],
+          "support_slot_ids": [
+            "candidate-relation-comparison-slot:v1:093472df95096f80f684cc22",
+            "candidate-relation-comparison-slot:v1:d3fd68ded016ce105cfa952d"
+          ],
+          "task_contract": {
+            "comparison_question": "Can the recorded studies_same_construct relation be compared for studyc_unknown_author, studyd_unknown_author without ignoring findings or boundaries?",
+            "output_semantics": "model_authored_comparison_using_both_source_sides_and_their_qualifiers",
+            "relation_id": "relation-980c3f1422ced97bf6f3573e",
+            "relation_id_is_not_a_conclusion": true,
+            "relation_type": "studies_same_construct",
+            "schema_version": "relation-comparison-task/v1",
+            "task_id": "relation_comparison:relation-980c3f1422ced97bf6f3573e"
+          }
+        },
+        {
+          "claim_group_index": 34,
+          "claim_group_id": "candidate-relation-comparison-group:v1:bb2205ba0283b0d05c8d1f74",
+          "task_id": "relation_comparison:relation-3298b831d27cd01155a2fa34",
+          "synthesis_claim_id": "synthesis:relation_comparison:bb2205ba0283b0d05c8d1f74",
+          "claim_kind": "model_authored_relation_comparison_slot",
+          "claim_seed": true,
+          "paper_keys": [
+            "studyb_unknown_author",
+            "studyc_unknown_author"
+          ],
+          "support_slot_ids": [
+            "candidate-relation-comparison-slot:v1:96fc721d5c989a59e7f00b1e",
+            "candidate-relation-comparison-slot:v1:e346f4936fa1e224b4c29cae"
+          ],
+          "task_contract": {
+            "comparison_question": "Can the recorded qualifies relation be compared for studyb_unknown_author, studyc_unknown_author without ignoring findings or boundaries?",
+            "output_semantics": "model_authored_comparison_using_both_source_sides_and_their_qualifiers",
+            "relation_id": "relation-3298b831d27cd01155a2fa34",
+            "relation_id_is_not_a_conclusion": true,
+            "relation_type": "qualifies",
+            "schema_version": "relation-comparison-task/v1",
+            "task_id": "relation_comparison:relation-3298b831d27cd01155a2fa34"
+          }
+        },
+        {
+          "claim_group_index": 35,
+          "claim_group_id": "candidate-relation-comparison-group:v1:cbb064f260f1069a5d0aa14e",
+          "task_id": "relation_comparison:relation-bc17f103785530eb050bea9b",
+          "synthesis_claim_id": "synthesis:relation_comparison:cbb064f260f1069a5d0aa14e",
+          "claim_kind": "model_authored_relation_comparison_slot",
+          "claim_seed": true,
+          "paper_keys": [
+            "studyb_unknown_author",
+            "studyc_unknown_author"
+          ],
+          "support_slot_ids": [
+            "candidate-relation-comparison-slot:v1:66904d7d369b584835458698",
+            "candidate-relation-comparison-slot:v1:ee44ddf003aaddf4d7605c5e"
+          ],
+          "task_contract": {
+            "comparison_question": "Can the recorded studies_same_construct relation be compared for studyb_unknown_author, studyc_unknown_author without ignoring findings or boundaries?",
+            "output_semantics": "model_authored_comparison_using_both_source_sides_and_their_qualifiers",
+            "relation_id": "relation-bc17f103785530eb050bea9b",
+            "relation_id_is_not_a_conclusion": true,
+            "relation_type": "studies_same_construct",
+            "schema_version": "relation-comparison-task/v1",
+            "task_id": "relation_comparison:relation-bc17f103785530eb050bea9b"
+          }
+        },
+        {
+          "claim_group_index": 36,
+          "claim_group_id": "candidate-relation-comparison-group:v1:cc07584b1b4fad9dbb2da3a5",
+          "task_id": "relation_comparison:relation-6fb77241cb144bac87f6e1c9",
+          "synthesis_claim_id": "synthesis:relation_comparison:cc07584b1b4fad9dbb2da3a5",
+          "claim_kind": "model_authored_relation_comparison_slot",
+          "claim_seed": true,
+          "paper_keys": [
+            "studya_unknown_author",
+            "studyb_unknown_author"
+          ],
+          "support_slot_ids": [
+            "candidate-relation-comparison-slot:v1:baa9ae9ca225c3f936a841ab",
+            "candidate-relation-comparison-slot:v1:dc1695c24f321909ef52d06c"
+          ],
+          "task_contract": {
+            "comparison_question": "Can the recorded qualifies relation be compared for studya_unknown_author, studyb_unknown_author without ignoring findings or boundaries?",
+            "output_semantics": "model_authored_comparison_using_both_source_sides_and_their_qualifiers",
+            "relation_id": "relation-6fb77241cb144bac87f6e1c9",
+            "relation_id_is_not_a_conclusion": true,
+            "relation_type": "qualifies",
+            "schema_version": "relation-comparison-task/v1",
+            "task_id": "relation_comparison:relation-6fb77241cb144bac87f6e1c9"
+          }
+        },
+        {
+          "claim_group_index": 37,
+          "claim_group_id": "candidate-relation-comparison-group:v1:d5678dd39ce2c5d4979047c4",
+          "task_id": "relation_comparison:relation-7d141f1dc6d74d97bddaf272",
+          "synthesis_claim_id": "synthesis:relation_comparison:d5678dd39ce2c5d4979047c4",
+          "claim_kind": "model_authored_relation_comparison_slot",
+          "claim_seed": true,
+          "paper_keys": [
+            "studya_unknown_author",
+            "studyb_unknown_author"
+          ],
+          "support_slot_ids": [
+            "candidate-relation-comparison-slot:v1:37ab97ecd8ba9774904507e4",
+            "candidate-relation-comparison-slot:v1:3a8f30e9a75849b862be0669"
+          ],
+          "task_contract": {
+            "comparison_question": "Compare actual source findings within their recorded sample boundary.",
+            "output_semantics": "model_authored_comparison_using_both_source_sides_and_their_qualifiers",
+            "relation_id": "relation-7d141f1dc6d74d97bddaf272",
+            "relation_id_is_not_a_conclusion": true,
+            "relation_type": "reported_magnitude_contrast",
+            "schema_version": "relation-comparison-task/v1",
+            "task_id": "relation_comparison:relation-7d141f1dc6d74d97bddaf272"
+          }
+        }
+      ]
+    },
+    "hierarchy": {
+      "level": "candidate_local_shard",
+      "claim_group_ids": [
+        "candidate-claim-group:v1:00c41aa0eec9a7d31c6b507d",
+        "candidate-claim-group:v1:02519410ac4a6c5f34988c08",
+        "candidate-claim-group:v1:06b5bd82fc7cf82404344119",
+        "candidate-claim-group:v1:21c93c3847d20385a2516674",
+        "candidate-claim-group:v1:37a0f7abe5bf2efd2009d201",
+        "candidate-claim-group:v1:388da033a1a59851acb6727c",
+        "candidate-claim-group:v1:3efe598e30a57a9a10ca750e",
+        "candidate-claim-group:v1:56b6aebe6f24c922434aa0c7",
+        "candidate-claim-group:v1:6b4990c15080930f7f16bc4c",
+        "candidate-claim-group:v1:7ed094b2df15fa8b3e7be459",
+        "candidate-claim-group:v1:8c01e8cfa4266d9364ad4b4f",
+        "candidate-claim-group:v1:939c6f05a8c1b3f8428f7772",
+        "candidate-claim-group:v1:955fef65b435281298552ce2",
+        "candidate-claim-group:v1:9bb13be62bfe12c51243b679",
+        "candidate-claim-group:v1:a2e2f47026d98a3a4fbd8706",
+        "candidate-claim-group:v1:a445be37939bf0f18bce54c3",
+        "candidate-claim-group:v1:a7a1d9e1fb37d28555b8e916",
+        "candidate-claim-group:v1:ab1c1437bf171d0c49c43751",
+        "candidate-claim-group:v1:acaed6238fe769b5f9e5507e",
+        "candidate-claim-group:v1:c347af14985dcb0f718da2b1",
+        "candidate-claim-group:v1:c949c6ad3a8049342a8a6bb3",
+        "candidate-claim-group:v1:e52e4e8f642db32e4c6e7579",
+        "candidate-claim-group:v1:e943631d569cecb714d9803e",
+        "candidate-claim-group:v1:ef029f91fcefc1a15928eda1",
+        "candidate-claim-group:v1:f2bc016d3db322088cb841a0",
+        "candidate-claim-group:v1:f515ecab8b2d3af9c3f701e4",
+        "candidate-relation-comparison-group:v1:094242d0f55c165926e0a974",
+        "candidate-relation-comparison-group:v1:2a422367a4e50a2514d34d80",
+        "candidate-relation-comparison-group:v1:5cbf75b0a3e405c116dbcb34",
+        "candidate-relation-comparison-group:v1:80dc4c3c571a73789677c02a",
+        "candidate-relation-comparison-group:v1:95edba6facc3853318d9ee99",
+        "candidate-relation-comparison-group:v1:a9a1205d7ea688e5b3c1df12",
+        "candidate-relation-comparison-group:v1:aea1de9b5f8d71f452b72906",
+        "candidate-relation-comparison-group:v1:b9f2871f411c303b1dbbacc6",
+        "candidate-relation-comparison-group:v1:bb2205ba0283b0d05c8d1f74",
+        "candidate-relation-comparison-group:v1:cbb064f260f1069a5d0aa14e",
+        "candidate-relation-comparison-group:v1:cc07584b1b4fad9dbb2da3a5",
+        "candidate-relation-comparison-group:v1:d5678dd39ce2c5d4979047c4"
+      ],
+      "paper_keys": [
+        "studya_unknown_author",
+        "studyb_unknown_author",
+        "studyc_unknown_author",
+        "studyd_unknown_author"
+      ],
+      "assignment_policy": "complete_assertion_closure"
+    },
+    "content_layer_refs": {
+      "artifact_type": "outline_content_layers",
+      "artifact_hash": "8dfa13cad5b069a755c5eb168f8f6284a631da5a7b7478538b4e04494bd90bed",
+      "dossier_ids": [
+        "dossier:studya_unknown_author",
+        "dossier:studyb_unknown_author",
+        "dossier:studyc_unknown_author",
+        "dossier:studyd_unknown_author"
+      ]
+    },
+    "shared_semantic_context": {
+      "interpretation_source_tables": {
+        "source_claims": [
+          {
+            "claim_id": "claim:studya_unknown_author:concept_definitions:60c411b2baec2ab5",
+            "claim_type": "author_interpretation",
+            "text": "treatment",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studya_unknown_author:concept_definitions:02ae745044c2e633"
+            ],
+            "source_locator": "stage1:ai_summary.concept_definitions",
+            "source_summary_hash": "de9ed49e51b8b6b24cba51b9e1f1cfe2f8bfecc1898dbf65da229e05d152faa5",
+            "paper_key": "studya_unknown_author"
+          },
+          {
+            "claim_id": "claim:studya_unknown_author:concept_definitions:e654d060f563f868",
+            "claim_type": "author_interpretation",
+            "text": "measured outcome",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studya_unknown_author:concept_definitions:88e289bca6e1668f"
+            ],
+            "source_locator": "stage1:ai_summary.concept_definitions",
+            "source_summary_hash": "de9ed49e51b8b6b24cba51b9e1f1cfe2f8bfecc1898dbf65da229e05d152faa5",
+            "paper_key": "studya_unknown_author"
+          },
+          {
+            "claim_id": "claim:studya_unknown_author:findings:9cf0c5c01ec2d03e",
+            "claim_type": "empirical_finding",
+            "text": "Treatment improved the measured outcome by four points.",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studya_unknown_author:findings:2f6000aae38dc919"
+            ],
+            "source_locator": "stage1:ai_summary.findings",
+            "source_summary_hash": "de9ed49e51b8b6b24cba51b9e1f1cfe2f8bfecc1898dbf65da229e05d152faa5",
+            "paper_key": "studya_unknown_author"
+          },
+          {
+            "claim_id": "claim:studya_unknown_author:limitations:933b43bbef72c19a",
+            "claim_type": "author_interpretation",
+            "text": "Findings apply only to this sample.",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studya_unknown_author:limitations:d89d7f798241b1a0"
+            ],
+            "source_locator": "stage1:ai_summary.limitations",
+            "source_summary_hash": "de9ed49e51b8b6b24cba51b9e1f1cfe2f8bfecc1898dbf65da229e05d152faa5",
+            "paper_key": "studya_unknown_author"
+          },
+          {
+            "claim_id": "claim:studya_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim_type": "author_interpretation",
+            "text": "Observed controlled sample.",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studya_unknown_author:moderators_boundaries:5c2a9a2cec67e801"
+            ],
+            "source_locator": "stage1:ai_summary.moderators_boundaries",
+            "source_summary_hash": "de9ed49e51b8b6b24cba51b9e1f1cfe2f8bfecc1898dbf65da229e05d152faa5",
+            "paper_key": "studya_unknown_author"
+          },
+          {
+            "claim_id": "claim:studya_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim_type": "author_interpretation",
+            "text": "Findings apply only to this sample.",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studya_unknown_author:moderators_boundaries:baabedd159b28a4f"
+            ],
+            "source_locator": "stage1:ai_summary.moderators_boundaries",
+            "source_summary_hash": "de9ed49e51b8b6b24cba51b9e1f1cfe2f8bfecc1898dbf65da229e05d152faa5",
+            "paper_key": "studya_unknown_author"
+          },
+          {
+            "claim_id": "claim:studya_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim_type": "author_interpretation",
+            "text": "Observed controlled sample of 24 participants.",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studya_unknown_author:moderators_boundaries:c2e229c13c68cdfa"
+            ],
+            "source_locator": "stage1:ai_summary.moderators_boundaries",
+            "source_summary_hash": "de9ed49e51b8b6b24cba51b9e1f1cfe2f8bfecc1898dbf65da229e05d152faa5",
+            "paper_key": "studya_unknown_author"
+          },
+          {
+            "claim_id": "claim:studya_unknown_author:operationalizations:d22e13af34a0bd66",
+            "claim_type": "author_interpretation",
+            "text": "Observed controlled sample of 24 participants.",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studya_unknown_author:operationalizations:065529d9d60ce0f9"
+            ],
+            "source_locator": "stage1:ai_summary.operationalizations",
+            "source_summary_hash": "de9ed49e51b8b6b24cba51b9e1f1cfe2f8bfecc1898dbf65da229e05d152faa5",
+            "paper_key": "studya_unknown_author"
+          },
+          {
+            "claim_id": "claim:studya_unknown_author:operationalizations:eafa2c457e93d9a0",
+            "claim_type": "author_interpretation",
+            "text": "Descriptive comparison of observed group means.",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studya_unknown_author:operationalizations:1813b51ce68e92c1"
+            ],
+            "source_locator": "stage1:ai_summary.operationalizations",
+            "source_summary_hash": "de9ed49e51b8b6b24cba51b9e1f1cfe2f8bfecc1898dbf65da229e05d152faa5",
+            "paper_key": "studya_unknown_author"
+          },
+          {
+            "claim_id": "claim:studyb_unknown_author:concept_definitions:60c411b2baec2ab5",
+            "claim_type": "author_interpretation",
+            "text": "treatment",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studyb_unknown_author:concept_definitions:da6da30984c50c17"
+            ],
+            "source_locator": "stage1:ai_summary.concept_definitions",
+            "source_summary_hash": "677cd271a0e81af15da9edcc7d9ee4feb83d3fbfa675a642ac2d3d304d1427f2",
+            "paper_key": "studyb_unknown_author"
+          },
+          {
+            "claim_id": "claim:studyb_unknown_author:concept_definitions:e654d060f563f868",
+            "claim_type": "author_interpretation",
+            "text": "measured outcome",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studyb_unknown_author:concept_definitions:9020e40fa1c63911"
+            ],
+            "source_locator": "stage1:ai_summary.concept_definitions",
+            "source_summary_hash": "677cd271a0e81af15da9edcc7d9ee4feb83d3fbfa675a642ac2d3d304d1427f2",
+            "paper_key": "studyb_unknown_author"
+          },
+          {
+            "claim_id": "claim:studyb_unknown_author:findings:f6586c2423a1dbe7",
+            "claim_type": "empirical_finding",
+            "text": "Treatment improved the measured outcome by two points.",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studyb_unknown_author:findings:52601d9730101e05"
+            ],
+            "source_locator": "stage1:ai_summary.findings",
+            "source_summary_hash": "677cd271a0e81af15da9edcc7d9ee4feb83d3fbfa675a642ac2d3d304d1427f2",
+            "paper_key": "studyb_unknown_author"
+          },
+          {
+            "claim_id": "claim:studyb_unknown_author:limitations:933b43bbef72c19a",
+            "claim_type": "author_interpretation",
+            "text": "Findings apply only to this sample.",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studyb_unknown_author:limitations:2c912bc444e571bd"
+            ],
+            "source_locator": "stage1:ai_summary.limitations",
+            "source_summary_hash": "677cd271a0e81af15da9edcc7d9ee4feb83d3fbfa675a642ac2d3d304d1427f2",
+            "paper_key": "studyb_unknown_author"
+          },
+          {
+            "claim_id": "claim:studyb_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim_type": "author_interpretation",
+            "text": "Observed controlled sample.",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studyb_unknown_author:moderators_boundaries:2992a90e640ce393"
+            ],
+            "source_locator": "stage1:ai_summary.moderators_boundaries",
+            "source_summary_hash": "677cd271a0e81af15da9edcc7d9ee4feb83d3fbfa675a642ac2d3d304d1427f2",
+            "paper_key": "studyb_unknown_author"
+          },
+          {
+            "claim_id": "claim:studyb_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim_type": "author_interpretation",
+            "text": "Findings apply only to this sample.",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studyb_unknown_author:moderators_boundaries:e0eab51ceb6f51ed"
+            ],
+            "source_locator": "stage1:ai_summary.moderators_boundaries",
+            "source_summary_hash": "677cd271a0e81af15da9edcc7d9ee4feb83d3fbfa675a642ac2d3d304d1427f2",
+            "paper_key": "studyb_unknown_author"
+          },
+          {
+            "claim_id": "claim:studyb_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim_type": "author_interpretation",
+            "text": "Observed controlled sample of 24 participants.",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studyb_unknown_author:moderators_boundaries:2f6da8d2a5ce047d"
+            ],
+            "source_locator": "stage1:ai_summary.moderators_boundaries",
+            "source_summary_hash": "677cd271a0e81af15da9edcc7d9ee4feb83d3fbfa675a642ac2d3d304d1427f2",
+            "paper_key": "studyb_unknown_author"
+          },
+          {
+            "claim_id": "claim:studyb_unknown_author:operationalizations:d22e13af34a0bd66",
+            "claim_type": "author_interpretation",
+            "text": "Observed controlled sample of 24 participants.",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studyb_unknown_author:operationalizations:cf3935e1126d456e"
+            ],
+            "source_locator": "stage1:ai_summary.operationalizations",
+            "source_summary_hash": "677cd271a0e81af15da9edcc7d9ee4feb83d3fbfa675a642ac2d3d304d1427f2",
+            "paper_key": "studyb_unknown_author"
+          },
+          {
+            "claim_id": "claim:studyb_unknown_author:operationalizations:eafa2c457e93d9a0",
+            "claim_type": "author_interpretation",
+            "text": "Descriptive comparison of observed group means.",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studyb_unknown_author:operationalizations:f8264683eedc044e"
+            ],
+            "source_locator": "stage1:ai_summary.operationalizations",
+            "source_summary_hash": "677cd271a0e81af15da9edcc7d9ee4feb83d3fbfa675a642ac2d3d304d1427f2",
+            "paper_key": "studyb_unknown_author"
+          },
+          {
+            "claim_id": "claim:studyc_unknown_author:concept_definitions:60c411b2baec2ab5",
+            "claim_type": "author_interpretation",
+            "text": "treatment",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studyc_unknown_author:concept_definitions:dc955454a8df7a64"
+            ],
+            "source_locator": "stage1:ai_summary.concept_definitions",
+            "source_summary_hash": "7793ed65d83b70d76fe8799861fd73f3444a168f492e8f2702f96cdbf172a87a",
+            "paper_key": "studyc_unknown_author"
+          },
+          {
+            "claim_id": "claim:studyc_unknown_author:concept_definitions:e654d060f563f868",
+            "claim_type": "author_interpretation",
+            "text": "measured outcome",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studyc_unknown_author:concept_definitions:731b8ff82c2b58f1"
+            ],
+            "source_locator": "stage1:ai_summary.concept_definitions",
+            "source_summary_hash": "7793ed65d83b70d76fe8799861fd73f3444a168f492e8f2702f96cdbf172a87a",
+            "paper_key": "studyc_unknown_author"
+          },
+          {
+            "claim_id": "claim:studyc_unknown_author:findings:20eb70c8f8b6fd23",
+            "claim_type": "empirical_finding",
+            "text": "Treatment improved the measured outcome by one point.",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studyc_unknown_author:findings:608c6188c257f7b5"
+            ],
+            "source_locator": "stage1:ai_summary.findings",
+            "source_summary_hash": "7793ed65d83b70d76fe8799861fd73f3444a168f492e8f2702f96cdbf172a87a",
+            "paper_key": "studyc_unknown_author"
+          },
+          {
+            "claim_id": "claim:studyc_unknown_author:limitations:933b43bbef72c19a",
+            "claim_type": "author_interpretation",
+            "text": "Findings apply only to this sample.",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studyc_unknown_author:limitations:16ad4860e65fe188"
+            ],
+            "source_locator": "stage1:ai_summary.limitations",
+            "source_summary_hash": "7793ed65d83b70d76fe8799861fd73f3444a168f492e8f2702f96cdbf172a87a",
+            "paper_key": "studyc_unknown_author"
+          },
+          {
+            "claim_id": "claim:studyc_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim_type": "author_interpretation",
+            "text": "Observed controlled sample.",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studyc_unknown_author:moderators_boundaries:cb931f242fa8df29"
+            ],
+            "source_locator": "stage1:ai_summary.moderators_boundaries",
+            "source_summary_hash": "7793ed65d83b70d76fe8799861fd73f3444a168f492e8f2702f96cdbf172a87a",
+            "paper_key": "studyc_unknown_author"
+          },
+          {
+            "claim_id": "claim:studyc_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim_type": "author_interpretation",
+            "text": "Findings apply only to this sample.",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studyc_unknown_author:moderators_boundaries:f0c4d984587f4b98"
+            ],
+            "source_locator": "stage1:ai_summary.moderators_boundaries",
+            "source_summary_hash": "7793ed65d83b70d76fe8799861fd73f3444a168f492e8f2702f96cdbf172a87a",
+            "paper_key": "studyc_unknown_author"
+          },
+          {
+            "claim_id": "claim:studyc_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim_type": "author_interpretation",
+            "text": "Observed controlled sample of 24 participants.",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studyc_unknown_author:moderators_boundaries:6e3aecdc675fd35e"
+            ],
+            "source_locator": "stage1:ai_summary.moderators_boundaries",
+            "source_summary_hash": "7793ed65d83b70d76fe8799861fd73f3444a168f492e8f2702f96cdbf172a87a",
+            "paper_key": "studyc_unknown_author"
+          },
+          {
+            "claim_id": "claim:studyc_unknown_author:operationalizations:d22e13af34a0bd66",
+            "claim_type": "author_interpretation",
+            "text": "Observed controlled sample of 24 participants.",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studyc_unknown_author:operationalizations:97bef31557c9f1a0"
+            ],
+            "source_locator": "stage1:ai_summary.operationalizations",
+            "source_summary_hash": "7793ed65d83b70d76fe8799861fd73f3444a168f492e8f2702f96cdbf172a87a",
+            "paper_key": "studyc_unknown_author"
+          },
+          {
+            "claim_id": "claim:studyc_unknown_author:operationalizations:eafa2c457e93d9a0",
+            "claim_type": "author_interpretation",
+            "text": "Descriptive comparison of observed group means.",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studyc_unknown_author:operationalizations:99e365d237eb06cc"
+            ],
+            "source_locator": "stage1:ai_summary.operationalizations",
+            "source_summary_hash": "7793ed65d83b70d76fe8799861fd73f3444a168f492e8f2702f96cdbf172a87a",
+            "paper_key": "studyc_unknown_author"
+          },
+          {
+            "claim_id": "claim:studyd_unknown_author:concept_definitions:60c411b2baec2ab5",
+            "claim_type": "author_interpretation",
+            "text": "treatment",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studyd_unknown_author:concept_definitions:5dc445bf67fcbc42"
+            ],
+            "source_locator": "stage1:ai_summary.concept_definitions",
+            "source_summary_hash": "410560326ded277aa3614294589200f6e7ba2d4e17b21fa2cc01685ae8c297de",
+            "paper_key": "studyd_unknown_author"
+          },
+          {
+            "claim_id": "claim:studyd_unknown_author:concept_definitions:e654d060f563f868",
+            "claim_type": "author_interpretation",
+            "text": "measured outcome",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studyd_unknown_author:concept_definitions:065a9dc91c37f33f"
+            ],
+            "source_locator": "stage1:ai_summary.concept_definitions",
+            "source_summary_hash": "410560326ded277aa3614294589200f6e7ba2d4e17b21fa2cc01685ae8c297de",
+            "paper_key": "studyd_unknown_author"
+          },
+          {
+            "claim_id": "claim:studyd_unknown_author:findings:497ca5821dde33f8",
+            "claim_type": "empirical_finding",
+            "text": "Treatment did not change the measured outcome.",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studyd_unknown_author:findings:ad5ca9c914a25e7a"
+            ],
+            "source_locator": "stage1:ai_summary.findings",
+            "source_summary_hash": "410560326ded277aa3614294589200f6e7ba2d4e17b21fa2cc01685ae8c297de",
+            "paper_key": "studyd_unknown_author"
+          },
+          {
+            "claim_id": "claim:studyd_unknown_author:limitations:933b43bbef72c19a",
+            "claim_type": "author_interpretation",
+            "text": "Findings apply only to this sample.",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studyd_unknown_author:limitations:6e1b52eb71b790b4"
+            ],
+            "source_locator": "stage1:ai_summary.limitations",
+            "source_summary_hash": "410560326ded277aa3614294589200f6e7ba2d4e17b21fa2cc01685ae8c297de",
+            "paper_key": "studyd_unknown_author"
+          },
+          {
+            "claim_id": "claim:studyd_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+            "claim_type": "author_interpretation",
+            "text": "Observed controlled sample.",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studyd_unknown_author:moderators_boundaries:f24dfc6f83cf30b2"
+            ],
+            "source_locator": "stage1:ai_summary.moderators_boundaries",
+            "source_summary_hash": "410560326ded277aa3614294589200f6e7ba2d4e17b21fa2cc01685ae8c297de",
+            "paper_key": "studyd_unknown_author"
+          },
+          {
+            "claim_id": "claim:studyd_unknown_author:moderators_boundaries:933b43bbef72c19a",
+            "claim_type": "author_interpretation",
+            "text": "Findings apply only to this sample.",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studyd_unknown_author:moderators_boundaries:c291b89701c99831"
+            ],
+            "source_locator": "stage1:ai_summary.moderators_boundaries",
+            "source_summary_hash": "410560326ded277aa3614294589200f6e7ba2d4e17b21fa2cc01685ae8c297de",
+            "paper_key": "studyd_unknown_author"
+          },
+          {
+            "claim_id": "claim:studyd_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+            "claim_type": "author_interpretation",
+            "text": "Observed controlled sample of 24 participants.",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studyd_unknown_author:moderators_boundaries:a07c49a87a2f69c2"
+            ],
+            "source_locator": "stage1:ai_summary.moderators_boundaries",
+            "source_summary_hash": "410560326ded277aa3614294589200f6e7ba2d4e17b21fa2cc01685ae8c297de",
+            "paper_key": "studyd_unknown_author"
+          },
+          {
+            "claim_id": "claim:studyd_unknown_author:operationalizations:d22e13af34a0bd66",
+            "claim_type": "author_interpretation",
+            "text": "Observed controlled sample of 24 participants.",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studyd_unknown_author:operationalizations:f8c120fddb6ab0a8"
+            ],
+            "source_locator": "stage1:ai_summary.operationalizations",
+            "source_summary_hash": "410560326ded277aa3614294589200f6e7ba2d4e17b21fa2cc01685ae8c297de",
+            "paper_key": "studyd_unknown_author"
+          },
+          {
+            "claim_id": "claim:studyd_unknown_author:operationalizations:eafa2c457e93d9a0",
+            "claim_type": "author_interpretation",
+            "text": "Descriptive comparison of observed group means.",
+            "study_id": "",
+            "evidence_ids": [
+              "evidence:studyd_unknown_author:operationalizations:d10413b5923a0d05"
+            ],
+            "source_locator": "stage1:ai_summary.operationalizations",
+            "source_summary_hash": "410560326ded277aa3614294589200f6e7ba2d4e17b21fa2cc01685ae8c297de",
+            "paper_key": "studyd_unknown_author"
+          }
+        ],
+        "source_fields": [
+          {
+            "source_field_id": "source-field:0fcad026d3818ef9840c7f9ea6d1d19ccc66ff9e7c50ad8762bd327e81c95f06",
+            "source_path": "ai_summary.core_analysis.findings",
+            "source_value": "Treatment improved the measured outcome by four points.",
+            "disposition": "exact",
+            "canonical_field": "findings",
+            "scope": "paper",
+            "study_id": "",
+            "interpretation_required": true,
+            "source_summary_hash": "de9ed49e51b8b6b24cba51b9e1f1cfe2f8bfecc1898dbf65da229e05d152faa5",
+            "derived_value": "",
+            "paper_key": "studya_unknown_author"
+          },
+          {
+            "source_field_id": "source-field:72512e5861bdb687d3213137ca3b99fb4404b176eaaacc8fa29b7f2ebe9cf963",
+            "source_path": "typed_research_unit.moderators_or_boundaries[1]",
+            "source_value": "Observed controlled sample of 24 participants.",
+            "disposition": "context",
+            "canonical_field": "moderators_boundaries",
+            "scope": "paper",
+            "study_id": "",
+            "interpretation_required": true,
+            "source_summary_hash": "de9ed49e51b8b6b24cba51b9e1f1cfe2f8bfecc1898dbf65da229e05d152faa5",
+            "derived_value": "",
+            "paper_key": "studya_unknown_author"
+          },
+          {
+            "source_field_id": "source-field:812e5a3c6f9fbf7b7837872871b256cf7297261a7a37dd1fe03927ace44a3c8b",
+            "source_path": "typed_research_unit.moderators_or_boundaries[2]",
+            "source_value": "Observed controlled sample.",
+            "disposition": "context",
+            "canonical_field": "moderators_boundaries",
+            "scope": "paper",
+            "study_id": "",
+            "interpretation_required": true,
+            "source_summary_hash": "de9ed49e51b8b6b24cba51b9e1f1cfe2f8bfecc1898dbf65da229e05d152faa5",
+            "derived_value": "",
+            "paper_key": "studya_unknown_author"
+          },
+          {
+            "source_field_id": "source-field:9020b5d1083af6fd1a69ca0447249a5858dea1b7a117e0b8a8b11758376edda4",
+            "source_path": "ai_summary.core_analysis.key_points[0]",
+            "source_value": "Treatment improved the measured outcome by four points.",
+            "disposition": "unmapped",
+            "canonical_field": "",
+            "scope": "paper",
+            "study_id": "",
+            "interpretation_required": false,
+            "source_summary_hash": "de9ed49e51b8b6b24cba51b9e1f1cfe2f8bfecc1898dbf65da229e05d152faa5",
+            "derived_value": "",
+            "paper_key": "studya_unknown_author"
+          },
+          {
+            "source_field_id": "source-field:9f9febd978450bd5b7b5736fa5a017fdf8a766ddba48a10d449d4ab792013094",
+            "source_path": "ai_summary.specialized_details.empirical.data_source_and_size",
+            "source_value": "Observed controlled sample of 24 participants.",
+            "disposition": "exact",
+            "canonical_field": "sample_or_context",
+            "scope": "paper",
+            "study_id": "",
+            "interpretation_required": true,
+            "source_summary_hash": "de9ed49e51b8b6b24cba51b9e1f1cfe2f8bfecc1898dbf65da229e05d152faa5",
+            "derived_value": "",
+            "paper_key": "studya_unknown_author"
+          },
+          {
+            "source_field_id": "source-field:dab7af42c3f68adfac819360ec29e8c53d2fcc6579bc7171f319b2d014b6d074",
+            "source_path": "ai_summary.core_analysis.conclusions",
+            "source_value": "Treatment improved the measured outcome by four points.",
+            "disposition": "exact",
+            "canonical_field": "conclusions",
+            "scope": "paper",
+            "study_id": "",
+            "interpretation_required": true,
+            "source_summary_hash": "de9ed49e51b8b6b24cba51b9e1f1cfe2f8bfecc1898dbf65da229e05d152faa5",
+            "derived_value": "",
+            "paper_key": "studya_unknown_author"
+          },
+          {
+            "source_field_id": "source-field:f189aad157394e0387607f93588b7af6fe25e75a30b8084ee1cbeb7f755e4607",
+            "source_path": "ai_summary.specialized_details.empirical.sample_characteristics_or_context",
+            "source_value": "Observed controlled sample.",
+            "disposition": "unmapped",
+            "canonical_field": "",
+            "scope": "paper",
+            "study_id": "",
+            "interpretation_required": false,
+            "source_summary_hash": "de9ed49e51b8b6b24cba51b9e1f1cfe2f8bfecc1898dbf65da229e05d152faa5",
+            "derived_value": "",
+            "paper_key": "studya_unknown_author"
+          },
+          {
+            "source_field_id": "source-field:f8fcf0b3cf9aa4999b7654470be89ae3963c241f80c37534b70d3651dc5e3ba7",
+            "source_path": "ai_summary.core_analysis.limitations",
+            "source_value": "Findings apply only to this sample.",
+            "disposition": "exact",
+            "canonical_field": "limitations",
+            "scope": "paper",
+            "study_id": "",
+            "interpretation_required": true,
+            "source_summary_hash": "de9ed49e51b8b6b24cba51b9e1f1cfe2f8bfecc1898dbf65da229e05d152faa5",
+            "derived_value": "",
+            "paper_key": "studya_unknown_author"
+          },
+          {
+            "source_field_id": "source-field:3b534b94b8a0026323c67bd09176020316f84e379c467a8f1711dac6faf63826",
+            "source_path": "ai_summary.core_analysis.key_points[0]",
+            "source_value": "Treatment improved the measured outcome by two points.",
+            "disposition": "unmapped",
+            "canonical_field": "",
+            "scope": "paper",
+            "study_id": "",
+            "interpretation_required": false,
+            "source_summary_hash": "677cd271a0e81af15da9edcc7d9ee4feb83d3fbfa675a642ac2d3d304d1427f2",
+            "derived_value": "",
+            "paper_key": "studyb_unknown_author"
+          },
+          {
+            "source_field_id": "source-field:3c2c5ffd33610496099fa52da71370d896b660c1aa881f2fa39cb65688f9df51",
+            "source_path": "typed_research_unit.moderators_or_boundaries[2]",
+            "source_value": "Observed controlled sample.",
+            "disposition": "context",
+            "canonical_field": "moderators_boundaries",
+            "scope": "paper",
+            "study_id": "",
+            "interpretation_required": true,
+            "source_summary_hash": "677cd271a0e81af15da9edcc7d9ee4feb83d3fbfa675a642ac2d3d304d1427f2",
+            "derived_value": "",
+            "paper_key": "studyb_unknown_author"
+          },
+          {
+            "source_field_id": "source-field:554fad9090d958900bd2004087696a8b99de2e6d00b21baf7b057dfd34611f45",
+            "source_path": "typed_research_unit.moderators_or_boundaries[1]",
+            "source_value": "Observed controlled sample of 24 participants.",
+            "disposition": "context",
+            "canonical_field": "moderators_boundaries",
+            "scope": "paper",
+            "study_id": "",
+            "interpretation_required": true,
+            "source_summary_hash": "677cd271a0e81af15da9edcc7d9ee4feb83d3fbfa675a642ac2d3d304d1427f2",
+            "derived_value": "",
+            "paper_key": "studyb_unknown_author"
+          },
+          {
+            "source_field_id": "source-field:71851fc255044eddd9ec245617f515ffd48298122abeb0ed6566c537a0e0350b",
+            "source_path": "ai_summary.core_analysis.findings",
+            "source_value": "Treatment improved the measured outcome by two points.",
+            "disposition": "exact",
+            "canonical_field": "findings",
+            "scope": "paper",
+            "study_id": "",
+            "interpretation_required": true,
+            "source_summary_hash": "677cd271a0e81af15da9edcc7d9ee4feb83d3fbfa675a642ac2d3d304d1427f2",
+            "derived_value": "",
+            "paper_key": "studyb_unknown_author"
+          },
+          {
+            "source_field_id": "source-field:792f8a7fabd20795e869900c6c71783297306263798af5e7427e9cc71984a810",
+            "source_path": "ai_summary.core_analysis.conclusions",
+            "source_value": "Treatment improved the measured outcome by two points.",
+            "disposition": "exact",
+            "canonical_field": "conclusions",
+            "scope": "paper",
+            "study_id": "",
+            "interpretation_required": true,
+            "source_summary_hash": "677cd271a0e81af15da9edcc7d9ee4feb83d3fbfa675a642ac2d3d304d1427f2",
+            "derived_value": "",
+            "paper_key": "studyb_unknown_author"
+          },
+          {
+            "source_field_id": "source-field:b06f90b6330350c57ce9b9cab3b576d37fa1fa87d51d98539121379d43218b91",
+            "source_path": "ai_summary.specialized_details.empirical.sample_characteristics_or_context",
+            "source_value": "Observed controlled sample.",
+            "disposition": "unmapped",
+            "canonical_field": "",
+            "scope": "paper",
+            "study_id": "",
+            "interpretation_required": false,
+            "source_summary_hash": "677cd271a0e81af15da9edcc7d9ee4feb83d3fbfa675a642ac2d3d304d1427f2",
+            "derived_value": "",
+            "paper_key": "studyb_unknown_author"
+          },
+          {
+            "source_field_id": "source-field:cda079fd63f4aa8fa90194d3fc2afc1ff2fff13f942725165bb91cafe998aa43",
+            "source_path": "ai_summary.core_analysis.limitations",
+            "source_value": "Findings apply only to this sample.",
+            "disposition": "exact",
+            "canonical_field": "limitations",
+            "scope": "paper",
+            "study_id": "",
+            "interpretation_required": true,
+            "source_summary_hash": "677cd271a0e81af15da9edcc7d9ee4feb83d3fbfa675a642ac2d3d304d1427f2",
+            "derived_value": "",
+            "paper_key": "studyb_unknown_author"
+          },
+          {
+            "source_field_id": "source-field:fd3cc5f67eb67b28bd5a9cbf9034504229c27a1e7db48e354284d634f3c44a2c",
+            "source_path": "ai_summary.specialized_details.empirical.data_source_and_size",
+            "source_value": "Observed controlled sample of 24 participants.",
+            "disposition": "exact",
+            "canonical_field": "sample_or_context",
+            "scope": "paper",
+            "study_id": "",
+            "interpretation_required": true,
+            "source_summary_hash": "677cd271a0e81af15da9edcc7d9ee4feb83d3fbfa675a642ac2d3d304d1427f2",
+            "derived_value": "",
+            "paper_key": "studyb_unknown_author"
+          },
+          {
+            "source_field_id": "source-field:02fd358d203b774b00494c919200bfdac3385609def5758b6515ba56a61619bf",
+            "source_path": "ai_summary.specialized_details.empirical.data_source_and_size",
+            "source_value": "Observed controlled sample of 24 participants.",
+            "disposition": "exact",
+            "canonical_field": "sample_or_context",
+            "scope": "paper",
+            "study_id": "",
+            "interpretation_required": true,
+            "source_summary_hash": "7793ed65d83b70d76fe8799861fd73f3444a168f492e8f2702f96cdbf172a87a",
+            "derived_value": "",
+            "paper_key": "studyc_unknown_author"
+          },
+          {
+            "source_field_id": "source-field:1b78aed2a146c2cf5eb13970587f4924503592a59ceab0adece1d2f827cf2c8e",
+            "source_path": "ai_summary.core_analysis.limitations",
+            "source_value": "Findings apply only to this sample.",
+            "disposition": "exact",
+            "canonical_field": "limitations",
+            "scope": "paper",
+            "study_id": "",
+            "interpretation_required": true,
+            "source_summary_hash": "7793ed65d83b70d76fe8799861fd73f3444a168f492e8f2702f96cdbf172a87a",
+            "derived_value": "",
+            "paper_key": "studyc_unknown_author"
+          },
+          {
+            "source_field_id": "source-field:52201e5ecf49031509fa77800481588966a771814337065fae2b4c7f1efc30b0",
+            "source_path": "typed_research_unit.moderators_or_boundaries[2]",
+            "source_value": "Observed controlled sample.",
+            "disposition": "context",
+            "canonical_field": "moderators_boundaries",
+            "scope": "paper",
+            "study_id": "",
+            "interpretation_required": true,
+            "source_summary_hash": "7793ed65d83b70d76fe8799861fd73f3444a168f492e8f2702f96cdbf172a87a",
+            "derived_value": "",
+            "paper_key": "studyc_unknown_author"
+          },
+          {
+            "source_field_id": "source-field:b74f7b15e70374ff05abc9080dcb076236ab9e60958d4e6ced2265945cca760d",
+            "source_path": "ai_summary.core_analysis.key_points[0]",
+            "source_value": "Treatment improved the measured outcome by one point.",
+            "disposition": "unmapped",
+            "canonical_field": "",
+            "scope": "paper",
+            "study_id": "",
+            "interpretation_required": false,
+            "source_summary_hash": "7793ed65d83b70d76fe8799861fd73f3444a168f492e8f2702f96cdbf172a87a",
+            "derived_value": "",
+            "paper_key": "studyc_unknown_author"
+          },
+          {
+            "source_field_id": "source-field:e30c7cdd9aad4ad9869d53066134765bf2dc9504f610108529fdb6b611c74a18",
+            "source_path": "ai_summary.specialized_details.empirical.sample_characteristics_or_context",
+            "source_value": "Observed controlled sample.",
+            "disposition": "unmapped",
+            "canonical_field": "",
+            "scope": "paper",
+            "study_id": "",
+            "interpretation_required": false,
+            "source_summary_hash": "7793ed65d83b70d76fe8799861fd73f3444a168f492e8f2702f96cdbf172a87a",
+            "derived_value": "",
+            "paper_key": "studyc_unknown_author"
+          },
+          {
+            "source_field_id": "source-field:f840b7a392afab7f23a93915480fbe25968d1bde2a0cc124588e8f84d7eb0e8b",
+            "source_path": "ai_summary.core_analysis.conclusions",
+            "source_value": "Treatment improved the measured outcome by one point.",
+            "disposition": "exact",
+            "canonical_field": "conclusions",
+            "scope": "paper",
+            "study_id": "",
+            "interpretation_required": true,
+            "source_summary_hash": "7793ed65d83b70d76fe8799861fd73f3444a168f492e8f2702f96cdbf172a87a",
+            "derived_value": "",
+            "paper_key": "studyc_unknown_author"
+          },
+          {
+            "source_field_id": "source-field:f9607c6c28a8e4bbd2692b3acc626435b9b83a92f9ba08799221d107c0267892",
+            "source_path": "typed_research_unit.moderators_or_boundaries[1]",
+            "source_value": "Observed controlled sample of 24 participants.",
+            "disposition": "context",
+            "canonical_field": "moderators_boundaries",
+            "scope": "paper",
+            "study_id": "",
+            "interpretation_required": true,
+            "source_summary_hash": "7793ed65d83b70d76fe8799861fd73f3444a168f492e8f2702f96cdbf172a87a",
+            "derived_value": "",
+            "paper_key": "studyc_unknown_author"
+          },
+          {
+            "source_field_id": "source-field:fbcd8e61e0c2d786a05bc714597385f9c94d88228280a31eab21d0e804b3f296",
+            "source_path": "ai_summary.core_analysis.findings",
+            "source_value": "Treatment improved the measured outcome by one point.",
+            "disposition": "exact",
+            "canonical_field": "findings",
+            "scope": "paper",
+            "study_id": "",
+            "interpretation_required": true,
+            "source_summary_hash": "7793ed65d83b70d76fe8799861fd73f3444a168f492e8f2702f96cdbf172a87a",
+            "derived_value": "",
+            "paper_key": "studyc_unknown_author"
+          },
+          {
+            "source_field_id": "source-field:41c9ef87295efcf897e03a2de7f4e20aac3cff8438d122038f6b92b5e29a7de9",
+            "source_path": "ai_summary.core_analysis.findings",
+            "source_value": "Treatment did not change the measured outcome.",
+            "disposition": "exact",
+            "canonical_field": "findings",
+            "scope": "paper",
+            "study_id": "",
+            "interpretation_required": true,
+            "source_summary_hash": "410560326ded277aa3614294589200f6e7ba2d4e17b21fa2cc01685ae8c297de",
+            "derived_value": "",
+            "paper_key": "studyd_unknown_author"
+          },
+          {
+            "source_field_id": "source-field:4a6bdf80d020c148e56866ad8cbd6a1a999987fcc4e2c38948e8418eed49c124",
+            "source_path": "ai_summary.core_analysis.key_points[0]",
+            "source_value": "Treatment did not change the measured outcome.",
+            "disposition": "unmapped",
+            "canonical_field": "",
+            "scope": "paper",
+            "study_id": "",
+            "interpretation_required": false,
+            "source_summary_hash": "410560326ded277aa3614294589200f6e7ba2d4e17b21fa2cc01685ae8c297de",
+            "derived_value": "",
+            "paper_key": "studyd_unknown_author"
+          },
+          {
+            "source_field_id": "source-field:64f18d4dd3410032d3ca558f755cb6996211f93de44046cd01a20c920405cfeb",
+            "source_path": "ai_summary.specialized_details.empirical.data_source_and_size",
+            "source_value": "Observed controlled sample of 24 participants.",
+            "disposition": "exact",
+            "canonical_field": "sample_or_context",
+            "scope": "paper",
+            "study_id": "",
+            "interpretation_required": true,
+            "source_summary_hash": "410560326ded277aa3614294589200f6e7ba2d4e17b21fa2cc01685ae8c297de",
+            "derived_value": "",
+            "paper_key": "studyd_unknown_author"
+          },
+          {
+            "source_field_id": "source-field:81369469c58c04a18762918facf0f55be6000380aaee35142392667f89ea6a61",
+            "source_path": "ai_summary.core_analysis.conclusions",
+            "source_value": "Treatment did not change the measured outcome.",
+            "disposition": "exact",
+            "canonical_field": "conclusions",
+            "scope": "paper",
+            "study_id": "",
+            "interpretation_required": true,
+            "source_summary_hash": "410560326ded277aa3614294589200f6e7ba2d4e17b21fa2cc01685ae8c297de",
+            "derived_value": "",
+            "paper_key": "studyd_unknown_author"
+          },
+          {
+            "source_field_id": "source-field:b34e06b5d63c24326c980753d17a8733204b20a6b5e6243d664b66c3c505aea9",
+            "source_path": "typed_research_unit.moderators_or_boundaries[1]",
+            "source_value": "Observed controlled sample of 24 participants.",
+            "disposition": "context",
+            "canonical_field": "moderators_boundaries",
+            "scope": "paper",
+            "study_id": "",
+            "interpretation_required": true,
+            "source_summary_hash": "410560326ded277aa3614294589200f6e7ba2d4e17b21fa2cc01685ae8c297de",
+            "derived_value": "",
+            "paper_key": "studyd_unknown_author"
+          },
+          {
+            "source_field_id": "source-field:ce94d0d6583cb6327ba294188667dcd8676f4a27bc2f89aca43831c171788aad",
+            "source_path": "ai_summary.specialized_details.empirical.sample_characteristics_or_context",
+            "source_value": "Observed controlled sample.",
+            "disposition": "unmapped",
+            "canonical_field": "",
+            "scope": "paper",
+            "study_id": "",
+            "interpretation_required": false,
+            "source_summary_hash": "410560326ded277aa3614294589200f6e7ba2d4e17b21fa2cc01685ae8c297de",
+            "derived_value": "",
+            "paper_key": "studyd_unknown_author"
+          },
+          {
+            "source_field_id": "source-field:cf1416ddc8af94154d002eb35af41e93cb1c468c8e9390a2dc406b15eba47e7f",
+            "source_path": "typed_research_unit.moderators_or_boundaries[2]",
+            "source_value": "Observed controlled sample.",
+            "disposition": "context",
+            "canonical_field": "moderators_boundaries",
+            "scope": "paper",
+            "study_id": "",
+            "interpretation_required": true,
+            "source_summary_hash": "410560326ded277aa3614294589200f6e7ba2d4e17b21fa2cc01685ae8c297de",
+            "derived_value": "",
+            "paper_key": "studyd_unknown_author"
+          },
+          {
+            "source_field_id": "source-field:f54f0f6a1d01bee45c5e365ccd4a46705a61f4085d754f029ea37bc26a0df50c",
+            "source_path": "ai_summary.core_analysis.limitations",
+            "source_value": "Findings apply only to this sample.",
+            "disposition": "exact",
+            "canonical_field": "limitations",
+            "scope": "paper",
+            "study_id": "",
+            "interpretation_required": true,
+            "source_summary_hash": "410560326ded277aa3614294589200f6e7ba2d4e17b21fa2cc01685ae8c297de",
+            "derived_value": "",
+            "paper_key": "studyd_unknown_author"
+          }
+        ],
+        "dependencies": [
+          {
+            "primary_claim_id": "claim:studya_unknown_author:findings:9cf0c5c01ec2d03e",
+            "required_source_claim_ids": [
+              "claim:studya_unknown_author:limitations:933b43bbef72c19a",
+              "claim:studya_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+              "claim:studya_unknown_author:moderators_boundaries:933b43bbef72c19a",
+              "claim:studya_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+              "claim:studya_unknown_author:operationalizations:d22e13af34a0bd66"
+            ],
+            "required_evidence_ids": [
+              "evidence:studya_unknown_author:limitations:d89d7f798241b1a0",
+              "evidence:studya_unknown_author:moderators_boundaries:5c2a9a2cec67e801",
+              "evidence:studya_unknown_author:moderators_boundaries:baabedd159b28a4f",
+              "evidence:studya_unknown_author:moderators_boundaries:c2e229c13c68cdfa",
+              "evidence:studya_unknown_author:operationalizations:065529d9d60ce0f9"
+            ],
+            "required_source_field_ids": [
+              "source-field:72512e5861bdb687d3213137ca3b99fb4404b176eaaacc8fa29b7f2ebe9cf963",
+              "source-field:812e5a3c6f9fbf7b7837872871b256cf7297261a7a37dd1fe03927ace44a3c8b",
+              "source-field:f8fcf0b3cf9aa4999b7654470be89ae3963c241f80c37534b70d3651dc5e3ba7"
+            ],
+            "scope": "paper",
+            "study_id": "",
+            "reason": "boundary",
+            "paper_key": "studya_unknown_author",
+            "primary_evidence_ids": [
+              "evidence:studya_unknown_author:findings:2f6000aae38dc919"
+            ]
+          },
+          {
+            "primary_claim_id": "claim:studyb_unknown_author:findings:f6586c2423a1dbe7",
+            "required_source_claim_ids": [
+              "claim:studyb_unknown_author:limitations:933b43bbef72c19a",
+              "claim:studyb_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+              "claim:studyb_unknown_author:moderators_boundaries:933b43bbef72c19a",
+              "claim:studyb_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+              "claim:studyb_unknown_author:operationalizations:d22e13af34a0bd66"
+            ],
+            "required_evidence_ids": [
+              "evidence:studyb_unknown_author:limitations:2c912bc444e571bd",
+              "evidence:studyb_unknown_author:moderators_boundaries:2992a90e640ce393",
+              "evidence:studyb_unknown_author:moderators_boundaries:2f6da8d2a5ce047d",
+              "evidence:studyb_unknown_author:moderators_boundaries:e0eab51ceb6f51ed",
+              "evidence:studyb_unknown_author:operationalizations:cf3935e1126d456e"
+            ],
+            "required_source_field_ids": [
+              "source-field:3c2c5ffd33610496099fa52da71370d896b660c1aa881f2fa39cb65688f9df51",
+              "source-field:554fad9090d958900bd2004087696a8b99de2e6d00b21baf7b057dfd34611f45",
+              "source-field:cda079fd63f4aa8fa90194d3fc2afc1ff2fff13f942725165bb91cafe998aa43"
+            ],
+            "scope": "paper",
+            "study_id": "",
+            "reason": "boundary",
+            "paper_key": "studyb_unknown_author",
+            "primary_evidence_ids": [
+              "evidence:studyb_unknown_author:findings:52601d9730101e05"
+            ]
+          },
+          {
+            "primary_claim_id": "claim:studyc_unknown_author:findings:20eb70c8f8b6fd23",
+            "required_source_claim_ids": [
+              "claim:studyc_unknown_author:limitations:933b43bbef72c19a",
+              "claim:studyc_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+              "claim:studyc_unknown_author:moderators_boundaries:933b43bbef72c19a",
+              "claim:studyc_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+              "claim:studyc_unknown_author:operationalizations:d22e13af34a0bd66"
+            ],
+            "required_evidence_ids": [
+              "evidence:studyc_unknown_author:limitations:16ad4860e65fe188",
+              "evidence:studyc_unknown_author:moderators_boundaries:6e3aecdc675fd35e",
+              "evidence:studyc_unknown_author:moderators_boundaries:cb931f242fa8df29",
+              "evidence:studyc_unknown_author:moderators_boundaries:f0c4d984587f4b98",
+              "evidence:studyc_unknown_author:operationalizations:97bef31557c9f1a0"
+            ],
+            "required_source_field_ids": [
+              "source-field:1b78aed2a146c2cf5eb13970587f4924503592a59ceab0adece1d2f827cf2c8e",
+              "source-field:52201e5ecf49031509fa77800481588966a771814337065fae2b4c7f1efc30b0",
+              "source-field:f9607c6c28a8e4bbd2692b3acc626435b9b83a92f9ba08799221d107c0267892"
+            ],
+            "scope": "paper",
+            "study_id": "",
+            "reason": "boundary",
+            "paper_key": "studyc_unknown_author",
+            "primary_evidence_ids": [
+              "evidence:studyc_unknown_author:findings:608c6188c257f7b5"
+            ]
+          },
+          {
+            "primary_claim_id": "claim:studyd_unknown_author:findings:497ca5821dde33f8",
+            "required_source_claim_ids": [
+              "claim:studyd_unknown_author:limitations:933b43bbef72c19a",
+              "claim:studyd_unknown_author:moderators_boundaries:53474e8fd6c4dd32",
+              "claim:studyd_unknown_author:moderators_boundaries:933b43bbef72c19a",
+              "claim:studyd_unknown_author:moderators_boundaries:d22e13af34a0bd66",
+              "claim:studyd_unknown_author:operationalizations:d22e13af34a0bd66"
+            ],
+            "required_evidence_ids": [
+              "evidence:studyd_unknown_author:limitations:6e1b52eb71b790b4",
+              "evidence:studyd_unknown_author:moderators_boundaries:a07c49a87a2f69c2",
+              "evidence:studyd_unknown_author:moderators_boundaries:c291b89701c99831",
+              "evidence:studyd_unknown_author:moderators_boundaries:f24dfc6f83cf30b2",
+              "evidence:studyd_unknown_author:operationalizations:f8c120fddb6ab0a8"
+            ],
+            "required_source_field_ids": [
+              "source-field:b34e06b5d63c24326c980753d17a8733204b20a6b5e6243d664b66c3c505aea9",
+              "source-field:cf1416ddc8af94154d002eb35af41e93cb1c468c8e9390a2dc406b15eba47e7f",
+              "source-field:f54f0f6a1d01bee45c5e365ccd4a46705a61f4085d754f029ea37bc26a0df50c"
+            ],
+            "scope": "paper",
+            "study_id": "",
+            "reason": "boundary",
+            "paper_key": "studyd_unknown_author",
+            "primary_evidence_ids": [
+              "evidence:studyd_unknown_author:findings:ad5ca9c914a25e7a"
+            ]
+          }
+        ],
+        "evidence_text_by_id": {
+          "evidence:studya_unknown_author:concept_definitions:02ae745044c2e633": "treatment",
+          "evidence:studya_unknown_author:concept_definitions:88e289bca6e1668f": "measured outcome",
+          "evidence:studya_unknown_author:findings:2f6000aae38dc919": "Treatment improved the measured outcome by four points.",
+          "evidence:studya_unknown_author:limitations:d89d7f798241b1a0": "Findings apply only to this sample.",
+          "evidence:studya_unknown_author:moderators_boundaries:5c2a9a2cec67e801": "Observed controlled sample.",
+          "evidence:studya_unknown_author:moderators_boundaries:baabedd159b28a4f": "Findings apply only to this sample.",
+          "evidence:studya_unknown_author:moderators_boundaries:c2e229c13c68cdfa": "Observed controlled sample of 24 participants.",
+          "evidence:studya_unknown_author:operationalizations:065529d9d60ce0f9": "Observed controlled sample of 24 participants.",
+          "evidence:studya_unknown_author:operationalizations:1813b51ce68e92c1": "Descriptive comparison of observed group means.",
+          "evidence:studyb_unknown_author:concept_definitions:9020e40fa1c63911": "measured outcome",
+          "evidence:studyb_unknown_author:concept_definitions:da6da30984c50c17": "treatment",
+          "evidence:studyb_unknown_author:findings:52601d9730101e05": "Treatment improved the measured outcome by two points.",
+          "evidence:studyb_unknown_author:limitations:2c912bc444e571bd": "Findings apply only to this sample.",
+          "evidence:studyb_unknown_author:moderators_boundaries:2992a90e640ce393": "Observed controlled sample.",
+          "evidence:studyb_unknown_author:moderators_boundaries:2f6da8d2a5ce047d": "Observed controlled sample of 24 participants.",
+          "evidence:studyb_unknown_author:moderators_boundaries:e0eab51ceb6f51ed": "Findings apply only to this sample.",
+          "evidence:studyb_unknown_author:operationalizations:cf3935e1126d456e": "Observed controlled sample of 24 participants.",
+          "evidence:studyb_unknown_author:operationalizations:f8264683eedc044e": "Descriptive comparison of observed group means.",
+          "evidence:studyc_unknown_author:concept_definitions:731b8ff82c2b58f1": "measured outcome",
+          "evidence:studyc_unknown_author:concept_definitions:dc955454a8df7a64": "treatment",
+          "evidence:studyc_unknown_author:findings:608c6188c257f7b5": "Treatment improved the measured outcome by one point.",
+          "evidence:studyc_unknown_author:limitations:16ad4860e65fe188": "Findings apply only to this sample.",
+          "evidence:studyc_unknown_author:moderators_boundaries:6e3aecdc675fd35e": "Observed controlled sample of 24 participants.",
+          "evidence:studyc_unknown_author:moderators_boundaries:cb931f242fa8df29": "Observed controlled sample.",
+          "evidence:studyc_unknown_author:moderators_boundaries:f0c4d984587f4b98": "Findings apply only to this sample.",
+          "evidence:studyc_unknown_author:operationalizations:97bef31557c9f1a0": "Observed controlled sample of 24 participants.",
+          "evidence:studyc_unknown_author:operationalizations:99e365d237eb06cc": "Descriptive comparison of observed group means.",
+          "evidence:studyd_unknown_author:concept_definitions:065a9dc91c37f33f": "measured outcome",
+          "evidence:studyd_unknown_author:concept_definitions:5dc445bf67fcbc42": "treatment",
+          "evidence:studyd_unknown_author:findings:ad5ca9c914a25e7a": "Treatment did not change the measured outcome.",
+          "evidence:studyd_unknown_author:limitations:6e1b52eb71b790b4": "Findings apply only to this sample.",
+          "evidence:studyd_unknown_author:moderators_boundaries:a07c49a87a2f69c2": "Observed controlled sample of 24 participants.",
+          "evidence:studyd_unknown_author:moderators_boundaries:c291b89701c99831": "Findings apply only to this sample.",
+          "evidence:studyd_unknown_author:moderators_boundaries:f24dfc6f83cf30b2": "Observed controlled sample.",
+          "evidence:studyd_unknown_author:operationalizations:d10413b5923a0d05": "Descriptive comparison of observed group means.",
+          "evidence:studyd_unknown_author:operationalizations:f8c120fddb6ab0a8": "Observed controlled sample of 24 participants."
+        }
+      }
+    }
+  }
+}

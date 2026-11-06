@@ -175,6 +175,52 @@ def test_job_runner_allows_ready_items_through_explicit_partial_quarantine(
     assert prepared.source_bundle is partial_bundle
 
 
+def test_typed_reuse_manifest_skips_zotero_bundle_before_preprocessing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = tmp_path / "final_manifest_typed.json"
+    manifest.write_text(
+        '{"artifact_type":"stage1_reusable_summary_manifest","artifact_version":"v1"}',
+        encoding="utf-8",
+    )
+    report = tmp_path / "zotero-report.txt"
+    report.write_text("report", encoding="utf-8")
+    library = tmp_path / "library"
+    library.mkdir()
+
+    def should_not_build_bundle(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("typed Stage 1 reuse must not resolve a source bundle")
+
+    monkeypatch.setattr(
+        "services.job_runner.build_source_bundle_for_request",
+        should_not_build_bundle,
+    )
+    request = JobRunRequest(
+        config="config.ini",
+        project_name="typed-reuse",
+        pdf_folder=None,
+        action="run_all",
+        source_mode="zotero",
+        zotero_report=str(report),
+        library_path=str(library),
+        reuse_summary_files=(str(manifest),),
+        reuse_stage1=True,
+    )
+
+    prepared = JobRunner()._prepare_source_inventory(
+        generator=object(),
+        request=request,
+        project_name="typed-reuse",
+    )
+
+    assert prepared.source_bundle is None
+    assert prepared.canonical_ready is True
+    assert not any(
+        record.source_type == "pdf" for record in prepared.inventory.files
+    )
+
+
 def test_zotero_source_intake_surfaces_ambiguous_pdf_candidates(tmp_path: Path) -> None:
     import fitz  # type: ignore
 

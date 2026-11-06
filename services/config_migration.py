@@ -32,12 +32,23 @@ import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Tuple, Union
+from typing import Dict, List, Mapping, Tuple, Union
 
 from services.settings import CONFIG_SCHEMA_VERSION
 
 # Legacy sections with no reader in any supported revision. Dropped, not mapped.
-DEAD_SECTIONS: frozenset[str] = frozenset({"Retry_Settings", "Stage2_Retry"})
+DEAD_SECTIONS: frozenset[str] = frozenset(
+    {
+        "Retry_Settings",
+        "Stage2_Retry",
+        # PR14-era duplicate routes. The current typed schema has one
+        # authoritative Outline_API/Writer_API route; keeping these sections
+        # live makes the current loader reject an otherwise usable config.
+        "Outline_GPT_API",
+        "Outline_GPT_Fallback_API",
+        "Writer_GPT_Fallback_API",
+    }
+)
 
 # The old catch-all parameter block. Values with an unambiguous per-provider home
 # are relocated; anything else is reported rather than guessed at.
@@ -71,6 +82,16 @@ API_PARAMETER_TIMEOUT_SECTIONS: Tuple[str, ...] = (
 DROPPED_KEYS: Dict[str, frozenset[str]] = {
     # Fixture providers are test-injected; production config must not enable one.
     "Outline": frozenset({"test_dev_fixture_mode"}),
+    "Writer_API": frozenset({"fallback_section"}),
+}
+
+# References in the current role table may be migrated only after the old route
+# and its proposed replacement are proven equivalent for this user's config.
+# These aliases describe a possible target, not proof that the endpoints match.
+LEGACY_SECTION_ALIASES: Dict[str, str] = {
+    "Outline_GPT_API": "Backup_Reader_API",
+    "Outline_GPT_Fallback_API": "Backup_Reader_API",
+    "Writer_GPT_Fallback_API": "Backup_Reader_API",
 }
 
 # The pre-vision default. Only rewritten when it is still exactly this value, so
@@ -139,6 +160,55 @@ def _section_values(lines: List[str], section_index: int) -> Dict[str, str]:
         if match:
             values[key] = match.group("value").strip()
     return values
+
+
+def _validate_legacy_route_aliases(
+    sections: Mapping[str, int],
+    lines: List[str],
+) -> None:
+    """Fail before rewriting any referenced provider route that is ambiguous."""
+
+    outline_models_index = sections.get("OutlineModels")
+    if outline_models_index is None:
+        return
+    for key, line_index in _existing_keys(lines, outline_models_index).items():
+        if not key.endswith("_model"):
+            continue
+        match = _KV_RE.match(lines[line_index])
+        if match is None:
+            continue
+        legacy_section = match.group("value").strip()
+        target_section = LEGACY_SECTION_ALIASES.get(legacy_section)
+        if not target_section:
+            continue
+        legacy_index = sections.get(legacy_section)
+        target_index = sections.get(target_section)
+        if legacy_index is None or target_index is None:
+            raise ValueError(
+                "provider route migration cannot verify "
+                f"OutlineModels.{key}: [{legacy_section}] and [{target_section}] "
+                "must both be present"
+            )
+        legacy_values = _section_values(lines, legacy_index)
+        target_values = _section_values(lines, target_index)
+        # Compare every configured value, including provider-specific request
+        # knobs that the current route layer may not know by name. Unknown
+        # differences are still meaningful user configuration and cannot be
+        # discarded as though the endpoints were equivalent.
+        legacy_route = dict(legacy_values)
+        target_route = dict(target_values)
+        differing = sorted(
+            name
+            for name in set(legacy_route) | set(target_route)
+            if legacy_route.get(name) != target_route.get(name)
+        )
+        if not legacy_route or differing:
+            detail = ", ".join(differing) if differing else "no comparable route settings"
+            raise ValueError(
+                "provider route migration would change the configured destination for "
+                f"OutlineModels.{key} ({legacy_section} -> {target_section}); "
+                f"resolve the conflict explicitly; differing fields: {detail}"
+            )
 
 
 def _section_bounds(lines: List[str], section_index: int) -> Tuple[int, int]:
@@ -228,6 +298,7 @@ def migrate_config_text(
     report = MigrationReport()
     lines = text.splitlines(keepends=True)
     sections = _index_sections(lines)
+    _validate_legacy_route_aliases(sections, lines)
 
     # Only a config that still declares an older schema is evidence of the legacy
     # default. A config already on the current schema has been touched by a
@@ -390,6 +461,15 @@ def migrate_config_text(
         if key in DROPPED_KEYS.get(current_section, frozenset()):
             report.note(f"removed [{current_section}].{key} (not accepted by the current schema)")
             continue
+
+        if current_section == "OutlineModels" and key.endswith("_model"):
+            replacement = LEGACY_SECTION_ALIASES.get(value)
+            if replacement:
+                report.note(
+                    f"migrated [{current_section}].{key} {value} -> {replacement}"
+                )
+                output.append(f"{key} = {replacement}\n")
+                continue
 
         if current_section == "Application" and key == "config_schema":
             if value != str(CONFIG_SCHEMA_VERSION):

@@ -18,7 +18,6 @@ from outline.evidence_projection import (
     build_pack,
     entry_source_hash,
     pack_bytes,
-    project_entries,
     project_entry,
     validate_pack,
 )

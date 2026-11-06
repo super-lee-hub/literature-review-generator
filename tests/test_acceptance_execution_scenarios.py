@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import configparser
 import hashlib
 import json
 import os
@@ -131,7 +132,15 @@ def _f1_manifest_fixture(tmp_path: Path) -> tuple[Path, F1CorpusManifestV1]:
 
 
 def _plan_payload(tmp_path: Path) -> dict[str, object]:
+    from tests.test_current_runtime_full_e2e import _test_config
+
     manifest_path, manifest = _f1_manifest_fixture(tmp_path)
+    config_path = _test_config(tmp_path)
+    config = configparser.ConfigParser(interpolation=None)
+    config.read(config_path, encoding="utf-8")
+    config["Runtime"]["total_job_deadline_seconds"] = "900"
+    with config_path.open("w", encoding="utf-8") as handle:
+        config.write(handle)
     selections = {
         "C": ["F1-01"],
         "D": ["F1-01", "F1-02", "F1-03"],
@@ -139,8 +148,8 @@ def _plan_payload(tmp_path: Path) -> dict[str, object]:
     }
     scenarios: dict[str, dict[str, object]] = {}
     for gate, source_ids in selections.items():
-        workspace = tmp_path / f"workspace-{gate}"
-        workspace.mkdir(exist_ok=True)
+        workspace = tmp_path / "output" / f"acceptance-{gate.lower()}__job-{gate.lower()}"
+        workspace.mkdir(parents=True, exist_ok=True)
         runtime_path = tmp_path / f"{gate.lower()}-runtime.json"
         runtime_path.write_text(
             json.dumps(
@@ -148,6 +157,9 @@ def _plan_payload(tmp_path: Path) -> dict[str, object]:
                     "project_name": f"acceptance-{gate.lower()}",
                     "job_id": f"job-{gate.lower()}",
                     "workspace_path": str(workspace),
+                    "config": str(config_path),
+                    "action": "run_all",
+                    "queue_file": str(tmp_path / f"{gate.lower()}-queue.json"),
                     "source": {"mode": "direct", "pdf_folder": manifest.source_root},
                     "metadata": {
                         "f1_corpus_binding": {
@@ -175,7 +187,9 @@ def _plan_payload(tmp_path: Path) -> dict[str, object]:
     return {
         "schema_version": "release-acceptance-plan-v2",
         "parent_run_id": "parent-acceptance-1",
+        "final_executable_sha": "a" * 40,
         "budget": {
+            "schema_version": "provider-aggregate-budget-contract-v2",
             "max_provider_calls_total": 12,
             "max_output_tokens_total": 1000,
             "max_retry_attempts_total": 1,
@@ -568,7 +582,9 @@ def test_parent_acceptance_plan_persists_independent_blocked_children_without_ow
     plan_path = tmp_path / "acceptance-plan.json"
     plan_path.write_text(json.dumps(payload), encoding="utf-8")
 
-    result = ReviewControlPlane(repo_root=Path.cwd()).acceptance_run(plan_path)
+    control = ReviewControlPlane(repo_root=Path.cwd())
+    monkeypatch.setattr(control, "_acceptance_checkout_sha", lambda *_args, **_kwargs: "a" * 40)
+    result = control.acceptance_run(plan_path)
 
     assert result["status"] == "blocked"
     assert set(result["scenarios"]) == {"C", "D", "Q"}
@@ -606,16 +622,21 @@ def test_parent_acceptance_plan_dispatches_each_runtime_child_independently(
 
     def fake_run(runtime_spec: str | Path) -> dict[str, object]:
         calls.append(str(runtime_spec))
-        gate = Path(runtime_spec).stem[0].upper()
+        runtime_payload = json.loads(Path(runtime_spec).read_text(encoding="utf-8"))
+        job_id = str(runtime_payload["job_id"])
+        workspace = Path(str(runtime_payload["workspace_path"]))
+        workspace.mkdir(parents=True, exist_ok=True)
+        from services.artifact_registry import ArtifactRegistry
+
+        ArtifactRegistry(workspace / "artifact_registry.json", job_id).save()
         return {
             "status": "complete",
             "job_status": "completed",
             "completion_status": "complete",
             "success": True,
-            "job_id": f"job-{gate.lower()}",
-            "workspace_path": str(tmp_path / f"workspace-{gate}"),
+            "job_id": job_id,
+            "workspace_path": str(workspace),
         }
-
     monkeypatch.setattr(control, "run", fake_run)
     plan_path = tmp_path / "acceptance-plan.json"
     plan_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -627,7 +648,7 @@ def test_parent_acceptance_plan_dispatches_each_runtime_child_independently(
         str(tmp_path / "c-runtime.json"),
         str(tmp_path / "d-runtime.json"),
         str(tmp_path / "q-runtime.json"),
-    ]
+    ], json.dumps(result["scenarios"], ensure_ascii=True)
     assert {gate: result["scenarios"][gate]["status"] for gate in ("C", "D", "Q")} == {
         "C": "NOT_VERIFIED",
         "D": "BLOCKED",
@@ -826,7 +847,9 @@ def test_gate_k_acceptance_binds_contention_receipt_from_evidence_root(
         encoding="utf-8",
     )
 
-    result = ReviewControlPlane(repo_root=Path.cwd()).acceptance_run(plan_path)
+    control = ReviewControlPlane(repo_root=Path.cwd())
+    monkeypatch.setattr(control, "_acceptance_checkout_sha", lambda *_args, **_kwargs: "a" * 40)
+    result = control.acceptance_run(plan_path)
     gate = result["scenarios"]["K"]
 
     assert result["parent_result"]["status"] == "PASS_OFFLINE"
@@ -878,10 +901,11 @@ def test_parent_acceptance_resumes_child_with_durable_workspace_marker(
 
     monkeypatch.setenv("AUTO_GENERATE_RUN_LIVE_ACCEPTANCE", "1")
     payload = _plan_payload(tmp_path)
-    workspace = tmp_path / "workspace-c"
-    workspace.mkdir(exist_ok=True)
-    (workspace / "artifact_registry.json").write_text("{}", encoding="utf-8")
     child = payload["scenarios"]["C"]
+    workspace = Path(child["workspace"])
+    workspace.mkdir(parents=True, exist_ok=True)
+    from services.artifact_registry import ArtifactRegistry
+    ArtifactRegistry(workspace / "artifact_registry.json", "job-c").save()
     runtime_path = Path(child["runtime_spec"])
     runtime_payload = json.loads(runtime_path.read_text(encoding="utf-8"))
     runtime_payload["workspace_path"] = str(workspace)
@@ -921,9 +945,9 @@ def test_parent_acceptance_resumes_child_with_durable_workspace_marker(
         or {"status": "complete", "job_id": "job-c", "workspace_path": str(workspace)},
     )
 
-    control.acceptance_run(plan_path)
+    resume_result = control.acceptance_run(plan_path)
 
-    assert calls == ["resume"]
+    assert calls == ["resume"], json.dumps(resume_result["scenarios"], ensure_ascii=True)
 
 
 def test_parent_acceptance_blocks_runtime_child_after_failed_preflight(
@@ -1068,7 +1092,7 @@ def test_gate_d_plan_carries_production_modality_refs_into_child_evidence(
 
     result = control.acceptance_run(plan_path)
 
-    assert result["scenarios"]["D"]["status"] == "NOT_VERIFIED"
+    assert result["scenarios"]["D"]["status"] == "NOT_VERIFIED", json.dumps(result["scenarios"]["D"], ensure_ascii=True)
     assert result["scenarios"]["D"]["receipt"]["status"] == "NOT_VERIFIED"
     assert any(ref.get("role") == "modality_profile" for ref in collected)
 

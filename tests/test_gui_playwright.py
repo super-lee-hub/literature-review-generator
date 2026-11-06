@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import configparser
+import json
 import os
 import re
 import socket
@@ -44,28 +45,107 @@ def _write_gui_test_config(config_path: Path, output_dir: Path) -> None:
         parser.write(handle)
 
 
-def _wait_for_server(base_url: str, process: subprocess.Popen[str], timeout: float = 30.0) -> None:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+def _wait_for_server(
+    base_url: str, process: subprocess.Popen[str], timeout: float = 30.0,
+    *, log_path: Path | None = None,
+) -> None:
+    deadline = time.monotonic() + timeout
+    last_error = ""
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            break
         try:
             with urllib.request.urlopen(base_url, timeout=2) as response:
                 if response.status == 200:
                     return
-        except Exception:
-            pass
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
         time.sleep(0.5)
 
     output = ""
-    if process.stdout:
+    if log_path is not None and log_path.exists():
         try:
-            output = process.stdout.read()
+            with log_path.open("rb") as log:
+                log.seek(0, os.SEEK_END)
+                log.seek(max(0, log.tell() - 8000))
+                output = log.read(8000).decode("utf-8", errors="replace")
+        except OSError:
+            output = "Startup log could not be read."
+    elif process.poll() is not None and process.stdout:
+        try:
+            output, _ = process.communicate(timeout=1)
         except Exception:
             output = ""
-    raise RuntimeError(f"GUI server did not start in time.\nCaptured output:\n{output}")
+    raise RuntimeError(
+        f"GUI server did not start in time. Last readiness error: {last_error}\n"
+        f"Captured output:\n{output}"
+    )
 
 
 def _notification(page):
     return page.locator(".q-notification").last
+
+
+def test_startup_wait_does_not_read_a_live_process_pipe():
+    from types import SimpleNamespace
+
+    reads = []
+
+    def read():
+        reads.append(True)
+        return "a live pipe has no EOF"
+
+    process = SimpleNamespace(stdout=SimpleNamespace(read=read), poll=lambda: None)
+    with pytest.raises(RuntimeError, match="did not start"):
+        _wait_for_server("http://127.0.0.1:1", process, timeout=0)
+    assert reads == []
+
+
+def test_startup_wait_failure_cleans_up_the_owned_gui_process(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    terminated = []
+    process = SimpleNamespace(
+        terminate=lambda: terminated.append(True),
+        wait=lambda timeout: 0,
+    )
+    monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(sys.modules[__name__], "_pick_free_port", lambda: 12000)
+
+    def fail_startup(*_args, **_kwargs):
+        raise RuntimeError("startup failure")
+
+    monkeypatch.setattr(sys.modules[__name__], "_wait_for_server", fail_startup)
+    fixture = gui_server.__wrapped__(tmp_path)
+    with pytest.raises(RuntimeError, match="startup failure"):
+        next(fixture)
+    assert terminated == [True]
+
+
+def test_startup_wait_live_launch_failure_closes_the_model_fixture(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from tests import test_pr25_repair_v2 as fixtures
+
+    closed = []
+    server = SimpleNamespace(
+        shutdown=lambda: closed.append("shutdown"),
+        server_close=lambda: closed.append("close"),
+    )
+    thread = SimpleNamespace(join=lambda timeout: closed.append("join"))
+    monkeypatch.setattr(fixtures, "_write_source_pdf", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(fixtures, "_runtime_config", lambda *_args: tmp_path / "config.ini")
+    monkeypatch.setattr(fixtures, "_start_local_model_fixture", lambda: (server, thread, "http://127.0.0.1:1/v1"))
+    monkeypatch.setattr(sys.modules[__name__], "_pick_free_port", lambda: 12000)
+
+    def fail_launch(*_args, **_kwargs):
+        raise OSError("launch failure")
+
+    monkeypatch.setattr(subprocess, "Popen", fail_launch)
+    fixture = live_gui_server.__wrapped__(tmp_path)
+    with pytest.raises(OSError, match="launch failure"):
+        next(fixture)
+    assert closed == ["shutdown", "join", "close"]
 
 
 def _field_input(page, label_text: str):
@@ -118,31 +198,28 @@ def gui_server(tmp_path):
     env["AUTO_GENERATE_ENV_PATH"] = str(env_path)
     env["NICEGUI_SCREEN_TEST_PORT"] = str(port)
 
-    process = subprocess.Popen(
-        [sys.executable, "launch_gui.py", "--no-show", "--port", str(port), "--config", str(config_path)],
-        cwd=REPO_ROOT,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-
     base_url = f"http://127.0.0.1:{port}"
-    _wait_for_server(base_url, process)
-
-    yield {
-        "base_url": base_url,
-        "config_path": config_path,
-        "env_path": env_path,
-        "output_dir": output_dir,
-        "pdf_dir": pdf_dir,
-    }
-
-    process.terminate()
-    try:
-        process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        process.kill()
+    log_path = temp_dir / "gui_server.log"
+    with log_path.open("w", encoding="utf-8") as log:
+        process = subprocess.Popen(
+            [sys.executable, "launch_gui.py", "--no-show", "--strict-port", "--port", str(port), "--config", str(config_path)],
+            cwd=REPO_ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, text=True,
+        )
+        try:
+            _wait_for_server(base_url, process, log_path=log_path)
+            yield {
+                "base_url": base_url,
+                "config_path": config_path,
+                "env_path": env_path,
+                "output_dir": output_dir,
+                "pdf_dir": pdf_dir,
+            }
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
 
 
 @pytest.fixture(scope="session")
@@ -160,6 +237,73 @@ def page(browser):
     yield page
     page.close()
     context.close()
+
+
+@pytest.fixture()
+def live_gui_server(tmp_path: Path):
+    """Start the actual GUI against an isolated loopback-only model fixture."""
+
+    from tests.test_pr25_repair_v2 import (
+        _runtime_config,
+        _start_local_model_fixture,
+        _write_source_pdf,
+    )
+
+    task_dir = tmp_path / "live_gui_playwright"
+    task_dir.mkdir()
+    output_dir = task_dir / "output"
+    output_dir.mkdir()
+    pdf_dir = task_dir / "pdfs"
+    pdf_dir.mkdir()
+    for suffix, finding in (
+        ("a", "Treatment improved the measured outcome by four points."),
+        ("b", "Treatment improved the measured outcome by two points."),
+        ("c", "Treatment improved the measured outcome by one point."),
+    ):
+        _write_source_pdf(
+            pdf_dir / f"study-{suffix}.pdf",
+            title=f"Study {suffix.upper()}",
+            finding=finding,
+        )
+
+    model_server, model_thread, api_base = _start_local_model_fixture()
+    process = None
+    try:
+        config_path = _runtime_config(task_dir, api_base)
+        env_path = task_dir / ".env"
+        env_path.write_text("", encoding="utf-8")
+        port = _pick_free_port()
+        env = os.environ.copy()
+        env.pop("AUTO_GENERATE_GUI_TEST_MODE", None)
+        env["AUTO_GENERATE_ENV_PATH"] = str(env_path)
+        env["NICEGUI_SCREEN_TEST_PORT"] = str(port)
+        base_url = f"http://127.0.0.1:{port}"
+        log_path = task_dir / "gui_server.log"
+        with log_path.open("w", encoding="utf-8") as log:
+            process = subprocess.Popen(
+                [sys.executable, "launch_gui.py", "--no-show", "--strict-port", "--port", str(port), "--config", str(config_path)],
+                cwd=REPO_ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, text=True,
+            )
+            _wait_for_server(base_url, process, log_path=log_path)
+            yield {
+                "base_url": base_url,
+                "config_path": config_path,
+                "output_dir": output_dir,
+                "pdf_dir": pdf_dir,
+                "model_server": model_server,
+            }
+    finally:
+        try:
+            if process is not None:
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+        finally:
+            model_server.shutdown()
+            model_thread.join(timeout=5)
+            model_server.server_close()
 
 
 def test_dashboard_shows_search_topbar(page, gui_server):
@@ -400,7 +544,9 @@ def test_switching_between_workflow_and_logs_keeps_ui_responsive(page, gui_serve
     page.wait_for_timeout(1200)
 
     _open_page(page, f'{gui_server["base_url"]}/logs')
-    expect(page.locator("textarea")).to_be_visible()
+    logs_page = page.locator(".ag-page")
+    expect(logs_page.get_by_text("最近日志文件", exact=True)).to_be_visible()
+    expect(logs_page.locator("textarea[readonly]")).to_be_visible()
     page.wait_for_timeout(1200)
 
     _open_page(page, f'{gui_server["base_url"]}/workflow')
@@ -468,21 +614,40 @@ def test_workflow_actions_and_links(page, gui_server):
     # third-party gateway can receive manuscript content. Exercise that real
     # consent boundary before submitting the workflow actions.
     page.goto(f'{gui_server["base_url"]}/setup/api', wait_until="domcontentloaded")
-    for card in page.locator(".ag-card", has_text="确认第三方 gateway").all():
-        button = card.get_by_role("button", name="确认第三方 gateway")
-        if button.count() > 0:
-            button.click()
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.read(gui_server["config_path"], encoding="utf-8")
+    expected_cards = sum(section.endswith("_API") for section in parser.sections())
+    gateway_buttons = page.get_by_role("button", name="确认第三方 gateway")
+    expect(gateway_buttons).to_have_count(expected_cards)
+    for index in range(expected_cards):
+        button = gateway_buttons.nth(index)
+        card = button.locator("xpath=ancestor::*[contains(@class,'ag-card')][1]")
+        button.click()
+        card.get_by_role("button", name="检查配置").click()
+        expect(card.locator(".ag-inline-alert")).to_contain_text("当前配置格式看起来正确")
     page.goto(f'{gui_server["base_url"]}/workflow', wait_until="domcontentloaded")
     _open_page(page, f'{gui_server["base_url"]}/workflow')
 
-    for button_name in ["仅分析文献", "生成大纲", "生成全文", "一键运行"]:
+    for button_name, action_label in [
+        ("仅分析文献", "文献分析"),
+        ("生成大纲", "大纲生成"),
+        ("生成全文", "全文生成"),
+        ("一键运行", "一键运行"),
+    ]:
         page.get_by_role("button", name=button_name).click()
-        expect(_notification(page)).to_contain_text("测试模式：已模拟提交")
+        expect(_card(page, "任务进度").locator(".text-body2").last).to_have_text(
+            f"测试模式：已模拟提交 {action_label} 到后台队列。"
+        )
 
     page.get_by_role("button", name="补跑、恢复与验证（按需展开）").click()
-    for button_name in ["验证综述", "重试失败论文"]:
+    for button_name, action_label in [
+        ("验证综述", "综述验证"),
+        ("重试失败论文", "失败重试"),
+    ]:
         page.get_by_role("button", name=button_name).click()
-        expect(_notification(page)).to_contain_text("测试模式：已模拟提交")
+        expect(_card(page, "任务进度").locator(".text-body2").last).to_have_text(
+            f"测试模式：已模拟提交 {action_label} 到后台队列。"
+        )
 
     _card(page, "相关入口").get_by_role("button", name="前往设置").click()
     expect(page).to_have_url(re.compile(r"/setup$"))
@@ -490,7 +655,9 @@ def test_workflow_actions_and_links(page, gui_server):
 
 def test_logs_and_guide_pages_render(page, gui_server):
     _open_page(page, f'{gui_server["base_url"]}/logs')
-    expect(page.locator("textarea")).to_be_visible()
+    logs_page = page.locator(".ag-page")
+    expect(logs_page.get_by_text("最近日志文件", exact=True)).to_be_visible()
+    expect(logs_page.locator("textarea[readonly]")).to_be_visible()
 
     page.get_by_role("button", name="打开日志目录").click()
     expect(_notification(page)).to_contain_text("测试模式：已模拟打开路径")
@@ -520,6 +687,60 @@ def test_gui_lifecycle_start_cancel_resume_export_are_wired_fail_closed(page, gu
         expect(button).to_be_visible()
         button.click()
         expect(_notification(page)).to_contain_text("no canonical job workspace is available")
+
+
+def test_real_browser_runs_local_provider_backed_stage1_job(page, live_gui_server):
+    """Exercise browser submission and the production queue/runtime, not GUI test mode."""
+
+    from runtime.runner import AgentRuntimeRunner
+
+    _open_page(page, f'{live_gui_server["base_url"]}/setup/api')
+    for card in page.locator(".ag-card", has_text="确认第三方 gateway").all():
+        confirm = card.get_by_role("button", name="确认第三方 gateway")
+        if confirm.count() > 0:
+            confirm.click()
+
+    _open_page(page, f'{live_gui_server["base_url"]}/workflow')
+    _set_path_value(
+        page,
+        open_button_name="选择 PDF 文件夹",
+        label_text="PDF 文件夹",
+        value=str(live_gui_server["pdf_dir"]),
+    )
+    _editable_field_input(page, "项目名").fill("PR25 Live GUI Fixture")
+    page.get_by_role("button", name="仅分析文献").click()
+    expect(_notification(page)).to_contain_text("已加入队列", timeout=15_000)
+    expect(_notification(page)).not_to_contain_text("已模拟提交")
+
+    deadline = time.monotonic() + 120
+    completed_workspace = None
+    while time.monotonic() < deadline:
+        for registry_path in live_gui_server["output_dir"].glob("*/artifact_registry.json"):
+            try:
+                workspace, registry = AgentRuntimeRunner._open_workspace(registry_path.parent)
+            except Exception:
+                continue
+            for record in registry.list_records():
+                if record.artifact_type != "runtime_stage_terminal" or record.status != "ready":
+                    continue
+                try:
+                    terminal = json.loads(Path(record.path).read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    continue
+                if terminal.get("stage_name") == "analyze" and terminal.get("status") == "succeeded":
+                    completed_workspace = workspace.root_dir
+                    break
+            if completed_workspace:
+                break
+        if completed_workspace:
+            break
+        time.sleep(0.5)
+
+    assert completed_workspace, "browser-submitted analyze job did not produce a successful runtime terminal"
+    assert live_gui_server["model_server"].reader_calls == 3
+    assert {
+        call["model"] for call in live_gui_server["model_server"].calls
+    } == {"reader-local"}
 
 
 def test_language_switch_changes_labels(page, gui_server):

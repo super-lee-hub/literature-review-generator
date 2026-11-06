@@ -293,7 +293,10 @@ def validate_all_config(
         section = config_dict[section_name]
         if not any(str(value).strip() for value in section.values()):
             continue
-        valid, error = validate_config_section(config_dict, section_name, ["api_key", "model", "api_base"])
+        # Unreachable provider sections may be intentionally credential-free
+        # during an analyze-only / explicit-import run. Their transport shape
+        # remains required and is still validated below.
+        valid, error = validate_config_section(config_dict, section_name, ["model", "api_base"])
         if not valid:
             return False, [error]
         valid, error = validate_api_key(

@@ -3,8 +3,6 @@ import os
 import re
 import types
 
-import pytest
-
 from services.citation_manifest import build_citation_manifest_from_review_draft
 from validation.claim_alignment_audit import build_claim_alignment_audit
 from validation.review_validator import ReviewValidator, ValidationConclusion

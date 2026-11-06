@@ -1,0 +1,108 @@
+{
+  "schema_version": "pr25-final-acceptance-matrix-v11",
+  "generated_at_utc": "2026-09-30T07:58:43Z",
+  "local_source": {
+    "repository": "super-lee-hub/literature-review-generator",
+    "path": "D:/tmp/pr25-v4-recovery-current-20260928-f",
+    "branch": "codex/pr25-v4-controlled-pilot",
+    "head": "4bd05b10a8a744e9891b650324c718133f5da599",
+    "tracked_diff_sha256_before_audit_docs": "982ee8e97ce8719e00560e4785462b987fe27ccdbecea6aaa63c759a22f0b4a1",
+    "outline_v3_executor_sha256": "db04445e39357d3bace0219a6457d271cc7f1c245dca3d3d868ddbb306a4d69a",
+    "committed": false,
+    "pushed": false
+  },
+  "remote_pr25": {
+    "url": "https://github.com/super-lee-hub/literature-review-generator/pull/25",
+    "state": "OPEN",
+    "base_branch": "codex/f1-validation-authority-closure",
+    "head_branch": "codex/r1-outline-final-repair",
+    "head_sha": "c1ad0da869bc68869a521f60bbda07342fb16058",
+    "local_changes_on_remote": false,
+    "hosted_ci_for_local_source": "NOT_RUN"
+  },
+  "model_configuration": {
+    "model": "claude-opus-5-5",
+    "provider_host": "api.yhlxj.ai",
+    "active_workspace_config_verified": true,
+    "workspace_example_updated": true,
+    "historical_receipts_rewritten": false
+  },
+  "implementation_items": [
+    {"id": "V3-01", "status": "LOCAL_FIX_AND_REGRESSION_PASS", "summary": "Use one effective request input cap for relation and candidate packing."},
+    {"id": "V3-02", "status": "LOCAL_FIX_AND_REGRESSION_PASS", "summary": "Keep independent shard-local section identities separate unless a shared blueprint binds them."},
+    {"id": "V3-03", "status": "LOCAL_FIX_AND_REGRESSION_PASS", "summary": "Merge claim support/provenance with the associated claims and reject conflicts."},
+    {"id": "V3-04", "status": "LOCAL_FIX_AND_REGRESSION_PASS", "summary": "Scope study support to claim, paper, and study identity."},
+    {"id": "V3-05", "status": "LOCAL_FIX_AND_REGRESSION_PASS", "summary": "Distinguish missing relation selection from an explicit empty selection."},
+    {"id": "V3-06", "status": "PARTIAL", "summary": "Topic wire preserves selected raw source-field rows and zero results; larger full-stage packing/reducer bounds remain open."},
+    {"id": "V3-07", "status": "NOT_CLOSED", "summary": "The full R1 future exposure graph still has unbounded branches."},
+    {"id": "V3-08", "status": "NOT_CLOSED", "summary": "The 63 source items remain paper-level fallbacks; study-level evidence was not independently reconstructed."},
+    {"id": "V3-09", "status": "PARTIAL", "summary": "Local source recovery and tests exist; no current hosted CI or verified agent model/effort ledger is available."}
+  ],
+  "additional_repairs": [
+    "Replace the universal provider-call ceiling with a 24-call default and explicit per-run limits.",
+    "Use a strict versioned V2 aggregate budget where zero means zero; preserve unversioned V1 zero semantics.",
+    "Preserve numeric zero in typed configuration, source-field ledgers, semantic evidence, and relation evidence.",
+    "Carry keyed source-field provenance into topic requests and distinguish provenance from validated interpretation.",
+    "Reject local call-cap, missing stability transport, and invalid fixture failures before aggregate budget reservation.",
+    "Bind Outline v3 review drafts to the current outline, adoption, and immutable Writer sections; apply the same check in reconciliation.",
+    "Add a provider-free regression that selects candidate 2 and checks its selected and revised hashes."
+  ],
+  "verification": {
+    "provider_calls_during_this_turn": 0,
+    "network_calls_during_provider_free_tests": 0,
+    "tests": [
+      {"name": "test_pr25_final_hardening_regressions.py", "result": "39 passed"},
+      {"name": "test_review_draft_v3_lineage.py", "result": "5 passed"},
+      {"name": "local three-PDF runtime-to-verified-export fixture", "result": "2 passed in 549.07s"},
+      {"name": "configuration/public defaults/model selection/Anthropic transport", "result": "119 passed"},
+      {"name": "candidate 2 selected revision", "result": "1 passed"},
+      {"name": "explicitly selected topic-pilot resume scope", "result": "1 passed"},
+      {"name": "keyed source-field provider-free wire", "result": "1 passed"},
+      {"name": "py_compile changed implementation and test modules", "result": "passed"},
+      {"name": "git diff --check", "result": "passed with line-ending warnings only"}
+    ],
+    "full_project_suite_on_final_source": "NOT_RUN",
+    "whole_project_previous_attempt": "322 passed, 1 skipped, one test-helper failure; the helper was fixed and the failing test passed in isolation. The full command was not rerun after the final edits."
+  },
+  "topic_scaling": {
+    "source_summary_set_hash_63": "079da38604d1fe4bbdbb6869bbce24cca9e6dafdd0f0ba51d31ec41ed79976a0",
+    "provider_posts": 0,
+    "network_calls": 0,
+    "results": [
+      {"papers": 10, "data": "real subset", "topics": 11, "batches": 10, "estimated_input_sum": 228092, "estimated_input_max": 31540, "serialized_request_bytes": 610100, "planning_seconds": 2.832},
+      {"papers": 63, "data": "verified real typed summaries", "topics": 64, "batches": 55, "estimated_input_sum": 1389145, "estimated_input_max": 31980, "serialized_request_bytes": 3719616, "planning_seconds": 105.274},
+      {"papers": 200, "data": "synthetic repeated summaries", "status": "INCOMPLETE", "elapsed_wall_seconds_before_session_end": 706, "last_observed_cpu_seconds": 640},
+      {"papers": 500, "data": "synthetic repeated summaries", "status": "NOT_RUN"}
+    ],
+    "output_reserve_per_topic_call": 12288,
+    "full_stage_plan": "NOT_READY; 14 known provider exposures, 3 with bounded logical call counts, 11 unbounded in V15; no newer full-stage closure was completed."
+  },
+  "provider_history": {
+    "v6": {"posts": 1, "node": "B01", "http_status": 524, "usage": "unreported", "billing": "unknown", "continuation": "stopped as card required"},
+    "v9": {"posts": 1, "node": "B01", "http_status": 524, "usage": "unreported", "billing": "unknown", "continuation": "stopped as card required"},
+    "v10_approved_request_hash": "55a5831ea53d7e0071453154e9e52357fdffe76b72eb3f5b5725dfaf0060a523",
+    "v11_current_request_hash_for_batch_29": "eacc0ec99f505b97b3b29dbcccb1fe2340be4e363dc343819df1429979869b61",
+    "v11_input_estimate": 13684,
+    "v11_output_allowance": 12288,
+    "v11_approval_card_sha256": "6EC07AB8D37B5C9ABACFD19A750C1805C2127B8B35F860807284EC397B3BAC52",
+    "v11_card_status": "PROPOSED_AWAITING_EXACT_SCOPE_APPROVAL",
+    "v11_provider_post": false
+  },
+  "cleanup": {
+    "action": "reversible quarantine move; no deletion",
+    "path": "D:/tmp/pr25-cleanup-quarantine-20260930/.pytest-tmp-20260915-escalated",
+    "file_count": 72531,
+    "bytes": 825837327,
+    "env_files_preserved": 90,
+    "receipt_files_preserved": 108,
+    "disk_space_freed": false
+  },
+  "acceptance": {
+    "OFFLINE_PRODUCT": "PARTIAL_PASS_LOCAL_FIXTURE_WITH_LIMITS",
+    "PAID_R1_ADMISSIBLE": "BLOCKED_FULL_STAGE_PLAN_AND_NEW_EXACT_SCOPE",
+    "LIVE_R1": "NOT_COMPLETE",
+    "F1": "NOT_RUN_NOT_VERIFIED",
+    "DOCX_visual_QA": "NOT_VERIFIED",
+    "GUI_and_real_browser_acceptance_on_final_source": "NOT_RUN"
+  }
+}

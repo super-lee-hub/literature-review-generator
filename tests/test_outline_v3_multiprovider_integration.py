@@ -11,10 +11,9 @@ is the real implementation.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping
-
-import pytest
 
 from outline.provider_router import (
     OutlineProviderRouter,
@@ -30,10 +29,7 @@ from services.job_workspace import JobWorkspace
 from services.model_capabilities import resolve_model_capability
 from services.model_selection import get_api_config_for_section
 
-from test_outline_v3_semantic_execution import (
-    _configured_test_provider,
-    _summary,
-)
+from test_outline_v3_semantic_execution import _summary
 
 # A configuration shaped like the real thing: three providers, three protocols.
 CONFIG: dict[str, dict[str, str]] = {
@@ -52,6 +48,7 @@ CONFIG: dict[str, dict[str, str]] = {
         "provider_family": "openai_responses",
         "max_context_tokens": "200000",
         "max_output_tokens": "32000",
+        "transport_retries": "0",
     },
     "Outline_API": {
         "model": "claude-opus-5",
@@ -60,6 +57,7 @@ CONFIG: dict[str, dict[str, str]] = {
         "provider_family": "anthropic",
         "max_context_tokens": "200000",
         "max_output_tokens": "16000",
+        "transport_retries": "0",
     },
     "Free_Mode_API": {
         "model": "deepseek-v4-pro",
@@ -68,6 +66,7 @@ CONFIG: dict[str, dict[str, str]] = {
         "provider_family": "deepseek",
         "max_context_tokens": "128000",
         "max_output_tokens": "16000",
+        "transport_retries": "0",
     },
     "OutlineModels": {
         "outline_model": "Outline_API",
@@ -98,7 +97,9 @@ class RecordingTransport:
 
     def __call__(self, node_id: str, request: Mapping[str, Any]) -> Any:
         self.invocations.append(str(node_id))
-        return _configured_test_provider(node_id, request)
+        from tests.test_current_runtime_full_e2e import _outline_provider_response
+
+        return _outline_provider_response(node_id, request)
 
 
 class _Settings:
@@ -150,6 +151,7 @@ def _resolve_route(role: str, section_name: str) -> OutlineRoleRoute | None:
         profile=profile,
         transport=None,  # attached below, so the api_config is recorded with it
         api_base=str(api_config.get("api_base") or "").strip(),
+        config_identity=api_config,
     )
 
 
@@ -182,6 +184,7 @@ def _build() -> tuple[OutlineProviderRouter, dict[str, RecordingTransport]]:
             profile=route.profile,
             transport=transport,
             api_base=route.api_base,
+            config_identity=route.config_identity,
         )
 
     # build_outline_provider_router passes the semantic role, which is the only
@@ -245,6 +248,27 @@ def test_executor_runs_each_role_on_its_own_provider_config(tmp_path: Path) -> N
             assert semantic_role(node_id) == role, f"{node_id} ran on the {role} provider"
 
 
+def test_unknown_external_retry_reserve_blocks_before_any_role_transport(tmp_path: Path) -> None:
+    router, transports = _build()
+    unknown_routes = {
+        role: replace(route, config_identity={})
+        for role, route in router.routes.items()
+    }
+    unknown_router = OutlineProviderRouter(
+        routes=unknown_routes,
+        diagnostics=collect_routing_diagnostics(unknown_routes),
+    )
+    executor = _executor(tmp_path, router=unknown_router)
+
+    result = executor.run()
+
+    assert result.status == "blocked"
+    assert executor.stability_preflight["estimated_provider_calls"] <= 24
+    assert executor.stability_preflight["estimated_provider_physical_attempts_upper_bound"] is None
+    assert executor.stability_preflight["rejection_reason"] == "provider_physical_attempt_bound_unknown"
+    assert not any(transport.invocations for transport in transports.values())
+
+
 def test_receipts_record_three_distinct_provider_identities(tmp_path: Path) -> None:
     """The claim the reviewer asked to be proven: receipts, not the plan."""
 
@@ -270,14 +294,28 @@ def test_receipts_record_three_distinct_provider_identities(tmp_path: Path) -> N
 
     # The receipt must close against the node's real binding, including the
     # gateway host and route-specific config fingerprint, not merely the plan.
+    dag_nodes = executor._dag.node_map()
+    dynamic_nodes_seen: set[str] = set()
     for receipt in receipts:
-        binding = executor._dag.get(receipt.node_id).execution_binding
+        if receipt.node_id in dag_nodes:
+            binding = dag_nodes[receipt.node_id].execution_binding
+        else:
+            # Fragment and organization tasks have their own exact transport
+            # binding; the candidate aggregate in the static DAG is local.
+            assert receipt.node_id.startswith((
+                "candidate_comparison_fragments_provider:",
+                "candidate_organization_provider:",
+            )), receipt.node_id
+            binding = executor._dynamic_provider_bindings[receipt.node_id]
+            dynamic_nodes_seen.add(receipt.node_id)
         assert receipt.provider == binding["provider_family"]
         assert receipt.model == binding["model_name"]
         assert receipt.endpoint_type == binding["endpoint_type"]
         assert receipt.endpoint == binding["api_base_host"]
         assert receipt.config_hash == binding["provider_config_hash"]
         assert binding["route_fingerprint"]
+    assert any(node.startswith("candidate_comparison_fragments_provider:") for node in dynamic_nodes_seen)
+    assert any(node.startswith("candidate_organization_provider:") for node in dynamic_nodes_seen)
 
 
 def test_node_bindings_carry_the_executing_section(tmp_path: Path) -> None:

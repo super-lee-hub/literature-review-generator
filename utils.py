@@ -79,71 +79,71 @@ ERROR_EXPLANATIONS = {
 def get_error_explanation(error_keyword: str) -> str:
     """
     根据错误关键字获取用户友好的错误解释与建议
-    
+
     Args:
         error_keyword: 错误关键字（如'401'或'connectionerror'）
-        
+
     Returns:
         str: 格式化的错误解释和建议
     """
     error_info = ERROR_EXPLANATIONS.get(error_keyword.lower(), ERROR_EXPLANATIONS["unknown"])
-    
+
     explanation = error_info["explanation"]
     suggestion = error_info["suggestion"]
-    
+
     return f"\n[错误解释] {explanation}\n[解决方案] {suggestion}\n"
 
 
 def sanitize_path_component(path_component: str) -> str:
     """
     清理路径组件，移除或替换Windows文件系统中的非法字符
-    
+
     Args:
         path_component: 路径组件字符串
-        
+
     Returns:
         str: 清理后的路径组件
     """
     if not path_component:
         return "unknown"
-    
+
     # 移除引号和特殊字符
     cleaned = path_component.strip('\'"')
-    
+
     # Windows文件系统非法字符
     illegal_chars = '<>:"/\\|?*'
     for char in illegal_chars:
         cleaned = cleaned.replace(char, '_')
-    
+
     # 移除控制字符
     cleaned = ''.join(char for char in cleaned if ord(char) >= 32)
-    
+
     # 确保不以点或空格开头或结尾
     cleaned = cleaned.strip('. ')
-    
+
     # 如果结果为空，返回默认值
     if not cleaned:
         return "unknown"
-    
+
     return cleaned
 
 
 def ensure_dir(path: str) -> Optional[str]:
     """
     确保一个目录存在，如果不存在则创建它
-    
+
     Args:
         path: 目录路径
-        
+
     Returns:
         Optional[str]: 成功时返回目录路径，失败时返回 None
-        
+
     Raises:
         OSError: 当创建目录失败时（权限不足、路径无效等）
     """
     if not path:
         raise ValueError("目录路径不能为空")
-    
+
     try:
         if not os.path.exists(path):
             os.makedirs(path, exist_ok=True)

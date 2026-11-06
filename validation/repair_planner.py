@@ -12,6 +12,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence
 
+from services.review_draft import find_review_text_block
 from validation.repair_models import (
     DependencyHashBundle,
     PatchGranularity,
@@ -49,7 +50,7 @@ def _build_dependency_bundle(
     """Build dependency hash bundle from artifacts."""
     primary_artifact = _resolve_primary_artifact(paper_artifact)
     selected_visual_refs = primary_artifact.get("stage1_inputs", {}).get("selected_visual_refs", [])
-    
+
     return DependencyHashBundle(
         summary_hash=_compute_hash(summary_data),
         paper_artifact_hash=_compute_hash(paper_artifact),
@@ -67,7 +68,7 @@ def _map_validation_root_cause(root_causes: List[RootCause]) -> Optional[RepairR
         RootCause.REVIEW_DRIFT: RepairRootCause.REVIEW_DRIFT,
         RootCause.INSUFFICIENT_CONTEXT: RepairRootCause.INSUFFICIENT_CONTEXT,
     }
-    
+
     # Return the first matching root cause, prioritizing citation_mapping_error
     priority_order = [
         RootCause.CITATION_MAPPING_ERROR,
@@ -76,11 +77,11 @@ def _map_validation_root_cause(root_causes: List[RootCause]) -> Optional[RepairR
         RootCause.REVIEW_DRIFT,
         RootCause.INSUFFICIENT_CONTEXT,
     ]
-    
+
     for priority_cause in priority_order:
         if priority_cause in root_causes:
             return cause_mapping.get(priority_cause)
-    
+
     return None
 
 
@@ -147,23 +148,14 @@ def _find_block_for_citation(
     Uses v3 priority: target_claim_unit.block_id → block_ids[0] →
     details.target_claim_unit.block_id → legacy details.block_id → text fallback.
     """
-    sections = review_draft.get("content", {}).get("sections", [])
-
-    # Resolve target block ID via priority order
     target_block_id = _resolve_target_block_id(citation)
-
-    if target_block_id:
-        for section in sections:
-            for block in section.get("blocks", []):
-                if block.get("block_id") == target_block_id:
-                    return block
-
-    for section in sections:
-        for block in section.get("blocks", []):
-            if block.get("block_id") == target_block_id:
-                return block
-
-    return None
+    if not target_block_id:
+        return None
+    try:
+        return find_review_text_block(review_draft, target_block_id)
+    except (KeyError, TypeError, ValueError):
+        # Malformed tables and ambiguous identities are not repair targets.
+        return None
 
 
 def _create_patch_proposal(
@@ -219,7 +211,7 @@ def _create_patch_proposal(
     # Composite artifact for hash: full list for multi-paper, single for single
     artifact_for_hash: Any = resolved_artifacts if len(resolved_artifacts) > 1 else paper_artifact
     dependency_bundle = _build_dependency_bundle(artifact_for_hash, aggregate_summary)
-    
+
     # Determine fix strategy based on root cause
     if root_cause == RepairRootCause.CITATION_MAPPING_ERROR:
         fix_strategy = "manifest_fix_rerender"
@@ -236,18 +228,18 @@ def _create_patch_proposal(
     else:
         fix_strategy = "summary_recheck"
         granularity = PatchGranularity.BLOCK
-    
+
     # Create target signature
     block_text = block.get("text", "")
     anchor_text = block_text[:80] if len(block_text) <= 80 else block_text[:80] + "..."
     anchor_hash = hashlib.sha256(block_text.encode("utf-8")).hexdigest()[:8]
-    
+
     target = PatchTargetSignature(
         block_id=block.get("block_id", ""),
         anchor_text=anchor_text,
         anchor_hash=anchor_hash,
     )
-    
+
     # Proposed text depends on fix strategy
     if root_cause == RepairRootCause.CITATION_MAPPING_ERROR:
         # For mapping errors, propose removing the problematic citation
@@ -258,7 +250,7 @@ def _create_patch_proposal(
     else:
         # For other errors, mark for recheck
         proposed_text = block_text  # Keep original, mark for recheck
-    
+
     # Build v3-enhanced metadata with paper_ids, citation_set_key,
     # validation_bundle_id, and claim_unit_id
     citation_set_key = str(
@@ -286,7 +278,7 @@ def _create_patch_proposal(
         "reasoning_summary": citation_result.reasoning_summary,
         "repair_hint": citation_result.repair_hint,
     }
-    
+
     return PatchProposal(
         proposal_id=str(uuid.uuid4()),
         citation_id=citation_result.citation_id,
@@ -304,11 +296,11 @@ def _create_patch_proposal(
 
 class RepairPlanner:
     """Plans repairs based on validation findings.
-    
+
     Converts validation findings into mapping-first PatchProposal objects.
     Orders proposals by priority: citation_mapping_error comes first.
     """
-    
+
     def __init__(
         self,
         validation_report: ReviewValidationReport,
@@ -322,16 +314,16 @@ class RepairPlanner:
         self.citation_manifest = citation_manifest
         self.paper_artifacts = paper_artifacts
         self.job_id = job_id
-    
+
     def create_plan(self, policy: RepairPolicy = RepairPolicy.REPORT_FIRST) -> RepairPlan:
         """Create a repair plan from validation findings."""
         proposals: List[PatchProposal] = []
-        
+
         # Only create proposals for non-supported citations
         for citation_result in self.validation_report.citation_results:
             if citation_result.conclusion.value in ["SUPPORTED"]:
                 continue
-            
+
             proposal = _create_patch_proposal(
                 citation_result,
                 self.review_draft,
@@ -340,13 +332,13 @@ class RepairPlanner:
             )
             if proposal:
                 proposals.append(proposal)
-        
+
         # Sort proposals: citation_mapping_error first, then by confidence
         proposals.sort(key=lambda p: (
             0 if p.root_cause == RepairRootCause.CITATION_MAPPING_ERROR else 1,
             -p.confidence,
         ))
-        
+
         return RepairPlan(
             plan_id=str(uuid.uuid4()),
             created_at=datetime.now().isoformat(),
@@ -355,7 +347,7 @@ class RepairPlanner:
             proposals=proposals,
             policy=policy,
         )
-    
+
     def create_report(self, plan: RepairPlan, apply_result_id: Optional[str] = None) -> RepairReport:
         """Create a repair report artifact."""
         # Group proposals by root cause
@@ -363,7 +355,7 @@ class RepairPlanner:
         for proposal in plan.proposals:
             cause = proposal.root_cause.value
             by_cause[cause] = by_cause.get(cause, 0) + 1
-        
+
         summary = {
             "total_proposals": len(plan.proposals),
             "by_root_cause": by_cause,
@@ -371,7 +363,7 @@ class RepairPlanner:
             "visual_gap_count": len(plan.get_visual_gap_proposals()),
             "policy": plan.policy.value,
         }
-        
+
         return RepairReport(
             report_id=str(uuid.uuid4()),
             created_at=datetime.now().isoformat(),
@@ -392,7 +384,7 @@ def run_repair_planning(
     policy: RepairPolicy = RepairPolicy.REPORT_FIRST,
 ) -> Dict[str, Any]:
     """Week 4 entry point for repair planning.
-    
+
     Creates a repair plan from validation findings.
     Default policy is report-first, not silent auto-apply.
     """
@@ -403,10 +395,10 @@ def run_repair_planning(
         paper_artifacts=paper_artifacts,
         job_id=job_id,
     )
-    
+
     plan = planner.create_plan(policy=policy)
     report = planner.create_report(plan)
-    
+
     return {
         "week4_repair_planning": True,
         "plan": plan.to_dict(),

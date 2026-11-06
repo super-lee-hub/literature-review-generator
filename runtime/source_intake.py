@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from collections import Counter
 from pathlib import Path
@@ -144,6 +145,19 @@ def build_direct_source_bundle(*, project_name: str, pdf_folder: str) -> SourceB
             "source_paths": list(pdf_files),
         },
     )
+
+
+def stage1_paper_work_item_basis(bundle: SourceBundle) -> dict[str, Any]:
+    """Return a stable count and identity for the selected Stage 1 work items."""
+
+    work_items = [item.to_dict() for item in bundle.paper_work_items]
+    return {
+        "schema_version": "stage1-paper-work-items/v1",
+        "paper_work_item_count": len(work_items),
+        "paper_work_items_sha256": hashlib.sha256(
+            json.dumps(work_items, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        ).hexdigest(),
+    }
 
 
 def validate_f1_corpus_source_bundle(

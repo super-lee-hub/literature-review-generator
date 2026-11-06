@@ -1,6 +1,10 @@
 """Durability, retry-scope, and exact replay tests for Outline v3."""
 
+import json
 from dataclasses import replace
+from pathlib import Path
+
+import pytest
 
 from outline.v3_models import compute_v3_hash
 from runtime.outline_v3_dag import (
@@ -78,6 +82,92 @@ def test_node_dag_contains_required_nodes_and_preserves_completed_candidates_on_
     assert retried.get("provider_receipt_closure").status == "pending"
     assert len(store.load().nodes) == len(dag.nodes)  # type: ignore[union-attr]
     assert len(registry.list_records()) >= 2
+
+
+def test_expected_current_dag_appends_exact_state_with_one_history_load(tmp_path, monkeypatch):
+    workspace, registry = _workspace(tmp_path)
+    store = OutlineNodeStore(workspace, registry)
+    initial = store.ensure(workspace.job_id, candidate_count=1)
+    node_id = initial.nodes[0].node_id
+    original_load = store.load
+    load_count = 0
+
+    def counted_load():
+        nonlocal load_count
+        load_count += 1
+        return original_load()
+
+    monkeypatch.setattr(store, "load", counted_load)
+    updated = store.record_node(
+        node_id,
+        status="running",
+        input_hash="expected-state-test-input",
+        expected_current_dag=initial,
+    )
+
+    assert load_count == 1
+    assert updated.snapshot_sequence == initial.snapshot_sequence + 1
+    assert updated.get(node_id).status == "running"
+    assert updated.get(node_id).input_hash == "expected-state-test-input"
+    assert original_load().to_dict() == updated.to_dict()
+
+
+@pytest.mark.parametrize("tampered_sequence", (1, 2))
+def test_expected_current_dag_rejects_old_or_latest_snapshot_drift_without_append(
+    tmp_path, tampered_sequence
+):
+    workspace, registry = _workspace(tmp_path)
+    store = OutlineNodeStore(workspace, registry)
+    initial = store.ensure(workspace.job_id, candidate_count=1)
+    node_id = initial.nodes[0].node_id
+    current = store.record_node(node_id, status="running")
+    snapshot = store._snapshot_path(tampered_sequence)
+    payload = json.loads(snapshot.read_text(encoding="utf-8"))
+    payload["nodes"][0]["diagnostics"].append("tampered_after_load")
+    snapshot.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    history_count = len(list(store.directory.glob("snapshot-*.json")))
+
+    with pytest.raises(ValueError, match="node DAG hash mismatch"):
+        store.record_node(
+            node_id,
+            status="failed",
+            expected_current_dag=current,
+        )
+
+    assert len(list(store.directory.glob("snapshot-*.json"))) == history_count
+
+@pytest.mark.parametrize("mismatch", ("sequence", "job", "content_hash"))
+def test_expected_current_dag_rejects_valid_but_different_state_without_store_writes(
+    tmp_path, mismatch
+):
+    workspace, registry = _workspace(tmp_path)
+    store = OutlineNodeStore(workspace, registry)
+    initial = store.ensure(workspace.job_id, candidate_count=1)
+    node_id = initial.nodes[0].node_id
+    current = store.record_node(node_id, status="running", input_hash="advanced-state")
+    if mismatch == "sequence":
+        expected = initial
+    elif mismatch == "job":
+        expected = replace(current, job_id="another-job")
+    else:
+        expected = replace(current, nodes=[
+            replace(node, diagnostics=[*node.diagnostics, "different-valid-state"])
+            if node.node_id == node_id else node for node in current.nodes
+        ])
+    snapshots_before = {
+        path.name: path.read_bytes() for path in store.directory.glob("snapshot-*.json")
+    }
+    registry_path = workspace.paths.registry_path
+    registry_before = Path(registry_path).read_bytes()
+
+    with pytest.raises(ValueError, match="job_id|changed since expected state"):
+        store.record_node(node_id, status="failed", expected_current_dag=expected)
+
+    assert {
+        path.name: path.read_bytes() for path in store.directory.glob("snapshot-*.json")
+    } == snapshots_before
+    assert Path(registry_path).read_bytes() == registry_before
+    assert store.load().to_dict() == current.to_dict()
 
 
 def test_receipt_closure_failure_reruns_only_receipt_closure_downstream(tmp_path):

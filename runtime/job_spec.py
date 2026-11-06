@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, timedelta
 import json
 from pathlib import Path
 import re
 from typing import Any, Dict, Literal, Mapping, cast
 
-from services.job_runner import JobRunRequest, resolve_stage1_reuse, validate_free_mode_options
+from services.job_runner import JobRunRequest, STAGE1_REUSE_ACTIONS, resolve_stage1_reuse, validate_free_mode_options
 
 
 SourceMode = Literal["direct", "zotero"]
@@ -35,11 +36,13 @@ _RUNTIME_JOB_FIELDS = frozenset({
     "metadata",
 })
 _RUNTIME_METADATA_FIELDS = frozenset({
+    "stage1_summary_input_mode",
     "review_batch_spec",
     "requested_stages",
     "free_mode_input",
     "free_mode_context",
     "review_intent",
+    "provider_budget",
     "validation_required",
     "require_clean_validation",
     "allow_unvalidated_when_validation_optional",
@@ -49,8 +52,11 @@ _RUNTIME_METADATA_FIELDS = frozenset({
     "audit_scope",
     "stage_plan",
     "external_host_acknowledgement",
+    "outline_pilot",
     "f1_corpus_binding",
     "f1_d_modality_policy",
+    "provider_semantic_contract_version",
+    "source_revision_plan",
 })
 _RUNTIME_COMPATIBILITY_FIELDS = frozenset(
     {
@@ -106,6 +112,152 @@ def _optional_bool(value: Any, *, field_name: str) -> bool | None:
     if not isinstance(value, bool):
         raise ValueError(f"{field_name} must be a JSON boolean")
     return value
+
+
+_OUTLINE_PILOT_FIELDS = frozenset({
+    "schema_version",
+    "selected_topic_batch_ids",
+    "selected_request_hashes",
+    "source_summary_set_hash",
+    "allowed_route_fingerprint",
+    "acceptance_run_id",
+    "max_physical_attempts",
+    "max_output_tokens_all_attempts",
+    "deadline_utc",
+    "auto_continue",
+    "adoption_authorized",
+})
+
+
+def _validate_outline_pilot(
+    metadata: Mapping[str, Any],
+    *,
+    action: str,
+) -> None:
+    """Validate the declared pilot boundary; this is not execution authority."""
+
+    if "outline_pilot" not in metadata:
+        return
+    pilot = metadata.get("outline_pilot")
+    if not isinstance(pilot, Mapping):
+        raise ValueError("metadata.outline_pilot must be a JSON object")
+    _reject_unknown_fields(
+        pilot,
+        _OUTLINE_PILOT_FIELDS,
+        label="metadata.outline_pilot",
+    )
+    missing = sorted(_OUTLINE_PILOT_FIELDS - {str(key) for key in pilot})
+    if missing:
+        raise ValueError(
+            "metadata.outline_pilot is missing required fields: " + ", ".join(missing)
+        )
+    if pilot.get("schema_version") != "outline-topic-pilot/v1":
+        raise ValueError("metadata.outline_pilot schema_version is invalid")
+    if action != "generate_outline":
+        raise ValueError("metadata.outline_pilot requires action=generate_outline")
+
+    raw_stages = metadata.get("requested_stages")
+    if not isinstance(raw_stages, (list, tuple)) or not raw_stages:
+        raise ValueError(
+            "metadata.outline_pilot requires requested_stages ending at outline only"
+        )
+    stages = tuple(str(item) for item in raw_stages)
+    if (
+        stages[-1] != "outline"
+        or any(stage not in {"source_intake", "outline"} for stage in stages)
+        or stages.count("outline") != 1
+        or len(stages) != len(set(stages))
+    ):
+        raise ValueError(
+            "metadata.outline_pilot requires requested_stages ending at outline only"
+        )
+
+    topic_batch_ids = pilot.get("selected_topic_batch_ids")
+    if not isinstance(topic_batch_ids, list) or not topic_batch_ids:
+        raise ValueError(
+            "metadata.outline_pilot.selected_topic_batch_ids must be a non-empty JSON array"
+        )
+    if any(
+        not isinstance(item, str)
+        or not re.fullmatch(r"topic_synthesis_provider:batch:[1-9][0-9]*", item)
+        for item in topic_batch_ids
+    ):
+        raise ValueError(
+            "metadata.outline_pilot.selected_topic_batch_ids must contain topic_synthesis_provider:batch:N IDs"
+        )
+    if len(topic_batch_ids) != len(set(topic_batch_ids)):
+        raise ValueError(
+            "metadata.outline_pilot.selected_topic_batch_ids must be unique"
+        )
+
+    selected_request_hashes = pilot.get("selected_request_hashes")
+    if not isinstance(selected_request_hashes, Mapping):
+        raise ValueError(
+            "metadata.outline_pilot.selected_request_hashes must be a JSON object"
+        )
+    if (
+        any(not isinstance(key, str) for key in selected_request_hashes)
+        or set(selected_request_hashes) != set(topic_batch_ids)
+    ):
+        raise ValueError(
+            "metadata.outline_pilot.selected_request_hashes keys must exactly match selected_topic_batch_ids"
+        )
+    for batch_id, request_hash in selected_request_hashes.items():
+        if (
+            not isinstance(request_hash, str)
+            or re.fullmatch(r"[0-9a-f]{64}", request_hash) is None
+        ):
+            raise ValueError(
+                "metadata.outline_pilot.selected_request_hashes values must be lowercase SHA-256 hashes"
+            )
+
+    for field_name in ("source_summary_set_hash", "allowed_route_fingerprint"):
+        value = pilot.get(field_name)
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ValueError(
+                f"metadata.outline_pilot.{field_name} must be a lowercase SHA-256"
+            )
+
+    acceptance_run_id = pilot.get("acceptance_run_id")
+    if not isinstance(acceptance_run_id, str) or not acceptance_run_id.strip():
+        raise ValueError(
+            "metadata.outline_pilot.acceptance_run_id must be a non-empty JSON string"
+        )
+
+    for field_name in ("max_physical_attempts", "max_output_tokens_all_attempts"):
+        value = pilot.get(field_name)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(
+                f"metadata.outline_pilot.{field_name} must be a positive JSON integer"
+            )
+
+    deadline_utc = pilot.get("deadline_utc")
+    if not isinstance(deadline_utc, str) or not re.fullmatch(
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:Z|\+00:00)",
+        deadline_utc,
+    ):
+        raise ValueError(
+            "metadata.outline_pilot.deadline_utc must be an ISO-8601 UTC timestamp"
+        )
+    try:
+        parsed_deadline = datetime.fromisoformat(
+            deadline_utc[:-1] + "+00:00" if deadline_utc.endswith("Z") else deadline_utc
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "metadata.outline_pilot.deadline_utc must be an ISO-8601 UTC timestamp"
+        ) from exc
+    if (
+        parsed_deadline.tzinfo is None
+        or parsed_deadline.utcoffset() != timedelta(0)
+    ):
+        raise ValueError(
+            "metadata.outline_pilot.deadline_utc must be an ISO-8601 UTC timestamp"
+        )
+
+    for field_name in ("auto_continue", "adoption_authorized"):
+        if pilot.get(field_name) is not False:
+            raise ValueError(f"metadata.outline_pilot.{field_name} must be false")
 
 
 @dataclass(frozen=True)
@@ -175,6 +327,26 @@ class RuntimeJobSpec:
         if not isinstance(self.metadata, Mapping):
             raise ValueError("metadata must be a JSON object")
         _reject_unknown_fields(self.metadata, _RUNTIME_METADATA_FIELDS, label="metadata")
+        if any(key in self.metadata for key in (
+            "provider_semantic_contract_version", "source_revision_plan",
+        )):
+            from runtime.source_revision import validate_source_revision_metadata
+
+            validate_source_revision_metadata(self.metadata)
+        if "stage1_summary_input_mode" in self.metadata:
+            if self.metadata["stage1_summary_input_mode"] != "explicit_typed_import":
+                raise ValueError("metadata.stage1_summary_input_mode must be 'explicit_typed_import'")
+            if self.action not in STAGE1_REUSE_ACTIONS:
+                raise ValueError("explicit typed Stage 1 import requires an analysis action")
+            if self.reuse_stage1 is not True or not self.reuse_summary_files:
+                raise ValueError("explicit typed Stage 1 import requires reuse_stage1=true and reuse_summary_files")
+            if self.summary_file or self.summary_sources:
+                raise ValueError("explicit typed Stage 1 import cannot mix summary_file or summary_sources")
+            requested = self.metadata.get("requested_stages")
+            if requested is not None and (
+                not isinstance(requested, (list, tuple)) or "analyze" not in requested
+            ):
+                raise ValueError("explicit typed Stage 1 import requires Analyze in requested_stages")
         allowed_actions = {
             "analyze",
             "derive_review_batch",
@@ -379,6 +551,7 @@ class RuntimeJobSpec:
                 raise ValueError(
                     "derive_review_batch requested_stages may contain only derive_review_batch"
                 )
+        _validate_outline_pilot(self.metadata, action=self.action)
         for field_name in (
             "validation_required",
             "require_clean_validation",
@@ -417,6 +590,9 @@ class RuntimeJobSpec:
             retry_failed=self.action == "retry_failed",
             retry_review_failed=self.action == "retry_review_failed",
             progress_tracker=None,
+            provider_budget=(dict(self.metadata["provider_budget"])
+                             if isinstance(self.metadata.get("provider_budget"), Mapping)
+                             else self.metadata.get("provider_budget")),
             gui=False,
             source_mode=self.source.mode,
             zotero_report=self.source.zotero_report or None,
@@ -436,6 +612,7 @@ class RuntimeJobSpec:
                 self.metadata.get("allow_partial_source_quarantine", False)
             ),
             derived_summary_source=bool(self.metadata.get("review_batch_spec")),
+            runtime_spec_payload=self.to_dict(),
         )
 
     def to_dict(self) -> Dict[str, Any]:

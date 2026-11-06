@@ -60,12 +60,12 @@ DEFAULT_FORBIDDEN_PATTERNS: dict[str, str] = {
     "generate_" "full_review_from_outline(": "legacy_review_generation",
     # Configuration compatibility and duplicate-truth symbols.
     "services." "config_compat": "legacy_config_compat_module",
-    "Compat" "ConfigView": "legacy_config_view",
+    "Compat" "ConfigView": "legacy_config_view_exact",
     "Validation" "CompatSettings": "legacy_validation_compat_settings",
     "apply_validation_" "compat_sections(": "legacy_validation_compat_sections",
     "remove_legacy_" "rate_limit_settings(": "legacy_rate_limit_settings",
     "LEGACY_" "RATE_LIMIT_KEYS": "legacy_rate_limit_keys",
-    "legacy_" "citation_policy": "legacy_citation_policy_config",
+    "legacy_" "citation_policy": "legacy_citation_policy_exact",
     "keep_legacy_" "projections": "legacy_projection_switch",
     # Runtime/CLI injection and the historical monolith dispatcher.
     "import main as " "legacy_main": "legacy_main_injection",
@@ -77,11 +77,11 @@ DEFAULT_FORBIDDEN_PATTERNS: dict[str, str] = {
     "outline." "v2_models": "legacy_outline_v2_models",
     "OutlineV2" "Config": "legacy_outline_v2_config_symbol",
     "OutlineQuality" "GateConfig": "legacy_outline_quality_config",
-    "V2" "Pipeline": "legacy_outline_v2_pipeline",
+    "V2" "Pipeline": "legacy_outline_v2_pipeline_exact",
     "OutlineRuntime" "Resolver": "legacy_outline_runtime_resolver",
     "outline." "legacy_adapter": "legacy_outline_adapter_module",
     "OutlineLegacy" "Adapter": "legacy_outline_adapter_symbol",
-    "enable_outline_" "intelligence_v2": "legacy_outline_v2_switch",
+    "enable_outline_" "intelligence_v2": "legacy_outline_v2_switch_exact",
     "legacy_" "outline_path": "legacy_outline_path",
     # The old context optimizer silently discarded evidence. Current paths
     # must fail on an over-budget request or use deterministic sharding/merge.
@@ -90,7 +90,7 @@ DEFAULT_FORBIDDEN_PATTERNS: dict[str, str] = {
     "optimize_context_" "for_synthesis(": "legacy_synthesis_context_optimizer",
     "head_" "text": "legacy_head_tail_truncation",
     "tail_" "text": "legacy_head_tail_truncation",
-    "950" "000": "legacy_context_token_ceiling",
+    "950" "000": "legacy_context_token_ceiling_exact",
     "research_streams" "[:80]": "legacy_research_stream_truncation",
     # Exact PR14 clean-cut sentinels. Keep these entries in the policy module
     # itself; the scanner excludes this file so the catalog does not produce
@@ -100,20 +100,15 @@ DEFAULT_FORBIDDEN_PATTERNS: dict[str, str] = {
     "primary_" "rpm_limit": "legacy_primary_rpm_limit",
     "backup_" "tpm_limit": "legacy_backup_tpm_limit",
     "backup_" "rpm_limit": "legacy_backup_rpm_limit",
-    "enable_outline_" "intelligence_v2": "legacy_outline_v2_switch_exact",
-    "Compat" "ConfigView": "legacy_config_view_exact",
     "legacy_" "main": "legacy_main_symbol",
     "migrate" "-legacy": "legacy_workspace_migration_command",
     "legacy_" "unverified": "legacy_unverified_state",
-    "legacy_" "citation_policy": "legacy_citation_policy_exact",
     "from " "validator import": "legacy_validator_import",
     "import " "validator": "legacy_validator_import",
     "from " "pdf_extractor import": "legacy_pdf_extractor_import",
     "import " "pdf_extractor": "legacy_pdf_extractor_import",
     "project_" "legacy_workspace_outcome": "legacy_workspace_projection",
-    "V2" "Pipeline": "legacy_outline_v2_pipeline_exact",
     "max_tokens_" "for_optimization": "legacy_optimizer_token_budget",
-    "950" "000": "legacy_context_token_ceiling_exact",
     "中间内容已截断": "legacy_truncated_content_marker",
     "manual_" "repaired_legacy": "legacy_manual_repair_marker",
 }

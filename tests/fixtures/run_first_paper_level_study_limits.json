@@ -1,0 +1,717 @@
+{
+  "schema_version": "run-first-paper-level-study-limitations/v2",
+  "source_artifact": {
+    "artifact_id": "outline-v3:outline_content_layers",
+    "content_hash": "b03b04b7d3b973256a4f723c9f0f42b058a2dcd566308c116edb5eaa60fb1e9b",
+    "artifact_hash": "17038f7d72b16622c2d47b2be5d9bffd9ce17306e3f266acd9cadf1fd0658d45",
+    "registry_job_id": "run-first-scale-63-local-http",
+    "artifact_filename": "outline_content_layers__17038f7d72b16622c2d47b2b.json"
+  },
+  "paper_alias_map_snapshot": {
+    "artifact_type": "outline_evidence_alias_map",
+    "artifact_version": "v1",
+    "artifact_filename": "outline_evidence_alias_map__209a4a53f4c5b288b3244291__77e5bf976a1f25e865ea2f45.json",
+    "payload_sha256": "f660bbdb26937893fe88e94f89fe52ed10346ee7682c6a6e49d16eb3558f6e0d",
+    "papers": {
+      "10.1002/dir.20024": "P001",
+      "10.1002/mar.21206": "P002",
+      "10.1002/mar.21356": "P003",
+      "10.1002/mar.21656": "P005",
+      "10.1016/j.ijresmar.2024.10.006": "P014",
+      "10.1016/j.jcps.2011.11.009": "P024",
+      "10.1016/j.joep.2010.07.001": "P025",
+      "10.1016/j.jretai.2009.10.003": "P027",
+      "10.1016/j.jretai.2011.10.004": "P029",
+      "10.1016/j.jretai.2019.09.004": "P030",
+      "10.1086/673193": "P045",
+      "10.1093/jcr/ucaf066": "P046",
+      "10.1093/jcr/ucag003": "P047",
+      "10.1177/002224379903600204": "P048",
+      "10.1177/0092070304269953": "P049",
+      "10.1177/1094670506295848": "P051",
+      "10.1177/1094670518755314": "P052",
+      "10.1509/jm.14.0389": "P056",
+      "10.1509/jmkr.44.2.261": "P059"
+    },
+    "papers_reverse": {
+      "P001": "10.1002/dir.20024",
+      "P002": "10.1002/mar.21206",
+      "P003": "10.1002/mar.21356",
+      "P005": "10.1002/mar.21656",
+      "P014": "10.1016/j.ijresmar.2024.10.006",
+      "P024": "10.1016/j.jcps.2011.11.009",
+      "P025": "10.1016/j.joep.2010.07.001",
+      "P027": "10.1016/j.jretai.2009.10.003",
+      "P029": "10.1016/j.jretai.2011.10.004",
+      "P030": "10.1016/j.jretai.2019.09.004",
+      "P045": "10.1086/673193",
+      "P046": "10.1093/jcr/ucaf066",
+      "P047": "10.1093/jcr/ucag003",
+      "P048": "10.1177/002224379903600204",
+      "P049": "10.1177/0092070304269953",
+      "P051": "10.1177/1094670506295848",
+      "P052": "10.1177/1094670518755314",
+      "P056": "10.1509/jm.14.0389",
+      "P059": "10.1509/jmkr.44.2.261"
+    },
+    "digest_provenance": "payload_sha256 is copied from the full durable current82 alias artifact; papers and papers_reverse below are the exact selected paper rows, so the digest is not recomputed over this excerpt."
+  },
+  "eligibility_policy": {
+    "claim_type": "author_interpretation",
+    "source_locators": [
+      "stage1:ai_summary.limitations",
+      "stage1:ai_summary.moderators_boundaries"
+    ],
+    "study_id": "empty",
+    "owner_study_ids": "no nonempty values (the inventory keeps the empty-string sentinel)",
+    "scope_note": "Fixture-only wording normalization; empirical findings, gaps, other locators, and owned study claims are untouched."
+  },
+  "claims": {
+    "claim:10.1002/dir.20024:limitations:8cf94e233d6cf9e5": {
+      "claim_id": "claim:10.1002/dir.20024:limitations:8cf94e233d6cf9e5",
+      "paper_key": "10.1002/dir.20024",
+      "provider_alias": "P001",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.limitations",
+      "source_summary_hash": "029ca5fed233f3cf7b6ee1e33616820172d29e1752ef8c1432416c068b88d7d8",
+      "evidence_ids": [
+        "evidence:10.1002/dir.20024:limitations:80964cccc92f97bc"
+      ],
+      "source_text_sha256": "8cf94e233d6cf9e5e14815fd59b6f6941359bb7edfc34e7abb3f3faccbca6e1b",
+      "source_text": "Authors state: (1) Study 1 found no significant trust difference between purchase timing and identification favoring a frequent flyer; (2) identification scenarios included information about tracking personal information while purchase timing scenarios did not, which may have negatively affected perceptions; (3) lack of a test of consumer attributions and norm theory; (4) single-item measure for repurchase intentions; (5) only two examples of Internet price segmentation tactics were examined."
+    },
+    "claim:10.1002/dir.20024:moderators_boundaries:8cf94e233d6cf9e5": {
+      "claim_id": "claim:10.1002/dir.20024:moderators_boundaries:8cf94e233d6cf9e5",
+      "paper_key": "10.1002/dir.20024",
+      "provider_alias": "P001",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.moderators_boundaries",
+      "source_summary_hash": "029ca5fed233f3cf7b6ee1e33616820172d29e1752ef8c1432416c068b88d7d8",
+      "evidence_ids": [
+        "evidence:10.1002/dir.20024:moderators_boundaries:f99805a6a78d27fd"
+      ],
+      "source_text_sha256": "8cf94e233d6cf9e5e14815fd59b6f6941359bb7edfc34e7abb3f3faccbca6e1b",
+      "source_text": "Authors state: (1) Study 1 found no significant trust difference between purchase timing and identification favoring a frequent flyer; (2) identification scenarios included information about tracking personal information while purchase timing scenarios did not, which may have negatively affected perceptions; (3) lack of a test of consumer attributions and norm theory; (4) single-item measure for repurchase intentions; (5) only two examples of Internet price segmentation tactics were examined."
+    },
+    "claim:10.1002/mar.21206:limitations:bd3e356570b8d06a": {
+      "claim_id": "claim:10.1002/mar.21206:limitations:bd3e356570b8d06a",
+      "paper_key": "10.1002/mar.21206",
+      "provider_alias": "P002",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.limitations",
+      "source_summary_hash": "de836b47f1e719679517ef9db1c54bc494c17aa991cc54ab5fdaa9dff79156cc",
+      "evidence_ids": [
+        "evidence:10.1002/mar.21206:limitations:1cd94e07e17b239d"
+      ],
+      "source_text_sha256": "bd3e356570b8d06a1da0ba235a3335262dd95d99a3cbcbf5edcf14af62c3ef84",
+      "source_text": "Authors state: (a) all studies were experiments, which may not always generalize to a retail setting; (b) participants were students or MTurk respondents, raising generalizability concerns; (c) future research should conduct a true field study; (d) MTurk sample appropriateness has caveats. The authors also note gender effects on referent deservingness and price fairness were not the focus but could be a fruitful area for future investigation. System observation (not author-stated): Study 1a used a small sample (n = 51) and single-item measures; several degrees of freedom in Study 2 appear inconsistent with the sample size."
+    },
+    "claim:10.1002/mar.21206:moderators_boundaries:bd3e356570b8d06a": {
+      "claim_id": "claim:10.1002/mar.21206:moderators_boundaries:bd3e356570b8d06a",
+      "paper_key": "10.1002/mar.21206",
+      "provider_alias": "P002",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.moderators_boundaries",
+      "source_summary_hash": "de836b47f1e719679517ef9db1c54bc494c17aa991cc54ab5fdaa9dff79156cc",
+      "evidence_ids": [
+        "evidence:10.1002/mar.21206:moderators_boundaries:2ca0dcb9eb445e34"
+      ],
+      "source_text_sha256": "bd3e356570b8d06a1da0ba235a3335262dd95d99a3cbcbf5edcf14af62c3ef84",
+      "source_text": "Authors state: (a) all studies were experiments, which may not always generalize to a retail setting; (b) participants were students or MTurk respondents, raising generalizability concerns; (c) future research should conduct a true field study; (d) MTurk sample appropriateness has caveats. The authors also note gender effects on referent deservingness and price fairness were not the focus but could be a fruitful area for future investigation. System observation (not author-stated): Study 1a used a small sample (n = 51) and single-item measures; several degrees of freedom in Study 2 appear inconsistent with the sample size."
+    },
+    "claim:10.1002/mar.21356:limitations:a3d7e3809bb02df1": {
+      "claim_id": "claim:10.1002/mar.21356:limitations:a3d7e3809bb02df1",
+      "paper_key": "10.1002/mar.21356",
+      "provider_alias": "P003",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.limitations",
+      "source_summary_hash": "6c8181b8bf5aa4b0a36f5589881e0e262fc4d8d082627c1b7648053e22f06253",
+      "evidence_ids": [
+        "evidence:10.1002/mar.21356:limitations:7be071c3f31939ab"
+      ],
+      "source_text_sha256": "a3d7e3809bb02df15c68bdae4d7b361d811b4df664cfb881f7db73e047d9eac1",
+      "source_text": "Author-stated: the findings rest on experiments in a hypothetical setting, and the authors state that a high priority for future research is to replicate and generalize them with field data; the degree of price discrimination was set at a single level (+15%) and only a price increase was examined, leaving continuous price changes and price decreases untested; the positive effect of choice on internal attribution is contingent on consumers' privacy decision (it holds only for those who agree to share data); in Study 2 the difference between allowing and the OK-cookie was only marginal (beta = 0.61, p < .10) and the downstream effects were descriptively less clear than in Study 1."
+    },
+    "claim:10.1002/mar.21356:moderators_boundaries:a3d7e3809bb02df1": {
+      "claim_id": "claim:10.1002/mar.21356:moderators_boundaries:a3d7e3809bb02df1",
+      "paper_key": "10.1002/mar.21356",
+      "provider_alias": "P003",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.moderators_boundaries",
+      "source_summary_hash": "6c8181b8bf5aa4b0a36f5589881e0e262fc4d8d082627c1b7648053e22f06253",
+      "evidence_ids": [
+        "evidence:10.1002/mar.21356:moderators_boundaries:e1f56fe4604b5d72"
+      ],
+      "source_text_sha256": "a3d7e3809bb02df15c68bdae4d7b361d811b4df664cfb881f7db73e047d9eac1",
+      "source_text": "Author-stated: the findings rest on experiments in a hypothetical setting, and the authors state that a high priority for future research is to replicate and generalize them with field data; the degree of price discrimination was set at a single level (+15%) and only a price increase was examined, leaving continuous price changes and price decreases untested; the positive effect of choice on internal attribution is contingent on consumers' privacy decision (it holds only for those who agree to share data); in Study 2 the difference between allowing and the OK-cookie was only marginal (beta = 0.61, p < .10) and the downstream effects were descriptively less clear than in Study 1."
+    },
+    "claim:10.1002/mar.21656:limitations:b8f553243e299a06": {
+      "claim_id": "claim:10.1002/mar.21656:limitations:b8f553243e299a06",
+      "paper_key": "10.1002/mar.21656",
+      "provider_alias": "P005",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.limitations",
+      "source_summary_hash": "819829cdb1f939c2ac2a4a1b288d3a1777028449e08d0d11ad2be2ab561981e2",
+      "evidence_ids": [
+        "evidence:10.1002/mar.21656:limitations:e6f1d87187acc703"
+      ],
+      "source_text_sha256": "b8f553243e299a0600b1429d0dafda48fd619459c7f309effd1fa0c1d0eb01c7",
+      "source_text": "Author-stated limitations and future research avenues: (1) further contingencies of the interaction effect should be investigated, for example combining the price increase manipulation with a justification such as increased costs, extending the findings to brands with long-standing CSR reputations (e.g., Patagonia, Stella McCartney), and comparing CSR engagement in different domains such as environmental protection and business process responsibility; (2) distributive justice offers an alternative explanation, since consumers might perceive that a product could be cheaper if the company did not allocate resources to CSR, or that CSR is financed through price increases, reducing the cost–benefit ratio and perceived price fairness; (3) the dependent variable reflects consumers' perceptions rather than behavior, so future research should include behavioral variables such as purchase volume and additional factors beyond the study's control (e.g., disposable income); (4) Study 2's price increase (from €35 to €45) is relatively high and may be perceived as unrealistic, and 46.88% (n = 180) of Study 2 participants did not respond to the manipulation checks."
+    },
+    "claim:10.1002/mar.21656:moderators_boundaries:b8f553243e299a06": {
+      "claim_id": "claim:10.1002/mar.21656:moderators_boundaries:b8f553243e299a06",
+      "paper_key": "10.1002/mar.21656",
+      "provider_alias": "P005",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.moderators_boundaries",
+      "source_summary_hash": "819829cdb1f939c2ac2a4a1b288d3a1777028449e08d0d11ad2be2ab561981e2",
+      "evidence_ids": [
+        "evidence:10.1002/mar.21656:moderators_boundaries:bb3f29d63438ed9c"
+      ],
+      "source_text_sha256": "b8f553243e299a0600b1429d0dafda48fd619459c7f309effd1fa0c1d0eb01c7",
+      "source_text": "Author-stated limitations and future research avenues: (1) further contingencies of the interaction effect should be investigated, for example combining the price increase manipulation with a justification such as increased costs, extending the findings to brands with long-standing CSR reputations (e.g., Patagonia, Stella McCartney), and comparing CSR engagement in different domains such as environmental protection and business process responsibility; (2) distributive justice offers an alternative explanation, since consumers might perceive that a product could be cheaper if the company did not allocate resources to CSR, or that CSR is financed through price increases, reducing the cost–benefit ratio and perceived price fairness; (3) the dependent variable reflects consumers' perceptions rather than behavior, so future research should include behavioral variables such as purchase volume and additional factors beyond the study's control (e.g., disposable income); (4) Study 2's price increase (from €35 to €45) is relatively high and may be perceived as unrealistic, and 46.88% (n = 180) of Study 2 participants did not respond to the manipulation checks."
+    },
+    "claim:10.1016/j.ijresmar.2024.10.006:limitations:82a1ebe7ba33884a": {
+      "claim_id": "claim:10.1016/j.ijresmar.2024.10.006:limitations:82a1ebe7ba33884a",
+      "paper_key": "10.1016/j.ijresmar.2024.10.006",
+      "provider_alias": "P014",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.limitations",
+      "source_summary_hash": "8382e90c0058c442246f616262d54007656fd7be1dc1033ecf6a7f6c4f37b7b5",
+      "evidence_ids": [
+        "evidence:10.1016/j.ijresmar.2024.10.006:limitations:8949db7c92cafbcf"
+      ],
+      "source_text_sha256": "82a1ebe7ba33884a727b6272e58365ab91c2e761a6dfecfe89b5679fae026bfd",
+      "source_text": "Author-stated limitations: Study 1's design is correlational, focuses on the post-purchase stage (whereas findings might differ pre-purchase), and relies on self-reported price search intentions (addressed by the controlled pre-purchase design of Study 2). Study 2's price-search phase is limited to seven days, which the authors argue does not change the trade-off underlying each search decision. The choice of the ADP approach is described as a strategic decision beyond the study's scope. The authors also note that Study 4b's manipulation checks showed significant side effects, which they defend as negligible in effect size (η²p = 0.02 vs. 0.34 for the primary effect). Scope notes: the studies rely on consumer electronics purchase scenarios and on targeted price search across time (not incidental price search or price search across stores), and the authors call for replications in field settings and other product categories."
+    },
+    "claim:10.1016/j.ijresmar.2024.10.006:moderators_boundaries:82a1ebe7ba33884a": {
+      "claim_id": "claim:10.1016/j.ijresmar.2024.10.006:moderators_boundaries:82a1ebe7ba33884a",
+      "paper_key": "10.1016/j.ijresmar.2024.10.006",
+      "provider_alias": "P014",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.moderators_boundaries",
+      "source_summary_hash": "8382e90c0058c442246f616262d54007656fd7be1dc1033ecf6a7f6c4f37b7b5",
+      "evidence_ids": [
+        "evidence:10.1016/j.ijresmar.2024.10.006:moderators_boundaries:733d4446c5f07c0f"
+      ],
+      "source_text_sha256": "82a1ebe7ba33884a727b6272e58365ab91c2e761a6dfecfe89b5679fae026bfd",
+      "source_text": "Author-stated limitations: Study 1's design is correlational, focuses on the post-purchase stage (whereas findings might differ pre-purchase), and relies on self-reported price search intentions (addressed by the controlled pre-purchase design of Study 2). Study 2's price-search phase is limited to seven days, which the authors argue does not change the trade-off underlying each search decision. The choice of the ADP approach is described as a strategic decision beyond the study's scope. The authors also note that Study 4b's manipulation checks showed significant side effects, which they defend as negligible in effect size (η²p = 0.02 vs. 0.34 for the primary effect). Scope notes: the studies rely on consumer electronics purchase scenarios and on targeted price search across time (not incidental price search or price search across stores), and the authors call for replications in field settings and other product categories."
+    },
+    "claim:10.1016/j.jcps.2011.11.009:limitations:72e07f591f73a2bb": {
+      "claim_id": "claim:10.1016/j.jcps.2011.11.009:limitations:72e07f591f73a2bb",
+      "paper_key": "10.1016/j.jcps.2011.11.009",
+      "provider_alias": "P024",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.limitations",
+      "source_summary_hash": "e7d5973d708e3bc94a9a78fd445c3c7f180d7eeea354a123990d7b0298e44734",
+      "evidence_ids": [
+        "evidence:10.1016/j.jcps.2011.11.009:limitations:3e9869c0c96e55fb"
+      ],
+      "source_text_sha256": "72e07f591f73a2bbab2f35f30f473c8312005241872bacb975f9bae55270607b",
+      "source_text": "Author-stated: (a) In Study 1 the main dependent variables were administered after the manipulation-check questionnaires, which could have strengthened the manipulations or made participants partially aware of the underlying premise; Study 2 addressed this by asking the manipulation questions of a separate control group recruited from the same participant pool. (b) Both studies use service-brand contexts (an auto service center and a takeout restaurant), chosen so the scenarios would seem natural and credible given that communality is a key dimension of service relationships; the authors argue the results should also apply broadly to product brands, especially those that depend on interaction with customers, but product brands are not tested. (c) The authors caution that substituting apologies for monetary compensation can backfire if the apology is not perceived as genuine and is not supported by consistent later behavior, in which case relationship norms may be violated and the relationship jeopardized."
+    },
+    "claim:10.1016/j.jcps.2011.11.009:moderators_boundaries:72e07f591f73a2bb": {
+      "claim_id": "claim:10.1016/j.jcps.2011.11.009:moderators_boundaries:72e07f591f73a2bb",
+      "paper_key": "10.1016/j.jcps.2011.11.009",
+      "provider_alias": "P024",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.moderators_boundaries",
+      "source_summary_hash": "e7d5973d708e3bc94a9a78fd445c3c7f180d7eeea354a123990d7b0298e44734",
+      "evidence_ids": [
+        "evidence:10.1016/j.jcps.2011.11.009:moderators_boundaries:f680b0942f0818a2"
+      ],
+      "source_text_sha256": "72e07f591f73a2bbab2f35f30f473c8312005241872bacb975f9bae55270607b",
+      "source_text": "Author-stated: (a) In Study 1 the main dependent variables were administered after the manipulation-check questionnaires, which could have strengthened the manipulations or made participants partially aware of the underlying premise; Study 2 addressed this by asking the manipulation questions of a separate control group recruited from the same participant pool. (b) Both studies use service-brand contexts (an auto service center and a takeout restaurant), chosen so the scenarios would seem natural and credible given that communality is a key dimension of service relationships; the authors argue the results should also apply broadly to product brands, especially those that depend on interaction with customers, but product brands are not tested. (c) The authors caution that substituting apologies for monetary compensation can backfire if the apology is not perceived as genuine and is not supported by consistent later behavior, in which case relationship norms may be violated and the relationship jeopardized."
+    },
+    "claim:10.1016/j.joep.2010.07.001:limitations:0a4cc9631880f94f": {
+      "claim_id": "claim:10.1016/j.joep.2010.07.001:limitations:0a4cc9631880f94f",
+      "paper_key": "10.1016/j.joep.2010.07.001",
+      "provider_alias": "P025",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.limitations",
+      "source_summary_hash": "813cff0d71e8b4dac4364fa5ac02cd5daf55ae08526ab6a9ac1776a16af9b504",
+      "evidence_ids": [
+        "evidence:10.1016/j.joep.2010.07.001:limitations:d9a72badc1cb9e25"
+      ],
+      "source_text_sha256": "0a4cc9631880f94f6ed102b77769784236cb57323e194decb5596a1161feab23",
+      "source_text": "The source does not include a dedicated limitations section. The authors explicitly state that the observed differences are subtle and the effects relatively small, and that some emotional differences were small and not statistically significant. They note that their research only examines the effect of an advantaged price outcome and its interactions with comparative reference characteristics (type of reference and multiple references). They also observe that the advantaged-inequity effect was smaller in Study 3 than in Study 1, which may reflect differences in communication context and reference identity. System observations from the evidence: the studies use student samples and scenario-based measures, so generalization to other populations and real purchase settings is limited; Study 2 has a modest sample after one deletion (cell sizes 24 and 26); and figure-level values were not verified through supplied visual observations, so the extraction relies on text-reported statistics."
+    },
+    "claim:10.1016/j.joep.2010.07.001:moderators_boundaries:0a4cc9631880f94f": {
+      "claim_id": "claim:10.1016/j.joep.2010.07.001:moderators_boundaries:0a4cc9631880f94f",
+      "paper_key": "10.1016/j.joep.2010.07.001",
+      "provider_alias": "P025",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.moderators_boundaries",
+      "source_summary_hash": "813cff0d71e8b4dac4364fa5ac02cd5daf55ae08526ab6a9ac1776a16af9b504",
+      "evidence_ids": [
+        "evidence:10.1016/j.joep.2010.07.001:moderators_boundaries:d41c0f3eeaee2981"
+      ],
+      "source_text_sha256": "0a4cc9631880f94f6ed102b77769784236cb57323e194decb5596a1161feab23",
+      "source_text": "The source does not include a dedicated limitations section. The authors explicitly state that the observed differences are subtle and the effects relatively small, and that some emotional differences were small and not statistically significant. They note that their research only examines the effect of an advantaged price outcome and its interactions with comparative reference characteristics (type of reference and multiple references). They also observe that the advantaged-inequity effect was smaller in Study 3 than in Study 1, which may reflect differences in communication context and reference identity. System observations from the evidence: the studies use student samples and scenario-based measures, so generalization to other populations and real purchase settings is limited; Study 2 has a modest sample after one deletion (cell sizes 24 and 26); and figure-level values were not verified through supplied visual observations, so the extraction relies on text-reported statistics."
+    },
+    "claim:10.1016/j.jretai.2009.10.003:limitations:b74861d14266cae7": {
+      "claim_id": "claim:10.1016/j.jretai.2009.10.003:limitations:b74861d14266cae7",
+      "paper_key": "10.1016/j.jretai.2009.10.003",
+      "provider_alias": "P027",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.limitations",
+      "source_summary_hash": "eff82ac6673ffeff7cefe5eb2b29aa68e16851d556a286436ba7593ecd8ab125",
+      "evidence_ids": [
+        "evidence:10.1016/j.jretai.2009.10.003:limitations:091607d1d09929b4"
+      ],
+      "source_text_sha256": "b74861d14266cae7463ce6b5586cbfe3bf28ea2f6e97e80fb7e9945aac5491f0",
+      "source_text": "Author-stated limitations: (1) the scenario-based approach is less realistic than real-world settings in which consumers expend actual effort, and future research may employ a field study using different consumer segments to measure rather than manipulate invested effort; a field study may actually produce stronger effects (Fern and Monroe 1996); (2) Studies 3 and 4 focused only on the condition in which the promoted price is denied when examining the underlying mechanism, and the lack of a condition in which the promoted price is granted makes it impossible to test for moderated mediation of effort; (3) the model was tested with only two different promotion tactics; results were consistent although minor differences were observed, and each promotion tactic has its own distinct characteristics, so further research examining the effect of effort in the context of different promotion tactics is desirable."
+    },
+    "claim:10.1016/j.jretai.2009.10.003:moderators_boundaries:b74861d14266cae7": {
+      "claim_id": "claim:10.1016/j.jretai.2009.10.003:moderators_boundaries:b74861d14266cae7",
+      "paper_key": "10.1016/j.jretai.2009.10.003",
+      "provider_alias": "P027",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.moderators_boundaries",
+      "source_summary_hash": "eff82ac6673ffeff7cefe5eb2b29aa68e16851d556a286436ba7593ecd8ab125",
+      "evidence_ids": [
+        "evidence:10.1016/j.jretai.2009.10.003:moderators_boundaries:7c66bdf1d673c3b1"
+      ],
+      "source_text_sha256": "b74861d14266cae7463ce6b5586cbfe3bf28ea2f6e97e80fb7e9945aac5491f0",
+      "source_text": "Author-stated limitations: (1) the scenario-based approach is less realistic than real-world settings in which consumers expend actual effort, and future research may employ a field study using different consumer segments to measure rather than manipulate invested effort; a field study may actually produce stronger effects (Fern and Monroe 1996); (2) Studies 3 and 4 focused only on the condition in which the promoted price is denied when examining the underlying mechanism, and the lack of a condition in which the promoted price is granted makes it impossible to test for moderated mediation of effort; (3) the model was tested with only two different promotion tactics; results were consistent although minor differences were observed, and each promotion tactic has its own distinct characteristics, so further research examining the effect of effort in the context of different promotion tactics is desirable."
+    },
+    "claim:10.1016/j.jretai.2011.10.004:limitations:76f44d4d8845df1b": {
+      "claim_id": "claim:10.1016/j.jretai.2011.10.004:limitations:76f44d4d8845df1b",
+      "paper_key": "10.1016/j.jretai.2011.10.004",
+      "provider_alias": "P029",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.limitations",
+      "source_summary_hash": "5762f96ac6e06fa224112bd37ed9378da1c87d83e8a3ec17c168c3263edc6f68",
+      "evidence_ids": [
+        "evidence:10.1016/j.jretai.2011.10.004:limitations:8e903c3c69d12f24"
+      ],
+      "source_text_sha256": "76f44d4d8845df1bd6d4850dab2e320e084dcdca8e0120c2bb040de390ec20ac",
+      "source_text": "['Study 1 (author-stated): although consumer outcomes and inputs were held constant so that the deservingness violation would not be affected, the measures revealed main effects of the experimental manipulations, suggesting the manipulations incorporated features that affected deservingness (e.g., different-seller or sale-price comparisons may simply be less informative about what one deserves).', \"Study 1 (author-stated): an alternative explanation for the observed interaction is that consumers considered deservingness relative to the seller's outcome (equity-type comparisons to the seller, whose inputs/costs would appear lower) rather than inferences of seller disrespect; the authors note this possibility is not incompatible with their thesis but Study 2 was designed to rule it out.\", 'Study 2 (author-stated): with same-seller consumer comparisons, inferences of disrespect were perfectly confounded with deservingness violations; the distinct role of inferred disrespect was demonstrated only by contrasting these results with different-seller comparisons, where the deservingness violation was the only source of unfairness.', 'Study 3 (author-stated): the study did not provide direct evidence that highlighting deservingness violations is a feature of consumer comparisons per se; it only showed that deservingness violations can vary and affect fairness even in the absence of input/outcome differentials.', 'General discussion (author-stated): the current work did not test a particular solution to the problem of reactions to price differentials.']"
+    },
+    "claim:10.1016/j.jretai.2011.10.004:moderators_boundaries:76f44d4d8845df1b": {
+      "claim_id": "claim:10.1016/j.jretai.2011.10.004:moderators_boundaries:76f44d4d8845df1b",
+      "paper_key": "10.1016/j.jretai.2011.10.004",
+      "provider_alias": "P029",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.moderators_boundaries",
+      "source_summary_hash": "5762f96ac6e06fa224112bd37ed9378da1c87d83e8a3ec17c168c3263edc6f68",
+      "evidence_ids": [
+        "evidence:10.1016/j.jretai.2011.10.004:moderators_boundaries:f18c520d9d83c0ba"
+      ],
+      "source_text_sha256": "76f44d4d8845df1bd6d4850dab2e320e084dcdca8e0120c2bb040de390ec20ac",
+      "source_text": "['Study 1 (author-stated): although consumer outcomes and inputs were held constant so that the deservingness violation would not be affected, the measures revealed main effects of the experimental manipulations, suggesting the manipulations incorporated features that affected deservingness (e.g., different-seller or sale-price comparisons may simply be less informative about what one deserves).', \"Study 1 (author-stated): an alternative explanation for the observed interaction is that consumers considered deservingness relative to the seller's outcome (equity-type comparisons to the seller, whose inputs/costs would appear lower) rather than inferences of seller disrespect; the authors note this possibility is not incompatible with their thesis but Study 2 was designed to rule it out.\", 'Study 2 (author-stated): with same-seller consumer comparisons, inferences of disrespect were perfectly confounded with deservingness violations; the distinct role of inferred disrespect was demonstrated only by contrasting these results with different-seller comparisons, where the deservingness violation was the only source of unfairness.', 'Study 3 (author-stated): the study did not provide direct evidence that highlighting deservingness violations is a feature of consumer comparisons per se; it only showed that deservingness violations can vary and affect fairness even in the absence of input/outcome differentials.', 'General discussion (author-stated): the current work did not test a particular solution to the problem of reactions to price differentials.']"
+    },
+    "claim:10.1016/j.jretai.2019.09.004:limitations:99b96b84a6ea3b8b": {
+      "claim_id": "claim:10.1016/j.jretai.2019.09.004:limitations:99b96b84a6ea3b8b",
+      "paper_key": "10.1016/j.jretai.2019.09.004",
+      "provider_alias": "P030",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.limitations",
+      "source_summary_hash": "452c8af784bfffd03025648de9c9d4e184f39855e31767fc2082cd55cea901f2",
+      "evidence_ids": [
+        "evidence:10.1016/j.jretai.2019.09.004:limitations:0e68cf96242f083e"
+      ],
+      "source_text_sha256": "99b96b84a6ea3b8b2ed0f085828272839c1af6dff2d94328fe7f3001ee1d2529",
+      "source_text": "Author-stated limitations: (1) Studies 2-5 use hypothetical scenarios and price-increase settings (deliberately, to build on prior price fairness research and to provide evidence of the underlying psychological process), although Study 1 augments this experimental approach with retail purchase behavior and further work of this nature would be valuable; (2) the research makes no overarching claims to generalizability, although it provides some evidence of robustness across pricing context, market power operationalizations (national brand/private label, market share, and size), and consumer sample (MTurkers, undergraduates, scanner data); future research examining other pricing contexts and characteristics of consumers and firms is merited."
+    },
+    "claim:10.1016/j.jretai.2019.09.004:moderators_boundaries:99b96b84a6ea3b8b": {
+      "claim_id": "claim:10.1016/j.jretai.2019.09.004:moderators_boundaries:99b96b84a6ea3b8b",
+      "paper_key": "10.1016/j.jretai.2019.09.004",
+      "provider_alias": "P030",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.moderators_boundaries",
+      "source_summary_hash": "452c8af784bfffd03025648de9c9d4e184f39855e31767fc2082cd55cea901f2",
+      "evidence_ids": [
+        "evidence:10.1016/j.jretai.2019.09.004:moderators_boundaries:af4331aaa0d74662"
+      ],
+      "source_text_sha256": "99b96b84a6ea3b8b2ed0f085828272839c1af6dff2d94328fe7f3001ee1d2529",
+      "source_text": "Author-stated limitations: (1) Studies 2-5 use hypothetical scenarios and price-increase settings (deliberately, to build on prior price fairness research and to provide evidence of the underlying psychological process), although Study 1 augments this experimental approach with retail purchase behavior and further work of this nature would be valuable; (2) the research makes no overarching claims to generalizability, although it provides some evidence of robustness across pricing context, market power operationalizations (national brand/private label, market share, and size), and consumer sample (MTurkers, undergraduates, scanner data); future research examining other pricing contexts and characteristics of consumers and firms is merited."
+    },
+    "claim:10.1086/673193:limitations:4ffa600e02a470b2": {
+      "claim_id": "claim:10.1086/673193:limitations:4ffa600e02a470b2",
+      "paper_key": "10.1086/673193",
+      "provider_alias": "P045",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.limitations",
+      "source_summary_hash": "d2f301008d2b9347be2a9550a053753e0a6ce8977e8603f28f2766e8aff0929a",
+      "evidence_ids": [
+        "evidence:10.1086/673193:limitations:adabccccb043e786"
+      ],
+      "source_text_sha256": "4ffa600e02a470b225c37d462b334002d3103051f17c78bb4eb6165bd0462552",
+      "source_text": "Author-stated limitations include: (1) the research assumes that individuals, regardless of power, wish to spend less, but this assumption is nontrivial because for a powerful individual paying more might signal superiority and affect subsequent fairness judgments; (2) high-power consumers may be hypersensitive to their own past treatment in some situations, such as when paying more than previously signals a loss of status; (3) the studies strictly controlled the relevance of comparative standards and omitted information about the identity or background of referenced others, such as a close friend, stranger, in-group, or out-group member, and future research should explore this omission; (4) Study 1 used experimentally induced power, which may not match chronic power, and exposed participants to only one reference price at a time, although Study 2 addressed this."
+    },
+    "claim:10.1086/673193:moderators_boundaries:4ffa600e02a470b2": {
+      "claim_id": "claim:10.1086/673193:moderators_boundaries:4ffa600e02a470b2",
+      "paper_key": "10.1086/673193",
+      "provider_alias": "P045",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.moderators_boundaries",
+      "source_summary_hash": "d2f301008d2b9347be2a9550a053753e0a6ce8977e8603f28f2766e8aff0929a",
+      "evidence_ids": [
+        "evidence:10.1086/673193:moderators_boundaries:7da990fe4f448ab9"
+      ],
+      "source_text_sha256": "4ffa600e02a470b225c37d462b334002d3103051f17c78bb4eb6165bd0462552",
+      "source_text": "Author-stated limitations include: (1) the research assumes that individuals, regardless of power, wish to spend less, but this assumption is nontrivial because for a powerful individual paying more might signal superiority and affect subsequent fairness judgments; (2) high-power consumers may be hypersensitive to their own past treatment in some situations, such as when paying more than previously signals a loss of status; (3) the studies strictly controlled the relevance of comparative standards and omitted information about the identity or background of referenced others, such as a close friend, stranger, in-group, or out-group member, and future research should explore this omission; (4) Study 1 used experimentally induced power, which may not match chronic power, and exposed participants to only one reference price at a time, although Study 2 addressed this."
+    },
+    "claim:10.1093/jcr/ucaf066:limitations:46144c8292a6cb9d": {
+      "claim_id": "claim:10.1093/jcr/ucaf066:limitations:46144c8292a6cb9d",
+      "paper_key": "10.1093/jcr/ucaf066",
+      "provider_alias": "P046",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.limitations",
+      "source_summary_hash": "3aecb8467619965b1545a90d1d91509b3a035a80216634987126be42b784d216",
+      "evidence_ids": [
+        "evidence:10.1093/jcr/ucaf066:limitations:e85245055d93dffd"
+      ],
+      "source_text_sha256": "46144c8292a6cb9d09cd2be7981dc64afbdcc495f5b179cd4d46f9bb966cc4e1",
+      "source_text": "Author-stated limitations: The paper defines deal fairness broadly and notes that it may differ from moral judgment; future research should identify whether and how ethical fairness shapes deal perceptions. The authors acknowledge that additional psychological mechanisms may underlie the effects, including smart-shopper feelings for achievable threshold promotions and lay beliefs that higher spending should yield proportionally greater rewards (making caps feel punitive); these remain unexamined. The studies examine immediate evaluations, leaving long-term and carryover effects of promotion architecture open. The framework assumes consumers consult usual spending amounts; evaluation in new product categories with uncertain usual spending remains untested. The research uses explicit nominal thresholds, leaving non-nominal thresholds (e.g., free delivery, free item, buy-two-items) for future research. Study 1 could not establish causality because of social media algorithmic confounds."
+    },
+    "claim:10.1093/jcr/ucaf066:moderators_boundaries:46144c8292a6cb9d": {
+      "claim_id": "claim:10.1093/jcr/ucaf066:moderators_boundaries:46144c8292a6cb9d",
+      "paper_key": "10.1093/jcr/ucaf066",
+      "provider_alias": "P046",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.moderators_boundaries",
+      "source_summary_hash": "3aecb8467619965b1545a90d1d91509b3a035a80216634987126be42b784d216",
+      "evidence_ids": [
+        "evidence:10.1093/jcr/ucaf066:moderators_boundaries:8092a660c7114c38"
+      ],
+      "source_text_sha256": "46144c8292a6cb9d09cd2be7981dc64afbdcc495f5b179cd4d46f9bb966cc4e1",
+      "source_text": "Author-stated limitations: The paper defines deal fairness broadly and notes that it may differ from moral judgment; future research should identify whether and how ethical fairness shapes deal perceptions. The authors acknowledge that additional psychological mechanisms may underlie the effects, including smart-shopper feelings for achievable threshold promotions and lay beliefs that higher spending should yield proportionally greater rewards (making caps feel punitive); these remain unexamined. The studies examine immediate evaluations, leaving long-term and carryover effects of promotion architecture open. The framework assumes consumers consult usual spending amounts; evaluation in new product categories with uncertain usual spending remains untested. The research uses explicit nominal thresholds, leaving non-nominal thresholds (e.g., free delivery, free item, buy-two-items) for future research. Study 1 could not establish causality because of social media algorithmic confounds."
+    },
+    "claim:10.1093/jcr/ucag003:limitations:7a24d0f4697cd868": {
+      "claim_id": "claim:10.1093/jcr/ucag003:limitations:7a24d0f4697cd868",
+      "paper_key": "10.1093/jcr/ucag003",
+      "provider_alias": "P047",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.limitations",
+      "source_summary_hash": "883bafe6f6367df79512c6156b820786d5e26702f92a125701107c12c14bce80",
+      "evidence_ids": [
+        "evidence:10.1093/jcr/ucag003:limitations:01777d5d254e0059"
+      ],
+      "source_text_sha256": "7a24d0f4697cd8680e8b0a519e94dd630347ada59b09cbed15cf311764a951d0",
+      "source_text": "Author-stated limitations: reliance on North American and Western European participants limits generalizability to geographic or cultural contexts with different disability stereotypes and pity. Study 4B did not explore whether higher acceptability for socialized costs would also increase mass-market consumers' choice of the now more expensive non-adaptive products. The authors also note uncertainty about how socializing costs would play out in a competitive marketplace with lower-price alternatives, and they did not empirically test possible pride from subsidizing adaptive innovations."
+    },
+    "claim:10.1093/jcr/ucag003:moderators_boundaries:7a24d0f4697cd868": {
+      "claim_id": "claim:10.1093/jcr/ucag003:moderators_boundaries:7a24d0f4697cd868",
+      "paper_key": "10.1093/jcr/ucag003",
+      "provider_alias": "P047",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.moderators_boundaries",
+      "source_summary_hash": "883bafe6f6367df79512c6156b820786d5e26702f92a125701107c12c14bce80",
+      "evidence_ids": [
+        "evidence:10.1093/jcr/ucag003:moderators_boundaries:242b24355dd10da6"
+      ],
+      "source_text_sha256": "7a24d0f4697cd8680e8b0a519e94dd630347ada59b09cbed15cf311764a951d0",
+      "source_text": "Author-stated limitations: reliance on North American and Western European participants limits generalizability to geographic or cultural contexts with different disability stereotypes and pity. Study 4B did not explore whether higher acceptability for socialized costs would also increase mass-market consumers' choice of the now more expensive non-adaptive products. The authors also note uncertainty about how socializing costs would play out in a competitive marketplace with lower-price alternatives, and they did not empirically test possible pride from subsidizing adaptive innovations."
+    },
+    "claim:10.1177/002224379903600204:limitations:4d076a29478a24fd": {
+      "claim_id": "claim:10.1177/002224379903600204:limitations:4d076a29478a24fd",
+      "paper_key": "10.1177/002224379903600204",
+      "provider_alias": "P048",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.limitations",
+      "source_summary_hash": "39daf5c945de546d35783af8758864380c9e29708b2771c0d8647dac4119b73a",
+      "evidence_ids": [
+        "evidence:10.1177/002224379903600204:limitations:7a550f79ac45131a"
+      ],
+      "source_text_sha256": "4d076a29478a24fd11ab071294ea563b3cabf3ff6fcad5b95bb8fabb0fd73655",
+      "source_text": "Author-stated limitations: experiments involve artificiality; reputation was manipulated with short written information and may be underrepresented; reputation information was presented immediately before the price increase, making it more salient than usual; reputation information was more consistent than in real-world settings; generalization to everyday situations requires caution. Both studies involved an auction of an extremely limited product with a highlighted temporary shortage, so it is unclear whether results extend to non-immediate-short-supply products or beyond auctions. The studies examined one product type and one pricing situation; results may differ for true luxury goods, and individual differences in fairness beliefs may matter. In Study 1, inferred motive was unexpectedly affected by inferred profit in one condition, indicating that the inferred motive construct and its relation to inferred profit need further development. Consumer resistance to unfair prices has limits; Study 2 bidding intentions were not affected by perceived unfairness, possibly because transportation costs and the doll's rarity made not buying from that store costly."
+    },
+    "claim:10.1177/002224379903600204:moderators_boundaries:4d076a29478a24fd": {
+      "claim_id": "claim:10.1177/002224379903600204:moderators_boundaries:4d076a29478a24fd",
+      "paper_key": "10.1177/002224379903600204",
+      "provider_alias": "P048",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.moderators_boundaries",
+      "source_summary_hash": "39daf5c945de546d35783af8758864380c9e29708b2771c0d8647dac4119b73a",
+      "evidence_ids": [
+        "evidence:10.1177/002224379903600204:moderators_boundaries:ffa55edd1545c93f"
+      ],
+      "source_text_sha256": "4d076a29478a24fd11ab071294ea563b3cabf3ff6fcad5b95bb8fabb0fd73655",
+      "source_text": "Author-stated limitations: experiments involve artificiality; reputation was manipulated with short written information and may be underrepresented; reputation information was presented immediately before the price increase, making it more salient than usual; reputation information was more consistent than in real-world settings; generalization to everyday situations requires caution. Both studies involved an auction of an extremely limited product with a highlighted temporary shortage, so it is unclear whether results extend to non-immediate-short-supply products or beyond auctions. The studies examined one product type and one pricing situation; results may differ for true luxury goods, and individual differences in fairness beliefs may matter. In Study 1, inferred motive was unexpectedly affected by inferred profit in one condition, indicating that the inferred motive construct and its relation to inferred profit need further development. Consumer resistance to unfair prices has limits; Study 2 bidding intentions were not affected by perceived unfairness, possibly because transportation costs and the doll's rarity made not buying from that store costly."
+    },
+    "claim:10.1177/0092070304269953:limitations:191ba3d2ab2438d6": {
+      "claim_id": "claim:10.1177/0092070304269953:limitations:191ba3d2ab2438d6",
+      "paper_key": "10.1177/0092070304269953",
+      "provider_alias": "P049",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.limitations",
+      "source_summary_hash": "e6f4029d20437c15cf485c563ff013563328e78b4e81b4d281475e420be12471",
+      "evidence_ids": [
+        "evidence:10.1177/0092070304269953:limitations:66c584467f36519d"
+      ],
+      "source_text_sha256": "191ba3d2ab2438d61f33b0e6cd9240be49b8c4bd8d1475390cfbdd58dbeebdac",
+      "source_text": "The authors state that a potential limitation of Studies 1 and 2 is that the dependent variable (repurchase intentions) was measured with a single item; single-item measures may attenuate estimated relationships, although such measures have been used successfully in prior research. They also note that the study used a hypothetical restaurant scenario to achieve high internal validity, and that future research should frame scenarios around actual consumption experiences to assess prior satisfaction and patronage behavior, use nonstudent samples, and investigate different industry contexts. In Study 3, participants were explicitly asked to think about motives, whereas Study 2 involved more natural evaluations."
+    },
+    "claim:10.1177/0092070304269953:moderators_boundaries:191ba3d2ab2438d6": {
+      "claim_id": "claim:10.1177/0092070304269953:moderators_boundaries:191ba3d2ab2438d6",
+      "paper_key": "10.1177/0092070304269953",
+      "provider_alias": "P049",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.moderators_boundaries",
+      "source_summary_hash": "e6f4029d20437c15cf485c563ff013563328e78b4e81b4d281475e420be12471",
+      "evidence_ids": [
+        "evidence:10.1177/0092070304269953:moderators_boundaries:da23b3e5dca0dad3"
+      ],
+      "source_text_sha256": "191ba3d2ab2438d61f33b0e6cd9240be49b8c4bd8d1475390cfbdd58dbeebdac",
+      "source_text": "The authors state that a potential limitation of Studies 1 and 2 is that the dependent variable (repurchase intentions) was measured with a single item; single-item measures may attenuate estimated relationships, although such measures have been used successfully in prior research. They also note that the study used a hypothetical restaurant scenario to achieve high internal validity, and that future research should frame scenarios around actual consumption experiences to assess prior satisfaction and patronage behavior, use nonstudent samples, and investigate different industry contexts. In Study 3, participants were explicitly asked to think about motives, whereas Study 2 involved more natural evaluations."
+    },
+    "claim:10.1177/1094670506295848:limitations:25eb776f2fcfdc2d": {
+      "claim_id": "claim:10.1177/1094670506295848:limitations:25eb776f2fcfdc2d",
+      "paper_key": "10.1177/1094670506295848",
+      "provider_alias": "P051",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.limitations",
+      "source_summary_hash": "3cd7e61d6c4b3919baffe5b9ff1e790c1136979b5512b4b909595d22502f8dd9",
+      "evidence_ids": [
+        "evidence:10.1177/1094670506295848:limitations:832a41fe44158c2a"
+      ],
+      "source_text_sha256": "25eb776f2fcfdc2dda29e360679b4a64ab0e322f2e5a1abd7b405fb15affd0e3",
+      "source_text": "Author-stated limitations: the studies were conducted in a single country (Singapore) using scenario-based experimental designs in two industry contexts (restaurants and hotels); in addition, the design of Study 1 could be improved by explicitly controlling for the perceived quality of the restaurant (e.g., a 60-minute fence may signal a lower-quality restaurant, similar to fast food) and for other potential reasons that may extend a stay beyond 60 minutes (e.g., crowding or slow service). The authors state that future work should replicate and extend the study across other countries, methods, and contexts to enhance the external validity of the findings."
+    },
+    "claim:10.1177/1094670506295848:moderators_boundaries:25eb776f2fcfdc2d": {
+      "claim_id": "claim:10.1177/1094670506295848:moderators_boundaries:25eb776f2fcfdc2d",
+      "paper_key": "10.1177/1094670506295848",
+      "provider_alias": "P051",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.moderators_boundaries",
+      "source_summary_hash": "3cd7e61d6c4b3919baffe5b9ff1e790c1136979b5512b4b909595d22502f8dd9",
+      "evidence_ids": [
+        "evidence:10.1177/1094670506295848:moderators_boundaries:90b0c44a80737857"
+      ],
+      "source_text_sha256": "25eb776f2fcfdc2dda29e360679b4a64ab0e322f2e5a1abd7b405fb15affd0e3",
+      "source_text": "Author-stated limitations: the studies were conducted in a single country (Singapore) using scenario-based experimental designs in two industry contexts (restaurants and hotels); in addition, the design of Study 1 could be improved by explicitly controlling for the perceived quality of the restaurant (e.g., a 60-minute fence may signal a lower-quality restaurant, similar to fast food) and for other potential reasons that may extend a stay beyond 60 minutes (e.g., crowding or slow service). The authors state that future work should replicate and extend the study across other countries, methods, and contexts to enhance the external validity of the findings."
+    },
+    "claim:10.1177/1094670518755314:limitations:048f1568a736c740": {
+      "claim_id": "claim:10.1177/1094670518755314:limitations:048f1568a736c740",
+      "paper_key": "10.1177/1094670518755314",
+      "provider_alias": "P052",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.limitations",
+      "source_summary_hash": "cacc826f5cba6c10c43512b5ad6b25f5597cf5c6fa72b9718cec4a183f3fbcc8",
+      "evidence_ids": [
+        "evidence:10.1177/1094670518755314:limitations:04949b8601783a19"
+      ],
+      "source_text_sha256": "048f1568a736c740eaad6ad702c637bef9573bf3a7719967208338050e86b234",
+      "source_text": "The authors acknowledge the following limitations: (1) the research relies on scenario-based methods and self-report measures, though scenario methods have ample precedent and provide insight into the underlying psychological process; future research should examine real pricing contexts and actual purchasing behavior. (2) The studies typically manipulated locus, temporal stability, and perceived benefit for a given surcharge to strengthen internal validity; the authors contend that surcharges vary inherently on these characteristics and report replication with ecologically valid operationalizations (Web Appendix D) as well as some evidence of generalizability across U.S. and European cultures. (3) The research prompts attributions by asking consumers to assess blame and does not investigate the conditions under which such attributions might occur spontaneously (except Study 1); future research should examine other contexts such as price decreases, no price change, or absence of total price information."
+    },
+    "claim:10.1177/1094670518755314:moderators_boundaries:048f1568a736c740": {
+      "claim_id": "claim:10.1177/1094670518755314:moderators_boundaries:048f1568a736c740",
+      "paper_key": "10.1177/1094670518755314",
+      "provider_alias": "P052",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.moderators_boundaries",
+      "source_summary_hash": "cacc826f5cba6c10c43512b5ad6b25f5597cf5c6fa72b9718cec4a183f3fbcc8",
+      "evidence_ids": [
+        "evidence:10.1177/1094670518755314:moderators_boundaries:7f2752710a0b53c3"
+      ],
+      "source_text_sha256": "048f1568a736c740eaad6ad702c637bef9573bf3a7719967208338050e86b234",
+      "source_text": "The authors acknowledge the following limitations: (1) the research relies on scenario-based methods and self-report measures, though scenario methods have ample precedent and provide insight into the underlying psychological process; future research should examine real pricing contexts and actual purchasing behavior. (2) The studies typically manipulated locus, temporal stability, and perceived benefit for a given surcharge to strengthen internal validity; the authors contend that surcharges vary inherently on these characteristics and report replication with ecologically valid operationalizations (Web Appendix D) as well as some evidence of generalizability across U.S. and European cultures. (3) The research prompts attributions by asking consumers to assess blame and does not investigate the conditions under which such attributions might occur spontaneously (except Study 1); future research should examine other contexts such as price decreases, no price change, or absence of total price information."
+    },
+    "claim:10.1509/jm.14.0389:limitations:6a524f53882f7f1e": {
+      "claim_id": "claim:10.1509/jm.14.0389:limitations:6a524f53882f7f1e",
+      "paper_key": "10.1509/jm.14.0389",
+      "provider_alias": "P056",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.limitations",
+      "source_summary_hash": "dd6f24a88d092fe63b794850505a81ca1261264495db00baaf9cd7b71dea6d98",
+      "evidence_ids": [
+        "evidence:10.1509/jm.14.0389:limitations:67d40e7be2e4cb35"
+      ],
+      "source_text_sha256": "6a524f53882f7f1e001d5a185a0654e564966d6282f1e4e59381e74d52880984",
+      "source_text": "Authors explicitly state: (1) Study 2's survey design could not fully establish causal relationships, motivating the experiment in Study 3. (2) In Study 3, causality between intrinsic CSR attribution and promotional CSR cost type perception may be bidirectional: the experiment supports extrinsic CSR attribution causally increasing promotional CSR cost type perception, but framing CSR costs as promotion investments may also causally increase extrinsic attribution. (3) Study 4 does not answer what actions firms can take to change customers' attributions from extrinsic to intrinsic. (4) For low firm CSR engagement, perceived CSR costs were lower for philanthropic than for business-process CSR, which the authors note as an avenue for future research."
+    },
+    "claim:10.1509/jm.14.0389:moderators_boundaries:6a524f53882f7f1e": {
+      "claim_id": "claim:10.1509/jm.14.0389:moderators_boundaries:6a524f53882f7f1e",
+      "paper_key": "10.1509/jm.14.0389",
+      "provider_alias": "P056",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.moderators_boundaries",
+      "source_summary_hash": "dd6f24a88d092fe63b794850505a81ca1261264495db00baaf9cd7b71dea6d98",
+      "evidence_ids": [
+        "evidence:10.1509/jm.14.0389:moderators_boundaries:a8a560c28aa57088"
+      ],
+      "source_text_sha256": "6a524f53882f7f1e001d5a185a0654e564966d6282f1e4e59381e74d52880984",
+      "source_text": "Authors explicitly state: (1) Study 2's survey design could not fully establish causal relationships, motivating the experiment in Study 3. (2) In Study 3, causality between intrinsic CSR attribution and promotional CSR cost type perception may be bidirectional: the experiment supports extrinsic CSR attribution causally increasing promotional CSR cost type perception, but framing CSR costs as promotion investments may also causally increase extrinsic attribution. (3) Study 4 does not answer what actions firms can take to change customers' attributions from extrinsic to intrinsic. (4) For low firm CSR engagement, perceived CSR costs were lower for philanthropic than for business-process CSR, which the authors note as an avenue for future research."
+    },
+    "claim:10.1509/jmkr.44.2.261:limitations:45eef8e1141f23ed": {
+      "claim_id": "claim:10.1509/jmkr.44.2.261:limitations:45eef8e1141f23ed",
+      "paper_key": "10.1509/jmkr.44.2.261",
+      "provider_alias": "P059",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.limitations",
+      "source_summary_hash": "79ff1f288227087c13ee1f0e9c0f7619e3de8d219691882e3fb9d184fdd8a105",
+      "evidence_ids": [
+        "evidence:10.1509/jmkr.44.2.261:limitations:e35913df142b5a75"
+      ],
+      "source_text_sha256": "45eef8e1141f23edb02791aa73b8febaaf4cd8b3bbae0a5e6b98883a53798dba",
+      "source_text": "['The author notes that in Study 1 fairness was measured before the affect and inferred-motive mediators; this later measurement may capture secondary rather than primary affect.', 'The author notes possible limitations due to measurement order and potential lack of spontaneity in measured affect; Studies 1 and 3 used different measurement orders, and Study 2 manipulated the role of affect rather than measuring it.', 'The research does not fully explicate the psychological difference to consumers between humans and nonhumans and does not pinpoint what exactly about humans versus nonhumans elicits the processing differences.', 'The author calls for further research on the human versus nonhuman construct and on price decreases.']"
+    },
+    "claim:10.1509/jmkr.44.2.261:moderators_boundaries:45eef8e1141f23ed": {
+      "claim_id": "claim:10.1509/jmkr.44.2.261:moderators_boundaries:45eef8e1141f23ed",
+      "paper_key": "10.1509/jmkr.44.2.261",
+      "provider_alias": "P059",
+      "owner_study_ids": [
+        ""
+      ],
+      "study_id": "",
+      "claim_type": "author_interpretation",
+      "source_locator": "stage1:ai_summary.moderators_boundaries",
+      "source_summary_hash": "79ff1f288227087c13ee1f0e9c0f7619e3de8d219691882e3fb9d184fdd8a105",
+      "evidence_ids": [
+        "evidence:10.1509/jmkr.44.2.261:moderators_boundaries:0fdde9a635028327"
+      ],
+      "source_text_sha256": "45eef8e1141f23edb02791aa73b8febaaf4cd8b3bbae0a5e6b98883a53798dba",
+      "source_text": "['The author notes that in Study 1 fairness was measured before the affect and inferred-motive mediators; this later measurement may capture secondary rather than primary affect.', 'The author notes possible limitations due to measurement order and potential lack of spontaneity in measured affect; Studies 1 and 3 used different measurement orders, and Study 2 manipulated the role of affect rather than measuring it.', 'The research does not fully explicate the psychological difference to consumers between humans and nonhumans and does not pinpoint what exactly about humans versus nonhumans elicits the processing differences.', 'The author calls for further research on the human versus nonhuman construct and on price decreases.']"
+    }
+  }
+}

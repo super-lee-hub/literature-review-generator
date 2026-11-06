@@ -105,6 +105,34 @@ def _bound_receipt(tmp_path: Path, *, call_id: str, epoch: str = "epoch-1"):
     return receipt, expected
 
 
+def test_mixed_call_epochs_exclude_another_calls_historical_failure(tmp_path: Path) -> None:
+    retained, retained_contract = _bound_receipt(tmp_path, call_id="retained", epoch="old-epoch")
+    current, current_contract = _bound_receipt(tmp_path, call_id="changed", epoch="new-epoch")
+    stamp = "2026-10-16T00:00:00Z"
+    current = replace(current, finished_at=stamp, sequence=1, attempts=1)
+    old_failure = replace(
+        current,
+        receipt_id="historical-failed-changed",
+        closure_epoch_id="old-epoch",
+        status="failed",
+        error_kind="transient_network",
+        prompt_hash="b" * 64,
+        input_hash="c" * 64,
+        response_hash=None,
+        usage_status="unknown",
+    )
+
+    closure = ProviderReceiptClosure.evaluate(
+        [retained_contract, current_contract],
+        [retained, old_failure, current],
+    )
+
+    assert closure.complete, closure.to_dict()
+    assert "changed" not in closure.failed_call_ids
+    assert old_failure.receipt_id in closure.historical_receipts
+    assert old_failure.receipt_id in closure.out_of_epoch_receipts
+
+
 def test_fully_bound_receipt_closure_passes(tmp_path: Path) -> None:
     receipt, expected = _bound_receipt(tmp_path, call_id="call-expected")
 
@@ -113,6 +141,37 @@ def test_fully_bound_receipt_closure_passes(tmp_path: Path) -> None:
     assert closure.complete is True
     assert closure.missing_call_ids == ()
     assert closure.hash_mismatches == {}
+
+
+def test_newer_success_wins_over_older_failed_internal_retry(tmp_path: Path) -> None:
+    receipt, expected = _bound_receipt(tmp_path, call_id="call-retried")
+    failed = replace(
+        receipt,
+        receipt_id="provider-receipt-old-failure",
+        status="failed",
+        error_kind="transient_network",
+        attempts=2,
+        input_tokens=None,
+        output_tokens=None,
+        total_tokens=None,
+        response_hash=None,
+        usage_status="unreported",
+        finished_at="2026-01-01T00:00:02Z",
+    )
+    succeeded = replace(
+        receipt,
+        receipt_id="provider-receipt-new-success",
+        sequence=2,
+        attempts=1,
+        finished_at="2026-01-01T00:00:03Z",
+    )
+
+    closure = ProviderReceiptClosure.evaluate([expected], [failed, succeeded])
+
+    assert closure.complete is True
+    assert closure.failed_call_ids == ()
+    assert closure.retry_exceeded_call_ids == ()
+    assert closure.usage_incomplete_call_ids == ()
 
 
 def test_historical_receipts_are_isolated_from_current_epoch(tmp_path: Path) -> None:

@@ -81,7 +81,7 @@ def _positive_int(value: Any, default: int) -> int:
 #   * Claude 4.5 and earlier that support thinking -- manual extended thinking
 #     only (``{"type": "enabled", "budget_tokens": N}``); ``adaptive`` is a 400.
 #   * Claude 4.6 -- both modes; manual is deprecated but still succeeds.
-#   * Claude 4.7 and later (Opus 4.7/4.8, Opus 5, Sonnet 5, Fable 5, Mythos 5)
+#   * Claude 4.7 and later (Opus 4.7/4.8/5/5.5, Sonnet 5, Fable 5, Mythos 5)
 #     -- adaptive only; ``{"type": "enabled"}`` is a 400.
 #
 # This derives the *thinking mode* from the model id. It deliberately does not
@@ -96,7 +96,7 @@ ANTHROPIC_MANUAL_ONLY_MODELS = frozenset(
     {"opus-4-5", "sonnet-4-5", "haiku-4-5", "opus-4-1", "opus-4", "sonnet-4", "haiku-4"}
 )
 ANTHROPIC_ADAPTIVE_ONLY_MODELS = frozenset(
-    {"opus-4-7", "opus-4-8", "opus-5", "sonnet-5", "fable-5", "mythos-5"}
+    {"opus-4-7", "opus-4-8", "opus-5", "opus-5-5", "sonnet-5", "fable-5", "mythos-5"}
 )
 ANTHROPIC_BOTH_MODES = frozenset({"opus-4-6", "sonnet-4-6", "mythos-preview"})
 

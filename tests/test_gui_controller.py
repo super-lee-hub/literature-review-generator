@@ -829,11 +829,28 @@ def test_processing_mineru_card_unknown_mode_primary_drift_falls_back_to_local(g
 
 def test_gui_lifecycle_states_are_registry_derived(gui_app_module) -> None:
     inspection = {
-        "status": {"job_status": "completed"},
+        "job_id": "job-lifecycle",
+        "status": {
+            "job_id": "job-lifecycle",
+            "job_status": "completed",
+            "completion_reasons": ["provider_receipts_incomplete"],
+        },
         "artifacts": [
-            {"artifact_type": "final_outline", "status": "ready"},
+            {
+                "artifact_id": "outline-v3:final_outline",
+                "artifact_type": "final_outline",
+                "artifact_version": "v3",
+                "job_id": "job-lifecycle",
+                "status": "ready",
+                "content_hash": "a" * 64,
+            },
             {"artifact_type": "repair_plan", "status": "ready"},
         ],
+        "integrity": [{
+            "artifact_id": "outline-v3:final_outline",
+            "status": "verified",
+            "content_hash": "a" * 64,
+        }],
         "provider_receipts": {"complete": False},
     }
 
@@ -1206,3 +1223,59 @@ def test_canonical_lifecycle_states_tolerate_blocked_string_status(gui_app_modul
         {"status": "blocked"},
     )
     assert "validation_not_run" in states
+
+
+@pytest.mark.parametrize("calls,output,retries,wall", [(200, 2_000_000, 2, 1800), (0, 0, 0, 0)])
+def test_gui_run_budget_survives_strict_queue_and_job_adapter(
+    gui_app_module, calls: int, output: int, retries: int, wall: int,
+) -> None:
+    from runtime.job_spec import RuntimeJobSpec
+    from runtime.provider_runtime import ProviderAggregateBudgetV2
+
+    controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
+    workflow = controller.state["workflow"]
+    workflow.update({
+        "provider_budget_enabled": True,
+        "provider_budget_calls": str(calls),
+        "provider_budget_output_tokens": str(output),
+        "provider_budget_retries": str(retries),
+        "provider_budget_wall_seconds": str(wall),
+    })
+    queued = controller._build_queue_job_spec("budget-gui", "papers", "", "run_all", input_mode="pdf")
+    strict_spec = RuntimeJobSpec.from_mapping(queued.parameters)
+    expected = ProviderAggregateBudgetV2(calls, output, retries, wall).to_dict()
+    assert strict_spec.metadata["provider_budget"] == expected
+    assert strict_spec.to_job_request().provider_budget == expected
+    assert queued.source_snapshot["provider_budget"] == expected
+    workflow["provider_budget_calls"] = "999"
+    assert queued.parameters["metadata"]["provider_budget"] == expected
+    assert queued.source_snapshot["provider_budget"] == expected
+
+
+def test_gui_disabled_budget_uses_configuration_without_explicit_override(gui_app_module) -> None:
+    controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
+    controller.state["workflow"]["provider_budget_calls"] = "invalid but disabled"
+    queued = controller._build_queue_job_spec("budget-gui", "papers", "", "run_all", input_mode="pdf")
+    assert "provider_budget" not in queued.parameters["metadata"]
+    assert "provider_budget" not in queued.source_snapshot
+
+
+@pytest.mark.parametrize("key,value", [
+    ("provider_budget_calls", "1.5"),
+    ("provider_budget_calls", "-1"),
+    ("provider_budget_output_tokens", ""),
+    ("provider_budget_retries", "NaN"),
+    ("provider_budget_wall_seconds", "inf"),
+])
+def test_gui_invalid_run_budget_is_rejected_before_queue_submission(gui_app_module, key, value) -> None:
+    controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
+    controller.state["workflow"].update({
+        "project_name": "budget-gui", "pdf_folder": "papers", "provider_budget_enabled": True,
+        key: value,
+    })
+    notices = []
+    controller.notify = lambda message, **_kwargs: notices.append(message)
+    assert controller.validate_workflow_request("run_all") is False
+    assert notices and "本次运行额度无效" in notices[-1]
+    with pytest.raises(ValueError):
+        controller._build_queue_job_spec("budget-gui", "papers", "", "run_all", input_mode="pdf")

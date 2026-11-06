@@ -34,7 +34,7 @@ Stage 1-specific work should then use `summary_schema.py`,
 - `AgentRuntimeRunner` and `AgentRuntimeBridge` own the AI-native execution
   path.
 - Outline Intelligence v3 is the only current Outline path.
-- Outline role routing is node-level and fail-closed: Claude Opus 5 generates
+- Outline role routing is node-level and fail-closed: Claude Opus 5.5 generates
   and arbitrates, GPT-5.6-sol critiques structure/evidence, and DeepSeek V4 Pro
   adjudicates relations/coverage under `[OutlineModels]`.
 - Stage 3 truth is `review_draft` v3 plus `citation_manifest` v3 and DOCX.

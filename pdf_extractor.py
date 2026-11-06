@@ -37,19 +37,19 @@ except ImportError:
 def extract_text_from_pdf(pdf_path: str) -> Optional[str]:
     """
     从PDF文件中提取文本
-    
+
     Args:
         pdf_path: PDF文件路径
-        
+
     Returns:
         提取的文本内容，失败返回None
     """
     if not pdf_path or not os.path.exists(pdf_path):
         logging.error(f"PDF文件不存在: {pdf_path}")
         return None
-    
+
     text_content: str = ""
-    
+
     # 尝试使用pdfplumber提取文本
     try:
         if pdfplumber is None:
@@ -59,7 +59,7 @@ def extract_text_from_pdf(pdf_path: str) -> Optional[str]:
         pdf = pdf_handle if hasattr(pdf_handle, 'pages') else pdf_handle.__enter__()
         try:
             logging.info(f"PDF文件包含 {len(pdf.pages)} 页")
-            
+
             for page_num, page in enumerate(pdf.pages, 1):
                 page_text: Optional[str] = page.extract_text()  # type: ignore
                 if page_text:
@@ -72,25 +72,25 @@ def extract_text_from_pdf(pdf_path: str) -> Optional[str]:
                 close_method()
             elif hasattr(pdf_handle, '__exit__'):
                 pdf_handle.__exit__(None, None, None)
-        
+
         if text_content.strip():  # type: ignore
             logging.info(f"使用pdfplumber成功提取文本，共 {len(text_content)} 字符")
             return text_content  # type: ignore
         else:
             logging.warning("pdfplumber提取结果为空")
-            
+
     except Exception as e:
         logging.warning(f"pdfplumber提取失败: {e}")
         # A partial parser result is not a valid prefix of the fallback
         # result. Reset it before PyMuPDF runs, otherwise every page that
         # pdfplumber emitted before the failure is duplicated.
         text_content = ""
-    
+
     # 尝试使用PyMuPDF提取文本
     try:
         doc: FitxDocument = fitz.open(pdf_path)  # type: ignore
         logging.info(f"PyMuPDF: PDF文件包含 {doc.page_count} 页")  # type: ignore
-        
+
         for page_num in range(doc.page_count):  # type: ignore
             page: _Any = doc.load_page(page_num)  # type: ignore - 使用load_page便于测试替身模拟
             page_text: str = page.get_text()  # type: ignore
@@ -98,18 +98,18 @@ def extract_text_from_pdf(pdf_path: str) -> Optional[str]:
                 text_content = f"{text_content}\n--- 第{page_num+1}页 ---\n{page_text.strip()}\n"  # type: ignore
             else:
                 logging.warning(f"PyMuPDF第{page_num+1}页无法提取文本")
-        
+
         doc.close()  # type: ignore
-        
+
         if text_content.strip():  # type: ignore
             logging.info(f"使用PyMuPDF成功提取文本，共 {len(text_content)} 字符")
             return text_content  # type: ignore
         else:
             logging.warning("PyMuPDF提取结果为空")
-            
+
     except Exception as e:
         logging.warning(f"PyMuPDF提取失败: {e}")
-    
+
     # 如果都失败了
     logging.error("所有PDF文本提取方法都失败了")
     return None
@@ -117,16 +117,16 @@ def extract_text_from_pdf(pdf_path: str) -> Optional[str]:
 def get_pdf_info(pdf_path: str) -> Optional[Dict[str, _Any]]:
     """
     获取PDF文件的基本信息
-    
+
     Args:
         pdf_path: PDF文件路径
-        
+
     Returns:
         包含PDF信息的字典，失败返回None
     """
     if not pdf_path or not os.path.exists(pdf_path):
         return None
-    
+
     try:
         doc: _Any = fitz.open(pdf_path)  # type: ignore - 使用_Any避免类型冲突
         metadata: Dict[str, _Any] = doc.metadata or {}  # type: ignore
@@ -139,9 +139,9 @@ def get_pdf_info(pdf_path: str) -> Optional[Dict[str, _Any]]:
             'file_size': os.path.getsize(pdf_path)
         }
         doc.close()  # type: ignore
-        
+
         return info
-        
+
     except Exception as e:
         logging.error(f"获取PDF信息失败: {e}")
         return None
@@ -149,16 +149,16 @@ def get_pdf_info(pdf_path: str) -> Optional[Dict[str, _Any]]:
 def is_scanned_pdf(pdf_path: str) -> bool:
     """
     判断是否为扫描版PDF（图片型PDF）
-    
+
     Args:
         pdf_path: PDF文件路径
-        
+
     Returns:
         如果是扫描版PDF返回True，否则返回False
     """
     try:
         doc: _Any = fitz.open(pdf_path)  # type: ignore - 使用_Any避免类型冲突
-        
+
         for page_num in range(doc.page_count):  # type: ignore
             page: _Any = doc[page_num]  # type: ignore - 使用_Any避免类型冲突
             # 如果页面上没有文本，则可能是扫描版
@@ -166,10 +166,10 @@ def is_scanned_pdf(pdf_path: str) -> bool:
             if not text or len(text.strip()) < 10:  # type: ignore
                 doc.close()  # type: ignore
                 return True
-        
+
         doc.close()  # type: ignore
         return False
-        
+
     except Exception as e:
         logging.error(f"检查PDF类型失败: {e}")
         return False

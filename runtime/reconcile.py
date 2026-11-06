@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import hashlib
+import re
 import json
 import os
 from pathlib import Path
@@ -157,6 +158,55 @@ def _validate_source_bundle(_record: ArtifactRecord, path: Path) -> None:
         raise ReconcileValidationError("source bundle collections have invalid types")
 
 
+def _validate_stage1_source_scope(record: ArtifactRecord, path: Path) -> None:
+    payload = _read_json_object(path)
+    if set(payload) != {"schema_version", "job_id", "source_bundle_hash", "runtime_spec_hash", "papers",
+                       "paper_count", "page_count", "reuse_status", "model_request_bounds"}:
+        raise ReconcileValidationError("Stage 1 source scope schema fields are invalid")
+    if payload.get("schema_version") != "stage1-source-scope/v1" or payload.get("job_id") != record.job_id:
+        raise ReconcileValidationError("Stage 1 source scope identity is invalid")
+    papers = payload.get("papers")
+    if not isinstance(papers, list):
+        raise ReconcileValidationError("Stage 1 source scope papers must be an array")
+    keys: set[str] = set()
+    pages = 0
+    for paper in papers:
+        if (not isinstance(paper, Mapping) or set(paper) != {"paper_key", "source_pdf", "source_pdf_sha256", "size_bytes", "page_count"}
+                or not isinstance(paper.get("paper_key"), str) or not paper["paper_key"]
+                or not isinstance(paper.get("source_pdf"), str) or not paper["source_pdf"] or paper["paper_key"] in keys):
+            raise ReconcileValidationError("Stage 1 source scope paper identity is invalid")
+        keys.add(paper["paper_key"])
+        if (type(paper.get("page_count")) is not int or paper["page_count"] <= 0
+                or type(paper.get("size_bytes")) is not int or paper["size_bytes"] < 0
+                or not re.fullmatch(r"[0-9a-f]{64}", str(paper.get("source_pdf_sha256") or ""))):
+            raise ReconcileValidationError("Stage 1 source scope PDF dimensions are invalid")
+        pages += paper["page_count"]
+    if payload.get("paper_count") != len(papers) or payload.get("page_count") != pages:
+        raise ReconcileValidationError("Stage 1 source scope totals are invalid")
+    for kind, hash_key in (("source_bundle", "source_bundle_hash"), ("runtime_job_spec", "runtime_spec_hash")):
+        dependencies = [ref for ref in record.depends_on if ref.artifact_type == kind]
+        if (len(dependencies) != 1 or not re.fullmatch(r"[0-9a-f]{64}", str(payload.get(hash_key) or ""))
+                or dependencies[0].content_hash != payload[hash_key]):
+            raise ReconcileValidationError("Stage 1 source scope input dependency is invalid")
+        if kind == "source_bundle":
+            bundle = _read_json_object(Path(dependencies[0].path))
+            declared = {(str(item.get("canonical_paper_key") or ""), str(Path(str(item.get("source_pdf") or "")).resolve()))
+                        for item in bundle.get("paper_work_items", ()) if isinstance(item, Mapping)}
+            observed = {(paper["paper_key"], str(Path(paper["source_pdf"]).resolve())) for paper in papers}
+            if declared != observed:
+                raise ReconcileValidationError("Stage 1 source scope papers do not match its source bundle")
+
+
+def _validate_validator_pretransport_inventory(_record: ArtifactRecord, path: Path) -> None:
+    from runtime.provider_runtime import hash_json
+
+    payload = _read_json_object(path)
+    if (payload.get("schema_version") != "validator-pretransport-inventory/v1"
+            or payload.get("inventory_hash") != hash_json({key: value for key, value in payload.items() if key != "inventory_hash"})
+            or not isinstance(payload.get("requests"), list)):
+        raise ReconcileValidationError("Validator pretransport inventory schema or identity is invalid")
+
+
 def validate_canonical_ai_summary(payload: Any, *, label: str) -> Mapping[str, Any]:
     if not isinstance(payload, Mapping):
         raise ReconcileValidationError(f"{label} must be a JSON object")
@@ -245,6 +295,19 @@ def _validate_summary_source_manifest(record: ArtifactRecord, path: Path) -> Non
         artifact_type="summary_source_manifest",
         versions=("v2",),
     )
+    load_summary_source_manifest(path)
+
+
+def load_summary_source_manifest(path: str | Path) -> tuple[Mapping[str, Any], Path, list[Any]]:
+    """Load and validate a public summary-source manifest and its materialized array."""
+
+    target = Path(path).expanduser().resolve()
+    payload = _read_json_object(target)
+    if (
+        payload.get("artifact_type") != "summary_source_manifest"
+        or payload.get("artifact_version") != "v2"
+    ):
+        raise ReconcileValidationError("unsupported summary_source_manifest contract")
     _require_fields(
         payload,
         (
@@ -263,9 +326,7 @@ def _validate_summary_source_manifest(record: ArtifactRecord, path: Path) -> Non
     _require_nonempty_string(payload.get("project_name"), label="summary manifest project_name")
     _require_nonempty_string(payload.get("source_kind"), label="summary manifest source_kind")
     source_items = _require_list(payload.get("source_items"), label="summary manifest source_items")
-    rejected = _require_list(
-        payload.get("rejected_candidates"), label="summary manifest rejected_candidates"
-    )
+    rejected = _require_list(payload.get("rejected_candidates"), label="summary manifest rejected_candidates")
     if any(not isinstance(item, Mapping) for item in (*source_items, *rejected)):
         raise ReconcileValidationError("summary manifest candidates must be JSON objects")
     summary_path = Path(
@@ -275,19 +336,20 @@ def _validate_summary_source_manifest(record: ArtifactRecord, path: Path) -> Non
         )
     ).expanduser()
     if not summary_path.is_absolute():
-        summary_path = path.parent / summary_path
+        summary_path = target.parent / summary_path
     summary_path = summary_path.resolve()
     try:
         summaries = json.loads(summary_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ReconcileValidationError(f"summary manifest target is unavailable: {exc}") from exc
-    if not isinstance(summaries, list):
-        raise ReconcileValidationError("summary manifest target must be a JSON array")
+    if not isinstance(summaries, list) or any(not isinstance(item, Mapping) for item in summaries):
+        raise ReconcileValidationError("summary manifest target must be an array of objects")
     summary_count = payload.get("summary_count")
     if isinstance(summary_count, bool) or not isinstance(summary_count, int) or summary_count < 0:
         raise ReconcileValidationError("summary manifest summary_count must be a non-negative integer")
     if summary_count != len(summaries):
         raise ReconcileValidationError("summary manifest summary_count is inconsistent")
+    return payload, summary_path, summaries
 
 
 def _validate_stage1_reusable_summary_manifest(record: ArtifactRecord, path: Path) -> None:
@@ -296,7 +358,7 @@ def _validate_stage1_reusable_summary_manifest(record: ArtifactRecord, path: Pat
         record,
         payload,
         artifact_type="stage1_reusable_summary_manifest",
-        versions=("v1",),
+        versions=("v1", "v2"),
     )
     _require_owned_job(record, payload, field="job_id")
     _require_fields(
@@ -357,6 +419,22 @@ def _validate_stage1_reusable_summary_manifest(record: ArtifactRecord, path: Pat
             raise ReconcileValidationError(
                 f"stage1_reusable_summary_manifest.{hash_label} is not a SHA-256 digest"
             )
+    if payload.get("artifact_version") == "v2":
+        from runtime.artifact_validators import ArtifactSchemaError, _validate_owner_corrected_manifest_shape
+
+        try:
+            _validate_owner_corrected_manifest_shape(payload)
+        except ArtifactSchemaError as exc:
+            raise ReconcileValidationError(str(exc)) from exc
+
+
+def _validate_stage1_portable_owner_correction(record: ArtifactRecord, path: Path) -> None:
+    from runtime.artifact_validators import ArtifactSchemaError, _validate_stage1_portable_owner_correction as validate_shape
+
+    try:
+        validate_shape(record, path, _read_json_object(path))
+    except ArtifactSchemaError as exc:
+        raise ReconcileValidationError(str(exc)) from exc
 
 
 def _validate_nonempty_text(_record: ArtifactRecord, path: Path) -> None:
@@ -694,7 +772,7 @@ def _validate_paper_artifact(record: ArtifactRecord, path: Path) -> None:
 
 
 def _validate_review_draft(record: ArtifactRecord, path: Path) -> None:
-    from services.review_draft import ReviewDraft
+    from services.review_draft import ReviewDraft, validate_review_section_writer_scope
 
     payload = _read_json_object(path)
     _require_contract_header(
@@ -749,7 +827,19 @@ def _validate_review_draft(record: ArtifactRecord, path: Path) -> None:
         for block in blocks:
             block_data = _require_mapping(block, label="review block")
             _require_nonempty_string(block_data.get("block_id"), label="review block_id")
-            _require_nonempty_string(block_data.get("text"), label="review block text")
+        try:
+            text_blocks = validate_review_section_writer_scope(section_data)
+        except (TypeError, ValueError, KeyError) as exc:
+            raise ReconcileValidationError(f"review section source/layout contract is invalid: {exc}") from exc
+        for block_data in text_blocks:
+            _require_nonempty_string(block_data.get("block_id"), label="review text block_id")
+            _require_nonempty_string(block_data.get("text"), label="review text block text")
+
+    if draft.generation_context.get("generation_mode") == "outline_v3":
+        # The focused compatibility checks above predate Outline v3 lineage.
+        # Reuse the Registry's strict validator for this production mode so
+        # reconciliation applies the same lineage contract as publication.
+        _validate_current_production_artifact(record, path)
 
 
 def _validate_citation_manifest(record: ArtifactRecord, path: Path) -> None:
@@ -1640,6 +1730,8 @@ DEFAULT_SCHEMA_VALIDATORS: dict[str, SchemaValidator] = {
     "job_outcome": _validate_job_outcome,
     STAGE_TERMINAL_ARTIFACT_TYPE: _validate_stage_terminal,
     "source_bundle": _validate_source_bundle,
+    "stage1_source_scope": _validate_stage1_source_scope,
+    "validator_pretransport_inventory": _validate_validator_pretransport_inventory,
     "summary_file": _validate_summary_file,
     "review_docx": _validate_docx,
     "source_pdf": _validate_pdf,
@@ -1654,6 +1746,10 @@ DEFAULT_SCHEMA_VALIDATORS: dict[str, SchemaValidator] = {
     "stage1_progress_snapshot": _validate_json_object,
     "summary_source_manifest": _validate_summary_source_manifest,
     "stage1_reusable_summary_manifest": _validate_stage1_reusable_summary_manifest,
+    "stage1_portable_owner_correction_origin_source": _validate_stage1_portable_owner_correction,
+    "stage1_portable_owner_correction_prior_manifest": _validate_stage1_portable_owner_correction,
+    "stage1_portable_owner_correction_derived_summary_set": _validate_stage1_portable_owner_correction,
+    "stage1_portable_owner_correction_adoption_receipt": _validate_stage1_portable_owner_correction,
     "summary_selection": _validate_summary_selection,
     "review_batch_manifest": _validate_review_batch_manifest,
     "paper_artifact": _validate_paper_artifact,
@@ -1731,13 +1827,99 @@ class RuntimeReconciler:
         self._validated_record_keys: set[tuple[str, ...]] = set()
         self.stage_store = StageTerminalStore(workspace, registry)
         self.last_completion_diagnostics: tuple[str, ...] = ()
+        self._completion_snapshots: dict[tuple[str, str], tuple[ArtifactRegistry, int, dict[str, str]]] | None = None
+        self._completion_used_records: dict[tuple[str, str], dict[str, str]] = {}
+        self._completion_files: dict[str, str] = {}
+        self._completion_refreshed: set[tuple[str, str]] | None = None
+
+    @staticmethod
+    def _completion_registry_key(registry: ArtifactRegistry) -> tuple[str, str]:
+        return (os.path.normcase(os.path.abspath(registry.registry_path)), registry.job_id)
+
+    @staticmethod
+    def _completion_record_signature(record: ArtifactRecord) -> str:
+        encoded = json.dumps(asdict(record), sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _refresh_completion_registry(self, registry: ArtifactRegistry) -> ArtifactRegistry:
+        snapshots = self._completion_snapshots
+        if snapshots is None:
+            registry.reload()
+            return registry
+        key = self._completion_registry_key(registry)
+        if key not in snapshots:
+            revision, records = registry.capture_record_snapshot()
+            snapshots[key] = (registry, revision, {
+                record.artifact_id: self._completion_record_signature(record) for record in records
+            })
+        return snapshots[key][0]
+
+    def _remember_completion_record(self, registry: ArtifactRegistry, record: ArtifactRecord) -> None:
+        if self._completion_snapshots is None:
+            return
+        self._refresh_completion_registry(registry)
+        key = self._completion_registry_key(registry)
+        expected = self._completion_snapshots[key][2].get(record.artifact_id)
+        if expected is None or expected != self._completion_record_signature(record):
+            raise ReconcileValidationError(f"participating Registry record changed during completion query: {record.artifact_id}")
+        self._completion_used_records.setdefault(key, {})[record.artifact_id] = expected
+
+    def _remember_completion_file(self, path: Path, content_hash: str) -> None:
+        if self._completion_snapshots is None:
+            return
+        locator = str(path.expanduser().absolute())
+        prior = self._completion_files.get(locator)
+        if prior is not None and prior != content_hash:
+            raise ReconcileValidationError(f"source identity changed during completion query: {locator}")
+        self._completion_files[locator] = content_hash
+
+    def _finish_completion_query(self) -> None:
+        for path, expected_hash in self._completion_files.items():
+            if file_sha256(path) != expected_hash:
+                raise ReconcileValidationError(f"source bytes changed during completion query: {path}")
+        for key, (registry, revision, _records) in (self._completion_snapshots or {}).items():
+            final_revision, records = registry.capture_record_snapshot()
+            current = {record.artifact_id: record for record in records}
+            if final_revision < revision:
+                raise ReconcileValidationError("Registry revision regressed during completion query")
+            # A diagnostic append may advance the revision without changing
+            # any authority used by this operation. Compare complete used
+            # records, including metadata and typed dependency edges.
+            for artifact_id, expected in self._completion_used_records.get(key, {}).items():
+                record = current.get(artifact_id)
+                if record is None or self._completion_record_signature(record) != expected:
+                    raise ReconcileValidationError(f"participating Registry record changed during completion query: {artifact_id}")
+
+    def _run_completion_query(self, stage_name: str, operation: Callable[[], Any]) -> Any:
+        if self._completion_snapshots is not None:
+            raise ReconcileValidationError("completion query is already active")
+        self._completion_snapshots = {}
+        self._completion_refreshed = set()
+        try:
+            if not self._begin_completion_query():
+                return None
+            result = operation()
+            self._finish_completion_query()
+            return result
+        except (OSError, UnicodeError, ValueError, RegistryError) as exc:
+            code = self._completion_failure_code(stage_name, exc)
+            self.last_completion_diagnostics = (f"{code}:{exc}",)
+            return None
+        finally:
+            self._completion_snapshots = None
+            self._completion_refreshed = None
+            self._completion_used_records.clear()
+            self._completion_files.clear()
+            self._validated_record_keys.clear()
 
     def _begin_completion_query(self) -> bool:
         """Refresh durable authority before answering a completion query."""
 
         self.last_completion_diagnostics = ()
         try:
-            self.registry.reload()
+            self._refresh_completion_registry(self.registry)
+            if self._completion_refreshed is not None:
+                self._completion_refreshed.add(self._completion_registry_key(self.registry))
         except (OSError, UnicodeError, ValueError, RegistryError) as exc:
             self.last_completion_diagnostics = (f"registry_reload_failed:{exc}",)
             return False
@@ -1824,12 +2006,17 @@ class RuntimeReconciler:
                 refreshed_registries=refreshed_registries,
             )
         target_registry = self._registry_for_ref(ref, local_registry=registry)
-        active_refreshed = refreshed_registries if refreshed_registries is not None else set()
+        active_refreshed = refreshed_registries if refreshed_registries is not None else (
+            self._completion_refreshed if self._completion_refreshed is not None else set()
+        )
         registry_key = (
             os.path.normcase(os.path.abspath(target_registry.registry_path)),
             target_registry.job_id,
         )
-        if registry_key not in active_refreshed:
+        if self._completion_snapshots is not None:
+            target_registry = self._refresh_completion_registry(target_registry)
+            active_refreshed.add(registry_key)
+        elif registry_key not in active_refreshed:
             target_registry.reload()
             active_refreshed.add(registry_key)
         record = target_registry.get(ref.artifact_id)
@@ -1882,8 +2069,13 @@ class RuntimeReconciler:
             os.path.normcase(os.path.abspath(registry.registry_path)),
             registry.job_id,
         )
-        active_refreshed = refreshed_registries if refreshed_registries is not None else set()
-        if registry_key not in active_refreshed:
+        active_refreshed = refreshed_registries if refreshed_registries is not None else (
+            self._completion_refreshed if self._completion_refreshed is not None else set()
+        )
+        if self._completion_snapshots is not None:
+            registry = self._refresh_completion_registry(registry)
+            active_refreshed.add(registry_key)
+        elif registry_key not in active_refreshed:
             registry.reload()
             active_refreshed.add(registry_key)
         registered = registry.get(ref.artifact_id)
@@ -1945,6 +2137,7 @@ class RuntimeReconciler:
             raise ReconcileValidationError(
                 f"lease publication target hash mismatch: {owner_record.artifact_id}"
             )
+        self._remember_completion_file(target, declared_hash)
         self.validate_record(
             registered,
             registry=registry,
@@ -1962,10 +2155,13 @@ class RuntimeReconciler:
         refreshed_registries: set[tuple[str, str]] | None = None,
     ) -> None:
         active_registry = registry or self.registry
+        self._remember_completion_record(active_registry, record)
         validation_cache_key = self._validation_cache_key(active_registry, record)
         if validation_cache_key in self._validated_record_keys:
             return
-        active_refreshed = refreshed_registries if refreshed_registries is not None else set()
+        active_refreshed = refreshed_registries if refreshed_registries is not None else (
+            self._completion_refreshed if self._completion_refreshed is not None else set()
+        )
         key = (record.job_id, record.artifact_id)
         active_visited = visited if visited is not None else set()
         if key in active_visited:
@@ -1988,6 +2184,7 @@ class RuntimeReconciler:
             actual_hash = file_sha256(path)
             if actual_hash != record.content_hash:
                 raise ReconcileValidationError(f"artifact content hash mismatch: {record.artifact_id}")
+            self._remember_completion_file(path, record.content_hash)
             if record.artifact_type == "review_batch_manifest":
                 validate_review_batch_manifest_location(record, path, active_registry)
             validator = self.schema_validators.get(record.artifact_type)
@@ -2032,8 +2229,6 @@ class RuntimeReconciler:
             )
 
     def _completed_stage_record(self, stage_name: str) -> TerminalStageRecordV1 | None:
-        if not self._begin_completion_query():
-            return None
         candidates = [
             (record, path)
             for record, path in self.stage_store.load_records()
@@ -2074,9 +2269,12 @@ class RuntimeReconciler:
         return None
 
     def stage_is_complete(self, stage_name: str) -> bool:
-        return self._completed_stage_record(stage_name) is not None
+        return self._run_completion_query(stage_name, lambda: self._completed_stage_record(stage_name)) is not None
 
     def load_completed_stage_result(self, stage_name: str) -> StageResult | None:
+        return self._run_completion_query(stage_name, lambda: self._load_completed_stage_result(stage_name))
+
+    def _load_completed_stage_result(self, stage_name: str) -> StageResult | None:
         """Rehydrate a completed stage from its durable terminal outputs."""
 
         terminal = self._completed_stage_record(stage_name)

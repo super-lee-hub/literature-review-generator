@@ -61,6 +61,12 @@ def _write_visual_pdf(path: Path) -> None:
 
 def _visual_config_overrides() -> dict[str, Mapping[str, Any]]:
     return {
+        "Preprocess": {
+            "parser_mode": "local",
+            "primary_parser": "local",
+            "fallback_parser": "local",
+            "ocr_mode": "off",
+        },
         "Stage1_Visual": {"enabled": "true"},
         "Stage1_Input": {
             "send_extracted_text": "true",
@@ -75,6 +81,19 @@ def _visual_config_overrides() -> dict[str, Mapping[str, Any]]:
             "endpoint_type": "chat_completions",
         },
     }
+
+def _disable_docling_fallback_for_visual_identity_test(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep PDF figure extraction real; these tests do not test Docling conversion."""
+
+    # Docling fallback behavior and subprocess contract have dedicated tests in
+    # test_preprocess_service.py and test_preprocess_platform_safety.py.
+    monkeypatch.setattr(
+        PreprocessManager,
+        "_extract_with_docling",
+        lambda *_args, **_kwargs: None,
+    )
 
 
 def _visual_artifact_identities(service: Stage1AnalysisService) -> tuple[dict[str, Any], ...]:
@@ -893,7 +912,9 @@ def test_current_stage1_deprecated_strategy_policy_is_ignored_for_reuse(
 
 def test_typed_manifest_reuses_equivalent_multimodal_evidence_after_path_move(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _disable_docling_fallback_for_visual_identity_test(monkeypatch)
     parent_pdf = tmp_path / "parent" / "visual-paper.pdf"
     _write_visual_pdf(parent_pdf)
     parent_calls: list[int] = []
@@ -971,6 +992,7 @@ def test_typed_manifest_multimodal_semantic_change_regenerates(
     monkeypatch: pytest.MonkeyPatch,
     mutation: str,
 ) -> None:
+    _disable_docling_fallback_for_visual_identity_test(monkeypatch)
     pdf_path = tmp_path / "visual-paper.pdf"
     _write_visual_pdf(pdf_path)
 
@@ -1075,6 +1097,7 @@ def test_typed_manifest_visual_bbox_metadata_change_regenerates_without_image_ch
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _disable_docling_fallback_for_visual_identity_test(monkeypatch)
     pdf_path = tmp_path / "visual-paper.pdf"
     _write_visual_pdf(pdf_path)
 
@@ -1528,22 +1551,25 @@ def test_current_stage1_existing_reuse_blocks_after_parent_authority_drift(
         normalized["stage1_reuse"] = reuse
         direct_parent_import.append(normalized)
 
+    def resolve_parent_registry(registry_id: str) -> ArtifactRegistry | None:
+        if registry_id in {parent.job_id, f"artifact-registry:{parent.job_id}"}:
+            return ArtifactRegistry(parent.registry.registry_path, parent.job_id)
+        return None
+
     child, child_bundle = _service(
         tmp_path / "child",
         pdf_path,
         reader,
         job_id="child-authority-drift",
-        external_registry_resolver=lambda registry_id: ArtifactRegistry(
-            parent.registry.registry_path, parent.job_id
-        )
-        if registry_id in {parent.job_id, f"artifact-registry:{parent.job_id}"}
-        else None,
+        external_registry_resolver=resolve_parent_registry,
     )
     reused = child.run(child_bundle, existing_summaries=direct_parent_import)
     child.finalize_provider_receipt_closure()
     assert reused.reused_count == 1, reused.summaries[0].get("stage1_reuse")
     assert reused.generated_count == 0
-    clean_map = resolve_current_stage_closure_map(child.registry)
+    clean_map = resolve_current_stage_closure_map(
+        child.registry, external_registry_resolver=resolve_parent_registry
+    )
     assert not tuple(
         issue
         for issue in clean_map.blocking_issues
@@ -1582,7 +1608,9 @@ def test_current_stage1_existing_reuse_blocks_after_parent_authority_drift(
             tamper_parent_record(
                 artifact_id, f"\npost-reuse-parent-tamper-{index}\n".encode("utf-8")
             )
-            drifted = resolve_current_stage_closure_map(child.registry)
+            drifted = resolve_current_stage_closure_map(
+                child.registry, external_registry_resolver=resolve_parent_registry
+            )
             reuse_issues = tuple(
                 issue
                 for issue in drifted.blocking_issues

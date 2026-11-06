@@ -45,7 +45,7 @@ class RepairPolicy(Enum):
 @dataclass(frozen=True)
 class DependencyHashBundle:
     """Bundle of dependency hashes for guard enforcement.
-    
+
     All dependencies must be present and match for repair application.
     """
     summary_hash: str
@@ -59,10 +59,10 @@ class DependencyHashBundle:
     review_draft_hash: str = ""
     citation_manifest_hash: str = ""
     outline_hash: str = ""
-    
+
     def to_dict(self) -> Dict[str, str]:
         return asdict(self)
-    
+
     @classmethod
     def from_dict(cls, data: Dict[str, str]) -> DependencyHashBundle:
         def value(name: str) -> str:
@@ -83,7 +83,7 @@ class DependencyHashBundle:
 @dataclass(frozen=True)
 class PatchTargetSignature:
     """Signature identifying the target location for a patch.
-    
+
     Uses anchor_text and anchor_hash for stable identification.
     """
     block_id: str
@@ -91,7 +91,7 @@ class PatchTargetSignature:
     anchor_hash: str
     span_start: Optional[int] = None  # Character offset for span patches
     span_end: Optional[int] = None
-    
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
@@ -136,7 +136,7 @@ class ManualReviewAction:
 @dataclass(frozen=True)
 class PatchProposal:
     """A proposed patch to fix a validation finding.
-    
+
     All patches are mapping-first and block/span granularity only.
     """
     proposal_id: str
@@ -150,7 +150,7 @@ class PatchProposal:
     fix_strategy: str  # e.g., "manifest_fix", "summary_recheck", "rerender"
     dependency_bundle: DependencyHashBundle
     metadata: Dict[str, Any] = field(default_factory=dict)
-    
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "proposal_id": self.proposal_id,
@@ -228,7 +228,7 @@ class AutoSafePatch:
 @dataclass(frozen=True)
 class RepairPlan:
     """A plan containing multiple patch proposals.
-    
+
     Ordered by priority: citation_mapping_error fixes come first.
     """
     plan_id: str
@@ -243,7 +243,7 @@ class RepairPlan:
     issues: List[RepairIssue] = field(default_factory=list)
     manual_review_actions: List[ManualReviewAction] = field(default_factory=list)
     auto_safe_patches: List[AutoSafePatch] = field(default_factory=list)
-    
+
     def to_dict(self) -> Dict[str, Any]:
         payload = {
             "artifact_type": self.artifact_type,
@@ -265,11 +265,11 @@ class RepairPlan:
             patch.to_dict() for patch in self.auto_safe_patches
         ]
         return payload
-    
+
     def get_mapping_first_proposals(self) -> List[PatchProposal]:
         """Get proposals for citation_mapping_error (highest priority)."""
         return [p for p in self.proposals if p.root_cause == RepairRootCause.CITATION_MAPPING_ERROR]
-    
+
     def get_visual_gap_proposals(self) -> List[PatchProposal]:
         """Get proposals for visual_understanding_gap."""
         return [p for p in self.proposals if p.root_cause == RepairRootCause.VISUAL_UNDERSTANDING_GAP]
@@ -284,7 +284,7 @@ class ApplyGuardResult:
     dependency_guard_passed: bool
     block_reasons: List[str] = field(default_factory=list)
     auto_safe_guard_passed: bool = True
-    
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
@@ -300,7 +300,7 @@ class RepairApplyResult:
     rejected_proposals: List[Dict[str, Any]]  # {proposal_id, reason}
     artifact_type: str = "repair_apply_result"
     artifact_version: str = "v1"
-    
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
@@ -320,7 +320,7 @@ class AppliedPatchRecord:
     anchor_hash_after: str
     artifact_type: str = "applied_patch_record"
     artifact_version: str = "v1"
-    
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
@@ -337,7 +337,7 @@ class RepairReport:
     proposals_detail: List[Dict[str, Any]]
     artifact_type: str = "repair_report"
     artifact_version: str = "v1"
-    
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 

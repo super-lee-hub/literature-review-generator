@@ -12,13 +12,15 @@ import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from ai_interface import canonical_provider_request_payload
+from runtime.provider_context import validator_output_token_limit
 from runtime.provider_runtime import (
     ProviderCallReceiptV1,
     _redact_mapping,
     hash_json,
     hash_text,
 )
-from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry, file_sha256
+from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry
 from validation.adjudication_checkpoint import ADJUDICATION_PROMPT_VERSION
 from validation.llm_adjudicator import (
     AdjudicationPacket,
@@ -84,25 +86,19 @@ def adjudication_schema_hash(packet: AdjudicationPacket) -> str:
 def _request_payload(packet: AdjudicationPacket, api_config: Mapping[str, Any]) -> dict[str, Any]:
     prompt, system_prompt = _build_prompts(packet)
     try:
-        base_max_tokens = int(api_config.get("max_output_tokens", 4096))
         base_temperature = float(api_config.get("temperature", 0.2))
     except (TypeError, ValueError):
-        base_max_tokens = 4096
         base_temperature = 0.2
-    if packet.stage == "stronger":
-        max_tokens = max(base_max_tokens, 6144)
-        temperature = min(base_temperature, 0.15)
-    else:
-        max_tokens = base_max_tokens
-        temperature = base_temperature
-    return {
-        "system": system_prompt,
-        "user": prompt,
-        "user_content": None,
-        "response_format": "json",
-        "max_output_tokens": int(max_tokens),
-        "temperature": temperature,
-    }
+    max_tokens = validator_output_token_limit(api_config, packet.stage)
+    temperature = min(base_temperature, 0.15) if packet.stage == "stronger" else base_temperature
+    return canonical_provider_request_payload(
+        prompt=prompt,
+        system_prompt=system_prompt,
+        user_content=None,
+        response_format="json",
+        max_output_tokens=int(max_tokens),
+        temperature=temperature,
+    )
 
 
 def build_reuse_key(
@@ -164,6 +160,7 @@ def build_reuse_record_payload(
         "redacted_provider_config_hash": hash_json(_redact_mapping(dict(api_config))),
         "prompt_hash": hash_text(prompt),
         "input_hash": hash_json(request_payload),
+        "requested_output_tokens_per_attempt": int(request_payload["max_output_tokens"]),
         "schema_hash": adjudication_schema_hash(packet),
         "provider_output_artifact_id": output_record.artifact_id,
         "provider_output_artifact_hash": output_record.content_hash,
@@ -283,7 +280,15 @@ def _receipt_matches_payload(
     }
     if not all(expected.values()) or receipt.status != "success":
         return False
-    return all(str(getattr(receipt, field) or "") == value for field, value in expected.items())
+    if not all(str(getattr(receipt, field) or "") == value for field, value in expected.items()):
+        return False
+    try:
+        expected_output = int(str(payload.get("requested_output_tokens_per_attempt")).strip())
+    except (TypeError, ValueError):
+        return False
+    receipt_metadata = receipt.metadata if isinstance(receipt.metadata, Mapping) else {}
+    actual_output = receipt_metadata.get("requested_output_tokens_per_attempt")
+    return type(actual_output) is int and actual_output == expected_output
 
 
 def _find_matching_receipt(
@@ -406,6 +411,7 @@ def durable_reuse_authority_issues(
         "redacted_provider_config_hash",
         "prompt_hash",
         "input_hash",
+        "requested_output_tokens_per_attempt",
         "schema_hash",
         "provider_output_artifact_id",
         "provider_output_artifact_hash",
@@ -631,6 +637,7 @@ def verify_reuse_record(
         "redacted_provider_config_hash": hash_json(_redact_mapping(dict(api_config))),
         "prompt_hash": hash_text(prompt),
         "input_hash": hash_json(_request_payload(packet, api_config)),
+        "requested_output_tokens_per_attempt": validator_output_token_limit(api_config, packet.stage),
         "schema_hash": adjudication_schema_hash(packet),
     }
     for field, expected in expected_fields.items():

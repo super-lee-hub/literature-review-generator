@@ -325,19 +325,19 @@ class EvidenceResolver:
     def _resolve_from_ai_summary(self, cited_span: str) -> List[EvidenceCandidate]:
         """Resolve evidence from AI summary in paper artifact."""
         candidates: List[EvidenceCandidate] = []
-        
+
         # Get AI summary from paper artifact
         ai_summary = self.context.paper_artifact.get("analysis", {}).get("ai_summary", {})
         if not ai_summary:
             return candidates
-        
+
         # Extract relevant fields from AI summary
         core_analysis = ai_summary.get("core_analysis", {})
         summary_fields = [
             core_analysis.get(field_name, default_value)
             for field_name, default_value in _CORE_ANALYSIS_FIELD_DEFAULTS
         ]
-        
+
         # Check specialized details
         specialized_details = ai_summary.get("specialized_details", {})
         for detail_type in ["empirical", "review", "conceptual"]:
@@ -348,10 +348,10 @@ class EvidenceResolver:
                         summary_fields.append(value)
                     elif isinstance(value, list):
                         summary_fields.extend(value)
-        
+
         # Flatten the list
         flattened_fields = self._flatten_summary_fields(summary_fields)
-        
+
         # Check each field for matches
         for idx, field_text in enumerate(flattened_fields):
             if isinstance(field_text, str) and field_text:
@@ -361,11 +361,11 @@ class EvidenceResolver:
                 # Filter out common stop words
                 stop_words = set(['的', '了', '是', '在', '我', '有', '和', '就', '不', '人', '都', '一', '一个', '上', '也', '很', '到', '说', '要', '去', '你', '会', '着', '没有', '看', '好', '自己', '这'])
                 significant_words = [word for word in cited_words if word not in stop_words and len(word) > 1]
-                
+
                 # Check if any significant words are in field_text
                 if significant_words:
                     matching_words = [word for word in significant_words if word in field_text.lower()]
-                    
+
                     # More flexible matching criteria
                     # If at least 1 significant word matches and there are few significant words
                     # OR at least 2 significant words match
@@ -394,7 +394,7 @@ class EvidenceResolver:
                                 evidence_scope="ai_summary",
                             )
                         )
-                
+
                 # Additional check: if cited_span is in Chinese and field_text is in English,
                 # check if the paper title or key concepts from the paper are mentioned in the field_text
                 elif any(char >= '\u4e00' and char <= '\u9fff' for char in cited_span):
@@ -424,7 +424,7 @@ class EvidenceResolver:
                                         evidence_scope="ai_summary",
                                     )
                                 )
-        
+
         return candidates
 
     def _create_negative_evidence_candidate(self, cited_span: str) -> EvidenceCandidate:
@@ -437,12 +437,12 @@ class EvidenceResolver:
             available_artifacts.append("normalized_text")
         if self.context.preprocess_artifacts.get("plain_text"):
             available_artifacts.append("plain_text")
-        
+
         if not available_artifacts:
             reason = "no_preprocess_artifacts_available"
         else:
             reason = "cited_text_not_found_in_any_tier"
-        
+
         return EvidenceCandidate(
             match_reason="negative_evidence",
             resolver_tier="negative",
@@ -462,18 +462,18 @@ class EvidenceResolver:
         """Calculate confidence based on text matching quality."""
         if not cited_span or not context_text:
             return 0.0
-        
+
         # Base confidence for exact match
         base_confidence = 0.8
-        
+
         # Adjust based on cited span length relative to context
         span_length = len(cited_span)
         context_length = len(context_text)
-        
+
         # Longer spans relative to context give higher confidence
         length_ratio = min(span_length / max(context_length, 1), 1.0)
         length_bonus = length_ratio * 0.15
-        
+
         # Adjust based on how early the match appears in context
         match_pos = context_text.lower().find(cited_span.lower())
         if match_pos == 0:
@@ -482,7 +482,7 @@ class EvidenceResolver:
             position_bonus = 0.03
         else:
             position_bonus = 0.0
-        
+
         # Calculate final confidence (capped at 0.95 to leave room for higher tiers)
         confidence = base_confidence + length_bonus + position_bonus
         return min(confidence, 0.95)
@@ -491,7 +491,7 @@ class EvidenceResolver:
         """Resolve evidence from locator/page index if available."""
         candidates: List[EvidenceCandidate] = []
         page_index = self.context.preprocess_artifacts.get("page_index", [])
-        
+
         if locator:
             # If we have a locator, try to find relevant pages
             for idx, page_entry in enumerate(page_index):
@@ -515,7 +515,7 @@ class EvidenceResolver:
                             evidence_scope="page",
                         )
                     )
-        
+
         # Also check page index without locator for matches
         if not locator:
             for idx, page_entry in enumerate(page_index):
@@ -538,7 +538,7 @@ class EvidenceResolver:
                             evidence_scope="page",
                         )
                     )
-        
+
         return candidates
 
     def _resolve_from_preprocess_chunks(self, cited_span: str) -> List[EvidenceCandidate]:
@@ -657,12 +657,12 @@ def build_evidence_resolver_context(
     preprocess_artifacts_path: Optional[str] = None,
 ) -> EvidenceResolverContext:
     preprocess_artifacts: Dict[str, Any] = {}
-    
+
     # 首先从paper_artifact的analysis.preprocess字段获取预处理信息
     analysis_preprocess = paper_artifact.get("analysis", {}).get("preprocess", {})
     if analysis_preprocess:
         preprocess_artifacts = analysis_preprocess
-    
+
     # 然后从preprocess_artifacts_path加载，覆盖已有信息
     if preprocess_artifacts_path and os.path.exists(preprocess_artifacts_path):
         try:

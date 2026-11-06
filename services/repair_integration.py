@@ -53,9 +53,9 @@ def persist_repair_plan(
 ) -> str:
     """Persist repair plan to workspace and register in artifact registry."""
     plan_path = workspace.artifact_path(f"repair_plan_{repair_plan.plan_id}.json")
-    
+
     atomic_write_json(plan_path, repair_plan.to_dict())
-    
+
     registry.register(
         artifact_id=f"repair_plan_{repair_plan.plan_id}",
         artifact_type=REPAIR_PLAN_ARTIFACT_TYPE,
@@ -66,7 +66,7 @@ def persist_repair_plan(
         status="ready",
         depends_on=[_registered_dependency(registry, repair_plan.validation_report_id)],
     )
-    
+
     return plan_path
 
 
@@ -77,9 +77,9 @@ def persist_repair_report(
 ) -> str:
     """Persist repair report to workspace and register in artifact registry."""
     report_path = workspace.artifact_path(f"repair_report_{repair_report.report_id}.json")
-    
+
     atomic_write_json(report_path, repair_report.to_dict())
-    
+
     registry.register(
         artifact_id=f"repair_report_{repair_report.report_id}",
         artifact_type=REPAIR_REPORT_ARTIFACT_TYPE,
@@ -90,7 +90,7 @@ def persist_repair_report(
         status="quarantined",
         depends_on=[_registered_dependency(registry, f"repair_plan_{repair_report.plan_id}")],
     )
-    
+
     return report_path
 
 
@@ -103,12 +103,12 @@ def persist_repair_apply_result(
 ) -> str:
     """Persist repair apply result to workspace and register in artifact registry."""
     result_path = workspace.artifact_path(f"repair_apply_result_{apply_result.plan_id}.json")
-    
+
     result_data = apply_result.to_dict()
     result_data["applied_records"] = [r.to_dict() for r in applied_records]
-    
+
     atomic_write_json(result_path, result_data)
-    
+
     registry.register(
         artifact_id=f"repair_apply_result_{apply_result.plan_id}",
         artifact_type=REPAIR_APPLY_RESULT_ARTIFACT_TYPE,
@@ -119,12 +119,12 @@ def persist_repair_apply_result(
         status="quarantined",
         depends_on=[_registered_dependency(registry, f"repair_plan_{apply_result.plan_id}")],
     )
-    
+
     # Also persist individual patch records
     for record in applied_records:
         record_path = workspace.artifact_path(f"applied_patch_{record.record_id}.json")
         atomic_write_json(record_path, record.to_dict())
-        
+
         registry.register(
             artifact_id=f"applied_patch_{record.record_id}",
             artifact_type=APPLIED_PATCH_RECORD_ARTIFACT_TYPE,
@@ -135,7 +135,7 @@ def persist_repair_apply_result(
             status="quarantined",
             depends_on=[_registered_dependency(registry, f"repair_plan_{apply_result.plan_id}")],
         )
-    
+
     return result_path
 
 
@@ -187,7 +187,7 @@ def run_repair_pipeline(
     validation_service: Any | None = None,
 ) -> Dict[str, Any]:
     """Run the full Week 4 repair pipeline.
-    
+
     1. Create repair plan from validation findings
     2. Persist repair plan and report
     3. Apply repairs (if auto_apply is True, otherwise report-only)
@@ -195,13 +195,13 @@ def run_repair_pipeline(
     5. Generate new review_draft, citation_manifest, and review docx
     6. Run review recheck
     7. Return patched review_draft if repairs were applied
-    
+
     Default policy is report-first, not silent auto-apply.
     """
     from dataclasses import replace
     from validation.repair_planner import RepairPlanner
     from services.citation_manifest import unresolved_occurrences
-    
+
     # 检查 citation manifest 是否完整
     if citation_manifest:
         unresolved_cites = unresolved_occurrences(citation_manifest)
@@ -220,7 +220,7 @@ def run_repair_pipeline(
             "message": "Citation manifest is missing or empty, skipping repair pipeline"
         }
         return result
-    
+
     # Step 1: Create repair plan
     external_policy = (
         parse_repair_policy(repair_policy)
@@ -237,10 +237,10 @@ def run_repair_pipeline(
     )
     repair_plan = planner.create_plan(policy=policy)
     safe_proposals = [proposal for proposal in repair_plan.proposals if is_auto_safe_proposal(proposal)]
-    
+
     # Step 2: Persist repair plan
     plan_path = persist_repair_plan(repair_plan, workspace, registry)
-    
+
     # Create and persist repair report
     repair_report = planner.create_report(repair_plan)
     repair_report.summary.update({
@@ -251,7 +251,7 @@ def run_repair_pipeline(
         "auto_safe_eligible_count": len(safe_proposals),
     })
     report_path = persist_repair_report(repair_report, workspace, registry)
-    
+
     result = {
         "repair_pipeline": True,
         "plan_id": repair_plan.plan_id,
@@ -266,7 +266,7 @@ def run_repair_pipeline(
         "auto_safe_eligible_count": len(safe_proposals),
         "applied": False,
     }
-    
+
     # Step 3: Apply repairs (only if explicitly allowed by policy)
     if auto_safe_apply_enabled(external_policy) and safe_proposals:
         apply_plan = replace(repair_plan, proposals=safe_proposals)
@@ -280,21 +280,21 @@ def run_repair_pipeline(
             dry_run=False,
             require_auto_safe=True,
         )
-        
+
         # Step 4: Persist apply results
         applied_records = [AppliedPatchRecord(**r) for r in apply_result.get("applied_records", [])]
         apply_result_obj = RepairApplyResult(**apply_result["apply_result"])
         result_path = persist_repair_apply_result(
             apply_result_obj, applied_records, workspace, registry, job_id
         )
-        
+
         result["applied"] = True
         result["apply_result_path"] = result_path
         result["patched_review_draft"] = apply_result.get("patched_review_draft")
         result["patched_citation_manifest"] = apply_result.get("patched_citation_manifest")
         result["applied_count"] = apply_result_obj.applied_count
         result["rejected_count"] = apply_result_obj.rejected_count
-        
+
         # Step 5: Persist repaired manifest and regenerate downstream artifacts.
         if apply_result.get("patched_review_draft"):
             patched_citation_manifest = apply_result.get("patched_citation_manifest") or citation_manifest
@@ -306,7 +306,7 @@ def run_repair_pipeline(
                 job_id,
             )
             result["patched_citation_manifest_path"] = manifest_path
-            
+
             # A repair result is never promoted on the strength of a placeholder
             # DOCX or a legacy validator adapter.  Register both repaired inputs
             # as quarantined artifacts, rebuild the DOCX through the current
@@ -415,30 +415,30 @@ def run_repair_pipeline(
             result["message"] = "Repair plan created but no proposals were eligible for auto_safe structural apply."
         else:
             result["message"] = f"Repair plan created but not applied ({external_policy.value} policy)."
-    
+
     return result
 
 
 def load_repair_plan(plan_id: str, workspace: JobWorkspace) -> Optional[RepairPlan]:
     """Load a persisted repair plan from workspace.
-    
+
     Reconstructs a RepairPlan from its JSON serialization, including all
     nested PatchProposal objects with their DependencyHashBundle and
     PatchTargetSignature.
     """
     plan_path = workspace.artifact_path(f"repair_plan_{plan_id}.json")
-    
+
     if not os.path.exists(plan_path):
         return None
-    
+
     with open(plan_path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    
+
     from validation.repair_models import (
         RepairPlan, RepairPolicy, PatchProposal, PatchTargetSignature,
         DependencyHashBundle, RepairRootCause, PatchGranularity
     )
-    
+
     # Reconstruct proposals
     proposals = []
     for prop_data in data.get("proposals", []):
@@ -451,7 +451,7 @@ def load_repair_plan(plan_id: str, workspace: JobWorkspace) -> Optional[RepairPl
             span_start=target_data.get("span_start"),
             span_end=target_data.get("span_end"),
         )
-        
+
         # Reconstruct dependency bundle
         bundle_data = prop_data.get("dependency_bundle", {})
         dependency_bundle = DependencyHashBundle(
@@ -460,7 +460,7 @@ def load_repair_plan(plan_id: str, workspace: JobWorkspace) -> Optional[RepairPl
             visual_manifest_hash=bundle_data.get("visual_manifest_hash", ""),
             selected_visual_refs_hash=bundle_data.get("selected_visual_refs_hash", ""),
         )
-        
+
         # Reconstruct proposal
         proposal = PatchProposal(
             proposal_id=prop_data.get("proposal_id", ""),
@@ -476,7 +476,7 @@ def load_repair_plan(plan_id: str, workspace: JobWorkspace) -> Optional[RepairPl
             metadata=prop_data.get("metadata", {}),
         )
         proposals.append(proposal)
-    
+
     # Reconstruct RepairPlan
     return RepairPlan(
         plan_id=data.get("plan_id", plan_id),

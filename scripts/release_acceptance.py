@@ -20,7 +20,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-from typing import Any, Mapping
+from typing import Any, Mapping, TypedDict
 
 _SCRIPT_REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_SCRIPT_REPO_ROOT) not in sys.path:
@@ -48,6 +48,20 @@ DEFAULT_PROVIDER_CALL_CEILING = 24
 DEFAULT_OUTPUT_TOKEN_CEILING = 5_000_000
 DEFAULT_RETRY_CEILING = 2
 MAX_ACCEPTANCE_INDEX_BYTES = 16 * 1024 * 1024
+
+
+class _EffectiveBudgetV1(TypedDict):
+    max_provider_calls_total: int
+    max_output_tokens_total: int
+    max_retry_attempts_total: int
+    max_wall_seconds: int
+
+
+class _EffectiveBudgetV2(_EffectiveBudgetV1):
+    schema_version: str
+
+
+_EffectiveBudget = _EffectiveBudgetV1 | _EffectiveBudgetV2
 
 _SECRET_PATTERNS = (
     re.compile(r"(?i)(bearer\s+)[^\s,}\"]+"),
@@ -249,15 +263,43 @@ def _effective_budget(
     payload: Mapping[str, Any],
     args: argparse.Namespace,
     acceptance_spec: ReleaseAcceptanceSpec | None = None,
-) -> dict[str, int]:
+) -> _EffectiveBudget:
     del payload
     command_budget = _command_budget(args)
     budget = acceptance_spec.budget if acceptance_spec is not None else command_budget
-    ceilings = command_budget.to_dict()
-    for name, value in budget.to_dict().items():
-        if value > ceilings[name]:
+    for name, value, ceiling in (
+        (
+            "max_provider_calls_total",
+            budget.max_provider_calls_total,
+            command_budget.max_provider_calls_total,
+        ),
+        (
+            "max_output_tokens_total",
+            budget.max_output_tokens_total,
+            command_budget.max_output_tokens_total,
+        ),
+        (
+            "max_retry_attempts_total",
+            budget.max_retry_attempts_total,
+            command_budget.max_retry_attempts_total,
+        ),
+        (
+            "max_wall_seconds",
+            budget.max_wall_seconds,
+            command_budget.max_wall_seconds,
+        ),
+    ):
+        if value > ceiling:
             raise ValueError(f"acceptance budget {name} exceeds the command ceiling")
-    return budget.to_dict()
+    numeric_budget: _EffectiveBudgetV1 = {
+        "max_provider_calls_total": budget.max_provider_calls_total,
+        "max_output_tokens_total": budget.max_output_tokens_total,
+        "max_retry_attempts_total": budget.max_retry_attempts_total,
+        "max_wall_seconds": budget.max_wall_seconds,
+    }
+    if budget.schema_version == "provider-aggregate-budget-v1":
+        return numeric_budget
+    return {**numeric_budget, "schema_version": budget.schema_version}
 
 
 def _budget_environment(budget: Mapping[str, Any]) -> dict[str, str]:

@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from outline.v3_artifacts import AdoptedOutline
-from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRecord, ArtifactRegistry
+from runtime.provider_runtime import hash_json
+from services.artifact_registry import (
+    ArtifactDependencyRefV2,
+    ArtifactRecord,
+    ArtifactRegistry,
+)
 from services.audit_record import AuditArtifactRefV1, AuditRecordV1
 from services.job_workspace import JobWorkspace, publish_json_artifact
 from services.queue_service import LocalPublicationContext
@@ -30,13 +36,20 @@ def _load_json(record: ArtifactRecord) -> dict[str, Any]:
     return dict(payload)
 
 
-def _ready_record(registry: ArtifactRegistry, artifact_id: str) -> ArtifactRecord:
+def _source_revision_resolver(registry: ArtifactRegistry):
+    if registry.get("source_revision_plan") is None:
+        return None
+    from runtime.runner import AgentRuntimeRunner
+
+    workspace, _ = AgentRuntimeRunner._open_workspace(Path(registry.registry_path).parent)
+    return AgentRuntimeRunner._external_registry_resolver(workspace)
+
+
+def _ready_record(registry: ArtifactRegistry, artifact_id: str, resolver=None) -> ArtifactRecord:
     record = registry.get(artifact_id)
     if record is None or record.status != "ready":
         raise ValueError(f"required adoption artifact is not ready: {artifact_id}")
-    registry.verify_ready_dependencies(
-        [_dependency(record)]
-    )
+    registry.verify_ready_artifact_closure(record, external_registry_resolver=resolver)
     return record
 
 
@@ -51,7 +64,7 @@ def _dependency(record: ArtifactRecord) -> ArtifactDependencyRefV2:
     )
 
 
-def current_adoption_record(registry: ArtifactRegistry) -> ArtifactRecord | None:
+def current_adoption_record(registry: ArtifactRegistry, *, external_registry_resolver=None) -> ArtifactRecord | None:
     """Resolve only the adoption selected by the durable current pointer.
 
     A missing, stale, or malformed pointer is a hard stop.  Falling back to a
@@ -59,17 +72,31 @@ def current_adoption_record(registry: ArtifactRegistry) -> ArtifactRecord | None
     outline version and make resume/export non-auditable.
     """
 
+    from hashlib import sha256
+
     try:
-        pointer = _ready_record(registry, ADOPTION_POINTER_ARTIFACT_ID)
-        pointer_payload = _load_json(pointer)
-    except (ValueError, OSError, TypeError, RuntimeError):
-        return None
-    target_id = str(pointer_payload.get("current_adoption_artifact_id") or "").strip()
-    target_hash = str(pointer_payload.get("current_adoption_hash") or "").strip()
-    if not target_id or not target_hash:
-        return None
-    try:
-        target = _ready_record(registry, target_id)
+        pointer = registry.get(ADOPTION_POINTER_ARTIFACT_ID)
+        if pointer is None or pointer.status != "ready":
+            return None
+        # Select the target only from these exact hash-bound bytes. The
+        # batch below independently verifies both roots and their union.
+        pointer_bytes = Path(pointer.path).read_bytes()
+        if sha256(pointer_bytes).hexdigest() != pointer.content_hash:
+            return None
+        pointer_payload = json.loads(pointer_bytes.decode("utf-8"))
+        if not isinstance(pointer_payload, Mapping):
+            return None
+        target_id = str(pointer_payload.get("current_adoption_artifact_id") or "").strip()
+        target_hash = str(pointer_payload.get("current_adoption_hash") or "").strip()
+        if not target_id or not target_hash:
+            return None
+        target = registry.get(target_id)
+        if target is None or target.status != "ready":
+            return None
+        resolver = external_registry_resolver or _source_revision_resolver(registry)
+        _verified_pointer, target = registry.verify_ready_artifact_closures(
+            [pointer, target], external_registry_resolver=resolver,
+        )
     except (ValueError, OSError, TypeError, RuntimeError):
         return None
     if (
@@ -88,6 +115,7 @@ def _write_current_pointer(
     registry: ArtifactRegistry,
     adopted_record: ArtifactRecord,
     publication_context: Any | None = None,
+    external_registry_resolver=None,
 ) -> ArtifactRecord:
     pointer_path = Path(workspace.artifact_path("outline_v3_adoption_current.json"))
     publication_context = (
@@ -115,6 +143,7 @@ def _write_current_pointer(
         artifact_version=ADOPTION_POINTER_ARTIFACT_VERSION,
         producer="outline.adoption_transaction.OutlineAdoptionTransaction",
         depends_on=[_dependency(adopted_record)],
+        external_registry_resolver=external_registry_resolver,
         metadata={
             "role": "current",
             "current_adoption_artifact_id": adopted_record.artifact_id,
@@ -163,9 +192,11 @@ class OutlineAdoptionTransaction:
         workspace: JobWorkspace,
         registry: ArtifactRegistry,
         publication_context: Any | None = None,
+        *, external_registry_resolver: Callable[[str], ArtifactRegistry | None] | None = None,
     ) -> None:
         self.workspace = workspace
         self.registry = registry
+        self.external_registry_resolver = external_registry_resolver or _source_revision_resolver(registry)
         self.publication_context = (
             publication_context
             or getattr(registry, "publication_context", None)
@@ -180,7 +211,7 @@ class OutlineAdoptionTransaction:
         reason: str,
         expected_hash: str,
     ) -> AdoptionTransactionResult:
-        source = _ready_record(self.registry, source_artifact_id)
+        source = _ready_record(self.registry, source_artifact_id, self.external_registry_resolver)
         if source.artifact_type != "final_outline" or source.artifact_version != "v3":
             return AdoptionTransactionResult(
                 status="blocked",
@@ -231,10 +262,10 @@ class OutlineAdoptionTransaction:
         final_payload = _load_json(source).get("payload")
         if not isinstance(final_payload, Mapping):
             raise ValueError("final outline payload is missing")
-        coverage = _ready_record(self.registry, "outline-v3:coverage_audit")
-        stability = _ready_record(self.registry, "outline-v3:stability_audit")
-        receipt_closure = _ready_record(self.registry, "outline-v3:provider_receipt_closure")
-        health = _ready_record(self.registry, "outline-v3:stage_health")
+        coverage = _ready_record(self.registry, "outline-v3:coverage_audit", self.external_registry_resolver)
+        stability = _ready_record(self.registry, "outline-v3:stability_audit", self.external_registry_resolver)
+        receipt_closure = _ready_record(self.registry, "outline-v3:provider_receipt_closure", self.external_registry_resolver)
+        health = _ready_record(self.registry, "outline-v3:stage_health", self.external_registry_resolver)
         coverage_payload = _load_json(coverage).get("payload")
         stability_payload = _load_json(stability).get("payload")
         receipt_closure_payload = _load_json(receipt_closure).get("payload")
@@ -293,11 +324,22 @@ class OutlineAdoptionTransaction:
         adopted_id = f"outline-v3:adoption:{source.content_hash[:16]}"
         existing = self.registry.get(adopted_id)
         if existing is not None and existing.status == "ready":
+            try:
+                _ready_record(self.registry, adopted_id, self.external_registry_resolver)
+            except (ValueError, OSError, TypeError, RuntimeError):
+                # Preserve the prior adoption when eligibility evidence is
+                # refreshed for the same scientific outline version.
+                gate_hash = hash_json({**expected_gate_hashes, "stage_health_hash": health.content_hash})
+                adopted_id += f":gates:{gate_hash[:16]}"
+                existing = self.registry.get(adopted_id)
+        if existing is not None and existing.status == "ready":
+            _ready_record(self.registry, adopted_id, self.external_registry_resolver)
             _write_current_pointer(
                 self.workspace,
                 self.registry,
                 existing,
                 self.publication_context,
+                self.external_registry_resolver,
             )
             return AdoptionTransactionResult(
                 status="already_adopted",
@@ -335,7 +377,8 @@ class OutlineAdoptionTransaction:
         )
         adopted_path = Path(
             self.workspace.artifact_path(
-                f"outline_v3/adoptions/{source.content_hash}/adoption.json"
+                f"outline_v3/adoptions/{source.content_hash}/"
+                + (f"adoption_{adopted_id.rsplit(':', 1)[-1]}.json" if ":gates:" in adopted_id else "adoption.json")
             )
         )
         adopted_record = publish_json_artifact(
@@ -349,6 +392,7 @@ class OutlineAdoptionTransaction:
             artifact_version=adopted.artifact_version,
             producer="outline.adoption_transaction.OutlineAdoptionTransaction",
             depends_on=[_dependency(record) for record in dependency_records],
+            external_registry_resolver=self.external_registry_resolver,
             metadata={"actor": actor, "reason": reason, "expected_hash": expected_hash},
         )
         _write_current_pointer(
@@ -356,6 +400,7 @@ class OutlineAdoptionTransaction:
             self.registry,
             adopted_record,
             self.publication_context,
+            self.external_registry_resolver,
         )
 
         refs = [
@@ -408,6 +453,7 @@ class OutlineAdoptionTransaction:
             artifact_version="v1",
             producer="outline.adoption_transaction.OutlineAdoptionTransaction",
             depends_on=[*(_dependency(record) for record in dependency_records), _dependency(adopted_record)],
+            external_registry_resolver=self.external_registry_resolver,
         )
         return AdoptionTransactionResult(
             status="succeeded",

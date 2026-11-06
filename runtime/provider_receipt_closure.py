@@ -227,15 +227,23 @@ class ProviderReceiptClosure:
             closure_epoch_id = ""
 
         if expected_epochs:
+            def in_current_call_epoch(receipt: ProviderCallReceiptV1) -> bool:
+                contract = expected_by_id.get(receipt.call_id)
+                call_epoch = str(contract.closure_epoch_id) if contract is not None else ""
+                receipt_epoch = str(receipt.closure_epoch_id or "")
+                # A reused call can retain its original epoch. Its scope does
+                # not admit historical outcomes for another current call.
+                return receipt_epoch == call_epoch if call_epoch else receipt_epoch in expected_epochs
+
             current_receipts = [
-                receipt for receipt in receipts if str(receipt.closure_epoch_id or "") in expected_epochs
+                receipt for receipt in receipts if in_current_call_epoch(receipt)
             ]
             out_of_epoch_receipts = tuple(
                 sorted(
                     {
                         str(receipt.receipt_id or receipt.call_id)
                         for receipt in receipts
-                        if str(receipt.closure_epoch_id or "") not in expected_epochs
+                        if not in_current_call_epoch(receipt)
                         and str(receipt.receipt_id or receipt.call_id)
                     }
                 )
@@ -297,7 +305,18 @@ class ProviderReceiptClosure:
             if not candidates:
                 missing.append(call_id)
                 continue
-            current = max(candidates, key=lambda item: (item.attempts, item.sequence, item.finished_at))
+            # A resumed execution can append a fresh receipt with a lower
+            # per-transport attempt count than an older failed receipt. The
+            # newest finished receipt is the current outcome; internal retry
+            # count must not make an older failure win over a later success.
+            current = max(
+                candidates,
+                key=lambda item: (
+                    str(item.finished_at or ""),
+                    int(item.sequence),
+                    int(item.attempts),
+                ),
+            )
             variant_matches = [
                 variant
                 for variant in contract.request_variants

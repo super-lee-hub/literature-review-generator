@@ -130,11 +130,11 @@ fail-closed 抛错。
 | Outline 角色 | API section | 模型 | 传输协议 / 网络归属 |
 | --- | --- | --- | --- |
 | 关系裁决 | `Free_Mode_API` | DeepSeek V4 Pro | DeepSeek Chat Completions，DeepSeek 官方 API |
-| 候选大纲生成 | `Outline_API` | Claude Opus 5 | 原生 Anthropic Messages，经 `chat.178266.xyz`，第三方 gateway |
+| 候选大纲生成 | `Outline_API` | Claude Opus 5.5 | 原生 Anthropic Messages，经 `chat.178266.xyz`，第三方 gateway |
 | 结构审查 | `Writer_API` | GPT-5.6-sol | OpenAI Responses 兼容协议，经 `ai.saigou.work`，第三方 gateway |
 | 覆盖度审查 | `Free_Mode_API` | DeepSeek V4 Pro | DeepSeek Chat Completions，DeepSeek 官方 API |
 | 证据审查 | `Writer_API` | GPT-5.6-sol | OpenAI Responses 兼容协议，经 `ai.saigou.work`，第三方 gateway |
-| 最终仲裁 | `Outline_API` | Claude Opus 5 | 原生 Anthropic Messages，经 `chat.178266.xyz`，第三方 gateway |
+| 最终仲裁 | `Outline_API` | Claude Opus 5.5 | 原生 Anthropic Messages，经 `chat.178266.xyz`，第三方 gateway |
 
 端点/协议和模型品牌是两件事。请求发往 `chat.178266.xyz` 或 `ai.saigou.work`，
 只能证明程序请求发给了第三方 gateway；项目不会因为返回的是 Claude 或 GPT 模型名，
@@ -155,7 +155,7 @@ route fingerprint 写入 binding/receipt；凭据留在 `.env` 或本地安全�
 * 该协议没有 `response_format` 参数，请求 JSON 时改为向 system prompt 追加指令；
 * 响应的 `content` 是 block 列表，只有 `type == "text"` 的块才作为回答内容。
 
-对 Claude Opus 5，当前请求策略是 adaptive thinking，并使用
+对 Claude Opus 5.5，当前请求策略是 adaptive thinking，并使用
 `output_config.effort` 控制深度；不会发送旧式 `enabled + budget_tokens` 组合。
 `thinking_budget_tokens` 仅为仍要求手工 extended thinking 的旧版 Claude 保留。
 

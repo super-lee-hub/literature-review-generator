@@ -7,8 +7,7 @@
 import pytest
 import os
 import tempfile
-from io import BytesIO
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import patch
 
 
 class TestPDFExtractor:

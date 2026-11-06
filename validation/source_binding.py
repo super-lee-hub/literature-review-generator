@@ -183,6 +183,7 @@ def build_validation_source_binding(
     summary_sources: Sequence[str],
     local_registry: Any | None = None,
     job_id: str = "",
+    include_paper_keys: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Build the durable upstream Stage 1 authority binding.
 
@@ -192,6 +193,11 @@ def build_validation_source_binding(
     with hashes so validation can verify them before use.
     """
 
+    selected_paper_keys = (
+        {str(key).strip() for key in include_paper_keys if str(key).strip()}
+        if include_paper_keys is not None
+        else None
+    )
     papers: dict[str, dict[str, Any]] = {}
     diagnostics: list[str] = []
     workspaces: list[str] = []
@@ -242,6 +248,8 @@ def build_validation_source_binding(
                 diagnostics.append(f"paper_artifact_unreadable:{record.get('artifact_id')}")
                 continue
             paper_key = _paper_key_of(body)
+            if selected_paper_keys is not None and paper_key not in selected_paper_keys:
+                continue
             if not paper_key or (
                 local_registry is not None
                 and upstream_job_id

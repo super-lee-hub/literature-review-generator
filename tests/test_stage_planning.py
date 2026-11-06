@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import pytest
 
-from runtime.stage_planning import StagePlanError, build_stage_plan, stage_plan_from_metadata
+from runtime.stage_planning import (
+    StagePlanError,
+    build_stage_plan,
+    stage_plan_from_metadata,
+)
 
 
 def test_run_all_adds_validation_when_validation_is_enabled() -> None:

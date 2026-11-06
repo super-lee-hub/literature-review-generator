@@ -7,7 +7,12 @@ from typing import Any, Dict, List, Mapping, Optional, cast
 
 from ai_interface import _call_ai_api
 from models import APIConfig
-from runtime.provider_runtime import ProviderBudgetExceeded, ProviderRuntime
+from runtime.provider_context import ProviderContextProfile, validator_output_token_limit
+from runtime.provider_runtime import (
+    ProviderBudgetExceeded,
+    ProviderRuntime,
+    canonical_provider_request_payload,
+)
 from services.prompt_registry import PromptRegistry, PromptRegistryError
 
 
@@ -197,18 +202,11 @@ def run_adjudication_stage(
         return None
 
     try:
-        base_max_tokens = int(api_config.get("max_output_tokens", 4096))
         base_temperature = float(api_config.get("temperature", 0.2))
-    except Exception:
-        base_max_tokens = 4096
+    except (TypeError, ValueError):
         base_temperature = 0.2
-
-    if packet.stage == "stronger":
-        max_tokens = max(base_max_tokens, 6144)
-        temperature = min(base_temperature, 0.15)
-    else:
-        max_tokens = base_max_tokens
-        temperature = base_temperature
+    max_tokens = validator_output_token_limit(api_config, packet.stage)
+    temperature = min(base_temperature, 0.15) if packet.stage == "stronger" else base_temperature
 
     prompt, system_prompt = _build_prompts(packet)
     packet_payload: Dict[str, Any]
@@ -239,18 +237,24 @@ def run_adjudication_stage(
         ))
     call_kwargs: Dict[str, Any] = {
         "max_tokens": max_tokens,
+        "wire_output_tokens": max_tokens,
         "temperature": temperature,
         "response_format": "json",
         "logger": getattr(service, "logger", None),
     }
-    request_payload: Dict[str, Any] = {
-        "system": system_prompt,
-        "user": prompt,
-        "user_content": None,
-        "response_format": "json",
-        "max_output_tokens": int(max_tokens),
-        "temperature": temperature,
-    }
+    attempt_limit = getattr(service, "validator_attempt_limit", None)
+    if callable(attempt_limit):
+        call_kwargs["retry_attempts"] = max(
+            1, int(cast(int, attempt_limit(api_config)))
+        )
+    request_payload: Dict[str, Any] = canonical_provider_request_payload(
+        prompt=prompt,
+        system_prompt=system_prompt,
+        user_content=None,
+        response_format="json",
+        max_output_tokens=int(max_tokens),
+        temperature=temperature,
+    )
     if provider_runtime is not None:
         call_kwargs["provider_runtime"] = provider_runtime
         bind_call = getattr(service, "bind_provider_call", None)
@@ -281,30 +285,24 @@ def run_adjudication_stage(
         # Real transports already append a receipt inside ai_interface and
         # therefore take the no-op branch above.
         try:
-            from runtime.provider_context import ProviderContextProfile
-
-            try:
-                context_limit = max(1, int(api_config.get("max_context_tokens") or 128_000))
-            except (TypeError, ValueError):
-                context_limit = 128_000
-            try:
-                output_limit = max(1, int(api_config.get("max_output_tokens") or max_tokens))
-            except (TypeError, ValueError):
-                output_limit = max_tokens
-            profile = ProviderContextProfile.conservative(
-                provider=str(api_config.get("provider_family") or "configured"),
-                model=str(api_config.get("model") or "validator"),
-                endpoint_type=str(api_config.get("endpoint_type") or "chat_completions"),
-                model_context_limit=context_limit,
-                max_output_tokens=output_limit,
+            profile = ProviderContextProfile.from_api_config(
+                api_config,
+                max_output_tokens=max_tokens,
+                default_provider="configured",
+                default_model="validator",
+                default_endpoint_type="chat_completions",
             )
+            output_limit = profile.max_output_tokens
             estimate = profile.estimate_request(request_payload)
+            attempts_used = (
+                max(1, int(report.get("attempts") or 1))
+                if isinstance(report, Mapping)
+                else 1
+            )
             admission = provider_runtime.admit(
                 estimated_tokens=max(1, int(estimate["estimated_input_tokens"])),
-                requested_output_tokens=output_limit,
-                requested_retry_attempts=max(0, int(report.get("attempts") or 1) - 1)
-                if isinstance(report, Mapping)
-                else 0,
+                requested_output_tokens=output_limit * attempts_used,
+                requested_retry_attempts=max(0, attempts_used - 1),
             )
             provider_runtime.complete(
                 admission=admission,
@@ -318,7 +316,10 @@ def run_adjudication_stage(
                     "usage_status": "reported",
                     "error_kind": None if isinstance(report, dict) else "invalid_response",
                 },
-                metadata={"execution_mode": "injected_adjudicator"},
+                metadata={
+                    "execution_mode": "injected_adjudicator",
+                    "requested_output_tokens_per_attempt": output_limit,
+                },
             )
         except ProviderBudgetExceeded:
             provider_runtime.blocked_receipt(

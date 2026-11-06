@@ -462,7 +462,7 @@ def build_citation_catalog(
             paper_info.get("doi"),
         ):
             _add_alias_with_variants(aliases, item)
-        
+
         # Add author-based aliases
         author_list = [str(author).strip() for author in authors if str(author).strip()]
         year = normalized_metadata.year or str(paper_info.get("year") or "").strip()

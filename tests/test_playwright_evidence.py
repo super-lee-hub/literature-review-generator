@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import multiprocessing
+import threading
 import zipfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -17,6 +19,28 @@ from runtime.playwright_evidence import (
     _runtime_source_mode_for_gui_input,
 )
 from services.artifact_registry import ArtifactRegistry
+
+
+def test_sync_playwright_collector_uses_worker_thread_inside_running_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    collector = object.__new__(PlaywrightEvidenceCollector)
+    caller_thread = threading.get_ident()
+    worker_threads: list[int] = []
+    expected = object()
+
+    def run_sync():
+        worker_threads.append(threading.get_ident())
+        return expected
+
+    monkeypatch.setattr(collector, "_run_sync", run_sync)
+
+    async def run_inside_loop():
+        return collector.run()
+
+    assert asyncio.run(run_inside_loop()) is expected
+    assert len(worker_threads) == 1
+    assert worker_threads[0] != caller_thread
 
 
 def _write_concurrent_trace(path: Path, payload: bytes) -> None:

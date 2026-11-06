@@ -8,6 +8,7 @@ bound resulting runtime job.
 
 from __future__ import annotations
 
+import asyncio
 import configparser
 import hashlib
 import json
@@ -18,7 +19,9 @@ import sys
 import tempfile
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from contextvars import copy_context
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -307,6 +310,25 @@ class PlaywrightEvidenceCollector:
             raise PlaywrightEvidenceError("Playwright collector is missing acceptance identity")
 
     def run(self) -> PlaywrightEvidenceResultV1:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return self._run_sync()
+
+        # Playwright's Sync API cannot start in a thread with a running
+        # asyncio loop.  Keep the existing synchronous collector API, but run
+        # its entire browser lifecycle in a fresh worker when called from an
+        # async acceptance/test context.  Copy the context so acceptance
+        # bindings remain available while every Playwright call stays on one
+        # dedicated thread.
+        context = copy_context()
+        with ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="playwright-evidence",
+        ) as executor:
+            return executor.submit(context.run, self._run_sync).result()
+
+    def _run_sync(self) -> PlaywrightEvidenceResultV1:
         try:
             from playwright.sync_api import (  # pyright: ignore[reportMissingImports]
                 sync_playwright,

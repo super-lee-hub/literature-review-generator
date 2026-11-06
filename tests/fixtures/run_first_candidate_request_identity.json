@@ -1,0 +1,48 @@
+{
+  "evidence_class": "local sealed relation scope, zero provider posts",
+  "rows": [
+    {
+      "assignment_coverage_hash": "19f09a898fb77ce023a42c77bec405fe92c71652cbe3a679c0aa5e66d20b3265",
+      "claim_group_ids": [
+        "candidate-relation-comparison-group:v1:47283ee969c7c96357dc7f74"
+      ],
+      "group_assignment": {
+        "candidate-relation-comparison-group:v1:47283ee969c7c96357dc7f74": "candidate_1_provider_generation:local:candidate_group_3a46e4f21d288131"
+      },
+      "node_id": "candidate_1_provider_generation:local:candidate_group_3a46e4f21d288131",
+      "paper_keys": [
+        "paper-c",
+        "paper-d"
+      ],
+      "relation_ids": [
+        "relation:confirmed:cd"
+      ],
+      "request_hash": "c1262eaeb4b37a29d72f9173f020be2d63c5a0b063f492abd553b005f8a174a4",
+      "scope_hash": "94ccc1a4b0de45d3c3e616e508f9757388b02a16d4b4edc7fdfc1beed0d9248d",
+      "semantic_context_hash": "dc4837fa1216d568be9cd6c40ab7eddc86bd642a40e10286931bb8eb98cf0296"
+    },
+    {
+      "assignment_coverage_hash": "19f09a898fb77ce023a42c77bec405fe92c71652cbe3a679c0aa5e66d20b3265",
+      "claim_group_ids": [
+        "candidate-relation-comparison-group:v1:94ef86084572b4e9b222c856"
+      ],
+      "group_assignment": {
+        "candidate-relation-comparison-group:v1:94ef86084572b4e9b222c856": "candidate_1_provider_generation:local:candidate_group_c1a4bc6e57947b07"
+      },
+      "node_id": "candidate_1_provider_generation:local:candidate_group_c1a4bc6e57947b07",
+      "paper_keys": [
+        "paper-a",
+        "paper-b"
+      ],
+      "relation_ids": [
+        "relation:confirmed:ab"
+      ],
+      "request_hash": "8933ce1506b7df3ea2172e75f6da6bc43eed1dcb1fded8fde7ac9d508d0cb0c9",
+      "scope_hash": "11e6569bf77e0b5c599d827d8a3703908d4feb54656eaa2c14f2813515f9c607",
+      "semantic_context_hash": "bb95a117827314bf00e2989934a540a23a139b8ac3aa866afe0f6c79d4cba945"
+    }
+  ],
+  "schema_version": "candidate-group-requests-golden/v1",
+  "semantic_plan_hash": "862b27f14e65f12103bd4c89b2159fe0b61acb86940d2bd3c6e7cecc8ccf0fac",
+  "source_scope_hash": "6e74b7441a869442dbab88e95f922628b157b225b627eb6d28fb4e1e5eaddec5"
+}

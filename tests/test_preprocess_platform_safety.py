@@ -179,6 +179,7 @@ def test_mineru_remote_transport_records_bounded_redacted_receipt(
     manager = PreprocessManager(
         config={
             "Preprocess": {
+                "cache_dir": str(tmp_path / "preprocess-cache"),
                 "parser_mode": "remote_first",
                 "primary_parser": "mineru_remote",
                 "fallback_parser": "none",

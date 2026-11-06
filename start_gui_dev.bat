@@ -2,11 +2,7 @@
 setlocal
 cd /d "%~dp0"
 
-echo Closing any previous GUI dev processes...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_Process ^| Where-Object { ($_.Name -eq 'python.exe' -or $_.Name -eq 'pythonw.exe') -and $_.CommandLine -match 'launch_gui.py' } ^| ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
-echo Releasing GUI ports 8098-8120 and 8950-8960...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue ^| Where-Object { ($_.LocalPort -ge 8098 -and $_.LocalPort -le 8120) -or ($_.LocalPort -ge 8950 -and $_.LocalPort -le 8960) } ^| Select-Object -ExpandProperty OwningProcess -Unique ^| ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }" >nul 2>&1
-timeout /t 1 >nul
+echo Existing GUI instances are left running. The launcher selects an available port.
 
 set "PREFERRED_ENV=auto-generate-gui"
 set "CONDA_BAT="

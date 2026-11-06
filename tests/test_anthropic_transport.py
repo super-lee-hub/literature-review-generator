@@ -373,6 +373,7 @@ def test_temperature_is_withheld_on_opus_5_even_when_thinking_is_disabled() -> N
 @pytest.mark.parametrize(
     "model,expected_deprecated",
     [
+        ("claude-opus-5-5", True),
         ("claude-opus-5", True),
         ("claude-opus-4-8", True),
         ("claude-opus-4-7", True),
@@ -605,6 +606,9 @@ def test_dated_snapshot_ids_resolve_to_their_family() -> None:
     assert anthropic_model_key("claude-opus-4-6-20260206") == "opus-4-6"
     assert anthropic_model_key("claude-opus-5[1m]") == "opus-5"
     assert anthropic_model_key("claude-opus-5") == "opus-5"
+    assert anthropic_model_key("claude-opus-5-5") == "opus-5-5"
+    assert anthropic_thinking_mode("claude-opus-5-5") == "adaptive"
+    assert "max" in anthropic_effort_levels("claude-opus-5-5")
 
 
 def test_high_effort_warns_when_max_tokens_is_too_small() -> None:

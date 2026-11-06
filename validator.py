@@ -268,7 +268,7 @@ def validate_paper_analysis(generator_instance: Any, pdf_text: str, ai_result: D
     try:
         core_analysis = get_core_analysis(ai_result)
         placeholder_fields: List[str] = []
-        
+
         # 检查所有字段是否包含'...'
         for field, value in core_analysis.items():
             if isinstance(value, str) and '...' in value:
@@ -277,7 +277,7 @@ def validate_paper_analysis(generator_instance: Any, pdf_text: str, ai_result: D
                 for i, item in enumerate(value):  # type: ignore
                     if isinstance(item, str) and '...' in item:
                         placeholder_fields.append(f"{field}[{i}]")
-        
+
         if placeholder_fields:
             generator_instance.logger.warning(f"发现占位符'...'在字段: {', '.join(placeholder_fields)}，跳过验证以避免错误填充")
             generator_instance.logger.info("内容质量检查通过（跳过验证）")
@@ -382,12 +382,12 @@ def validate_paper_analysis(generator_instance: Any, pdf_text: str, ai_result: D
                     if corrected_value is None:
                         generator_instance.logger.warning(f"修正项{i}缺少修正值，跳过")
                         continue
-                    
+
                     # 检查修正值的有效性
                     if isinstance(corrected_value, str) and corrected_value.strip() == '':
                         generator_instance.logger.warning(f"修正项{i}修正值为空字符串，跳过")
                         continue
-                    
+
                     if isinstance(corrected_value, str) and len(corrected_value.strip()) < 3:
                         generator_instance.logger.warning(f"修正项{i}修正值过短({len(corrected_value.strip())}字符): '{corrected_value}'，跳过")
                         continue
@@ -407,27 +407,27 @@ def validate_paper_analysis(generator_instance: Any, pdf_text: str, ai_result: D
                     else:
                         field_name = keys[-1]
                         original_value = temp_dict.get(field_name, '')
-                        
+
                         # 记录修正前状态
                         generator_instance.logger.info(f"🔍 修正前: {field_to_correct} = '{str(original_value)[:100]}...' (长度: {len(str(original_value))})")
                         generator_instance.logger.info(f"🔍 修正值: '{str(corrected_value)[:100]}...' (长度: {len(str(corrected_value))})")
-                        
+
                         # 🎯 智能分支处理策略
-                        is_original_empty = (not original_value or 
+                        is_original_empty = (not original_value or
                                            original_value in ['未提供相关信息', '未提及', '', 'N/A', '...'])
-                        is_corrected_valid = (corrected_value and 
+                        is_corrected_valid = (corrected_value and
                                              corrected_value not in ['未提供相关信息', '未提及', '', 'N/A'])
-                        
+
                         if isinstance(original_value, str) and isinstance(corrected_value, str):
                             original_len = len(original_value)
                             corrected_len = len(corrected_value)
-                            
+
                             # 情况A：完全替换 - 修正值长度显著大于原值（>80%），或者原值为空/占位符
                             # 提高阈值从0.6到0.8，避免过短修正导致信息丢失
                             if is_original_empty or corrected_len > original_len * 0.8:
                                 temp_dict[field_name] = corrected_value
                                 generator_instance.logger.info(f"✅ 字段 '{field_to_correct}' 执行完全替换 (修正长度: {corrected_len}, 原长度: {original_len})")
-                                
+
                             # 情况B：精准替换 - 修正值较短，直接替换（不再追加验证元数据）
                             else:
                                 # 直接使用修正值替换原值，避免验证元数据污染摘要
@@ -441,7 +441,7 @@ def validate_paper_analysis(generator_instance: Any, pdf_text: str, ai_result: D
                                 if justification:
                                     generator_instance.logger.debug(f"🔧 修正依据: {justification}")
                                 generator_instance.logger.info(f"✅ 字段 '{field_to_correct}' 执行精准替换 (修正: {corrected_len}字符替换原值: {original_len}字符)")
-                                
+
                         elif is_corrected_valid:
                             # 非字符串类型修正，直接替换
                             temp_dict[field_name] = corrected_value
@@ -449,11 +449,11 @@ def validate_paper_analysis(generator_instance: Any, pdf_text: str, ai_result: D
                         else:
                             # 修正值无效，保持原值
                             generator_instance.logger.warning(f"⚠️  字段 '{field_to_correct}' 保持原值 (修正值无效)")
-                        
+
                         # 记录修正后状态
                         final_value = temp_dict.get(field_name, '')
                         generator_instance.logger.info(f"🔍 修正后: {field_to_correct} = '{str(final_value)[:100]}...' (长度: {len(str(final_value))})")
-                        
+
                         applied_corrections += 1
 
                 except Exception as e:

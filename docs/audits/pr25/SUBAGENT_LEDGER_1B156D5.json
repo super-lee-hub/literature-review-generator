@@ -1,0 +1,33 @@
+{
+  "schema_version": "pr25-subagent-ledger/v1",
+  "code_owner": "/root",
+  "tested_executable_sha": "1b156d5d5de4408645af324ee2e02bdc3e2b670f",
+  "current_turn_agent": {
+    "agent_id": "/root/pr25_requirements_audit",
+    "role": "verifier",
+    "scope": "read-only mapping of V3-01..09, V4-01..06, and 11 legacy runtime protections",
+    "files_modified": 0,
+    "tests_run": 0,
+    "provider_or_network_calls": 0,
+    "role_catalog_model": "gpt-5.6-luna",
+    "role_catalog_reasoning_effort": "high",
+    "agent_self_reported_model": "GPT-5",
+    "runtime_model_and_effort_confirmed": false,
+    "note": "The coordinator has role-catalog defaults; the verifier's self-report conflicts and no runtime telemetry is exposed, so actual model/effort is not asserted."
+  },
+  "prior_audit_agents": {
+    "status": "historical_outputs_available",
+    "reported_source_sha": "860420c2bfc558390131b238cf79fdd59c69a2d3",
+    "names": [
+      "stability_audit_luna",
+      "v3_budget_review",
+      "v3_candidate_review",
+      "v3_scope_review",
+      "v4_semantic_review"
+    ],
+    "runtime_model_effort_reconciled": false,
+    "used_as_current_acceptance_evidence": false,
+    "note": "Their findings were rechecked against current 1b156d5 code/tests where relevant; the outputs themselves were produced against an older SHA."
+  },
+  "provider_budget_separate_from_engineering_agents": true
+}

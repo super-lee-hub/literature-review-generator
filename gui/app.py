@@ -1180,6 +1180,9 @@ class WorkspaceController:
         self.lifecycle_busy = False
         self.status_message = self.t("工作台已就绪。先完成设置，再按“输入来源 → 运行方式 → 主流程”开始第一轮。")
         current_settings = ApplicationSettings.from_config(self.sections)
+        from runtime.run_budget_binding import resolve_run_provider_budget
+
+        default_provider_budget, _ = resolve_run_provider_budget({}, self.resolved_sections)
         mineru_base_url = self.effective_env_values.get("MINERU_BASE_URL", DEFAULT_MINERU_BASE_URL)
         mineru_model_version = self.effective_env_values.get("MINERU_MODEL_VERSION", "vlm") or "vlm"
         allow_local_parse_fallback = str(
@@ -1233,11 +1236,22 @@ class WorkspaceController:
                 "pdf_folder": "",
                 "summary_file": "",
                 "summary_sources": "",
+                "review_intent_json": "",
+                "review_intent_file": "",
                 "reuse_stage1": True,
                 "reuse_summary_files": "",
                 "concept": "",
                 "free_mode_idea": "",
                 "section_number": "1",
+                "provider_budget_enabled": False,
+                "provider_budget_calls": str(default_provider_budget.max_provider_calls_total),
+                "provider_budget_output_tokens": str(default_provider_budget.max_output_tokens_total),
+                "provider_budget_retries": str(default_provider_budget.max_retry_attempts_total),
+                "provider_budget_wall_seconds": str(default_provider_budget.max_wall_seconds),
+            },
+            "lifecycle": {
+                "manual_repair_proposal_json": "",
+                "manual_repair_proposal_file": "",
             },
         }
         self._initial_mineru_state = dict(self.state["mineru"])
@@ -1275,7 +1289,7 @@ class WorkspaceController:
             name: str(card.get("api_key") or "")
             for name, card in self.api_cards.items()
         }
-        
+
         # 初始化队列服务
         self._queue_service: Optional[Any] = None
         self._queue_runner: Optional[Any] = None
@@ -1465,9 +1479,10 @@ class WorkspaceController:
             try:
                 runtime = self._queue_service.get_job_runtime(job_id)
                 if runtime and runtime.state in (QueueState.FAILED, QueueState.CANCELLED):
-                    if not self._queue_service.reset_job(job_id):
+                    if not self._queue_service.prepare_retry(job_id):
                         raise RuntimeError("queue job could not be reset")
-                    retry_count = self._queue_service.increment_retry_count(job_id)
+                    retried_runtime = self._queue_service.get_job_runtime(job_id)
+                    retry_count = retried_runtime.retry_count if retried_runtime is not None else 0
                     scheduled = self._schedule_queue_processor()
                     message = self.tf("任务已重置并将重试: {job_id}", job_id=job_id)
                     if retry_count:
@@ -1505,6 +1520,118 @@ class WorkspaceController:
         else:
             ui.notify(self.t("队列服务未初始化"), type="warning")
 
+    def _build_workflow_review_intent(self) -> dict[str, Any] | None:
+        """Parse and validate the optional GUI ReviewIntent before queueing."""
+
+        workflow = self.state["workflow"]
+        inline_json = str(workflow.get("review_intent_json") or "").strip()
+        file_value = str(workflow.get("review_intent_file") or "").strip()
+        if inline_json and file_value:
+            raise ValueError("enter ReviewIntent either as JSON text or as a JSON file, not both")
+        if not inline_json and not file_value:
+            return None
+
+        if file_value:
+            path = Path(file_value).expanduser()
+            if not path.is_absolute():
+                path = Path(self.config_path).parent / path
+            try:
+                raw_json = path.resolve().read_text(encoding="utf-8-sig")
+            except (OSError, UnicodeError) as exc:
+                raise ValueError(f"ReviewIntent JSON file could not be read: {path}") from exc
+        else:
+            raw_json = inline_json
+
+        def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            result: dict[str, Any] = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError(f"ReviewIntent JSON repeats the field {key!r}")
+                result[key] = value
+            return result
+
+        try:
+            payload = json.loads(raw_json, object_pairs_hook=reject_duplicate_keys)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"ReviewIntent JSON syntax error at line {exc.lineno}, column {exc.colno}"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise TypeError("ReviewIntent JSON root must be an object")
+
+        from outline.v3_models import ReviewIntent
+
+        allowed_fields = {*ReviewIntent().to_dict(), "required_comparisons"}
+        unknown_fields = sorted(str(key) for key in payload if key not in allowed_fields)
+        if unknown_fields:
+            raise ValueError("ReviewIntent contains unknown fields: " + ", ".join(unknown_fields))
+        for key in (
+            "review_question",
+            "scope",
+            "target_audience",
+            "desired_contribution",
+            "preferred_organizing_logic",
+            "language",
+            "target_depth",
+            "target_length",
+            "artifact_type",
+            "artifact_version",
+        ):
+            if key in payload and not isinstance(payload[key], str):
+                raise ValueError(f"ReviewIntent.{key} must be a string")
+        defaults = ReviewIntent().to_dict()
+        for key in ("artifact_type", "artifact_version"):
+            if key in payload and payload[key] != defaults[key]:
+                raise ValueError(f"ReviewIntent.{key} is fixed by the current schema")
+        for key in ("must_cover", "must_not_do"):
+            if key in payload and (
+                not isinstance(payload[key], list)
+                or any(not isinstance(value, str) for value in payload[key])
+            ):
+                raise ValueError(f"ReviewIntent.{key} must be an array of strings")
+
+        comparisons = payload.get("required_comparisons", [])
+        if not isinstance(comparisons, list):
+            raise TypeError("ReviewIntent.required_comparisons must be an array")
+        allowed_comparison_fields = {"paper_keys", "question", "relation_type"}
+        for index, comparison in enumerate(comparisons):
+            if not isinstance(comparison, dict):
+                raise TypeError(f"ReviewIntent.required_comparisons[{index}] must be an object")
+            unknown_comparison_fields = sorted(
+                str(key) for key in comparison if key not in allowed_comparison_fields
+            )
+            if unknown_comparison_fields:
+                raise ValueError(
+                    f"ReviewIntent.required_comparisons[{index}] contains unknown fields: "
+                    + ", ".join(unknown_comparison_fields)
+                )
+            paper_keys = comparison.get("paper_keys")
+            if (
+                not isinstance(paper_keys, list)
+                or len(paper_keys) != 2
+                or any(
+                    not isinstance(key, str) or not key or key != key.strip()
+                    for key in paper_keys
+                )
+                or len(set(paper_keys)) != 2
+            ):
+                raise ValueError(
+                    f"ReviewIntent.required_comparisons[{index}].paper_keys must contain exactly two distinct canonical paper keys"
+                )
+            question = comparison.get("question")
+            if not isinstance(question, str) or not question.strip():
+                raise ValueError(
+                    f"ReviewIntent.required_comparisons[{index}].question must be a non-empty string"
+                )
+            if "relation_type" in comparison and not isinstance(comparison["relation_type"], str):
+                raise ValueError(
+                    f"ReviewIntent.required_comparisons[{index}].relation_type must be a string"
+                )
+
+        # The model parser canonicalizes pair ordering and validates the same
+        # ReviewIntent shape consumed by Outline and the control plane.
+        return ReviewIntent.from_dict(payload).to_dict()
+
     def _build_queue_job_spec(
         self,
         project_name: str,
@@ -1515,14 +1642,19 @@ class WorkspaceController:
         input_mode: str | None = None,
         work_mode: str | None = None,
     ) -> Any:
-        from services.queue_service import QueueJobSpec, create_queue_job_id
         from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
+        from services.queue_service import QueueJobSpec, create_queue_job_id
 
         workflow_state = self.state["workflow"]
         resolved_input_mode = str(input_mode or workflow_state.get("input_mode") or "pdf")
         resolved_work_mode = str(work_mode or workflow_state.get("work_mode") or "normal")
         if resolved_work_mode == "concept":
             raise ValueError("Concept Mode is not yet available in the current PR14 runtime")
+        review_intent = self._build_workflow_review_intent()
+        if resolved_work_mode == "free" and review_intent is not None:
+            raise ValueError(
+                "Free Mode supplies its own review intent; clear the manual ReviewIntent input or switch to Normal Mode."
+            )
         library_path = str(self.state["paths"].get("library_path") or "").strip() or None if resolved_input_mode == "zotero" else None
         effective_pdf_folder = str(pdf_folder or "").strip() or None if resolved_input_mode == "pdf" else None
         effective_zotero_report = str(zotero_report or "").strip() or None if resolved_input_mode == "zotero" else None
@@ -1543,6 +1675,11 @@ class WorkspaceController:
         }.get(action, action)
 
         metadata: dict[str, Any] = {}
+        if review_intent is not None:
+            metadata["review_intent"] = review_intent
+        provider_budget = self._build_workflow_provider_budget()
+        if provider_budget is not None:
+            metadata["provider_budget"] = provider_budget
         external_host_acknowledgement = self._build_durable_external_host_acknowledgement(
             canonical_action
         )
@@ -1620,6 +1757,8 @@ class WorkspaceController:
             "free_mode_idea": free_mode_idea,
             "generate_section": generate_section,
         }
+        if provider_budget is not None:
+            source_snapshot["provider_budget"] = dict(provider_budget)
 
         return QueueJobSpec(
             job_id=create_queue_job_id(),
@@ -1628,6 +1767,20 @@ class WorkspaceController:
             parameters=parameters,
             source_snapshot=source_snapshot,
         )
+
+    def _build_workflow_provider_budget(self) -> dict[str, Any] | None:
+        workflow = self.state["workflow"]
+        if not workflow.get("provider_budget_enabled"):
+            return None
+        from runtime.provider_runtime import ProviderAggregateBudgetV2
+
+        return ProviderAggregateBudgetV2.from_mapping({
+            "schema_version": ProviderAggregateBudgetV2.SCHEMA_VERSION,
+            "max_provider_calls_total": workflow.get("provider_budget_calls"),
+            "max_output_tokens_total": workflow.get("provider_budget_output_tokens"),
+            "max_retry_attempts_total": workflow.get("provider_budget_retries"),
+            "max_wall_seconds": workflow.get("provider_budget_wall_seconds"),
+        }).to_dict()
 
     def _build_durable_external_host_acknowledgement(
         self,
@@ -2537,6 +2690,57 @@ class WorkspaceController:
         validation_status: Dict[str, Any],
     ) -> list[str]:
         records = [item for item in inspection.get("artifacts") or () if isinstance(item, dict)]
+        record_rows_by_id: dict[str, list[dict[str, Any]]] = {}
+        for record in records:
+            artifact_id = str(record.get("artifact_id") or "").strip()
+            if artifact_id:
+                record_rows_by_id.setdefault(artifact_id, []).append(record)
+        integrity_rows_by_id: dict[str, list[dict[str, Any]]] = {}
+        for row in inspection.get("integrity") or ():
+            if not isinstance(row, dict):
+                continue
+            artifact_id = str(row.get("artifact_id") or "").strip()
+            if artifact_id:
+                integrity_rows_by_id.setdefault(artifact_id, []).append(row)
+
+        raw_status = inspection.get("status")
+        status_payload = raw_status if isinstance(raw_status, dict) else {}
+        job_id = str(inspection.get("job_id") or status_payload.get("job_id") or "").strip()
+
+        def record_by_id(artifact_id: str) -> dict[str, Any] | None:
+            matches = record_rows_by_id.get(artifact_id, ())
+            return matches[0] if len(matches) == 1 else None
+
+        def verified_ready_record(
+            record: Any,
+            *,
+            artifact_type: str = "",
+            artifact_version: str = "",
+            artifact_role: str = "",
+        ) -> bool:
+            if not isinstance(record, dict) or not job_id:
+                return False
+            artifact_id = str(record.get("artifact_id") or "").strip()
+            content_hash = str(record.get("content_hash") or "").strip().lower()
+            if (
+                not artifact_id
+                or str(record.get("job_id") or "") != job_id
+                or str(record.get("status") or "") != "ready"
+                or len(content_hash) != 64
+                or any(character not in "0123456789abcdef" for character in content_hash)
+                or (artifact_type and str(record.get("artifact_type") or "") != artifact_type)
+                or (artifact_version and str(record.get("artifact_version") or "") != artifact_version)
+                or (artifact_role and str(record.get("artifact_role") or "") != artifact_role)
+            ):
+                return False
+            integrity_rows = integrity_rows_by_id.get(artifact_id, ())
+            if len(integrity_rows) != 1:
+                return False
+            integrity = integrity_rows[0]
+            return (
+                str(integrity.get("status") or "") == "verified"
+                and str(integrity.get("content_hash") or "").strip().lower() == content_hash
+            )
 
         def has_ready_type(*artifact_types: str) -> bool:
             return any(
@@ -2545,43 +2749,448 @@ class WorkspaceController:
                 for item in records
             )
 
+        def current_adoption_is_verified() -> bool:
+            pointer_id = "outline-v3:adoption:current"
+            pointer = record_by_id(pointer_id)
+            if not verified_ready_record(
+                pointer,
+                artifact_type="outline_adoption_pointer",
+                artifact_version="v1",
+                artifact_role="outline_v3_adoption_current",
+            ):
+                return False
+            assert pointer is not None
+            pointer_metadata = pointer.get("metadata")
+            if not isinstance(pointer_metadata, dict) or pointer_metadata.get("role") != "current":
+                return False
+            target_id = str(pointer_metadata.get("current_adoption_artifact_id") or "").strip()
+            target_hash = str(pointer_metadata.get("current_adoption_hash") or "").strip().lower()
+            target = record_by_id(target_id)
+            if (
+                not target_id
+                or len(target_hash) != 64
+                or not verified_ready_record(
+                    target,
+                    artifact_type="adopted_outline",
+                    artifact_version="v3",
+                    artifact_role="outline_v3_adoption",
+                )
+            ):
+                return False
+            assert target is not None
+            if str(target.get("content_hash") or "").strip().lower() != target_hash:
+                return False
+
+            pointer_dependencies = pointer.get("depends_on")
+            if not isinstance(pointer_dependencies, list) or len(pointer_dependencies) != 1:
+                return False
+            pointer_target = pointer_dependencies[0]
+            if (
+                not isinstance(pointer_target, dict)
+                or str(pointer_target.get("artifact_id") or "") != target_id
+                or str(pointer_target.get("artifact_type") or "") != "adopted_outline"
+                or str(pointer_target.get("job_id") or "") != job_id
+                or str(pointer_target.get("content_hash") or "").strip().lower() != target_hash
+            ):
+                return False
+
+            target_metadata = target.get("metadata")
+            if (
+                not isinstance(target_metadata, dict)
+                or not str(target_metadata.get("actor") or "").strip()
+                or not str(target_metadata.get("reason") or "").strip()
+            ):
+                return False
+            expected_gate_types = {
+                "outline-v3:final_outline": "final_outline",
+                "outline-v3:coverage_audit": "coverage_audit",
+                "outline-v3:stability_audit": "stability_audit",
+                "outline-v3:provider_receipt_closure": "provider_receipt_closure",
+                "outline-v3:stage_health": "outline_stage_health",
+            }
+            target_dependencies = target.get("depends_on")
+            if not isinstance(target_dependencies, list):
+                return False
+            target_dependencies_by_id = {
+                str(item.get("artifact_id") or ""): item
+                for item in target_dependencies
+                if isinstance(item, dict) and str(item.get("artifact_id") or "")
+            }
+            if set(target_dependencies_by_id) != set(expected_gate_types):
+                return False
+            for dependency_id, dependency_type in expected_gate_types.items():
+                dependency_ref = target_dependencies_by_id[dependency_id]
+                dependency_record = record_by_id(dependency_id)
+                if (
+                    not isinstance(dependency_ref, dict)
+                    or not verified_ready_record(
+                        dependency_record,
+                        artifact_type=dependency_type,
+                    )
+                    or dependency_record is None
+                    or str(dependency_ref.get("artifact_type") or "") != dependency_type
+                    or str(dependency_ref.get("job_id") or "") != job_id
+                    or str(dependency_ref.get("content_hash") or "").strip().lower()
+                    != str(dependency_record.get("content_hash") or "").strip().lower()
+                ):
+                    return False
+            return (
+                str(target_metadata.get("expected_hash") or "").strip().lower()
+                == str(target_dependencies_by_id["outline-v3:final_outline"].get("content_hash") or "").strip().lower()
+            )
+
+        def current_repair_promotion_binding() -> dict[str, Any] | None:
+            pointer_id = "current-artifact-set:pointer"
+            pointer = record_by_id(pointer_id)
+            if not verified_ready_record(
+                pointer,
+                artifact_type="current_artifact_set_pointer",
+                artifact_version="v1",
+                artifact_role="current_artifact_set_pointer",
+            ):
+                return None
+            assert pointer is not None
+            pointer_metadata = pointer.get("metadata")
+            pointer_dependencies = pointer.get("depends_on")
+            if not isinstance(pointer_metadata, dict) or not isinstance(pointer_dependencies, list):
+                return None
+            current_set_id = str(
+                pointer_metadata.get("current_artifact_set_id")
+                or (pointer_dependencies[0].get("artifact_id") if len(pointer_dependencies) == 1 and isinstance(pointer_dependencies[0], dict) else "")
+                or ""
+            ).strip()
+            current_set_hash = str(
+                pointer_metadata.get("current_artifact_set_hash")
+                or (pointer_dependencies[0].get("content_hash") if len(pointer_dependencies) == 1 and isinstance(pointer_dependencies[0], dict) else "")
+                or ""
+            ).strip().lower()
+            if not current_set_id or len(pointer_dependencies) != 1:
+                return None
+            pointer_ref = pointer_dependencies[0]
+            if (
+                not isinstance(pointer_ref, dict)
+                or str(pointer_ref.get("artifact_id") or "") != current_set_id
+                or str(pointer_ref.get("artifact_type") or "") != "current_artifact_set"
+                or str(pointer_ref.get("job_id") or "") != job_id
+                or str(pointer_ref.get("content_hash") or "").strip().lower() != current_set_hash
+            ):
+                return None
+            current_set = record_by_id(current_set_id)
+            if not verified_ready_record(
+                current_set,
+                artifact_type="current_artifact_set",
+                artifact_version="v1",
+                artifact_role="current_artifact_set",
+            ):
+                return None
+            assert current_set is not None
+            if (
+                str(current_set.get("content_hash") or "").strip().lower() != current_set_hash
+                or str(pointer.get("content_hash") or "").strip().lower() != current_set_hash
+            ):
+                return None
+            current_set_metadata = current_set.get("metadata")
+            current_set_dependencies = current_set.get("depends_on")
+            if not isinstance(current_set_metadata, dict) or not isinstance(current_set_dependencies, list):
+                return None
+
+            promotion_id = str(pointer_metadata.get("promotion_transaction_id") or "").strip()
+            promotion_hash = str(pointer_metadata.get("promotion_transaction_hash") or "").strip().lower()
+            if (
+                not promotion_id
+                or len(promotion_hash) != 64
+                or str(current_set_metadata.get("promotion_transaction_id") or "").strip() != promotion_id
+                or str(current_set_metadata.get("promotion_transaction_hash") or "").strip().lower() != promotion_hash
+            ):
+                return None
+            promotion_references = [
+                dependency
+                for dependency in current_set_dependencies
+                if isinstance(dependency, dict)
+                and str(dependency.get("artifact_id") or "") == promotion_id
+            ]
+            if len(promotion_references) != 1:
+                return None
+            promotion_reference = promotion_references[0]
+            if (
+                str(promotion_reference.get("artifact_type") or "") != "repair_promotion_transaction"
+                or str(promotion_reference.get("job_id") or "") != job_id
+                or str(promotion_reference.get("content_hash") or "").strip().lower() != promotion_hash
+            ):
+                return None
+            promotion = record_by_id(promotion_id)
+            if not verified_ready_record(
+                promotion,
+                artifact_type="repair_promotion_transaction",
+                artifact_version="v1",
+                artifact_role="repair_promotion_transaction",
+            ):
+                return None
+            assert promotion is not None
+            if str(promotion.get("content_hash") or "").strip().lower() != promotion_hash:
+                return None
+
+            def verified_dependency(reference: Any) -> bool:
+                if not isinstance(reference, dict):
+                    return False
+                dependency_id = str(reference.get("artifact_id") or "").strip()
+                dependency_type = str(reference.get("artifact_type") or "").strip()
+                dependency_hash = str(reference.get("content_hash") or "").strip().lower()
+                dependency_job_id = str(reference.get("job_id") or "").strip()
+                dependency_record = record_by_id(dependency_id)
+                return bool(
+                    dependency_id
+                    and dependency_type
+                    and dependency_hash
+                    and dependency_job_id == job_id
+                    and verified_ready_record(dependency_record, artifact_type=dependency_type)
+                    and dependency_record is not None
+                    and str(dependency_record.get("content_hash") or "").strip().lower() == dependency_hash
+                )
+
+            promotion_dependencies = promotion.get("depends_on")
+            if not isinstance(promotion_dependencies, list) or not promotion_dependencies:
+                return None
+            if not all(verified_dependency(dependency) for dependency in promotion_dependencies):
+                return None
+            promotion_dependency_keys = {
+                (
+                    str(dependency.get("artifact_id") or ""),
+                    str(dependency.get("artifact_type") or ""),
+                    str(dependency.get("job_id") or ""),
+                    str(dependency.get("content_hash") or "").strip().lower(),
+                )
+                for dependency in promotion_dependencies
+                if isinstance(dependency, dict)
+            }
+            current_set_asset_dependencies = [
+                dependency
+                for dependency in current_set_dependencies
+                if not (
+                    isinstance(dependency, dict)
+                    and str(dependency.get("artifact_id") or "") == promotion_id
+                )
+            ]
+            if not current_set_asset_dependencies or not all(
+                verified_dependency(dependency)
+                and (
+                    str(dependency.get("artifact_id") or ""),
+                    str(dependency.get("artifact_type") or ""),
+                    str(dependency.get("job_id") or ""),
+                    str(dependency.get("content_hash") or "").strip().lower(),
+                ) in promotion_dependency_keys
+                for dependency in current_set_asset_dependencies
+            ):
+                return None
+            return {
+                "promotion_id": promotion_id,
+                "current_set_asset_dependencies": current_set_asset_dependencies,
+            }
+
+        def promoted_quarantined_apply_result_id(
+            transaction: dict[str, Any],
+            promotion_binding: dict[str, Any],
+        ) -> str | None:
+            transaction_id = str(transaction.get("artifact_id") or "").strip()
+            transaction_hash = str(transaction.get("content_hash") or "").strip().lower()
+            if (
+                not transaction_id
+                or str(transaction.get("job_id") or "") != job_id
+                or len(transaction_hash) != 64
+                or any(character not in "0123456789abcdef" for character in transaction_hash)
+                or promotion_binding.get("promotion_id") != f"repair-promotion:{transaction_hash[:16]}"
+                or record_by_id(transaction_id) is not transaction
+            ):
+                return None
+            apply_references = [
+                dependency
+                for dependency in transaction.get("depends_on") or ()
+                if isinstance(dependency, dict)
+                and str(dependency.get("artifact_type") or "") == "repair_apply_result"
+            ]
+            if len(apply_references) != 1:
+                return None
+            apply_reference = apply_references[0]
+            apply_id = str(apply_reference.get("artifact_id") or "").strip()
+            apply_record = record_by_id(apply_id)
+            if (
+                not apply_id
+                or apply_record is None
+                or str(apply_record.get("artifact_type") or "") != "repair_apply_result"
+                or str(apply_record.get("job_id") or "") != job_id
+                or str(apply_record.get("status") or "") != "quarantined"
+                    or str(apply_reference.get("job_id") or "") != job_id
+                or str(apply_record.get("content_hash") or "").strip().lower()
+                != str(apply_reference.get("content_hash") or "").strip().lower()
+            ):
+                return None
+
+            repaired_outputs: dict[str, dict[str, Any]] = {}
+            for reference in apply_record.get("depends_on") or ():
+                if not isinstance(reference, dict):
+                    continue
+                output_type = str(reference.get("artifact_type") or "")
+                if output_type not in {"review_draft_repaired", "citation_manifest_repaired"}:
+                    continue
+                output_id = str(reference.get("artifact_id") or "").strip()
+                output_record = record_by_id(output_id)
+                if (
+                    not output_id
+                    or output_id in repaired_outputs
+                    or output_record is None
+                    or str(output_record.get("artifact_type") or "") != output_type
+                    or str(output_record.get("job_id") or "") != job_id
+                    or str(output_record.get("status") or "") != "quarantined"
+                    or str(reference.get("job_id") or "") != job_id
+                    or str(output_record.get("content_hash") or "").strip().lower()
+                    != str(reference.get("content_hash") or "").strip().lower()
+                ):
+                    return None
+                repaired_outputs[output_type] = output_record
+            if set(repaired_outputs) != {"review_draft_repaired", "citation_manifest_repaired"}:
+                return None
+
+            for output_type, current_type in (
+                ("review_draft_repaired", "review_draft"),
+                ("citation_manifest_repaired", "citation_manifest"),
+            ):
+                current_references = [
+                    dependency
+                    for dependency in promotion_binding["current_set_asset_dependencies"]
+                    if isinstance(dependency, dict)
+                    and str(dependency.get("artifact_type") or "") == current_type
+                ]
+                if (
+                    len(current_references) != 1
+                    or str(current_references[0].get("content_hash") or "").strip().lower()
+                    != str(repaired_outputs[output_type].get("content_hash") or "").strip().lower()
+                ):
+                    return None
+            return apply_id
+
+        def validation_inputs_are_current(
+            semantic: dict[str, Any],
+            closure: dict[str, Any],
+        ) -> bool:
+            current_inputs = closure.get("input_artifacts")
+            result_inputs = semantic.get("input_artifacts")
+            if not isinstance(current_inputs, dict) or not isinstance(result_inputs, dict):
+                return False
+            for key, id_key, hash_key, expected_type, expected_version in (
+                ("review_draft", "review_draft_id", "review_draft_hash", "review_draft", "v3"),
+                ("citation_manifest", "citation_manifest_id", "citation_manifest_hash", "citation_manifest", "v3"),
+            ):
+                current = current_inputs.get(key)
+                if not isinstance(current, dict):
+                    return False
+                artifact_id = str(current.get("artifact_id") or "").strip()
+                content_hash = str(current.get("content_hash") or "").strip().lower()
+                record = record_by_id(artifact_id)
+                if (
+                    not artifact_id
+                    or len(content_hash) != 64
+                    or not verified_ready_record(
+                        record,
+                        artifact_type=expected_type,
+                        artifact_version=expected_version,
+                    )
+                    or record is None
+                    or str(record.get("content_hash") or "").strip().lower() != content_hash
+                    or str(result_inputs.get(id_key) or "") != artifact_id
+                    or str(result_inputs.get(hash_key) or "").strip().lower() != content_hash
+                ):
+                    return False
+            return True
+
         states: list[str] = []
-        raw_status = inspection.get("status")
-        status_payload = raw_status if isinstance(raw_status, dict) else {}
         job_status = str(status_payload.get("job_status") or "").strip().lower()
         if job_status == "cancel_requested":
             states.append("cancel_requested")
         elif job_status == "cancelled" or has_ready_type("cancellation_acknowledgement"):
             states.append("cancel_acknowledged")
 
-        provider_receipts = inspection.get("provider_receipts") or {}
-        if provider_receipts and not bool(provider_receipts.get("complete")):
+        completion_reasons = status_payload.get("completion_reasons")
+        if isinstance(completion_reasons, (list, tuple)) and any(
+            str(reason).strip() == "provider_receipts_incomplete"
+            for reason in completion_reasons
+        ):
             states.append("receipt_incomplete")
 
-        if has_ready_type("adopted_final_outline"):
+        if current_adoption_is_verified():
             states.append("adopted")
-        elif has_ready_type("final_outline"):
-            states.append("ready_for_adoption")
+        else:
+            current_outline = record_by_id("outline-v3:final_outline")
+            if verified_ready_record(
+                current_outline,
+                artifact_type="final_outline",
+                artifact_version="v3",
+            ):
+                states.append("ready_for_adoption")
 
-        validation_artifact = validation_status.get("validation_artifact")
+        validation_job_id = str(validation_status.get("job_id") or "").strip()
+        closure = validation_status.get("closure")
+        closure = closure if isinstance(closure, dict) else {}
+        closure_job_id = str(closure.get("job_id") or "").strip()
+        validation_is_current = bool(job_id) and validation_job_id == job_id and closure_job_id == job_id
+        semantic = closure.get("semantic")
+        if not isinstance(semantic, dict):
+            semantic = validation_status.get("semantic")
+        semantic = semantic if isinstance(semantic, dict) else {}
         validation_state = str(validation_status.get("status") or "").strip().lower()
-        if isinstance(validation_artifact, dict) and validation_artifact.get("status") == "ready":
-            if validation_state == "clean":
-                states.append("validation_clean")
-            elif validation_state in {"findings", "needs_review"}:
-                states.append("validation_findings")
-            else:
-                states.append("validation_not_run")
-        elif validation_state == "running":
+        execution_status = str(semantic.get("execution_status") or "").strip().lower()
+        if validation_is_current and (validation_state == "running" or execution_status == "running"):
             states.append("validation_running")
         else:
-            states.append("validation_not_run")
+            validation_artifact = validation_status.get("validation_artifact")
+            artifact_id = str(validation_artifact.get("artifact_id") or "").strip() if isinstance(validation_artifact, dict) else ""
+            registered_validation = record_by_id(artifact_id)
+            disposition = str(semantic.get("validation_disposition") or "").strip().lower()
+            if (
+                validation_is_current
+                and verified_ready_record(
+                    registered_validation,
+                    artifact_type="validation_run_result",
+                    artifact_version="v1",
+                )
+                and registered_validation is not None
+                and isinstance(validation_artifact, dict)
+                and validation_artifact.get("status") == "ready"
+                and str(validation_artifact.get("artifact_type") or "") == "validation_run_result"
+                and str(validation_artifact.get("artifact_version") or "") == "v1"
+                and str(validation_artifact.get("content_hash") or "").strip().lower()
+                == str(registered_validation.get("content_hash") or "").strip().lower()
+                and execution_status == "succeeded"
+                and semantic.get("contract_satisfied") is True
+                and validation_inputs_are_current(semantic, closure)
+            ):
+                if disposition == "clean":
+                    states.append("validation_clean")
+                elif disposition in {"findings", "needs_review"}:
+                    states.append("validation_findings")
+                else:
+                    states.append("validation_not_run")
+            else:
+                states.append("validation_not_run")
 
         if has_ready_type("repair_plan"):
             states.append("repair_available")
+        promoted_quarantine_ids: set[str] = set()
+        promotion_binding = current_repair_promotion_binding()
+        if promotion_binding is not None:
+            for transaction in records:
+                if (
+                    str(transaction.get("artifact_type") or "") != "repair_transaction"
+                    or str(transaction.get("status") or "") != "quarantined"
+                ):
+                    continue
+                apply_result_id = promoted_quarantined_apply_result_id(transaction, promotion_binding)
+                if apply_result_id:
+                    promoted_quarantine_ids.add(str(transaction.get("artifact_id") or ""))
+                    promoted_quarantine_ids.add(apply_result_id)
         if any(
             str(item.get("artifact_type") or "") in {"repair_transaction", "repair_apply_result"}
             and str(item.get("status") or "") == "quarantined"
+            and str(item.get("artifact_id") or "") not in promoted_quarantine_ids
             for item in records
         ):
             states.append("repair_quarantined")
@@ -2722,8 +3331,104 @@ class WorkspaceController:
         self.refresh_lifecycle(notify_user=False)
         return result
 
+    def _build_manual_repair_proposal(self) -> dict[str, Any] | None:
+        """Read one explicit manual proposal without inferring source corrections."""
+
+        lifecycle = self.state["lifecycle"]
+        inline_json = str(lifecycle.get("manual_repair_proposal_json") or "").strip()
+        file_value = str(lifecycle.get("manual_repair_proposal_file") or "").strip()
+        if inline_json and file_value:
+            raise ValueError("enter a manual repair proposal as JSON text or a JSON file, not both")
+        if not inline_json and not file_value:
+            return None
+
+        if file_value:
+            path = Path(file_value).expanduser()
+            if not path.is_absolute():
+                path = Path(self.config_path).parent / path
+            try:
+                raw_json = path.resolve().read_text(encoding="utf-8-sig")
+            except (OSError, UnicodeError) as exc:
+                raise ValueError(f"manual repair proposal JSON file could not be read: {path}") from exc
+        else:
+            raw_json = inline_json
+
+        def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            result: dict[str, Any] = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError(f"manual repair proposal JSON repeats the field {key!r}")
+                result[key] = value
+            return result
+
+        try:
+            proposal = json.loads(raw_json, object_pairs_hook=reject_duplicate_keys)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"manual repair proposal JSON syntax error at line {exc.lineno}, column {exc.colno}"
+            ) from exc
+        if not isinstance(proposal, dict):
+            raise TypeError("manual repair proposal JSON root must be an object")
+
+        allowed_fields = {
+            "block_id",
+            "expected_anchor_hash",
+            "replacement_text",
+            "source_evidence_ids",
+            "citation_mapping",
+        }
+        unknown_fields = sorted(str(key) for key in proposal if key not in allowed_fields)
+        if unknown_fields:
+            raise ValueError("manual repair proposal contains unsupported fields: " + ", ".join(unknown_fields))
+        required_fields = {
+            "block_id",
+            "expected_anchor_hash",
+            "replacement_text",
+            "source_evidence_ids",
+        }
+        missing_fields = sorted(required_fields - set(proposal))
+        if missing_fields:
+            raise ValueError("manual repair proposal is missing required fields: " + ", ".join(missing_fields))
+        for key in ("block_id", "expected_anchor_hash", "replacement_text"):
+            if not isinstance(proposal[key], str) or not proposal[key].strip():
+                raise ValueError(f"manual repair proposal {key} must be a non-empty string")
+        source_ids = proposal["source_evidence_ids"]
+        if (
+            not isinstance(source_ids, list)
+            or not source_ids
+            or any(not isinstance(value, str) or not value.strip() for value in source_ids)
+        ):
+            raise ValueError("manual repair proposal source_evidence_ids must be a non-empty string array")
+        if "citation_mapping" in proposal and not isinstance(proposal["citation_mapping"], dict):
+            raise TypeError("manual repair proposal citation_mapping must be an object")
+        return proposal
+
     def apply_repair_plan_from_gui(self) -> Dict[str, Any]:
         """Ask the control plane to apply the selected verified repair plan."""
+
+        try:
+            manual_proposal = self._build_manual_repair_proposal()
+        except (OSError, TypeError, ValueError) as exc:
+            result = {
+                "status": "blocked",
+                "reason": str(exc),
+                "mutation_performed": False,
+            }
+            self._notify_control_plane_result(result)
+            self.refresh_lifecycle(notify_user=False)
+            return result
+
+        actor = str(self.lifecycle_actor or "").strip()
+        reason = str(self.lifecycle_reason or "").strip()
+        if manual_proposal is not None and (not actor or not reason):
+            result = {
+                "status": "blocked",
+                "reason": "manual repair requires a reviewer and reason",
+                "mutation_performed": False,
+            }
+            self._notify_control_plane_result(result)
+            self.refresh_lifecycle(notify_user=False)
+            return result
 
         inspection = self._control_plane_call("inspect")
         target = next(
@@ -2743,9 +3448,18 @@ class WorkspaceController:
                 "mutation_performed": False,
             }
         else:
+            repair_apply_kwargs: dict[str, Any] = {
+                "plan_id": str(target.get("artifact_id") or ""),
+            }
+            if manual_proposal is not None:
+                repair_apply_kwargs.update({
+                    "manual_proposal": manual_proposal,
+                    "actor": actor,
+                    "reason": reason,
+                })
             result = self._control_plane_call(
                 "repair_apply",
-                plan_id=str(target.get("artifact_id") or ""),
+                **repair_apply_kwargs,
             )
         self._notify_control_plane_result(result)
         self.refresh_lifecycle(notify_user=False)
@@ -3042,6 +3756,20 @@ class WorkspaceController:
             self.notify(self.t("自由模式对话还没有应用到本次任务。请先应用当前规划，或清空对话后再运行。"), color="warning", multi_line=True)
             return False
 
+        try:
+            explicit_review_intent = self._build_workflow_review_intent()
+            if work_mode == "free" and explicit_review_intent is not None:
+                raise ValueError(
+                    "Free Mode supplies its own review intent; clear the manual ReviewIntent input or switch to Normal Mode."
+                )
+        except (OSError, TypeError, ValueError) as exc:
+            self.notify(
+                self.tf("ReviewIntent 无效: {error}", error=str(exc)),
+                color="warning",
+                multi_line=True,
+            )
+            return False
+
         # Every current RuntimeJobSpec action has an explicit source contract;
         # downstream actions may reuse Stage 1 results but still must bind the
         # source that owns those artifacts.
@@ -3063,6 +3791,14 @@ class WorkspaceController:
                 self.notify(self.t("请先输入有效的章节号。"), color="warning")
                 return False
 
+        try:
+            self._build_workflow_provider_budget()
+        except (TypeError, ValueError) as exc:
+            self.notify(
+                self.tf("本次运行额度无效: {error}", error=str(exc)),
+                color="warning", multi_line=True,
+            )
+            return False
         return True
 
     def _require_third_party_gateway_acknowledgement(self, action: str) -> bool:
@@ -3199,86 +3935,189 @@ class WorkspaceController:
 
 def _render_lifecycle_card(controller: WorkspaceController) -> None:
     t = controller.t
-    controller.refresh_lifecycle(notify_user=False)
+    status_refresh_lock = asyncio.Lock()
+    action_buttons: list[Any] = []
 
-    state_labels = {
-        "ready_for_adoption": "ready_for_adoption",
-        "adopted": "adopted",
-        "validation_not_run": "validation_not_run",
-        "validation_running": "validation_running",
-        "validation_findings": "validation_findings",
-        "validation_clean": "validation_clean",
-        "receipt_incomplete": "receipt_incomplete",
-        "repair_available": "repair_available",
-        "repair_quarantined": "repair_quarantined",
-        "export_canonical_verified": "export_canonical_verified",
-        "export_untrusted": "export_untrusted",
-        "cancel_requested": "cancel_requested",
-        "cancel_acknowledged": "cancel_acknowledged",
-    }
-
-    def refresh_panel() -> None:
-        controller.refresh_lifecycle(notify_user=True)
-        render_panel.refresh()
-
-    async def execute_validation() -> None:
-        await controller.execute_current_validation()
-        render_panel.refresh()
-
-    def view_validation_status() -> None:
-        controller.inspect_validation_status()
-        render_panel.refresh()
+    def _set_action_buttons_disabled(disabled: bool) -> None:
+        for button in action_buttons:
+            button.disable() if disabled else button.enable()
 
     @ui.refreshable
-    def render_panel() -> None:
+    def render_status_panel() -> None:
         snapshot = controller.lifecycle_snapshot
-        states = [state_labels.get(str(item), str(item)) for item in snapshot.get("canonical_states") or ()]
+        state_labels = {
+            "ready_for_adoption": "ready_for_adoption",
+            "adopted": "adopted",
+            "validation_not_run": "validation_not_run",
+            "validation_running": "validation_running",
+            "validation_findings": "validation_findings",
+            "validation_clean": "validation_clean",
+            "receipt_incomplete": "receipt_incomplete",
+            "repair_available": "repair_available",
+            "repair_quarantined": "repair_quarantined",
+            "export_canonical_verified": "export_canonical_verified",
+            "export_untrusted": "export_untrusted",
+            "cancel_requested": "cancel_requested",
+            "cancel_acknowledged": "cancel_acknowledged",
+        }
+        states = [
+            state_labels.get(str(item), str(item))
+            for item in snapshot.get("canonical_states") or ()
+        ]
         inspection = snapshot.get("inspection") or {}
         validation = snapshot.get("validation_status") or {}
-        with ui.card().classes("ag-card ag-card-strong p-6 w-full"):
-            ui.label(t("Canonical lifecycle")).classes("ag-section-title")
-            ui.label(
-                t("These states come from ReviewControlPlane and Registry evidence; the GUI does not infer success from files.")
-            ).classes("ag-subtle")
-            workspace_path = str(snapshot.get("workspace_path") or "")
-            ui.label(workspace_path or t("No canonical job workspace found.")).classes("ag-subtle q-mt-sm")
-            if states:
-                with ui.row().classes("gap-2 q-mt-md flex-wrap"):
-                    for state in states:
-                        ui.badge(state).props("outline")
-            else:
-                ui.label(t("canonical status unavailable")).classes("ag-subtle q-mt-md")
-            reason = str(inspection.get("reason") or validation.get("reason") or "").strip()
-            if reason:
-                ui.label(reason).classes("ag-subtle q-mt-sm")
-
+        workspace_path = str(snapshot.get("workspace_path") or "")
+        ui.label(
+            workspace_path or t("No canonical job workspace found.")
+        ).classes("ag-subtle q-mt-sm")
+        if states:
             with ui.row().classes("gap-2 q-mt-md flex-wrap"):
-                ui.button(t("Refresh canonical status"), on_click=refresh_panel).props("outline size=sm")
-                ui.button(t("View validation status"), on_click=view_validation_status).props("outline size=sm")
-                ui.button(t("Run validation"), on_click=execute_validation).props("unelevated size=sm")
-                ui.button(t("Resume workspace"), on_click=lambda: (controller.resume_current_workspace(), render_panel.refresh())).props("outline size=sm")
-                ui.button(t("Request cancellation"), on_click=lambda: (controller.cancel_current_workspace(), render_panel.refresh())).props("outline color=negative size=sm")
-                ui.button(t("Export workspace"), on_click=lambda: (controller.export_current_workspace(), render_panel.refresh())).props("outline size=sm")
-                ui.button(t("Create report-only repair plan"), on_click=lambda: (controller.create_repair_plan_from_gui(), render_panel.refresh())).props("outline size=sm")
-                ui.button(t("Apply verified repair plan"), on_click=lambda: (controller.apply_repair_plan_from_gui(), render_panel.refresh())).props("outline size=sm")
+                for state in states:
+                    ui.badge(state).props("outline")
+        else:
+            ui.label(t("canonical status unavailable")).classes("ag-subtle q-mt-md")
+        reason = str(inspection.get("reason") or validation.get("reason") or "").strip()
+        if reason:
+            ui.label(reason).classes("ag-subtle q-mt-sm")
 
-            with ui.grid(columns=2).classes("w-full gap-3 q-mt-md"):
-                actor = ui.input(t("Adoption actor"), value=controller.lifecycle_actor)
-                actor.on("update:model-value", lambda event: setattr(controller, "lifecycle_actor", str(getattr(event, "value", "") or "")))
-                reason_input = ui.input(t("Adoption reason"), value=controller.lifecycle_reason)
-                reason_input.on("update:model-value", lambda event: setattr(controller, "lifecycle_reason", str(getattr(event, "value", "") or "")))
-            ui.button(
-                t("Adopt verified outline"),
-                on_click=lambda: (controller.adopt_current_outline(), render_panel.refresh()),
-            ).props("outline color=primary size=sm")
-            ui.button(
-                t("Promote repaired artifacts"),
-                on_click=lambda: (controller.promote_repaired_artifacts_from_gui(), render_panel.refresh()),
-            ).props("outline color=primary size=sm")
+    async def refresh_status_panel(*, notify_user: bool = False) -> None:
+        if controller.lifecycle_busy or status_refresh_lock.locked():
+            return
+        async with status_refresh_lock:
+            if controller.lifecycle_busy:
+                return
+            await asyncio.to_thread(controller.refresh_lifecycle, notify_user=False)
+            if controller.lifecycle_busy:
+                return
+            render_status_panel.refresh()
+            if notify_user:
+                inspection = controller.lifecycle_snapshot.get("inspection") or {}
+                if str(inspection.get("status") or "").strip().lower() == "blocked":
+                    controller.notify(
+                        str(inspection.get("reason") or "canonical status is unavailable"),
+                        color="warning",
+                    )
+                else:
+                    controller.notify(t("canonical lifecycle status refreshed"), color="positive")
 
-    render_panel()
+    def schedule_status_refresh() -> None:
+        if not controller.lifecycle_busy and not status_refresh_lock.locked():
+            asyncio.create_task(refresh_status_panel(notify_user=False))
+
+    async def run_lifecycle_action(action: Callable[[], Any]) -> None:
+        if controller.lifecycle_busy:
+            return
+        controller.lifecycle_busy = True
+        _set_action_buttons_disabled(True)
+        try:
+            await asyncio.to_thread(action)
+        finally:
+            controller.lifecycle_busy = False
+            _set_action_buttons_disabled(False)
+            render_status_panel.refresh()
+
+    async def execute_validation() -> None:
+        if controller.lifecycle_busy:
+            return
+        controller.lifecycle_busy = True
+        _set_action_buttons_disabled(True)
+        try:
+            await controller.execute_current_validation()
+        finally:
+            controller.lifecycle_busy = False
+            _set_action_buttons_disabled(False)
+            render_status_panel.refresh()
+
+    async def request_cancellation() -> None:
+        # Cancellation must remain available while Resume or Validate is busy.
+        await asyncio.to_thread(controller.cancel_current_workspace)
+        render_status_panel.refresh()
+
+    def action_button(label: str, action: Callable[[], Any], props: str) -> Any:
+        button = ui.button(
+            t(label),
+            on_click=lambda: asyncio.create_task(run_lifecycle_action(action)),
+        ).props(props)
+        action_buttons.append(button)
+        return button
+
+    with ui.card().classes("ag-card ag-card-strong p-6 w-full"):
+        ui.label(t("Canonical lifecycle")).classes("ag-section-title")
+        ui.label(
+            t("These states come from ReviewControlPlane and Registry evidence; the GUI does not infer success from files.")
+        ).classes("ag-subtle")
+        render_status_panel()
+
+        with ui.row().classes("gap-2 q-mt-md flex-wrap"):
+            ui.button(
+                t("Refresh canonical status"),
+                on_click=lambda: asyncio.create_task(refresh_status_panel(notify_user=True)),
+            ).props("outline size=sm")
+            action_button("View validation status", controller.inspect_validation_status, "outline size=sm")
+            validation_button = ui.button(
+                t("Run validation"),
+                on_click=lambda: asyncio.create_task(execute_validation()),
+            ).props("unelevated size=sm")
+            action_buttons.append(validation_button)
+            action_button("Resume workspace", controller.resume_current_workspace, "outline size=sm")
+            ui.button(
+                t("Request cancellation"),
+                on_click=lambda: asyncio.create_task(request_cancellation()),
+            ).props("outline color=negative size=sm")
+            action_button("Export workspace", controller.export_current_workspace, "outline size=sm")
+            action_button("Create report-only repair plan", controller.create_repair_plan_from_gui, "outline size=sm")
+            action_button("Apply verified repair plan", controller.apply_repair_plan_from_gui, "outline size=sm")
+
+        lifecycle = controller.state["lifecycle"]
+        ui.label(t("Optional manual repair proposal")).classes("ag-subtle q-mt-md")
+        ui.textarea(
+            t("Manual repair proposal JSON (optional)"),
+            value=lifecycle["manual_repair_proposal_json"],
+            placeholder=(
+                "{\n  \"block_id\": \"<current block id>\",\n"
+                "  \"expected_anchor_hash\": \"<sha256 of exact current block text>\",\n"
+                "  \"replacement_text\": \"<reviewer-authored replacement>\",\n"
+                "  \"source_evidence_ids\": [\"<canonical paper key>\"],\n"
+                "  \"citation_mapping\": {\n"
+                "    \"occurrence_id\": \"<current citation occurrence id>\",\n"
+                "    \"expected_ref_id\": \"<current reference id>\",\n"
+                "    \"expected_paper_id\": \"<current canonical paper key>\",\n"
+                "    \"replacement_ref_id\": \"<approved replacement reference id>\",\n"
+                "    \"replacement_paper_id\": \"<approved replacement canonical paper key>\"\n"
+                "  }\n}"
+            ),
+        ).bind_value(lifecycle, "manual_repair_proposal_json").props(
+            "outlined autogrow rows=8 data-testid=lifecycle-manual-repair-proposal-json"
+        ).classes("w-full")
+        _render_path_field(
+            controller,
+            label=t("Manual repair proposal JSON file (optional)"),
+            section="lifecycle",
+            key="manual_repair_proposal_file",
+            pick="file",
+            title="Select manual repair proposal JSON file",
+            filetypes=[("JSON Files", "*.json"), ("All Files", "*.*")],
+            test_id="lifecycle-manual-repair-proposal-file",
+        )
+        ui.label(
+            t("Choose pasted JSON or a file, not both. A supplied proposal requires the reviewer and reason below; without one, the existing report-plan repair path is used.")
+        ).classes("ag-subtle ag-wrap-note")
+
+        with ui.grid(columns=2).classes("w-full gap-3 q-mt-md"):
+            ui.input(
+                t("Reviewer / lifecycle actor"),
+                value=controller.lifecycle_actor,
+            ).bind_value(controller, "lifecycle_actor")
+            ui.input(
+                t("Reason for this lifecycle action"),
+                value=controller.lifecycle_reason,
+            ).bind_value(controller, "lifecycle_reason")
+        action_button("Adopt verified outline", controller.adopt_current_outline, "outline color=primary size=sm")
+        action_button("Promote repaired artifacts", controller.promote_repaired_artifacts_from_gui, "outline color=primary size=sm")
+
     if not controller.test_mode:
-        ui.timer(4.0, refresh_panel)
+        asyncio.create_task(refresh_status_panel(notify_user=False))
+        ui.timer(4.0, schedule_status_refresh)
 
 
 def _render_progress_card(controller: WorkspaceController) -> None:
@@ -3580,6 +4419,48 @@ def _render_workflow_mode_card(controller: WorkspaceController) -> None:
                 ui.label(t("自由模式：先和规划助手聊清目标，再把规划应用到本次任务。")).classes("ag-subtle ag-wrap-note")
 
 
+def _render_workflow_review_intent_card(controller: WorkspaceController) -> None:
+    t = controller.t
+    workflow = controller.state["workflow"]
+    with (
+        ui.expansion(t("可选：审稿意图与必需比较"), icon="compare_arrows").classes("w-full"),
+        ui.card().classes("ag-card p-5 w-full q-mt-sm"),
+    ):
+        ui.label(
+            t("如有明确研究问题或必须比较的来源，可提供 ReviewIntent JSON。系统会保留你的比较问题，不会替你写比较结论。")
+        ).classes("ag-subtle ag-wrap-note")
+        ui.textarea(
+            t("粘贴 ReviewIntent JSON"),
+            value=workflow["review_intent_json"],
+            placeholder=(
+                '{\n  "review_question": "<your review question>",\n'
+                '  "required_comparisons": [{\n'
+                '    "paper_keys": ["<canonical-paper-key-a>", "<canonical-paper-key-b>"],\n'
+                '    "question": "<the comparison question>",\n'
+                '    "relation_type": "<optional exact type>"\n'
+                "  }]\n}"
+            ),
+        ).bind_value(workflow, "review_intent_json").props(
+            "outlined autogrow rows=8 data-testid=workflow-review-intent-json"
+        ).classes("w-full")
+        _render_path_field(
+            controller,
+            label=t("ReviewIntent JSON 文件（可选）"),
+            section="workflow",
+            key="review_intent_file",
+            pick="file",
+            title=t("选择 ReviewIntent JSON 文件"),
+            filetypes=[("JSON Files", "*.json"), ("All Files", "*.*")],
+            test_id="workflow-review-intent-file",
+        )
+        ui.label(
+            t("粘贴 JSON 和文件路径二选一；两者都留空时使用默认意图。required_comparisons 每项需有两个不同的规范 paper key 和非空问题。")
+        ).classes("ag-subtle ag-wrap-note")
+        ui.label(
+            t("自由模式的规划器拥有本次意图；如需手动设置比较，请切换到普通模式。")
+        ).classes("ag-subtle ag-wrap-note")
+
+
 def _render_workflow_concept_card(controller: WorkspaceController) -> None:
     t = controller.t
     with ui.card().classes("ag-card p-6 w-full").bind_visibility_from(controller.state["workflow"], "work_mode", value="concept"):
@@ -3636,7 +4517,7 @@ def _render_workflow_actions_card(controller: WorkspaceController) -> None:
         ("仅分析文献", "先检查文献提取、预处理和结构化结果是否稳定。", "analyze"),
         ("生成大纲", "在分析结果基础上先搭出综述结构。", "generate_outline"),
         ("生成全文", "直接生成正文，适合已经确认过结构和素材的任务。", "generate_review"),
-        ("一键运行", "从分析到正文一口气跑完，适合稳定的批量流程。", "run_all"),
+        ("一键运行", "按任务配置连续执行；需要采用大纲时，采用后再续跑正文和验证。", "run_all"),
     ]
 
     with ui.card().classes("ag-card ag-card-strong p-6 w-full"):
@@ -3692,6 +4573,25 @@ def _render_workflow_summary_reuse_card(controller: WorkspaceController) -> None
                     ui.button(t("Open summary file"), on_click=lambda: _open_path(controller.state["workflow"]["summary_file"], controller.language)).props("outline")
 
 
+def _render_workflow_budget_card(controller: WorkspaceController) -> None:
+    t = controller.t
+    workflow = controller.state["workflow"]
+    with (
+        ui.expansion(t("本次运行额度（按需设置）"), icon="speed").classes("w-full"),
+        ui.card().classes("ag-card p-5 w-full q-mt-sm"),
+    ):
+        ui.label(t("额度覆盖本次任务的全部阶段和恢复续跑；已用额度会保留。未启用时使用配置中的默认额度。零表示禁止相应资源。")).classes("ag-subtle")
+        ui.checkbox(t("设置本次运行的总额度"), value=workflow["provider_budget_enabled"]).bind_value(workflow, "provider_budget_enabled").props("data-testid=workflow-budget-enabled")
+        with ui.column().classes("w-full gap-3 q-mt-md").bind_visibility_from(workflow, "provider_budget_enabled"):
+            for label, key in (
+                ("模型请求总次数（包含重试）", "provider_budget_calls"),
+                ("输出 token 总量", "provider_budget_output_tokens"),
+                ("共享重试总次数", "provider_budget_retries"),
+                ("总运行时间（秒）", "provider_budget_wall_seconds"),
+            ):
+                ui.input(t(label), value=workflow[key]).bind_value(workflow, key).props(f"outlined data-testid=workflow-{key.replace('_', '-')}").classes("w-full")
+
+
 def _render_workflow_recovery_card(controller: WorkspaceController) -> None:
     t = controller.t
     with ui.expansion(t("补跑、恢复与验证（按需展开）"), icon="build_circle").classes("w-full"):
@@ -3726,7 +4626,7 @@ def _render_workflow_recovery_card(controller: WorkspaceController) -> None:
 
                 with ui.element("div").classes("ag-mini-card"):
                     ui.label(t("质量检查")).classes("ag-section-title")
-                    ui.label(t("综述验证是可选增强步骤。需要额外核查时再运行，不影响默认主流程。")).classes("ag-subtle")
+                    ui.label(t("验证针对当前正文与引用清单，是否为必需阶段由任务配置决定；结果会影响正式导出状态。")).classes("ag-subtle")
                     validate_button = ui.button(
                         t("验证综述"),
                         on_click=lambda: asyncio.create_task(controller.run_workflow("validate")),
@@ -4207,9 +5107,11 @@ def launch_gui(
                 with ui.column().classes("gap-5 w-full"):
                     _render_workflow_input_card(controller)
                     _render_workflow_mode_card(controller)
+                    _render_workflow_review_intent_card(controller)
                     _render_workflow_concept_card(controller)
                     _render_free_mode_planner_card(controller)
                     _render_workflow_actions_card(controller)
+                    _render_workflow_budget_card(controller)
                     _render_workflow_summary_reuse_card(controller)
                     _render_workflow_recovery_card(controller)
                 with ui.column().classes("ag-sidebar-stack w-full"):

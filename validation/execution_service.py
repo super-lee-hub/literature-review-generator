@@ -20,7 +20,9 @@ from runtime.provider_receipt_closure import (
 )
 from runtime.provider_runtime import (
     ProviderBudgetV1,
+    ProviderResponseSnapshotSink,
     ProviderRuntime,
+    ProviderRuntimeContractError,
     ProviderRuntimeLedger,
     compute_closure_epoch_id,
     _redact_mapping,
@@ -37,8 +39,6 @@ from services.prompt_registry import PromptRegistry
 from validation.adjudication_reuse import (
     ADJUDICATION_REUSE_ARTIFACT_TYPE,
     ADJUDICATION_REUSE_ARTIFACT_VERSION,
-    build_reuse_key,
-    build_reuse_record_payload,
     reuse_record_artifact_id,
     verify_reuse_record,
 )
@@ -69,6 +69,9 @@ class ValidationExecutionService:
     validation_external_registry_resolver: Callable[[str], Any | None] | None = None
     publication_context: Any | None = None
     validation_source_binding_record: ArtifactRecord | None = None
+    response_snapshot_sink: ProviderResponseSnapshotSink | None = field(
+        default=None, kw_only=True, repr=False,
+    )
     _provider_receipt_ledger: ProviderRuntimeLedger | None = field(
         default=None,
         init=False,
@@ -342,6 +345,7 @@ class ValidationExecutionService:
             retry_limit = max(0, int(getattr(runtime_settings, "validation_retry_limit", 1)))
         except (TypeError, ValueError):
             retry_limit = 1
+        expected_attempt_limit = self.validator_attempt_limit(config)
         resolved_schema_hash = schema_hash or hashlib.sha256(
             json.dumps(
                 {
@@ -357,6 +361,10 @@ class ValidationExecutionService:
         ).hexdigest()
         endpoint_type = str(config.get("endpoint_type") or "chat_completions")
         if self.provider_factory is not None:
+            snapshot_kwargs = (
+                {"response_snapshot_sink": self.response_snapshot_sink}
+                if self.response_snapshot_sink is not None else {}
+            )
             runtime = self.provider_factory(
                 budget=ProviderBudgetV1(max_calls=1, max_retries_per_call=retry_limit),
                 ledger=self.provider_receipt_ledger,
@@ -370,6 +378,7 @@ class ValidationExecutionService:
                 logical_attempt_identity=self.attempt_id,
                 endpoint_type=endpoint_type,
                 schema_hash=resolved_schema_hash,
+                **snapshot_kwargs,
             )
         else:
             runtime = ProviderRuntime(
@@ -388,9 +397,13 @@ class ValidationExecutionService:
                 prompt_id=self._validation_user_prompt_identity.prompt_id,
                 prompt_version=self._validation_user_prompt_identity.version,
                 prompt_sha256=self._validation_user_prompt_identity.sha256,
+                response_snapshot_sink=self.response_snapshot_sink,
             )
         if not isinstance(runtime, ProviderRuntime):
             raise TypeError("provider_factory must return ProviderRuntime")
+        if (self.response_snapshot_sink is not None
+                and runtime.response_snapshot_sink is not self.response_snapshot_sink):
+            raise ProviderRuntimeContractError("provider_factory did not preserve the response snapshot sink")
         runtime.prompt_id = self._validation_user_prompt_identity.prompt_id
         runtime.prompt_version = self._validation_user_prompt_identity.version
         runtime.prompt_sha256 = self._validation_user_prompt_identity.sha256
@@ -406,11 +419,38 @@ class ValidationExecutionService:
             prompt_id=self._validation_user_prompt_identity.prompt_id,
             prompt_version=self._validation_user_prompt_identity.version,
             prompt_sha256=self._validation_user_prompt_identity.sha256,
-            max_attempts=max(1, retry_limit + 1),
+            max_attempts=expected_attempt_limit,
             usage_required=endpoint_type not in {"internal", "fixture"},
         )
         self._provider_runtimes[resolved_call] = runtime
         return runtime
+
+    def validator_attempt_limit(self, api_config: Mapping[str, Any]) -> int:
+        """Return the total HTTP attempts permitted for one Validator call.
+
+        Validation's ``validation_retry_limit`` is a stage contract. A zero
+        value means exactly the initial attempt, even though a generic
+        ProviderRuntime with a zero retry budget leaves its caller's requested
+        attempt count untouched. Keep this rule local to Stage 4 so generic V1
+        ProviderRuntime zero semantics remain unchanged.
+        """
+
+        from ai_interface import _load_api_runtime_settings
+
+        _timeout_seconds, configured_attempts = _load_api_runtime_settings(
+            api_config
+        )
+        requested_total_attempts = max(1, int(configured_attempts))
+        runtime_settings = getattr(self.settings, "runtime", None)
+        try:
+            validation_retry_limit = max(
+                0, int(getattr(runtime_settings, "validation_retry_limit", 1))
+            )
+        except (TypeError, ValueError):
+            validation_retry_limit = 1
+        if validation_retry_limit == 0:
+            return 1
+        return min(requested_total_attempts, validation_retry_limit + 1)
 
     def bind_provider_call(
         self,
@@ -445,8 +485,19 @@ class ValidationExecutionService:
             char if char.isalnum() or char in {"-", "_"} else "_"
             for char in str(call_id)
         )
+        attempt_scope = hash_json(
+            {
+                "job_id": self.job_id,
+                "attempt_id": self.attempt_id,
+                "closure_epoch_id": self.closure_epoch_id,
+            }
+        )[:24]
+        output_artifact_id = (
+            f"validation-provider-output:{safe_call_id}:{attempt_scope}:{normalized_hash}"
+        )
         output_path = self.workspace.artifact_path(
-            f"validation_provider_outputs/{safe_call_id}.json"
+            "validation_provider_outputs/"
+            f"{hash_json({'artifact_id': output_artifact_id})}.json"
         )
         output_record = publish_json_artifact(
             self.publication_context,
@@ -466,7 +517,7 @@ class ValidationExecutionService:
             artifact_type="validation_provider_output",
             artifact_version="v1",
             producer="validation.execution_service.ValidationExecutionService",
-            artifact_id=f"validation-provider-output:{safe_call_id}",
+            artifact_id=output_artifact_id,
         )
         self._expected_provider_calls[str(call_id)] = replace(
             expected,
@@ -489,6 +540,36 @@ class ValidationExecutionService:
         if not isinstance(raw, Mapping):
             raise RuntimeError(f"artifact is not a JSON object: {path}")
         return dict(raw)
+
+    def _existing_immutable_json_record(
+        self,
+        *,
+        artifact_id: str,
+        payload: Mapping[str, Any],
+        dependencies: Sequence[ArtifactDependencyRefV2],
+    ) -> ArtifactRecord | None:
+        """Preserve an existing stable reuse identity instead of rewriting it."""
+
+        existing = self.artifact_registry.get(str(artifact_id))
+        if existing is None:
+            return None
+        if existing.status != "ready":
+            raise RuntimeError(
+                f"immutable validation reuse record is not ready: {artifact_id}"
+            )
+        try:
+            ArtifactRegistry._verify_ready_artifact(existing)
+            self.artifact_registry.verify_ready_artifact_closure(existing)
+            existing_payload = self._load_json(existing.path)
+        except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"immutable validation reuse record is untrusted: {artifact_id}"
+            ) from exc
+        if existing_payload != dict(payload) or list(existing.depends_on or ()) != list(dependencies):
+            raise RuntimeError(
+                f"immutable validation reuse identity already has different evidence: {artifact_id}"
+            )
+        return existing
 
     def publish_adjudication_reuse_record(
         self,
@@ -520,6 +601,16 @@ class ValidationExecutionService:
         )
         artifact_id = reuse_record_artifact_id(reuse_key)
         path = self.workspace.artifact_path(f"validation_reuse/{reuse_key}.json")
+        dependencies = [ArtifactDependencyRefV2.from_record(output_record)]
+        record = self._existing_immutable_json_record(
+            artifact_id=artifact_id,
+            payload=payload,
+            dependencies=dependencies,
+        )
+        if record is not None:
+            self._adjudication_reuse_records[reuse_key] = record
+            self._provisional_adjudication_reuse_records[reuse_key] = record
+            return record
         record = publish_json_artifact(
             self.publication_context,
             self.artifact_registry,
@@ -530,7 +621,7 @@ class ValidationExecutionService:
             artifact_version=ADJUDICATION_REUSE_ARTIFACT_VERSION,
             producer="validation.execution_service.ValidationExecutionService.publish_adjudication_reuse_record",
             artifact_id=artifact_id,
-            depends_on=[ArtifactDependencyRefV2.from_record(output_record)],
+            depends_on=dependencies,
             metadata={"reuse_key": reuse_key, "closure_bound": False},
         )
         self._adjudication_reuse_records[reuse_key] = record
@@ -631,23 +722,29 @@ class ValidationExecutionService:
             dependencies = [ArtifactDependencyRefV2.from_record(original)]
             dependencies.append(ArtifactDependencyRefV2.from_record(ledger_record))
             dependencies.append(ArtifactDependencyRefV2.from_record(closure_record))
-            record = publish_json_artifact(
-                self.publication_context,
-                self.artifact_registry,
-                path,
-                payload,
-                artifact_role="validation_adjudication_reuse_record",
-                artifact_type=ADJUDICATION_REUSE_ARTIFACT_TYPE,
-                artifact_version=ADJUDICATION_REUSE_ARTIFACT_VERSION,
-                producer="validation.execution_service.ValidationExecutionService.publish_closure_bound_reuse_records",
+            record = self._existing_immutable_json_record(
                 artifact_id=artifact_id,
-                depends_on=dependencies,
-                metadata={
-                    "reuse_key": reuse_key,
-                    "closure_bound": "true",
-                    "authority_state": "durable",
-                },
+                payload=payload,
+                dependencies=dependencies,
             )
+            if record is None:
+                record = publish_json_artifact(
+                    self.publication_context,
+                    self.artifact_registry,
+                    path,
+                    payload,
+                    artifact_role="validation_adjudication_reuse_record",
+                    artifact_type=ADJUDICATION_REUSE_ARTIFACT_TYPE,
+                    artifact_version=ADJUDICATION_REUSE_ARTIFACT_VERSION,
+                    producer="validation.execution_service.ValidationExecutionService.publish_closure_bound_reuse_records",
+                    artifact_id=artifact_id,
+                    depends_on=dependencies,
+                    metadata={
+                        "reuse_key": reuse_key,
+                        "closure_bound": "true",
+                        "authority_state": "durable",
+                    },
+                )
             self._adjudication_reuse_records[f"{reuse_key}:closure-bound"] = record
             records.append(record)
         return records
@@ -854,6 +951,7 @@ class ValidationExecutionService:
         output_dir: str,
         result_artifact_id: str,
         paper_artifact_records: Sequence[ArtifactRecord] | None = None,
+        repair_transaction_record: ArtifactRecord | None = None,
     ) -> dict[str, Any]:
         """Run the current validator against explicit repaired artifacts.
 
@@ -874,13 +972,17 @@ class ValidationExecutionService:
 
         from validation.current_validation import run_current_validation
 
-        paper_payloads: list[dict[str, Any]] = []
-        for record in paper_artifact_records or self.paper_artifact_records:
-            if record.status != "ready":
-                continue
-            payload = json.loads(Path(record.path).read_text(encoding="utf-8"))
-            if isinstance(payload, Mapping):
-                paper_payloads.append(dict(payload))
+        paper_payloads: list[dict[str, Any]] | None = None
+        if paper_artifact_records is not None:
+            paper_payloads = []
+            for record in paper_artifact_records:
+                if record.status != "ready":
+                    continue
+                payload = json.loads(Path(record.path).read_text(encoding="utf-8"))
+                if isinstance(payload, Mapping):
+                    paper_payloads.append({**dict(payload), "_registry_artifact_id": record.artifact_id,
+                                           "_registry_artifact_hash": record.content_hash,
+                                           "_registry_path": record.path})
         result: dict[str, Any] | None = None
         try:
             result = run_current_validation(
@@ -891,6 +993,8 @@ class ValidationExecutionService:
                 review_draft_record_override=review_draft_record,
                 citation_manifest_record_override=citation_manifest_record,
                 output_dir=output_dir,
+                validation_scope="repair_revalidation",
+                repair_transaction_record=repair_transaction_record,
                 result_artifact_id=result_artifact_id,
                 result_artifact_type="validation_run_result_repaired",
                 result_artifact_role="validation_run_result_repaired",
@@ -911,7 +1015,7 @@ class ValidationExecutionService:
         self,
         *,
         artifact_id: str = "validation:provider_receipt_closure",
-        ledger_artifact_id: str = "validation_provider_receipts",
+        ledger_artifact_id: str | None = None,
         closure_path: str | None = None,
     ) -> dict[str, Any]:
         """Persist receipt ledger and evaluate against pre-transport expectations."""
@@ -926,26 +1030,56 @@ class ValidationExecutionService:
             expected_calls,
             receipts,
         )
+        resolved_epoch = closure.closure_epoch_id or self.closure_epoch_id
         ledger_record = None
         ledger_path = self.provider_receipt_ledger.path
         ledger_payload = ledger_path.read_bytes() if ledger_path.is_file() else b""
         if ledger_payload:
+            ledger_hash = hashlib.sha256(ledger_payload).hexdigest()
+            ledger_scope = hash_json(
+                {
+                    "requested_artifact_id": str(ledger_artifact_id or "validation_provider_receipts"),
+                    "closure_epoch_id": resolved_epoch,
+                }
+            )[:24]
+            immutable_ledger_id = (
+                f"validation_provider_receipts:{ledger_scope}:{ledger_hash}"
+            )
             ledger_record = publish_bytes_artifact(
                 self.publication_context,
                 self.artifact_registry,
-                self.workspace.artifact_path("validation_provider_receipts.jsonl"),
+                self.workspace.artifact_path(
+                    f"validation_provider_receipts__{ledger_scope}__{ledger_hash}.jsonl"
+                ),
                 ledger_payload,
                 artifact_role="provider_receipts",
                 artifact_type="provider_receipt_ledger",
                 artifact_version="v1",
                 producer="validation.execution_service.ValidationExecutionService",
-                artifact_id=ledger_artifact_id,
-                metadata={"receipt_count": len(receipts)},
+                artifact_id=immutable_ledger_id,
+                metadata={
+                    "receipt_count": len(receipts),
+                    "closure_epoch_id": resolved_epoch,
+                    "requested_artifact_id": str(ledger_artifact_id or "validation_provider_receipts"),
+                    "ledger_sha256": ledger_hash,
+                },
             )
         closure_path = closure_path or self.workspace.artifact_path(
             "validation_provider_receipt_closure.json"
         )
-        resolved_epoch = closure.closure_epoch_id or self.closure_epoch_id
+        closure_scope = hash_json(
+            {
+                "closure_epoch_id": resolved_epoch,
+                "closure_hash": closure.closure_hash,
+                "requested_artifact_id": str(artifact_id),
+            }
+        )[:24]
+        closure_path_obj = Path(closure_path)
+        closure_path = str(
+            closure_path_obj.with_name(
+                f"{closure_path_obj.stem}__{closure_scope}.json"
+            )
+        )
         closure_payload = {
             **closure.to_dict(),
             "job_id": self.job_id,
@@ -956,7 +1090,9 @@ class ValidationExecutionService:
             "expected_call_graph_hash": self.expected_call_graph_hash,
             "expected_calls": [asdict(expected) for expected in expected_calls],
         }
-        closure_artifact_id = f"provider-receipt-closure:stage4_validate:{resolved_epoch}"
+        closure_artifact_id = (
+            f"provider-receipt-closure:stage4_validate:{resolved_epoch}:{closure.closure_hash}"
+        )
         dependencies: list[ArtifactDependencyRefV2] = []
         dependency_ids: set[str] = set()
 
@@ -974,22 +1110,52 @@ class ValidationExecutionService:
             *self.visual_artifact_records,
         ):
             add_dependency(record)
-        for expected in expected_calls:
-            expected_path = str(expected.artifact_path or "").strip()
-            if not expected_path:
-                continue
-            expected_resolved = Path(expected_path).resolve()
-            add_dependency(
-                next(
-                    (
-                        record
-                        for record in self.artifact_registry.list_records()
-                        if record.status == "ready"
-                        and Path(record.path).resolve() == expected_resolved
-                    ),
-                    None,
-                )
+        expected_paths = tuple(
+            path for expected in expected_calls
+            if (path := str(expected.artifact_path or "").strip())
+        )
+
+        def select_provider_outputs() -> tuple[
+            tuple[Path, ...], tuple[ArtifactRecord | None, ...],
+            dict[Path, tuple[str, str]],
+        ]:
+            resolved_paths = tuple(Path(path).resolve() for path in expected_paths)
+            wanted_paths = set(resolved_paths)
+            records_by_path: dict[Path, ArtifactRecord] = {}
+            if wanted_paths:
+                _revision, ordered_records = self.artifact_registry.capture_record_snapshot()
+                for record in ordered_records:
+                    if record.status != "ready":
+                        continue
+                    resolved_path = Path(record.path).resolve()
+                    if resolved_path in wanted_paths:
+                        records_by_path.setdefault(resolved_path, record)
+                        if len(records_by_path) == len(wanted_paths):
+                            break
+            signatures: dict[Path, tuple[str, str]] = {}
+            for resolved_path, record in records_by_path.items():
+                actual_hash = hashlib.sha256(Path(record.path).read_bytes()).hexdigest()
+                if actual_hash != record.content_hash:
+                    raise RuntimeError(
+                        f"validation provider output bytes changed during finalization: {record.artifact_id}"
+                    )
+                record_signature = hashlib.sha256(json.dumps(
+                    asdict(record), sort_keys=True, separators=(",", ":"),
+                    ensure_ascii=False, allow_nan=False,
+                ).encode("utf-8")).hexdigest()
+                signatures[resolved_path] = (record_signature, actual_hash)
+            return (
+                resolved_paths,
+                tuple(records_by_path.get(path) for path in resolved_paths),
+                signatures,
             )
+
+        initial_paths, _initial_records, initial_signatures = select_provider_outputs()
+        current_paths, output_records, current_signatures = select_provider_outputs()
+        if initial_paths != current_paths or initial_signatures != current_signatures:
+            raise RuntimeError("validation provider output selection changed during finalization")
+        for record in output_records:
+            add_dependency(record)
         for reuse_record in list(self._adjudication_reuse_records.values()):
             add_dependency(reuse_record)
         for reuse_record in list(self._verified_reuse_evidence_records.values()):
