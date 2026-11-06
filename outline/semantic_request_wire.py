@@ -35,7 +35,7 @@ _CONTRACT = (
     "canonical IDs/string values, never input table/string reference tokens."
 )
 _MULTI_SOURCE_CONTRACT = _CONTRACT.replace("v1: in topic_synthesis only", "v2: in each named source_keys field")
-_ALLOWED_SOURCE_KEYS = {"topic_synthesis", "cross_group_comparison", "writer_task_scope"}
+_ALLOWED_SOURCE_KEYS = {"topic_synthesis", "cross_group_comparison", "writer_task_scope", "citation_ref_catalog"}
 
 
 class SemanticRequestWireError(ValueError):
@@ -122,15 +122,21 @@ def pack_semantic_request_wire(
     if (not source_keys or len(set(source_keys)) != len(source_keys)
             or any(key not in _ALLOWED_SOURCE_KEYS for key in source_keys)):
         raise SemanticRequestWireError("semantic source fields are invalid")
+    if "citation_ref_catalog" in source_keys and "writer_task_scope" not in source_keys:
+        raise SemanticRequestWireError("citation_ref_catalog requires writer_task_scope")
     if not any(request.get(key) for key in source_keys):
         return copy.deepcopy(dict(request))
     for key in source_keys:
-        if (key not in request or not isinstance(request[key], list if key == "topic_synthesis" else Mapping)):
+        expected = list if key in {"topic_synthesis", "citation_ref_catalog"} else Mapping
+        if key not in request or not isinstance(request[key], expected):
             raise SemanticRequestWireError("semantic source field is missing or malformed")
     packed = copy.deepcopy(dict(request))
-    table_keys = _WRITER_TABLE_KEYS if "writer_task_scope" in source_keys else _TABLE_KEYS
     for key in source_keys:
-        packed[key] = _pack_rows(request[key], table_keys=table_keys)
+        source_table_keys = _WRITER_TABLE_KEYS if key == "writer_task_scope" else _TABLE_KEYS
+        if key == "citation_ref_catalog" and request[key] and all(isinstance(row, Mapping) for row in request[key]):
+            packed[key] = _pack_rows({"fields": request[key]}, table_keys={"fields"})["fields"]
+        else:
+            packed[key] = _pack_rows(request[key], table_keys=source_table_keys)
     present_strings = {value for key in source_keys for value in _strings(packed[key])}
     # Keys stay literal. Count only value occurrences before choosing strings.
     repeated: Counter[str] = Counter()
@@ -207,6 +213,8 @@ def expand_semantic_request_wire(request: Mapping[str, Any]) -> dict[str, Any]:
             or any(key not in _ALLOWED_SOURCE_KEYS for key in source_keys)
             or len(source_keys) != len(set(source_keys))):
         raise SemanticRequestWireError("semantic source fields are invalid")
+    if "citation_ref_catalog" in source_keys and "writer_task_scope" not in source_keys:
+        raise SemanticRequestWireError("citation_ref_catalog requires writer_task_scope")
     prefix, strings = metadata["prefix"], metadata["strings"]
     if not isinstance(prefix, str) or re.fullmatch(r"\$S_*", prefix) is None:
         raise SemanticRequestWireError("semantic string prefix is invalid")
@@ -233,10 +241,18 @@ def expand_semantic_request_wire(request: Mapping[str, Any]) -> dict[str, Any]:
     result = {key: copy.deepcopy(value) for key, value in request.items() if key != WIRE_KEY}
     for key in source_keys:
         source = result.get(key)
-        if not isinstance(source, list if key == "topic_synthesis" else Mapping):
+        expected = list if key == "topic_synthesis" or (key == "citation_ref_catalog" and isinstance(source, list)) else Mapping
+        if not isinstance(source, expected):
             raise SemanticRequestWireError(f"semantic source wire lost {key}")
-        table_keys = _WRITER_TABLE_KEYS if "writer_task_scope" in source_keys else _TABLE_KEYS
-        result[key] = _expand_rows(restore(source), table_keys=table_keys)
+        table_keys = _WRITER_TABLE_KEYS if key == "writer_task_scope" else _TABLE_KEYS
+        if key == "citation_ref_catalog" and isinstance(source, Mapping) and set(source) == {_TABLE_MARKER}:
+            result[key] = _expand_rows({"fields": restore(source)}, table_allowed=True, table_keys={"fields"})["fields"]
+        elif key == "citation_ref_catalog" and isinstance(source, list):
+            result[key] = _expand_rows(restore(source), table_keys=_TABLE_KEYS)
+        elif key == "citation_ref_catalog":
+            raise SemanticRequestWireError("citation_ref_catalog row table marker is missing")
+        else:
+            result[key] = _expand_rows(restore(source), table_keys=table_keys)
     if used != set(range(len(strings))):
         raise SemanticRequestWireError("semantic string catalog contains unused entries")
     if hash_json(result) != metadata["expanded_request_hash"]:

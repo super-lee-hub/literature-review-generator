@@ -2034,7 +2034,7 @@ class ReviewGenerationService:
             if not self._provider_context_profile(writer_config).estimate_request(probe)["within_budget"]:
                 packed_scope = pack_semantic_request_wire(
                     payload,
-                    source_keys=("writer_task_scope",),
+                    source_keys=("writer_task_scope", "citation_ref_catalog"),
                 )
                 payload = packed_scope
         return json.dumps(payload, ensure_ascii=False, sort_keys=True)

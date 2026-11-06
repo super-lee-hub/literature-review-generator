@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 
+import pytest
+
 from outline.semantic_request_wire import (
     expand_semantic_request_wire,
     pack_semantic_request_wire,
@@ -49,6 +51,18 @@ def test_writer_scope_wire_leaves_other_source_fields_unpacked(tmp_path):
     assert expand_semantic_request_wire(wire) == request
 
 
+def test_writer_scope_wire_packs_visible_catalog_rows_losslessly(tmp_path):
+    scope = project_writer_scope_for_provider_v1(_scope_with_shared_sources(tmp_path))
+    catalog = [
+        {"ref_id": "R001", "canonical_paper_key": "paper-a", "author": "A", "year": 2024},
+        {"ref_id": "R002", "canonical_paper_key": "paper-a", "author": "A", "year": 2024},
+    ]
+    request = {"writer_task_scope": scope, "citation_ref_catalog": catalog, "identity": "review-v3"}
+    wire = pack_semantic_request_wire(request, source_keys=("writer_task_scope", "citation_ref_catalog"))
+    assert wire["citation_ref_catalog"].get("semantic_row_table_v1")
+    assert expand_semantic_request_wire(wire) == request
+
+
 def test_writer_string_codec_requires_conservative_net_gain():
     short = "12345678"
     strong = "long-source-identity-" * 4
@@ -57,6 +71,20 @@ def test_writer_string_codec_requires_conservative_net_gain():
     assert short not in wire["semantic_source_wire"]["strings"]
     assert strong in wire["semantic_source_wire"]["strings"]
     assert expand_semantic_request_wire(wire) == request
+
+
+def test_writer_catalog_codec_requires_writer_scope_and_valid_row_marker():
+    with pytest.raises(ValueError, match="requires writer_task_scope"):
+        pack_semantic_request_wire(
+            {"citation_ref_catalog": [{"ref_id": "R1"}]},
+            source_keys=("citation_ref_catalog",),
+        )
+    request = {"writer_task_scope": {"tasks": []}, "citation_ref_catalog": []}
+    wire = pack_semantic_request_wire(request, source_keys=("writer_task_scope", "citation_ref_catalog"))
+    bad = dict(wire)
+    bad["citation_ref_catalog"] = {"unexpected": []}
+    with pytest.raises(ValueError, match="row table marker"):
+        expand_semantic_request_wire(bad)
 
 
 def test_writer_prompt_applies_wire_only_when_plain_request_exceeds_profile(tmp_path):
