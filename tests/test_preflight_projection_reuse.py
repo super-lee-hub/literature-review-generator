@@ -13,7 +13,7 @@ def test_all_provider_rows_remain_while_repeated_candidate_work_is_materialized_
     monkeypatch.setattr(executor, "_provider_node_ids", lambda: nodes)
     seen = []
 
-    def project(summaries, profile, *, variant_name, candidate_id=None):
+    def project(summaries, profile, *, variant_name, candidate_id=None, preflight_context=None):
         seen.append((variant_name, candidate_id or "candidate_1", asdict(profile)))
         executor._candidate_preflight_projection_state[f"{variant_name}:{candidate_id or 'candidate_1'}"] = {
             "status": "unmaterialized_legacy_paper_shard_projection",
@@ -50,7 +50,7 @@ def test_profile_change_between_roles_cannot_use_previous_projection(tmp_path, m
             result = replace(result, profile=replace(result.profile, max_output_tokens=512))
         return result
 
-    def project(_summaries, profile, *, variant_name, candidate_id=None):
+    def project(_summaries, profile, *, variant_name, candidate_id=None, preflight_context=None):
         seen.append(profile.max_output_tokens)
         return 32_000, 2
 
@@ -69,7 +69,7 @@ def test_all_candidate_projection_above_five_is_not_candidate_one(tmp_path, monk
     ))
     seen = []
 
-    def project(_summaries, _profile, *, variant_name, candidate_id=None):
+    def project(_summaries, _profile, *, variant_name, candidate_id=None, preflight_context=None):
         seen.append(candidate_id)
         return 32_000, 2 if candidate_id else 6
 
