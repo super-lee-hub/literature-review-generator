@@ -137,6 +137,7 @@ from runtime.provider_runtime import (
     ProviderRuntime,
     ProviderRuntimeLedger,
     acceptance_execution_context_from_environment,
+    active_bound_provider_budget_controller,
     authorized_provider_call_limit,
     compute_closure_epoch_id,
     current_acceptance_execution_context,
@@ -3539,9 +3540,16 @@ class OutlineV3Executor:
                 # rather than a potentially stale model property.  This keeps
                 # cache reuse fail-closed when a caller mutates source facts
                 # while retaining an old projected hash field.
+                def snapshot_payload_hash(model: Any, fallback_name: str) -> str:
+                    try:
+                        payload = object.__getattribute__(model, "_payload")
+                    except (AttributeError, TypeError):
+                        return str(getattr(model, fallback_name, "") or "")
+                    return str(payload.get("content_hash") or payload.get("artifact_hash") or "")
+
                 source_identity = {
-                    "evidence": str(getattr(snapshot.evidence_model, "content_hash", "") or getattr(snapshot.evidence_model, "artifact_hash", "")),
-                    "content_layers": str(getattr(snapshot.content_layers_model, "content_hash", "")),
+                    "evidence": snapshot_payload_hash(snapshot.evidence_model, "content_hash"),
+                    "content_layers": snapshot_payload_hash(snapshot.content_layers_model, "content_hash"),
                 }
                 cache_key = hash_json({
                     "topic_plan": [item.to_dict() for item in topic_plan],
@@ -3551,6 +3559,15 @@ class OutlineV3Executor:
                     },
                     "source_identity": source_identity,
                     "profile": self._profile_identity(profile),
+                    "effective_input_cap": self._effective_input_cap(profile),
+                    "semantic_output_max_tokens": self.semantic_output_max_tokens,
+                    "semantic_output_token_limit": self._semantic_output_token_limit(profile),
+                    "max_source_prompt_tokens": self.max_source_prompt_tokens,
+                    "technical_shard_target_tokens": self.technical_shard_target_tokens,
+                    "prompt_identity": {
+                        "system": self._outline_prompt_identity.sha256,
+                        "policy": self._outline_policy_identity.sha256,
+                    },
                     "semantic_contract": self.provider_semantic_contract_version,
                 })
                 cached = self._topic_provider_plan_cache.get(cache_key)
@@ -9136,7 +9153,7 @@ class OutlineV3Executor:
         # work so a stale UI interruption cannot silently start another call.
         if phase in {"before", "planning"} and control_check_due:
             self._pause_state.assert_runnable(node_id=node_id)
-            controller = provider_budget_controller_from_environment()
+            controller = active_bound_provider_budget_controller()
             if controller is not None:
                 deadline = controller.durable_deadline_epoch
                 if deadline is not None and datetime.now(timezone.utc).timestamp() >= deadline:

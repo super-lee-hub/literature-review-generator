@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
+from contextvars import ContextVar
+import hashlib
 import os
 from pathlib import Path
 from typing import Any, Mapping
@@ -18,6 +21,57 @@ from services.stage1_visual_contract import (
 
 class ArtifactSchemaError(ValueError):
     """Raised when a current artifact is structurally or hash invalid."""
+
+
+_RECEIPT_PARSE_SCOPE: ContextVar[dict[tuple[str, str], tuple[tuple[Mapping[str, Any], Any], ...]] | None] = ContextVar(
+    "receipt_parse_scope", default=None
+)
+
+
+@contextmanager
+def receipt_parse_scope():
+    existing = _RECEIPT_PARSE_SCOPE.get()
+    if existing is not None:
+        yield
+        return
+    token = _RECEIPT_PARSE_SCOPE.set({})
+    try:
+        yield
+    finally:
+        _RECEIPT_PARSE_SCOPE.reset(token)
+
+
+def _decode_receipt_lines(lines: list[str], *, digest: str) -> tuple[tuple[Mapping[str, Any], Any], ...]:
+    cache = _RECEIPT_PARSE_SCOPE.get()
+    key = (digest, "provider_call_receipt:v2")
+    if cache is not None and key in cache:
+        return cache[key]
+    decoded: list[tuple[Mapping[str, Any], Any]] = []
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ArtifactSchemaError(f"provider_receipt_ledger line {line_number} is invalid JSON") from exc
+        if not isinstance(payload, Mapping):
+            raise ArtifactSchemaError(f"provider_receipt_ledger line {line_number} is not an object")
+        _require_fields(payload, ("artifact_type", "artifact_version", "receipt_id", "call_id", "job_id", "stage_name", "status"), "provider_receipt_ledger entry")
+        if str(payload.get("artifact_type") or "") != "provider_call_receipt":
+            raise ArtifactSchemaError("provider receipt ledger entry has an invalid artifact_type")
+        if str(payload.get("artifact_version") or "") != "v2":
+            raise ArtifactSchemaError("provider receipt ledger entry is not provider_call_receipt v2")
+        try:
+            from runtime.provider_runtime import ProviderCallReceiptV1
+            decoded.append((payload, ProviderCallReceiptV1.from_dict(payload)))
+        except (TypeError, ValueError, KeyError) as exc:
+            raise ArtifactSchemaError(f"provider receipt ledger entry failed ProviderCallReceiptV1 validation: {exc}") from exc
+    result = tuple(decoded)
+    if cache is not None:
+        if len(cache) >= 8:
+            cache.pop(next(iter(cache)))
+        cache[key] = result
+    return result
 
 
 # These are the current Outline/validation artifacts that must never be
@@ -1696,16 +1750,12 @@ def _validate_receipt_ledger(record: Any, path: str | Path, _root: Mapping[str, 
         raise ArtifactSchemaError("provider_receipt_ledger must use artifact_version v1")
     records = 0
     try:
-        lines = Path(path).read_text(encoding="utf-8").splitlines()
+        raw = Path(path).read_bytes()
+        lines = raw.decode("utf-8").splitlines()
     except (OSError, UnicodeError) as exc:
         raise ArtifactSchemaError("provider_receipt_ledger cannot be read") from exc
-    for line_number, line in enumerate(lines, start=1):
-        if not line.strip():
-            continue
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise ArtifactSchemaError(f"provider_receipt_ledger line {line_number} is invalid JSON") from exc
+    decoded = _decode_receipt_lines(lines, digest=hashlib.sha256(raw).hexdigest())
+    for line_number, (payload, _receipt) in enumerate(decoded, start=1):
         if not isinstance(payload, Mapping):
             raise ArtifactSchemaError(f"provider_receipt_ledger line {line_number} is not an object")
         _require_fields(payload, ("artifact_type", "artifact_version", "receipt_id", "call_id", "job_id", "stage_name", "status"), "provider_receipt_ledger entry")
@@ -1713,14 +1763,6 @@ def _validate_receipt_ledger(record: Any, path: str | Path, _root: Mapping[str, 
             raise ArtifactSchemaError("provider receipt ledger entry has an invalid artifact_type")
         if str(payload.get("artifact_version") or "") != "v2":
             raise ArtifactSchemaError("provider receipt ledger entry is not provider_call_receipt v2")
-        try:
-            from runtime.provider_runtime import ProviderCallReceiptV1
-
-            ProviderCallReceiptV1.from_dict(payload)
-        except (TypeError, ValueError, KeyError) as exc:
-            raise ArtifactSchemaError(
-                f"provider receipt ledger entry failed ProviderCallReceiptV1 validation: {exc}"
-            ) from exc
         records += 1
     if records == 0:
         raise ArtifactSchemaError("provider_receipt_ledger must contain at least one receipt")

@@ -2697,10 +2697,10 @@ class ReviewControlPlane:
                 {"verified_explicit_stage1_scope": verified_scope} if verified_scope is not None else {}
             )
             external_host_admission = self._admit_runtime_spec_external_hosts(spec, **scope_kwargs)
-            runner = AgentRuntimeRunner(
-                spec, resume_control_snapshot=captured_controls,
-                **scope_kwargs,
-            )
+            runner_kwargs: dict[str, Any] = dict(scope_kwargs)
+            if captured_controls is not None:
+                runner_kwargs["resume_control_snapshot"] = captured_controls
+            runner = AgentRuntimeRunner(spec, **runner_kwargs)
             result = runner.resume() if resume else runner.run()
             payload = self._status_payload(result)
             if result.job_status != "completed" or result.completion_status != "complete":

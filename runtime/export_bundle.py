@@ -825,7 +825,7 @@ class ExportBundleService:
         self.workspace = workspace
         self.registry = registry
 
-    def export(
+    def _export_impl(
         self,
         *,
         spec: ExportBundleSpecV1 | Mapping[str, Any] | None = None,
@@ -1222,6 +1222,18 @@ class ExportBundleService:
             manifest=manifest,
             issues=tuple(sorted(set([*issues, registration_error] if registration_error else issues))),
         )
+
+    def export(
+        self,
+        *,
+        spec: ExportBundleSpecV1 | Mapping[str, Any] | None = None,
+        completion: Mapping[str, Any] | None = None,
+        closure: Mapping[str, Any] | None = None,
+    ) -> ExportBundleResultV1:
+        from runtime.artifact_validators import receipt_parse_scope
+
+        with receipt_parse_scope():
+            return self._export_impl(spec=spec, completion=completion, closure=closure)
 
 
 class ForensicAttestationService:

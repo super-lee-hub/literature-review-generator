@@ -345,7 +345,7 @@ def test_same_revision_artifact_identity_change_fails_final_fence(
     assert latest["revision"] == initial_revision
 
 
-def test_external_registry_resolution_remains_per_owner(
+def test_external_registry_snapshot_is_shared_and_referenced_once_per_operation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -357,6 +357,7 @@ def test_external_registry_resolution_remains_per_owner(
     owners = [
         _register(local, tmp_path, "owner:one", "test_owner", "test-owner", dependencies=[ref], external_registry_resolver=resolver),
         _register(local, tmp_path, "owner:two", "test_owner", "test-owner", dependencies=[ref], external_registry_resolver=resolver),
+        _register(local, tmp_path, "owner:three", "test_owner", "test-owner", dependencies=[ref], external_registry_resolver=resolver),
     ]
     reads = 0
     original_read = external._read_registry_unlocked
@@ -372,7 +373,46 @@ def test_external_registry_resolution_remains_per_owner(
         external_registry_resolver=resolver,
         complete_ready_set_excluding=_EXCLUDED,
     ) == {}
-    assert reads == len(owners)
+    # One external snapshot read plus one final revision/content fence, rather
+    # than one read per local owner.
+    assert reads == 2
+
+
+def test_shared_external_snapshot_still_rejects_mid_operation_revision_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local = ArtifactRegistry(tmp_path / "local_registry.json", "local-job")
+    external = ArtifactRegistry(tmp_path / "external_registry.json", "external-job")
+    dependency = _register(external, tmp_path, "external:dep", "test_dependency", "test-dependency")
+    ref = ArtifactDependencyRefV2.from_record(dependency, dependency_kind="external_job")
+    resolver = lambda job_id: external if job_id == external.job_id else None
+    owners = [
+        _register(local, tmp_path, "owner:one", "test_owner", "test-owner", dependencies=[ref], external_registry_resolver=resolver),
+        _register(local, tmp_path, "owner:two", "test_owner", "test-owner", dependencies=[ref], external_registry_resolver=resolver),
+    ]
+    original_read = external._read_registry_unlocked
+    calls = 0
+
+    def mutate_on_fence():
+        nonlocal calls
+        calls += 1
+        revision, records = original_read()
+        if calls == 2:
+            path = Path(external.registry_path)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["revision"] += 1
+            _write_json(path, payload)
+            return original_read()
+        return revision, records
+
+    monkeypatch.setattr(external, "_read_registry_unlocked", mutate_on_fence)
+    with pytest.raises(RegistrySnapshotChanged, match="external Registry revision changed"):
+        local.verify_ready_artifact_dependency_sets(
+            owners,
+            external_registry_resolver=resolver,
+            complete_ready_set_excluding=_EXCLUDED,
+        )
 
 
 def test_export_reports_registry_snapshot_read_failure_as_locatable_issue() -> None:

@@ -99,7 +99,7 @@ def test_topic_planning_observes_original_durable_deadline(tmp_path: Path, monke
         max_retry_attempts_total=0, max_wall_seconds=30,
     ))
     controller._absolute_deadline_epoch = time.time() + 30
-    monkeypatch.setattr("outline.v3_executor.provider_budget_controller_from_environment", lambda: controller)
+    monkeypatch.setattr("outline.v3_executor.active_bound_provider_budget_controller", lambda: controller)
     topic, routes, evidence, layers = _topic(executor)
     original_build = executor._build_topic_provider_request
     def build_then_expire(*args, **kwargs):

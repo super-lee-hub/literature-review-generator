@@ -84,7 +84,7 @@ class RuntimeExecutionResult:
         return self.canonical_ready
 
 
-def _evaluate_runtime_completion(
+def _evaluate_runtime_completion_impl(
     outcome: JobOutcomeV1,
     registry: ArtifactRegistry,
     *,
@@ -98,6 +98,7 @@ def _evaluate_runtime_completion(
     required_provider_stages = {"analyze", "outline", "review", "validate"}.intersection(
         outcome.required_stages
     )
+
     provider_receipts_complete = not required_provider_stages
     provider_receipt_closure: Mapping[str, Any] | None = None
     current_stage_closure_map: Mapping[str, Any] | None = None
@@ -205,6 +206,22 @@ def _evaluate_runtime_completion(
             "evidence_sources": ("job_outcome_v1", "artifact_registry"),
         }
     )
+
+
+def _evaluate_runtime_completion(
+    outcome: JobOutcomeV1,
+    registry: ArtifactRegistry,
+    *,
+    external_registry_resolver: Callable[[str], ArtifactRegistry | None] | None = None,
+) -> CompletionEvaluationV1:
+    from runtime.artifact_validators import receipt_parse_scope
+
+    with receipt_parse_scope():
+        return _evaluate_runtime_completion_impl(
+            outcome,
+            registry,
+            external_registry_resolver=external_registry_resolver,
+        )
 
 
 def _stage1_status_projection(registry: ArtifactRegistry) -> dict[str, bool]:

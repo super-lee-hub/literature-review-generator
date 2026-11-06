@@ -1320,7 +1320,9 @@ class ArtifactRegistry:
         # the captured immutable local snapshot above.
         lease_verified_nodes: dict[tuple[str, str, int], ArtifactRecord] = {}
         lease_historical_targets: dict[str, str] = {}
-        lease_external_snapshots: dict[
+        # Share foreign Registry snapshots across every owner in this one
+        # operation, then recheck all of them before returning.
+        operation_external_snapshots: dict[
             str, tuple[ArtifactRegistry, int, Dict[str, ArtifactRecord]]
         ] = {}
         verified_lease_owners: list[ArtifactRecord] = []
@@ -1347,7 +1349,7 @@ class ArtifactRegistry:
                         require_ready=True,
                         external_registry_resolver=external_registry_resolver,
                         owner_record=owner,
-                        external_snapshots=lease_external_snapshots,
+                        external_snapshots=operation_external_snapshots,
                         _verified_nodes=lease_verified_nodes,
                         _historical_targets=lease_historical_targets,
                     )
@@ -1360,6 +1362,7 @@ class ArtifactRegistry:
                         require_ready=True,
                         external_registry_resolver=external_registry_resolver,
                         owner_record=owner,
+                        external_snapshots=operation_external_snapshots,
                     )
             except (OSError, RegistryError, ValueError, TypeError) as exc:
                 failures[owner.artifact_id] = exc
@@ -1374,8 +1377,8 @@ class ArtifactRegistry:
             self._verify_ready_artifact(record)
         if lease_historical_targets:
             self._recheck_historical_targets(lease_historical_targets)
-        if lease_external_snapshots:
-            self._assert_external_snapshots_unchanged(lease_external_snapshots)
+        if operation_external_snapshots:
+            self._assert_external_snapshots_unchanged(operation_external_snapshots)
 
         # Fence the unlocked validation against both normal revisioned writes
         # and same-revision artifact identity changes before returning success.

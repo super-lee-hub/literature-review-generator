@@ -3014,6 +3014,12 @@ _ENV_BUDGET_RAW = ""
 _ENV_BUDGET_CONTROLLER: ProviderBudgetController | None = None
 
 
+def active_bound_provider_budget_controller() -> ProviderBudgetController | None:
+    """Return only an explicitly bound in-process execution controller."""
+
+    return _ACTIVE_ACCEPTANCE_CONTROLLER.get() or _ACTIVE_RUN_PROVIDER_CONTROLLER.get()
+
+
 def provider_budget_controller_from_environment() -> ProviderBudgetController | None:
     """Resolve accepted, bound ordinary-run, then legacy environment budgets."""
 
@@ -6590,6 +6596,7 @@ __all__ = [
     "bind_provider_run_scope_authorization",
     "bind_provider_run_scope_proof",
     "bind_provider_run_budget",
+    "active_bound_provider_budget_controller",
     "bind_provider_run_plan_binding",
     "compute_closure_epoch_id",
     "current_acceptance_execution_context",
