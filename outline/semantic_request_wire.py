@@ -31,6 +31,7 @@ _CONTRACT = (
     "canonical IDs/string values, never input table/string reference tokens."
 )
 _MULTI_SOURCE_CONTRACT = _CONTRACT.replace("v1: in topic_synthesis only", "v2: in each named source_keys field")
+_ALLOWED_SOURCE_KEYS = {"topic_synthesis", "cross_group_comparison", "writer_task_scope"}
 
 
 class SemanticRequestWireError(ValueError):
@@ -115,7 +116,7 @@ def pack_semantic_request_wire(
     if WIRE_KEY in request:
         raise SemanticRequestWireError("request already has semantic source wire metadata")
     if (not source_keys or len(set(source_keys)) != len(source_keys)
-            or any(key not in {"topic_synthesis", "cross_group_comparison"} for key in source_keys)):
+            or any(key not in _ALLOWED_SOURCE_KEYS for key in source_keys)):
         raise SemanticRequestWireError("semantic source fields are invalid")
     if not any(request.get(key) for key in source_keys):
         return copy.deepcopy(dict(request))
@@ -186,7 +187,7 @@ def expand_semantic_request_wire(request: Mapping[str, Any]) -> dict[str, Any]:
         raise SemanticRequestWireError("semantic source wire metadata is invalid")
     source_keys = metadata.get("source_keys", ["topic_synthesis"])
     if (not isinstance(source_keys, list) or not source_keys
-            or any(key not in {"topic_synthesis", "cross_group_comparison"} for key in source_keys)
+            or any(key not in _ALLOWED_SOURCE_KEYS for key in source_keys)
             or len(source_keys) != len(set(source_keys))):
         raise SemanticRequestWireError("semantic source fields are invalid")
     prefix, strings = metadata["prefix"], metadata["strings"]

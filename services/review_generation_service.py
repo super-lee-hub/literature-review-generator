@@ -268,7 +268,12 @@ class ReviewGenerationService:
                 section_id,
                 writer_config=writer_config_for_epoch,
             )
-            prompt = self._prompt(raw_section, packet, catalog, allowed_ref_ids, writer_task_scope=task_scope)
+            prompt = self._prompt(
+                raw_section, packet, catalog, allowed_ref_ids,
+                writer_task_scope=task_scope,
+                writer_config=writer_config_for_epoch,
+                max_output_tokens=writer_max_output_tokens,
+            )
             request_payload = self._writer_request_payload(
                 prompt,
                 system_prompt=writer_system_prompt,
@@ -1967,6 +1972,8 @@ class ReviewGenerationService:
         allowed_ref_ids: Sequence[str],
         *,
         writer_task_scope: Mapping[str, Any] | None = None,
+        writer_config: Mapping[str, Any] | None = None,
+        max_output_tokens: int | None = None,
     ) -> str:
         evidence = self._summaries_for_packet(packet)
         payload = {
@@ -2012,6 +2019,24 @@ class ReviewGenerationService:
                 "requires_primary_unit_for_covered_task": True,
                 "requires_exact_task_unit_and_basis_ids": True,
             }
+        if writer_task_scope is not None and writer_config is not None:
+            from outline.semantic_request_wire import pack_semantic_request_wire
+
+            prompt_text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+            probe = canonical_provider_request_payload(
+                prompt=prompt_text,
+                system_prompt=self._system_prompt(),
+                user_content=None,
+                response_format="json",
+                max_output_tokens=(self._max_output_tokens() if max_output_tokens is None else int(max_output_tokens)),
+                temperature=0.2,
+            )
+            if not self._provider_context_profile(writer_config).estimate_request(probe)["within_budget"]:
+                packed_scope = pack_semantic_request_wire(
+                    payload,
+                    source_keys=("writer_task_scope",),
+                )
+                payload = packed_scope
         return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
     def _summaries_for_packet(self, packet: Mapping[str, Any]) -> list[dict[str, Any]]:

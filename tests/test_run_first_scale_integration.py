@@ -1232,6 +1232,10 @@ class _ScaleHTTPHandler(BaseHTTPRequestHandler):
                 input_content = outline_content(node_id, request)
             elif model == "rfs-writer-local":
                 envelope = json.loads(user_text)
+                if isinstance(envelope, Mapping) and "semantic_source_wire" in envelope:
+                    from outline.semantic_request_wire import expand_semantic_request_wire
+
+                    envelope = expand_semantic_request_wire(envelope)
                 node_id = str(envelope.get("node_id") or "") if isinstance(envelope, Mapping) else ""
                 outline_request = envelope.get("request") if isinstance(envelope, Mapping) else None
                 # Dispatch by the serialized runtime envelope, not by the
@@ -1484,6 +1488,52 @@ def test_scale_http_fixture_keeps_finite_writer_scope_mandatory() -> None:
         assert calls[0]["model"] == "rfs-writer-local"
         assert calls[0]["error"] == "AssertionError: Writer request omitted production writer_task_scope"
     finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_scale_http_fixture_expands_full_packed_writer_scope_and_preserves_raw_wire() -> None:
+    from outline.semantic_request_wire import pack_semantic_request_wire
+
+    server, thread, api_base = _start_scale_server([])
+    observed: list[Mapping[str, Any]] = []
+    original = _source_bound_writer_response
+
+    def response(envelope: Mapping[str, Any], trace: list[dict[str, Any]] | None) -> dict[str, Any] | None:
+        observed.append(dict(envelope))
+        return {"status": "success", "content": {"blocks": [{"text": "[[cite_ref:R001]]"}]}}
+
+    globals()["_source_bound_writer_response"] = response
+    claim_id = "claim:" + ("a" * 64)
+    scope = {
+        "schema_version": "writer_task_scope_wire/v1",
+        "usable_for_provider_admission": True,
+        "source_claim_ids": [claim_id],
+        "evidence_ids": ["evidence:" + ("b" * 64)],
+        "source_claim_text": "Source-bound text repeated for wire packing.",
+        "evidence_text": "Source-bound text repeated for wire packing.",
+    }
+    request = {
+        "writer_task_scope": scope,
+        "citation_ref_catalog": [{"ref_id": "R001", "paper_key": "paper-1"}],
+        "prompt": "Preserve the source scope exactly.",
+    }
+    packed = pack_semantic_request_wire(request, source_keys=("writer_task_scope",))
+    body = json.dumps({"model": "rfs-writer-local", "max_tokens": 2048, "messages": [{"role": "user", "content": json.dumps(packed)}]}).encode("utf-8")
+    try:
+        http_request = urllib.request.Request(f"{api_base}/chat/completions", data=body, headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(http_request, timeout=5) as response_handle:
+            payload = json.loads(response_handle.read().decode("utf-8"))
+        assert json.loads(payload["choices"][0]["message"]["content"])["blocks"]
+        assert observed and observed[0] == request
+        assert packed["semantic_source_wire"]["strings"]
+        packed_user_text = json.dumps(packed)
+        assert server.calls[0]["user_text_bytes"] == len(packed_user_text.encode("utf-8"))  # type: ignore[attr-defined]
+        assert server.calls[0]["user_text_sha256"] == hashlib.sha256(packed_user_text.encode("utf-8")).hexdigest()  # type: ignore[attr-defined]
+        assert server.calls[0]["stage"] == "stage3_writer"  # type: ignore[attr-defined]
+    finally:
+        globals()["_source_bound_writer_response"] = original
         server.shutdown()
         thread.join(timeout=5)
         server.server_close()
