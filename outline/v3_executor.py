@@ -17,6 +17,7 @@ import math
 import os
 import re
 import tempfile
+import time
 import unicodedata
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -129,6 +130,7 @@ from runtime.provider_runtime import (
     ProviderAggregateBudgetV2,
     ProviderBudgetV1,
     ProviderBudgetController,
+    ProviderBudgetExceeded,
     ProviderCancellationRequested,
     ProviderResponseSnapshotSink,
     ProviderCallReceiptV1,
@@ -849,6 +851,8 @@ class OutlineV3Executor:
         self._frozen_stability_relation_scope: dict[str, Any] | None = None
         self.provider_call_plans: tuple[OutlineProviderCallPlan, ...] = ()
         self.semantic_request_plan: list[dict[str, Any]] = []
+        self._topic_provider_plan_cache: dict[str, tuple[list[TopicSynthesis], list[list[TopicSynthesis]], list[dict[str, Any]]]] = {}
+        self._last_planning_control_check = 0.0
         self.topic_request_plan_identity_hash = ""
         self.semantic_relation_candidates: list[dict[str, Any]] = []
         self.semantic_cross_group_questions: list[str] = []
@@ -3531,7 +3535,28 @@ class OutlineV3Executor:
 
         try:
             with snapshot_topic_materialization(evidence_model, content_layers_model) as snapshot:
-                return self._plan_topic_provider_batches_from_snapshot(
+                # Derive the key from the immutable snapshot serialization,
+                # rather than a potentially stale model property.  This keeps
+                # cache reuse fail-closed when a caller mutates source facts
+                # while retaining an old projected hash field.
+                source_identity = {
+                    "evidence": str(getattr(snapshot.evidence_model, "content_hash", "") or getattr(snapshot.evidence_model, "artifact_hash", "")),
+                    "content_layers": str(getattr(snapshot.content_layers_model, "content_hash", "")),
+                }
+                cache_key = hash_json({
+                    "topic_plan": [item.to_dict() for item in topic_plan],
+                    "topic_routes": {
+                        str(key): getattr(value, "to_dict", lambda: str(value))()
+                        for key, value in sorted(topic_routes.items())
+                    },
+                    "source_identity": source_identity,
+                    "profile": self._profile_identity(profile),
+                    "semantic_contract": self.provider_semantic_contract_version,
+                })
+                cached = self._topic_provider_plan_cache.get(cache_key)
+                if cached is not None:
+                    return copy.deepcopy(cached)
+                planned = self._plan_topic_provider_batches_from_snapshot(
                     topic_plan, topic_routes=topic_routes,
                     evidence_model=snapshot.evidence_model,
                     content_layers_model=snapshot.content_layers_model, profile=profile,
@@ -3539,6 +3564,8 @@ class OutlineV3Executor:
                         {} if snapshot.cached and type(self) is OutlineV3Executor else None
                     ),
                 )
+                self._topic_provider_plan_cache[cache_key] = copy.deepcopy(planned)
+                return planned
         except TopicMaterializationSourceChanged as exc:
             raise OutlineV3ExecutionError(f"topic planning source models changed: {exc}") from exc
 
@@ -3583,6 +3610,7 @@ class OutlineV3Executor:
         current_measurement: tuple[dict[str, Any], dict[str, Any]] | None = None
 
         def measure(items: Sequence[TopicSynthesis], batch_index: int) -> tuple[dict[str, Any], dict[str, Any]]:
+            self._check(f"topic_synthesis:request:{batch_index}:before", phase="planning")
             request = self._build_topic_provider_request(
                 items,
                 topic_routes=topic_routes,
@@ -3592,6 +3620,10 @@ class OutlineV3Executor:
                 content_layers_hash=content_layers_hash,
                 materialization_cache=materialization_cache,
             )
+            # Force a full control boundary after serialization: a pause,
+            # cancellation, or expired run deadline raised during request
+            # construction must prevent the next estimate/batch.
+            self._check(f"topic_synthesis:request:{batch_index}:after", phase="before")
             node_id = self._topic_provider_node_id(request, batch_index)
             budget = profile.estimate_request(self._attach_prompt_authority(node_id, request))
             tokens = int(budget.get("estimated_input_tokens") or profile.estimate_tokens(request))
@@ -3609,6 +3641,7 @@ class OutlineV3Executor:
             return request, budget
 
         for topic in expanded:
+            self._check(f"topic_synthesis:plan:{len(expanded) + 1}", phase="planning")
             if (current
                     and getattr(self, "provider_semantic_contract_version", None) == PROVIDER_SEMANTIC_CONTRACT_V2
                     and not ownership_compatible_v2(current, [topic])):
@@ -3916,7 +3949,9 @@ class OutlineV3Executor:
     ) -> int:
         """Count the exact bounded topic requests used by the executor."""
 
+        self._check("topic_synthesis:batch_count", phase="planning")
         evidence_model = build_outline_evidence_views(summaries, self.job_id)
+        self._check("topic_synthesis:batch_count:after_evidence", phase="before")
         ledger = build_global_corpus_ledger(evidence_model)
         matrix = build_multi_view_matrix(evidence_model)
         relation_map = build_global_relation_map(
@@ -3928,12 +3963,14 @@ class OutlineV3Executor:
             evidence_model,
             job_id=self.job_id,
         )
+        self._check("topic_synthesis:batch_count:after_source_layers", phase="before")
         semantic_plan = build_semantic_chunk_plan(
             content_layers_model,
             relation_map,
             candidate_count=self.candidate_count,
             physical_call_limit=authorized_provider_call_limit(self.max_provider_calls),
         )
+        self._check("topic_synthesis:batch_count:after_semantic_plan", phase="before")
         selected_relation_ids = {
             str(value)
             for value in semantic_plan.coverage.get("selected_relation_ids") or ()
@@ -3954,6 +3991,7 @@ class OutlineV3Executor:
             content_layers_model=content_layers_model,
             profile=profile,
         )
+        self._check("topic_synthesis:batch_count:after_plan", phase="before")
         self.semantic_request_plan = request_plan
         return len(batches)
 
@@ -4093,6 +4131,7 @@ class OutlineV3Executor:
                 content_layers_hash=content_layers_hash,
                 materialization_cache=materialization_cache,
             )
+            self._check(f"topic_synthesis:split:{topic.topic_id}:after_request", phase="before")
             full_budget = profile.estimate_request(
                 self._attach_prompt_authority(
                     f"topic_synthesis:preflight:{len(expanded) + 1}",
@@ -4142,6 +4181,7 @@ class OutlineV3Executor:
             paper_ids = [str(item) for item in topic.paper_ids if str(item)]
             current: list[str] = []
             for paper_id in paper_ids:
+                self._check(f"topic_synthesis:split:{topic.topic_id}:{paper_id}", phase="planning")
                 trial_ids = [*current, paper_id]
                 trial_topic = with_paper_set(topic, trial_ids)
                 trial_request = self._build_topic_provider_request(
@@ -4153,6 +4193,7 @@ class OutlineV3Executor:
                     content_layers_hash=content_layers_hash,
                     materialization_cache=materialization_cache,
                 )
+                self._check(f"topic_synthesis:split:{topic.topic_id}:{paper_id}:after_request", phase="before")
                 trial_budget = profile.estimate_request(
                     self._attach_prompt_authority(
                         f"topic_synthesis:preflight:{len(expanded) + 1}",
@@ -4178,6 +4219,7 @@ class OutlineV3Executor:
                         content_layers_hash=content_layers_hash,
                         materialization_cache=materialization_cache,
                     )
+                    self._check(f"topic_synthesis:split:{topic.topic_id}:{paper_id}:after_single_request", phase="before")
                     one_budget = profile.estimate_request(
                         self._attach_prompt_authority(
                             f"topic_synthesis:preflight:{len(expanded) + 1}",
@@ -9083,13 +9125,25 @@ class OutlineV3Executor:
         return call_id
 
     def _check(self, node_id: str, *, phase: str = "before") -> None:
-        if self.cancellation_checker is not None:
+        control_check_due = (
+            phase != "planning"
+            or time.monotonic() - self._last_planning_control_check >= 0.1
+        )
+        if self.cancellation_checker is not None and control_check_due:
             self.cancellation_checker()
         # Pause is an explicit durable admission gate, separate from
         # cancellation.  It is checked immediately before local/provider node
         # work so a stale UI interruption cannot silently start another call.
-        if phase == "before":
+        if phase in {"before", "planning"} and control_check_due:
             self._pause_state.assert_runnable(node_id=node_id)
+            controller = provider_budget_controller_from_environment()
+            if controller is not None:
+                deadline = controller.durable_deadline_epoch
+                if deadline is not None and datetime.now(timezone.utc).timestamp() >= deadline:
+                    raise ProviderBudgetExceeded(
+                        "aggregate provider wall-clock budget exhausted during local planning"
+                    )
+            self._last_planning_control_check = time.monotonic()
         if self.fault_injector is not None:
             self.fault_injector(
                 node_id,

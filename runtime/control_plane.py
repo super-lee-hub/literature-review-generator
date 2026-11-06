@@ -2655,6 +2655,7 @@ class ReviewControlPlane:
         *,
         resume: bool = False,
         job_id: str = "",
+        resume_control_snapshot: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         spec = _load_spec_path(spec_path)
         if job_id:
@@ -2663,8 +2664,43 @@ class ReviewControlPlane:
             spec = replace(spec, job_id=job_id)
 
         def execute_bound_spec() -> dict[str, Any]:
-            external_host_admission = self._admit_runtime_spec_external_hosts(spec)
-            runner = AgentRuntimeRunner(spec)
+            captured_controls = resume_control_snapshot
+            if resume and captured_controls is None:
+                # Capture the operator's stop markers before host admission or
+                # any other lengthy resume preflight. The runner later clears
+                # exactly these versions after acquiring its execution lease.
+                snapshot_workspace, snapshot_registry = AgentRuntimeRunner._open_workspace(
+                    Path(spec_path).expanduser().resolve().parent.parent
+                )
+                cancel_state, cancel_hash = CancellationRequestStore(
+                    snapshot_workspace, snapshot_registry
+                ).read_snapshot()
+                pause_state, pause_hash = PauseStateStore(
+                    snapshot_workspace, snapshot_registry
+                ).read_snapshot()
+                captured_controls = {
+                    "cancel_state": cancel_state,
+                    "cancel_hash": cancel_hash,
+                    "pause_state": pause_state,
+                    "pause_hash": pause_hash,
+                }
+            verified_scope = None
+            if spec.metadata.get("stage1_summary_input_mode") == "explicit_typed_import":
+                from runtime.explicit_stage1_scope import load_explicit_stage1_scope
+                from runtime.test_dependencies import current_runtime_test_dependencies
+
+                dependencies = current_runtime_test_dependencies()
+                verified_scope = load_explicit_stage1_scope(
+                    spec, allow_template_credentials=bool(dependencies and dependencies.allow_template_credentials),
+                )
+            scope_kwargs: dict[str, Any] = (
+                {"verified_explicit_stage1_scope": verified_scope} if verified_scope is not None else {}
+            )
+            external_host_admission = self._admit_runtime_spec_external_hosts(spec, **scope_kwargs)
+            runner = AgentRuntimeRunner(
+                spec, resume_control_snapshot=captured_controls,
+                **scope_kwargs,
+            )
             result = runner.resume() if resume else runner.run()
             payload = self._status_payload(result)
             if result.job_status != "completed" or result.completion_status != "complete":
@@ -2870,6 +2906,8 @@ class ReviewControlPlane:
     def _admit_runtime_spec_external_hosts(
         self,
         spec: RuntimeJobSpec,
+        *,
+        verified_explicit_stage1_scope: Any | None = None,
     ) -> dict[str, Any]:
         """Fail closed before a direct run/resume constructs any transport."""
 
@@ -2889,6 +2927,7 @@ class ReviewControlPlane:
 
                 explicit_scope = load_explicit_stage1_scope(
                     spec, allow_template_credentials=bool(test_dependencies and test_dependencies.allow_template_credentials),
+                    verified_scope=verified_explicit_stage1_scope,
                 )
             normalized = explicit_scope.config if explicit_scope is not None else load_config(
                 str(spec.config),
@@ -7182,11 +7221,10 @@ class ReviewControlPlane:
         spec_path = _persisted_runtime_spec_path(resolved, registry)
         if not spec_path.is_file():
             raise ControlPlaneError(f"persisted runtime spec is missing: {spec_path}")
-        cancel_store = CancellationRequestStore(workspace_obj, registry)
-        try:
-            captured_cancel, captured_cancel_hash = cancel_store.read_snapshot()
-        except (OSError, RegistryError, ValueError, TypeError) as exc:
-            raise ControlPlaneError(f"resume cancellation state is invalid: {exc}") from exc
+        cancel_state, cancel_hash = CancellationRequestStore(workspace_obj, registry).read_snapshot()
+        pause_state, pause_hash = PauseStateStore(workspace_obj, registry).read_snapshot()
+        control_snapshot = {"cancel_state": cancel_state, "cancel_hash": cancel_hash,
+                            "pause_state": pause_state, "pause_hash": pause_hash}
         # Validate the persisted runtime identity before mutating any resume
         # state. A malformed/stale spec or fingerprint must leave the DAG,
         # cancellation request, and pause marker untouched.
@@ -7210,36 +7248,24 @@ class ReviewControlPlane:
             load_current_continuation(workspace_obj, registry, normalized_resume_spec.to_dict())
         except (OSError, RegistryError, ValueError, TypeError, RuntimeError) as exc:
             raise ControlPlaneError(f"resume identity preflight is invalid: {exc}") from exc
-        outline_resume_plan: dict[str, Any] | None = None
+        # Do not mutate the DAG or stop markers until the runner has acquired
+        # the execution lease.  A rejected resume must leave both byte-for-byte
+        # unchanged; the runner performs the CAS-protected preparation inside
+        # its existing lease preflight.
+        from runtime.cancellation import CancellationRequestError
+        from runtime.pause_state import PauseRequestedError
+
         try:
-            node_store = OutlineNodeStore(workspace_obj, registry)
-            dag = node_store.load()
-            if dag is not None and dag.failed_node_ids:
-                _updated, plan = node_store.resume()
-                outline_resume_plan = plan.to_dict()
-        except (OSError, ValueError, TypeError, RegistryError) as exc:
-            raise ControlPlaneError(f"Outline v3 resume planning is blocked: {exc}") from exc
-        try:
-            if captured_cancel is not None and captured_cancel.active:
-                cancel_store.clear(
-                    cleared_by="reviewctl", reason="resume_requested",
-                    expected_hash=captured_cancel_hash,
-                )
-        except (OSError, RegistryError, ValueError, TypeError) as exc:
+            payload = self._run_spec(
+                spec_path,
+                resume=True,
+                job_id=Path(resolved).name.rsplit("__", 1)[-1],
+                resume_control_snapshot=control_snapshot,
+            )
+        except CancellationRequestError as exc:
             raise ControlPlaneError(f"resume cancellation state is invalid: {exc}") from exc
-        try:
-            pause_store = PauseStateStore(workspace_obj, registry)
-            pause_state = pause_store.read()
-            if pause_state is not None and pause_state.paused:
-                pause_store.clear(cleared_by="reviewctl", reason="explicit_resume")
-        except (OSError, RegistryError, ValueError, TypeError, RuntimeError) as exc:
+        except PauseRequestedError as exc:
             raise ControlPlaneError(f"resume pause state is invalid: {exc}") from exc
-        payload = self._run_spec(
-            spec_path,
-            resume=True,
-            job_id=Path(resolved).name.rsplit("__", 1)[-1],
-        )
-        payload["outline_v3_resume_plan"] = outline_resume_plan
         return payload
 
     def retry_node(

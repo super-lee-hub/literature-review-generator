@@ -54,10 +54,15 @@ class _SnapshotReadViewBehavior:
         hashes: Mapping[str, Any] | None = None,
         overrides: Mapping[str, Callable[[], Any]] | None = None,
         lease: _SnapshotLease,
+        copy_payload: bool = True,
+        copy_canonical: bool = True,
     ) -> None:
         object.__setattr__(self, "_source", source)
-        object.__setattr__(self, "_payload", deepcopy(dict(payload)))
-        object.__setattr__(self, "_canonical", deepcopy(dict(canonical)) if canonical is not None else None)
+        # Snapshot builders pass detached, privately-owned mappings. Keep one
+        # internal copy instead of recursively copying the same frozen payload
+        # at every view/model wrapper. Public accessors still deepcopy values.
+        object.__setattr__(self, "_payload", deepcopy(dict(payload)) if copy_payload else dict(payload))
+        object.__setattr__(self, "_canonical", deepcopy(dict(canonical)) if canonical is not None and copy_canonical else (dict(canonical) if canonical is not None else None))
         object.__setattr__(self, "_hashes", dict(hashes or {}))
         object.__setattr__(self, "_overrides", dict(overrides or {}))
         object.__setattr__(self, "_lease", lease)
@@ -130,7 +135,7 @@ def _identity(model_type: type[Any], payload: Mapping[str, Any]) -> str:
 def _evidence_serialization(model: OutlineEvidenceViews) -> tuple[dict[str, Any], dict[str, Any], str]:
     canonical = deepcopy(model.canonical_payload())
     content_hash = compute_v3_hash(canonical)
-    payload = deepcopy(canonical)
+    payload = dict(canonical)
     payload.update({
         "created_from_job_id": model.created_from_job_id,
         "shard_id": model.shard_id,
@@ -144,7 +149,7 @@ def _evidence_serialization(model: OutlineEvidenceViews) -> tuple[dict[str, Any]
 def _content_layers_serialization(model: PaperContentLayers) -> tuple[dict[str, Any], dict[str, Any], str]:
     canonical = deepcopy(model.canonical_payload())
     content_hash = compute_v3_hash(canonical)
-    payload = deepcopy(canonical)
+    payload = dict(canonical)
     payload.update({"status": model.status, "content_hash": content_hash})
     return canonical, payload, _identity(type(model), payload)
 
@@ -190,12 +195,13 @@ def _view_snapshot(
     payload: Mapping[str, Any],
     lease: _SnapshotLease,
 ) -> _SnapshotOutlineEvidenceView:
-    detached = deepcopy(dict(payload))
+    detached = dict(payload)
     return _SnapshotOutlineEvidenceView(
         view,
         detached,
         hashes={"view_hash": compute_v3_hash(detached)},
         lease=lease,
+        copy_payload=False,
     )
 
 
@@ -204,8 +210,8 @@ def _dossier_snapshot(
     payload: Mapping[str, Any],
     lease: _SnapshotLease,
 ) -> _SnapshotPaperEvidenceDossier:
-    detached = deepcopy(dict(payload))
-    canonical = deepcopy(detached)
+    detached = dict(payload)
+    canonical = dict(detached)
     evidence_ids = canonical.pop("evidence_ids")
     content_hash = canonical.pop("content_hash")
     if compute_v3_hash(canonical) != content_hash:
@@ -216,11 +222,13 @@ def _dossier_snapshot(
         canonical=canonical,
         hashes={"content_hash": content_hash, "evidence_ids": evidence_ids},
         lease=lease,
+        copy_payload=False,
+        copy_canonical=False,
     )
 
 
 def _card_snapshot(card: PaperIndexCard, payload: Mapping[str, Any], lease: _SnapshotLease) -> _SnapshotPaperIndexCard:
-    return _SnapshotPaperIndexCard(card, payload, lease=lease)
+    return _SnapshotPaperIndexCard(card, dict(payload), lease=lease, copy_payload=False)
 
 
 def _snapshot_evidence_model(
@@ -246,6 +254,7 @@ def _snapshot_evidence_model(
     }
     return _SnapshotOutlineEvidenceViews(
         model, payload, canonical=canonical, hashes=hashes, overrides=overrides, lease=lease,
+        copy_payload=False, copy_canonical=False,
     ), identity
 
 
@@ -287,6 +296,7 @@ def _snapshot_content_layers_model(
     }
     return _SnapshotPaperContentLayers(
         model, payload, canonical=canonical, hashes=hashes, overrides=overrides, lease=lease,
+        copy_payload=False, copy_canonical=False,
     ), identity
 
 

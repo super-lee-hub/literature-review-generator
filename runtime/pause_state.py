@@ -8,11 +8,13 @@ admission until an explicit resume clears the marker.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from contextlib import nullcontext
 import json
 from pathlib import Path
 from typing import Any, Mapping
 
 from services.artifact_registry import ArtifactRecord, ArtifactRegistry, file_sha256
+from services.durable_io import interprocess_file_lock
 from services.job_workspace import JobWorkspace, atomic_write_json, utc_now_iso
 
 
@@ -71,6 +73,10 @@ class PauseStateStore:
         self.artifact_id = f"pause_state:{workspace.job_id}"
 
     def read(self) -> PauseStateV1 | None:
+        with interprocess_file_lock(self.path):
+            return self._read_unlocked()
+
+    def _read_unlocked(self) -> PauseStateV1 | None:
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
         except FileNotFoundError:
@@ -109,6 +115,12 @@ class PauseStateStore:
                 )
         return state
 
+    def read_snapshot(self) -> tuple[PauseStateV1 | None, str]:
+        """Read the pause marker together with the bytes it authorizes."""
+        with interprocess_file_lock(self.path):
+            state = self._read_unlocked()
+            return state, file_sha256(self.path) if state is not None else ""
+
     def _persist(self, state: PauseStateV1, *, producer: str) -> ArtifactRecord | None:
         atomic_write_json(str(self.path), state.to_dict())
         if self.registry is None:
@@ -143,10 +155,23 @@ class PauseStateStore:
             reason=reason,
             checkpoint=checkpoint,
         )
-        self._persist(state, producer="runtime.pause_state.request")
+        with interprocess_file_lock(self.path):
+            self._persist(state, producer="runtime.pause_state.request")
         return state
 
-    def clear(self, *, cleared_by: str = "reviewctl", reason: str = "explicit_resume") -> PauseStateV1:
+    def clear(
+        self,
+        *,
+        cleared_by: str = "reviewctl",
+        reason: str = "explicit_resume",
+        expected_hash: str | None = None,
+        _lock_held: bool = False,
+    ) -> PauseStateV1:
+        if expected_hash is not None and (
+            not isinstance(expected_hash, str)
+            or (expected_hash and (len(expected_hash) != 64 or any(c not in "0123456789abcdef" for c in expected_hash)))
+        ):
+            raise PauseRequestedError("CONTROL_STATE_INVALID: expected pause hash is invalid")
         state = PauseStateV1(
             state_id=f"pause:{self.workspace.job_id}",
             job_id=self.workspace.job_id,
@@ -156,7 +181,12 @@ class PauseStateStore:
             reason=reason,
             checkpoint="provider_admission",
         )
-        self._persist(state, producer="runtime.pause_state.clear")
+        with (nullcontext() if _lock_held else interprocess_file_lock(self.path)):
+            if expected_hash is not None:
+                current_hash = file_sha256(self.path) if self.path.is_file() else ""
+                if current_hash != expected_hash:
+                    raise PauseRequestedError("pause marker changed after resume was requested")
+            self._persist(state, producer="runtime.pause_state.clear")
         return state
 
     def is_paused(self) -> bool:

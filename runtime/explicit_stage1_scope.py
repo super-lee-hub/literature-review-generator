@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import copy
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -15,7 +16,8 @@ from runtime.provider_routes import (
 from runtime.stage_planning import StagePlan, build_stage_plan
 from runtime.stage_contracts import SourceBundle
 from runtime.source_intake import build_source_bundle_for_request
-from services.artifact_registry import ArtifactRegistry, RegistryError
+from services.artifact_registry import ArtifactRegistry, RegistryError, file_sha256
+from runtime.provider_runtime import hash_json
 from services.explicit_stage1_typed_import import (
     ExplicitTypedImportPlan,
     resolve_explicit_typed_imports,
@@ -48,6 +50,10 @@ class ExplicitStage1Scope:
     provider_route_plan: EffectiveProviderRoutePlan
     config: Mapping[str, Mapping[str, Any]]
     remote_preprocess_required: bool
+    input_identity: str = ""
+    verified_files: tuple[tuple[str, str], ...] = ()
+    discovery_membership: tuple[str, ...] = ()
+    template_credentials_allowed: bool = False
 
     @property
     def effective_provider_route_plan(self) -> EffectiveProviderRoutePlan:
@@ -245,6 +251,105 @@ def _require_complete_visual_coverage(config: Mapping[str, Mapping[str, Any]]) -
     )
 
 
+def _input_identity(spec: RuntimeJobSpec, stage_plan: StagePlan) -> str:
+    # Normalization may add job/workspace IDs and explicit stage defaults.
+    # Only the resolved, complete source/routing input belongs to this scope.
+    return hash_json({
+        "project_name": spec.project_name, "source": spec.source.to_dict(),
+        "config": spec.config, "action": spec.action,
+        "stage_plan": stage_plan.to_dict(),
+        "reuse_stage1": spec.reuse_stage1,
+        "reuse_summary_files": list(spec.reuse_summary_files),
+        "f1_corpus_binding": spec.metadata.get("f1_corpus_binding"),
+        "free_mode_profile": spec.free_mode_profile,
+        "free_mode_idea": spec.free_mode_idea,
+        "free_mode_input": spec.metadata.get("free_mode_input"),
+    })
+
+
+def _membership(spec: RuntimeJobSpec) -> tuple[str, ...]:
+    folder = spec.source.pdf_folder if spec.source.mode == "direct" else spec.source.library_path
+    return tuple(sorted(str(p.absolute()) + "|" + str(p.resolve()) for p in Path(folder).rglob("*")
+                        if p.is_file() and p.suffix.lower() == ".pdf"))
+
+
+def _snapshot_files(spec: RuntimeJobSpec, scope: ExplicitStage1Scope) -> tuple[tuple[str, str], ...]:
+    """Bind the verified V1 inputs; retain fresh V2 owner-Registry admission."""
+    from services.stage1_reuse import Stage1TypedManifestAuthorityV2
+
+    if any(isinstance(entry.authority, Stage1TypedManifestAuthorityV2)
+           for entry in scope.import_plan.imports):
+        return ()
+    files: dict[str, str] = {}
+
+    def remember(path: str, expected: str = "", base: Path | None = None) -> None:
+        if not path:
+            return
+        target = Path(path).expanduser()
+        if not target.is_absolute() and base is not None:
+            target = base / target
+        path = str(target.absolute())
+        if path in files:
+            if expected and files[path] != expected:
+                raise ExplicitStage1ScopeError("explicit Stage 1 input hash conflicts: " + path)
+            return
+        actual = file_sha256(path)
+        if expected and actual != expected:
+            raise ExplicitStage1ScopeError("explicit Stage 1 input changed: " + path)
+        previous = files.setdefault(path, actual)
+        if previous != actual:
+            raise ExplicitStage1ScopeError("explicit Stage 1 input changed: " + path)
+
+    for path in (spec.config, spec.source.zotero_report, spec.free_mode_profile,
+                 *spec.reuse_summary_files):
+        remember(path)
+    for item in scope.full_bundle.paper_work_items:
+        remember(item.source_pdf)
+    seen_closures: set[str] = set()
+    for entry in scope.import_plan.imports:
+        authority = entry.authority
+        manifest = authority.manifest
+        remember(entry.binding.source_authority_registry_path)
+        remember(entry.current_source_pdf_path, entry.current_source_pdf_sha256)
+        remember(authority.manifest_path, authority.manifest_file_hash)
+        remember(authority.source_summary_path, manifest.source_summary_artifact_hash)
+        remember(authority.provider_closure_path, manifest.provider_receipt_closure_hash)
+        remember(authority.provider_ledger_path, manifest.provider_receipt_ledger_hash)
+        qualification = manifest.visual_evidence_qualification or {}
+        base = Path(authority.manifest_path).parent
+        if qualification.get("coverage_artifact_path"):
+            remember(str(qualification["coverage_artifact_path"]),
+                     str(qualification.get("coverage_artifact_hash") or ""), base)
+        paths = qualification.get("observation_artifact_paths") or ()
+        hashes = qualification.get("observation_artifact_hashes") or ()
+        for path, expected in zip(paths, hashes):
+            remember(str(path), str(expected), base)
+        if authority.provider_closure_path and authority.provider_closure_path not in seen_closures:
+            seen_closures.add(authority.provider_closure_path)
+            closure = json.loads(Path(authority.provider_closure_path).read_text(encoding="utf-8"))
+            for call in closure.get("expected_calls", ()):
+                remember(str(call.get("artifact_path") or ""), str(call.get("registry_file_hash") or ""))
+    return tuple(sorted(files.items()))
+
+
+def _reuse_verified_scope(spec: RuntimeJobSpec, scope: ExplicitStage1Scope) -> ExplicitStage1Scope:
+    from services.settings import ApplicationSettings
+
+    plan = build_stage_plan(
+        action=spec.action, requested_stages=spec.metadata.get("requested_stages"),
+        validation_enabled=ApplicationSettings.from_config(scope.config).review_validation_enabled(),
+        validation_required=spec.metadata.get("validation_required"),
+        require_clean_validation=spec.metadata.get("require_clean_validation"),
+        allow_unvalidated_when_validation_optional=spec.metadata.get("allow_unvalidated_when_validation_optional"),
+    )
+    if scope.input_identity != _input_identity(spec, plan) or scope.discovery_membership != _membership(spec):
+        raise ExplicitStage1ScopeError("verified explicit Stage 1 scope input identity changed")
+    for path, expected in scope.verified_files:
+        if file_sha256(path) != expected:
+            raise ExplicitStage1ScopeError("verified explicit Stage 1 scope bytes changed: " + path)
+    return copy.deepcopy(scope)
+
+
 def _resolve_with_config(
     spec: RuntimeJobSpec,
     config: Mapping[str, Mapping[str, Any]],
@@ -314,14 +419,20 @@ def load_explicit_stage1_scope(
     *,
     external_registry_resolver: RegistryResolver | None = None,
     allow_template_credentials: bool = False,
+    verified_scope: ExplicitStage1Scope | None = None,
 ) -> ExplicitStage1Scope:
     """Load credentials once, verify the partition, then reload effective routes."""
 
     _require_explicit_spec(spec)
+    if (verified_scope is not None and verified_scope.verified_files
+            and verified_scope.template_credentials_allowed == allow_template_credentials
+            and external_registry_resolver is None):
+        return _reuse_verified_scope(spec, verified_scope)
     from config_loader import load_config
     from services.settings import ApplicationSettings
 
     free_mode_enabled = _free_mode_enabled(spec)
+    config_hash = file_sha256(spec.config)
     bootstrap = load_config(
         spec.config,
         action=spec.action,
@@ -357,12 +468,21 @@ def load_explicit_stage1_scope(
         free_mode_enabled=free_mode_enabled,
         allow_template_credentials=allow_template_credentials,
     )
-    return _resolve_with_config(
-        spec,
-        final_config,
-        actual_plan,
-        external_registry_resolver=external_registry_resolver,
+    # Route normalization changes credentials/reachability, not source policy.
+    # Reuse this operation's verified partition instead of verifying it twice.
+    if _require_complete_visual_coverage(bootstrap) != _require_complete_visual_coverage(final_config):
+        raise ExplicitStage1ScopeError("explicit Stage 1 policy changed during configuration load")
+    routes = build_reachable_provider_route_plan(
+        final_config, action=spec.action, requested_stages=effective_plan.requested_stages,
+        free_mode_enabled=free_mode_enabled, stage_plan=effective_plan,
     )
+    result = replace(provisional, config=final_config, provider_route_plan=EffectiveProviderRoutePlan(
+        action=routes.action, stage_plan=effective_plan, routes=routes.routes, diagnostics=routes.diagnostics,
+    ), input_identity=_input_identity(spec, actual_plan), discovery_membership=_membership(spec))
+    if file_sha256(spec.config) != config_hash:
+        raise ExplicitStage1ScopeError("configuration changed during explicit Stage 1 admission")
+    return replace(result, verified_files=_snapshot_files(spec, result),
+                   template_credentials_allowed=allow_template_credentials)
 
 
 __all__ = [

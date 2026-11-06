@@ -350,6 +350,8 @@ class _RuntimeStageHost:
         request: JobRunRequest,
         project_name: str,
         cancel_token: CancelToken,
+        *,
+        verified_explicit_stage1_scope: Any | None = None,
     ) -> None:
         self.logger = logging.getLogger("auto_generate.runtime")
         from runtime.test_dependencies import current_runtime_test_dependencies
@@ -364,6 +366,7 @@ class _RuntimeStageHost:
 
             scope = load_explicit_stage1_scope(
                 strict_spec,
+                verified_scope=verified_explicit_stage1_scope,
                 allow_template_credentials=bool(
                     test_dependencies and test_dependencies.allow_template_credentials
                 ),
@@ -2135,12 +2138,14 @@ class AgentRuntimeBridge:
         direct_validation_route_fingerprint: str = "",
         direct_validation_host_acknowledgement: Mapping[str, Any] | None = None,
         verified_source_revision_plan: Mapping[str, Any] | None = None,
+        verified_explicit_stage1_scope: Any | None = None,
     ) -> None:
         job_spec.validate()
         self._job_id_was_omitted = not bool(str(job_spec.job_id or "").strip())
         resolved_job_id = job_spec.job_id or JobWorkspace.generate_job_id()
         job_spec = replace(job_spec, job_id=resolved_job_id)
         self.job_spec = job_spec
+        self._verified_explicit_stage1_scope = verified_explicit_stage1_scope
         self.source_revision_plan = verified_source_revision_plan
         self.source_revision_replay_context = None
         self.stage1_partial_recovery_context: Stage1PartialRecoveryContext | None = None
@@ -2258,7 +2263,10 @@ class AgentRuntimeBridge:
         if self.job_spec.metadata.get("stage1_summary_input_mode") == "explicit_typed_import":
             from runtime.explicit_stage1_scope import load_explicit_stage1_scope
 
-            explicit_scope = load_explicit_stage1_scope(self.job_spec)
+            explicit_scope = load_explicit_stage1_scope(
+                self.job_spec, verified_scope=self._verified_explicit_stage1_scope,
+            )
+            self._verified_explicit_stage1_scope = explicit_scope
         config = explicit_scope.config if explicit_scope is not None else load_config(
             str(self.job_spec.config), action=self.job_spec.action,
             requested_stages=self.job_spec.metadata.get("requested_stages"),
@@ -2578,7 +2586,11 @@ class AgentRuntimeBridge:
         active_cancel_token = cancel_token or CancelToken()
         active_cancel_token.check_cancelled()
 
-        stage_host = _RuntimeStageHost(request, project_name, active_cancel_token)
+        stage_host = _RuntimeStageHost(
+            request, project_name, active_cancel_token,
+            **({"verified_explicit_stage1_scope": self._verified_explicit_stage1_scope}
+               if self._verified_explicit_stage1_scope is not None else {}),
+        )
         stage_host.audit_actor = str(self.job_spec.metadata.get("audit_actor") or "")
         stage_host.audit_reason = str(self.job_spec.metadata.get("audit_reason") or "")
         stage_host.audit_scope = dict(self.job_spec.metadata.get("audit_scope") or {})

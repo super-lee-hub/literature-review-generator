@@ -416,6 +416,8 @@ class AgentRuntimeRunner:
         cancel_token: CancelToken | None = None,
         publication_context: Any | None = None,
         queue_resume_intent: Mapping[str, Any] | None = None,
+        resume_control_snapshot: Mapping[str, Any] | None = None,
+        verified_explicit_stage1_scope: Any | None = None,
     ) -> None:
         if queue_resume_intent is not None:
             from services.queue_service import QueuePublicationContext
@@ -461,6 +463,8 @@ class AgentRuntimeRunner:
         self.cancel_token = cancel_token
         self.publication_context = publication_context
         self.queue_resume_intent = dict(queue_resume_intent) if queue_resume_intent is not None else None
+        self.resume_control_snapshot = dict(resume_control_snapshot or {})
+        self._verified_explicit_stage1_scope = verified_explicit_stage1_scope
 
     def _apply_queue_resume_intent(self, session: AgentRuntimeSession) -> None:
         intent = self.queue_resume_intent
@@ -558,7 +562,9 @@ class AgentRuntimeRunner:
                 explicit_scope = load_explicit_stage1_scope(
                     self.job_spec,
                     allow_template_credentials=bool(test_dependencies and test_dependencies.allow_template_credentials),
+                    verified_scope=self._verified_explicit_stage1_scope,
                 )
+                self._verified_explicit_stage1_scope = explicit_scope
             resolved_config = explicit_scope.config if explicit_scope is not None else load_config(
                 self.job_spec.config,
                 action=self.job_spec.action,
@@ -1432,9 +1438,14 @@ class AgentRuntimeRunner:
                 batch_spec.parent_selection()
             )
             validated_batch_parent_registry_path = validated_parent_registry.registry_path
+        scope_kwargs: dict[str, Any] = (
+            {"verified_explicit_stage1_scope": self._verified_explicit_stage1_scope}
+            if self._verified_explicit_stage1_scope is not None else {}
+        )
         bridge = AgentRuntimeBridge(
             spec, publication_context=self.publication_context,
             verified_source_revision_plan=verified_source_revision_plan,
+            **scope_kwargs,
         )
         normalized_spec_payload = spec.to_dict()
         resume_preflight = None
@@ -1458,6 +1469,18 @@ class AgentRuntimeRunner:
                         normalized_spec_payload,
                         ArtifactRegistry(workspace.paths.registry_path, workspace.job_id),
                     )
+                    registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+                    from runtime.cancellation import CancellationRequestStore
+                    from runtime.pause_state import PauseStateStore
+
+                    cancel_store = CancellationRequestStore(workspace, registry)
+                    if not self.resume_control_snapshot:
+                        captured_cancel, captured_cancel_hash = cancel_store.read_snapshot()
+                        pause_state, pause_hash = PauseStateStore(workspace, registry).read_snapshot()
+                        self.resume_control_snapshot = {
+                            "cancel_state": captured_cancel, "cancel_hash": captured_cancel_hash,
+                            "pause_state": pause_state, "pause_hash": pause_hash,
+                        }
                 except BaseException:
                     candidate.release()
                     raise
@@ -1560,6 +1583,11 @@ class AgentRuntimeRunner:
                 # all been validated. Clear only the captured prior marker;
                 # its Registry keeps the current queue publication fence.
                 self._apply_queue_resume_intent(session)
+            elif resume:
+                # The one execution lease, persisted identity, continuation and
+                # original aggregate ledger are now admitted. Only this branch
+                # may consume the stop versions captured when resume was asked.
+                self._prepare_resume_controls(session)
             control_identity = RuntimeControlIdentityV1(
                 job_id=session.context.workspace.job_id,
                 workspace_path=str(session.context.workspace.root_dir),
@@ -1597,6 +1625,39 @@ class AgentRuntimeRunner:
                 )
         finally:
             execution_lease.release()
+
+    def _prepare_resume_controls(self, session: AgentRuntimeSession) -> None:
+        from runtime.cancellation import CancellationRequestError, CancellationRequestStore
+        from runtime.pause_state import PauseRequestedError, PauseStateStore
+        from runtime.outline_v3_dag import OutlineNodeStore
+        from services.durable_io import interprocess_file_lock
+
+        workspace, registry = session.context.workspace, session.context.registry
+        cancel = CancellationRequestStore(workspace, registry)
+        pause = PauseStateStore(workspace, registry)
+        captured = self.resume_control_snapshot
+        # Validate both snapshots before changing either marker. A marker that
+        # was absent at request time must remain absent, never be recaptured.
+        store = OutlineNodeStore(workspace, registry)
+        dag = store.load()
+        # Take the existing marker locks in a fixed order. Requests use these
+        # same locks, so a newer pause cannot appear between cancel and pause
+        # CAS and leave a partially consumed stop transition.
+        with interprocess_file_lock(cancel.path), interprocess_file_lock(pause.path):
+            current_cancel = cancel._read_unlocked()
+            current_pause = pause._read_unlocked()
+            if (file_sha256(cancel.path) if current_cancel is not None else "") != captured.get("cancel_hash", ""):
+                raise CancellationRequestError("cancellation marker changed after resume was requested")
+            if (file_sha256(pause.path) if current_pause is not None else "") != captured.get("pause_hash", ""):
+                raise PauseRequestedError("pause marker changed after resume was requested")
+            if captured.get("cancel_state") is not None and captured["cancel_state"].active:
+                cancel.clear(cleared_by="reviewctl", reason="resume_requested",
+                             expected_hash=captured["cancel_hash"], _lock_held=True)
+            if captured.get("pause_state") is not None and captured["pause_state"].paused:
+                pause.clear(cleared_by="reviewctl", reason="explicit_resume",
+                            expected_hash=captured["pause_hash"], _lock_held=True)
+        if dag is not None and dag.failed_node_ids:
+            store.resume()
 
     def _admit_run_provider_envelope(self, session: AgentRuntimeSession, spec: RuntimeJobSpec) -> None:
         from runtime.provider_runtime import (

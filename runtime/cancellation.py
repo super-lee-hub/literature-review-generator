@@ -177,6 +177,7 @@ class CancellationRequestStore:
     def clear(
         self, *, cleared_by: str = "reviewctl", reason: str = "new_attempt",
         expected_hash: str | None = None,
+        _lock_held: bool = False,
     ) -> CancellationRequestV1:
         if expected_hash is not None and (
             not isinstance(expected_hash, str)
@@ -193,7 +194,7 @@ class CancellationRequestStore:
             checkpoint="cooperative",
             request_token=uuid.uuid4().hex,
         )
-        with interprocess_file_lock(self.path):
+        with (nullcontext() if _lock_held else interprocess_file_lock(self.path)):
             with self._mutation_guard(clearing=True) as register:
                 if expected_hash is not None:
                     current = self._read_unlocked()

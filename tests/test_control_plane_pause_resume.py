@@ -83,3 +83,29 @@ def test_public_resume_rejection_keeps_job_paused(tmp_path: Path) -> None:
     state_after = PauseStateStore(reopened_workspace, reopened_registry).read()
     assert state_after is not None and state_after.paused
     assert CancellationRequestStore(reopened_workspace, reopened_registry).is_requested()
+
+def test_pause_clear_cas_preserves_a_newer_pause_request(tmp_path: Path) -> None:
+    papers = tmp_path / "papers"
+    papers.mkdir()
+    _write_pdf(papers / "paper.pdf", "Paper", "A bounded finding.")
+    spec = RuntimeJobSpec(
+        project_name="pause-cas",
+        source=RuntimeSourceSpec(mode="direct", pdf_folder=str(papers)),
+        job_id="pause-cas-job",
+        config=str(_local_config(tmp_path)),
+        action="run_all",
+        queue_file=str(tmp_path / "queue.json"),
+        workspace_path=str(tmp_path / "workspace"),
+    )
+    session = AgentRuntimeBridge(spec).bootstrap(
+        resume_requested=False, claim_latest_pointer=False, publish_running_state=False,
+    )
+    store = PauseStateStore(session.context.workspace, session.context.registry)
+    store.request(requested_by="tests.first")
+    _state, old_hash = store.read_snapshot()
+    store.request(requested_by="tests.concurrent")
+    with pytest.raises(Exception, match="changed after resume"):
+        store.clear(expected_hash=old_hash)
+    current, current_hash = store.read_snapshot()
+    assert current is not None and current.paused
+    assert current_hash != old_hash

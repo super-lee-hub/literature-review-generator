@@ -6048,27 +6048,32 @@ class ProviderRuntime:
 
     def mark_transport_started(self, admission: ProviderCallAdmissionV1) -> None:
         """Durably mark the boundary immediately before a transport call."""
-
         try:
             self._assert_pause_state_before_admission()
-        except ProviderCancellationRequested:
-            self.release_unstarted(admission)
+            if self.aggregate_budget is None or admission.aggregate_reservation_id is None:
+                return
+            with self._lock:
+                reservation = self._aggregate_reservations.get(admission.sequence)
+                primary_scope = self._primary_repair_scopes.get(admission.sequence)
+            if reservation is None:
+                raise ProviderRuntimeContractError(
+                    f"aggregate reservation is missing for admission sequence {admission.sequence}"
+                )
+            if primary_scope is not None:
+                # PRIMARY's physical POST marker is recorded by the adapter's
+                # attempt-start callback after local request preparation. The
+                # executor's earlier call marks the transport phase only.
+                return
+            self.aggregate_budget.mark_transport_started(reservation)
+        except BaseException:
+            # Any exception before the durable transport marker is proof that
+            # this process did not start the request. release_unstarted is
+            # itself fail-closed and refuses to refund a started/unknown call.
+            try:
+                self.release_unstarted(admission)
+            except BaseException:
+                pass
             raise
-        if self.aggregate_budget is None or admission.aggregate_reservation_id is None:
-            return
-        with self._lock:
-            reservation = self._aggregate_reservations.get(admission.sequence)
-            primary_scope = self._primary_repair_scopes.get(admission.sequence)
-        if reservation is None:
-            raise ProviderRuntimeContractError(
-                f"aggregate reservation is missing for admission sequence {admission.sequence}"
-            )
-        if primary_scope is not None:
-            # PRIMARY's physical POST marker is recorded by the adapter's
-            # attempt-start callback after local request preparation. The
-            # executor's earlier call marks the transport phase only.
-            return
-        self.aggregate_budget.mark_transport_started(reservation)
 
     def primary_provider_attempt_started_callback(
         self,
